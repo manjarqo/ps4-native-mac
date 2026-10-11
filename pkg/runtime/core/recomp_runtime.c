@@ -52,8 +52,16 @@ static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
       }
     }
 #if defined(__APPLE__) && defined(__arm64__)
-    uint64_t host_pc = ((ucontext_t *)ucontext)->uc_mcontext->__ss.__pc;
-    fprintf(stderr, "Host PC: 0x%llx\n", (unsigned long long)host_pc);
+    arm_thread_state64_t *state = (arm_thread_state64_t *)&(((ucontext_t *)ucontext)->uc_mcontext->__ss);
+    fprintf(stderr, "Host PC: 0x%llx (ARM64)\n", (unsigned long long)state->__pc);
+    for (int i = 0; i < 29; i++) {
+      fprintf(stderr, "x%d=0x%llx ", i, (unsigned long long)state->__x[i]);
+      if ((i + 1) % 4 == 0) fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "\nfp=0x%llx lr=0x%llx sp=0x%llx\n",
+            (unsigned long long)state->__fp,
+            (unsigned long long)state->__lr,
+            (unsigned long long)state->__sp);
 #endif
     void *callstack[64];
     int frames = backtrace(callstack, 64);
@@ -224,6 +232,8 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
   sa.sa_sigaction = crash_handler;
   sigaction(SIGSEGV, &sa, NULL);
   sigaction(SIGBUS, &sa, NULL);
+  sigaction(SIGTRAP, &sa, NULL);
+  sigaction(SIGILL, &sa, NULL);
 
   // Dynamic memory size calculation without hardcoded limits
   if (guest_mem_sz == 0) {
@@ -582,6 +592,10 @@ void shim_sceKernelGetProcParam(GuestContext *ctx) {
   GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
   ctx->rax = proc->proc_param_addr;
   SHIM_RETURN();
+}
+
+void recomp_dispatch_external(GuestContext *ctx, uint64_t target) {
+  recomp_dispatch(ctx, target);
 }
 
 void recomp_free_runtime(GuestContext *ctx) {
@@ -1659,4 +1673,21 @@ xmm_reg_t recomp_vaeskeygenassist(xmm_reg_t s, uint8_t rcon) {
   res.u32[2] = sw3;
   res.u32[3] = aes_rotword(sw3) ^ (uint32_t)rcon;
   return res;
+}
+
+void recomp_unsupported_instruction(uint64_t rip, uint64_t fn_entry, const char *inst_str) {
+  fprintf(stderr, "\n=======================================================\n");
+  fprintf(stderr, "FATAL: Unsupported guest instruction executed!\n");
+  fprintf(stderr, "  Guest RIP:   0x%llx\n", (unsigned long long)rip);
+  if (fn_entry != 0) {
+    fprintf(stderr, "  Function:    fn_0x%llx (offset +0x%llx)\n",
+            (unsigned long long)fn_entry,
+            (unsigned long long)(rip >= fn_entry ? rip - fn_entry : 0));
+  }
+  if (inst_str && (uintptr_t)inst_str > 0x1000 && inst_str[0]) {
+    fprintf(stderr, "  Instruction: %s\n", inst_str);
+  }
+  fprintf(stderr, "=======================================================\n\n");
+  fflush(stderr);
+  abort();
 }

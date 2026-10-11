@@ -38,6 +38,7 @@ type Config struct {
 	AppDir        string
 	CopyResources bool
 	Asan          bool
+	Backend       string
 }
 
 const banner = `
@@ -51,6 +52,7 @@ Usage:
   ps4-recomp analyze <eboot.bin | input.elf | module.prx>
 
 Options:
+  -b, -backend <mode>     Target emission backend: asm (ARM64 assembly) or c (C source) (default: "asm")
   -o, -out <dir>          Output directory for generated C code and binaries (default: "build")
   -e, -elf <file>         Path to input PS4 ELF binary
   -c, -compile            Compile generated C code to native ARM64 binary with clang (default: true)
@@ -71,6 +73,7 @@ func normalizeArgs(args []string) ([]string, []string) {
 	var flags []string
 	var positional []string
 	valueFlags := map[string]bool{
+		"-b": true, "-backend": true, "--backend": true,
 		"-o": true, "-out": true, "--out": true,
 		"-e": true, "-elf": true, "--elf": true,
 		"-t": true, "-timeout": true, "--timeout": true,
@@ -109,10 +112,13 @@ func ParseArgs(args []string) (*Config, error) {
 		Jobs:      runtime.NumCPU(),
 		OptLevel:  "2",
 		ChunkSize: 250,
+		Backend:   "asm",
 	}
 
 	var help bool
 
+	fs.StringVar(&cfg.Backend, "backend", cfg.Backend, "Target emission backend: asm (ARM64 assembly) or c (C source)")
+	fs.StringVar(&cfg.Backend, "b", cfg.Backend, "Target emission backend (short)")
 	fs.StringVar(&cfg.ElfPath, "elf", "", "Path to input PS4 ELF binary")
 	fs.StringVar(&cfg.ElfPath, "e", "", "Path to input PS4 ELF binary (short)")
 	fs.StringVar(&cfg.OutDir, "out", cfg.OutDir, "Output directory for recompiled C code and binaries")
@@ -369,17 +375,33 @@ func Execute(args []string) error {
 		knownFuncs[f.Addr] = true
 	}
 
-	l := lifter.NewLifter(knownFuncs)
-	em := emitter.NewCEmitter(loaded, d, l)
-	em.AppDir = cfg.AppDir
-	em.Modules = moduleInfos
-	em.ChunkSize = cfg.ChunkSize
-	em.Funcs = funcs
-	em.HLE = hle
-
-	cFiles, err := em.EmitAll(cfg.OutDir)
-	if err != nil {
-		return fmt.Errorf("failed to emit C code: %w", err)
+	var cFiles []string
+	if cfg.Backend == "asm" {
+		l := lifter.NewArm64Lifter(knownFuncs)
+		em := emitter.NewAsmEmitter(loaded, d, l)
+		em.AppDir = cfg.AppDir
+		em.Modules = moduleInfos
+		em.ChunkSize = cfg.ChunkSize
+		em.Funcs = funcs
+		em.HLE = hle
+		var err error
+		cFiles, err = em.EmitAll(cfg.OutDir)
+		if err != nil {
+			return fmt.Errorf("failed to emit ARM64 assembly: %w", err)
+		}
+	} else {
+		l := lifter.NewLifter(knownFuncs)
+		em := emitter.NewCEmitter(loaded, d, l)
+		em.AppDir = cfg.AppDir
+		em.Modules = moduleInfos
+		em.ChunkSize = cfg.ChunkSize
+		em.Funcs = funcs
+		em.HLE = hle
+		var err error
+		cFiles, err = em.EmitAll(cfg.OutDir)
+		if err != nil {
+			return fmt.Errorf("failed to emit C code: %w", err)
+		}
 	}
 	hlePath := filepath.Join(cfg.OutDir, "hle_report.txt")
 	if err := hle.WriteFile(hlePath); err != nil {
@@ -476,12 +498,24 @@ func generateNinjaBuild(cFiles []string, outDir string, includeDirs []string, ta
 	}
 	incFlags = append(incFlags, ftCflags...)
 
+	hasAsm := false
+	for _, f := range cFiles {
+		if filepath.Ext(f) == ".s" {
+			hasAsm = true
+			break
+		}
+	}
+
 	cflags := []string{"-O" + optLevel, "-fvisibility=hidden", "-Wno-parentheses-equality"}
 	if asan {
 		cflags = append(cflags, "-fsanitize=address,undefined", "-fno-omit-frame-pointer")
 	}
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-		cflags = append([]string{"-target", "arm64-apple-darwin", "-mcpu=apple-m1"}, cflags...)
+		darwinFlags := []string{"-target", "arm64-apple-darwin", "-mcpu=apple-m1"}
+		if hasAsm {
+			darwinFlags = append(darwinFlags, "-DRECOMP_ARM64_ASM=1")
+		}
+		cflags = append(darwinFlags, cflags...)
 	}
 
 	cflagsStr := strings.Join(append(cflags, incFlags...), " ")
@@ -492,6 +526,12 @@ func generateNinjaBuild(cFiles []string, outDir string, includeDirs []string, ta
 	sb.WriteString("  depfile = $out.d\n")
 	sb.WriteString("  deps = gcc\n")
 	sb.WriteString("  description = CC $in\n\n")
+
+	sb.WriteString("rule compile_s\n")
+	sb.WriteString("  command = clang -MD -MF $out.d $cflags -c $in -o $out\n")
+	sb.WriteString("  depfile = $out.d\n")
+	sb.WriteString("  deps = gcc\n")
+	sb.WriteString("  description = AS $in\n\n")
 
 	sb.WriteString("rule compile_m\n")
 	sb.WriteString("  command = clang -MD -MF $out.d $cflags -fobjc-arc -c $in -o $out\n")
@@ -547,7 +587,9 @@ func generateNinjaBuild(cFiles []string, outDir string, includeDirs []string, ta
 		objFile := strings.TrimSuffix(relCFile, ext) + ".o"
 		objFiles = append(objFiles, objFile)
 		rule := "compile_c"
-		if ext == ".m" {
+		if ext == ".s" {
+			rule = "compile_s"
+		} else if ext == ".m" {
 			rule = "compile_m"
 		} else if ext == ".mm" {
 			rule = "compile_mm"
@@ -672,7 +714,7 @@ func compileParallel(cFiles []string, outDir string, includeDirs []string, targe
 				}
 				clangArgs = append(clangArgs, "-c", cFile, "-o", objFile)
 				if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-					clangArgs = append([]string{"-target", "arm64-apple-darwin", "-mcpu=apple-m1"}, clangArgs...)
+					clangArgs = append([]string{"-target", "arm64-apple-darwin", "-mcpu=apple-m1", "-DRECOMP_ARM64_ASM=1"}, clangArgs...)
 				}
 
 				cmd := exec.Command(compilerBin, clangArgs...)

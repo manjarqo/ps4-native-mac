@@ -392,7 +392,12 @@ static inline void recomp_dispatch(GuestContext *ctx, uint64_t target) {
       if (__builtin_expect(l3 != NULL, 1)) {
         recomp_fn_t fn = l3[target & DISPATCH_LEVEL_MASK];
         if (__builtin_expect(fn != NULL, 1)) {
+#if defined(RECOMP_ARM64_ASM)
+          extern void recomp_enter_guest(GuestContext *ctx, uint64_t target_fn);
+          recomp_enter_guest(ctx, (uint64_t)fn);
+#else
           fn(ctx);
+#endif
           return;
         }
       }
