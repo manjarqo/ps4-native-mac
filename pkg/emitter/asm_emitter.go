@@ -506,10 +506,54 @@ _recomp_indirect_call:
 99:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
+    adrp x2, _g_current_guest_ctx@PAGE
+    ldr  x2, [x2, _g_current_guest_ctx@PAGEOFF]
+    cbz  x2, 98f
+    str x19, [x2, #0x0]   // rax
+    str x21, [x2, #0x8]   // rcx
+    str x22, [x2, #0x10]  // rdx
+    str x20, [x2, #0x18]  // rbx
+    str x26, [x2, #0x20]  // rsp
+    str x25, [x2, #0x28]  // rbp
+    str x23, [x2, #0x30]  // rsi
+    str x24, [x2, #0x38]  // rdi
+    str x8,  [x2, #0x40]  // r8
+    str x9,  [x2, #0x48]  // r9
+    str x10, [x2, #0x50]  // r10
+    str x11, [x2, #0x58]  // r11
+    str x12, [x2, #0x60]  // r12
+    str x13, [x2, #0x68]  // r13
+    str x14, [x2, #0x70]  // r14
+    str x15, [x2, #0x78]  // r15
+
+98:
     mov x1, x0
-    adrp x0, _g_current_guest_ctx@PAGE
-    ldr  x0, [x0, _g_current_guest_ctx@PAGEOFF]
+    mov x0, x2
     bl   _recomp_dispatch_external
+
+    adrp x2, _g_current_guest_ctx@PAGE
+    ldr  x0, [x2, _g_current_guest_ctx@PAGEOFF]
+    cbz  x0, 97f
+    ldr x19, [x0, #0x0]   // rax
+    ldr x21, [x0, #0x8]   // rcx
+    ldr x22, [x0, #0x10]  // rdx
+    ldr x20, [x0, #0x18]  // rbx
+    ldr x26, [x0, #0x20]  // rsp
+    ldr x25, [x0, #0x28]  // rbp
+    ldr x23, [x0, #0x30]  // rsi
+    ldr x24, [x0, #0x38]  // rdi
+    ldr x8,  [x0, #0x40]  // r8
+    ldr x9,  [x0, #0x48]  // r9
+    ldr x10, [x0, #0x50]  // r10
+    ldr x11, [x0, #0x58]  // r11
+    ldr x12, [x0, #0x60]  // r12
+    ldr x13, [x0, #0x68]  // r13
+    ldr x14, [x0, #0x70]  // r14
+    ldr x15, [x0, #0x78]  // r15
+    ldr x27, [x0, #0x88]  // fs_base
+    ldr x28, [x0, #0x330] // mem_base
+
+97:
     ldp x29, x30, [sp], #16
     ret
 
@@ -534,10 +578,54 @@ _recomp_indirect_jump:
 99:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
+    adrp x2, _g_current_guest_ctx@PAGE
+    ldr  x2, [x2, _g_current_guest_ctx@PAGEOFF]
+    cbz  x2, 98f
+    str x19, [x2, #0x0]   // rax
+    str x21, [x2, #0x8]   // rcx
+    str x22, [x2, #0x10]  // rdx
+    str x20, [x2, #0x18]  // rbx
+    str x26, [x2, #0x20]  // rsp
+    str x25, [x2, #0x28]  // rbp
+    str x23, [x2, #0x30]  // rsi
+    str x24, [x2, #0x38]  // rdi
+    str x8,  [x2, #0x40]  // r8
+    str x9,  [x2, #0x48]  // r9
+    str x10, [x2, #0x50]  // r10
+    str x11, [x2, #0x58]  // r11
+    str x12, [x2, #0x60]  // r12
+    str x13, [x2, #0x68]  // r13
+    str x14, [x2, #0x70]  // r14
+    str x15, [x2, #0x78]  // r15
+
+98:
     mov x1, x0
-    adrp x0, _g_current_guest_ctx@PAGE
-    ldr  x0, [x0, _g_current_guest_ctx@PAGEOFF]
+    mov x0, x2
     bl   _recomp_dispatch_external
+
+    adrp x2, _g_current_guest_ctx@PAGE
+    ldr  x0, [x2, _g_current_guest_ctx@PAGEOFF]
+    cbz  x0, 97f
+    ldr x19, [x0, #0x0]   // rax
+    ldr x21, [x0, #0x8]   // rcx
+    ldr x22, [x0, #0x10]  // rdx
+    ldr x20, [x0, #0x18]  // rbx
+    ldr x26, [x0, #0x20]  // rsp
+    ldr x25, [x0, #0x28]  // rbp
+    ldr x23, [x0, #0x30]  // rsi
+    ldr x24, [x0, #0x38]  // rdi
+    ldr x8,  [x0, #0x40]  // r8
+    ldr x9,  [x0, #0x48]  // r9
+    ldr x10, [x0, #0x50]  // r10
+    ldr x11, [x0, #0x58]  // r11
+    ldr x12, [x0, #0x60]  // r12
+    ldr x13, [x0, #0x68]  // r13
+    ldr x14, [x0, #0x70]  // r14
+    ldr x15, [x0, #0x78]  // r15
+    ldr x27, [x0, #0x88]  // fs_base
+    ldr x28, [x0, #0x330] // mem_base
+
+97:
     ldp x29, x30, [sp], #16
     ret
 `

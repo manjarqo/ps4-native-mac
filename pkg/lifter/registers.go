@@ -127,7 +127,6 @@ var regMap = map[x86asm.Reg]RegInfo{
 	x86asm.M5: {BaseReg: "mmx[5]", Size: 8},
 	x86asm.M6: {BaseReg: "mmx[6]", Size: 8},
 	x86asm.M7: {BaseReg: "mmx[7]", Size: 8},
-
 }
 
 type regReadEntry struct {
@@ -265,3 +264,8 @@ func GetRegWriteStmt(reg x86asm.Reg, valExpr string) (string, error) {
 	}
 	return entry.prefix + valExpr + entry.suffix, nil
 }
+
+func isSegmentReg(reg x86asm.Reg) bool {
+	return reg == x86asm.CS || reg == x86asm.DS || reg == x86asm.ES || reg == x86asm.SS || reg == x86asm.FS || reg == x86asm.GS
+}
+

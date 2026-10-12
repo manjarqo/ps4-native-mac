@@ -66,4 +66,3 @@ func IsJcc(op x86asm.Op) bool {
 		return false
 	}
 }
-
