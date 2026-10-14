@@ -426,8 +426,21 @@ func (l *Arm64Lifter) liftAes(inst disasm.Instruction, nextPC uint64, lines []st
 			lines = append(lines, "    ldr q0, [x28, x16]")
 		}
 		lines = append(lines,
+			"    sub  sp, sp, #96",
+			"    stp  x29, x30, [sp, #80]",
+			"    add  x29, sp, #80",
+			"    stp  x8,  x9,  [sp, #0]",
+			"    stp  x10, x11, [sp, #16]",
+			"    stp  x12, x13, [sp, #32]",
+			"    stp  x14, x15, [sp, #48]",
 			fmt.Sprintf("    mov  w0, #%d", uint8(imm)),
 			"    bl   _recomp_vaeskeygenassist",
+			"    ldp  x8,  x9,  [sp, #0]",
+			"    ldp  x10, x11, [sp, #16]",
+			"    ldp  x12, x13, [sp, #32]",
+			"    ldp  x14, x15, [sp, #48]",
+			"    ldp  x29, x30, [sp, #80]",
+			"    add  sp, sp, #96",
 			fmt.Sprintf("    mov  %s.16b, v0.16b", dLowV),
 			fmt.Sprintf("    movi %s.16b, #0", dHighV),
 		)
@@ -809,31 +822,42 @@ func (l *Arm64Lifter) liftPcmpistri(inst disasm.Instruction, nextPC uint64, line
 	}
 
 	s1Q := "q" + strings.TrimPrefix(s1LowV, "v")
+
+	if mem, okMem := s2.(x86asm.Mem); okMem {
+		lines = append(lines, computeEffAddr(mem, nextPC, "x1")...)
+		lines = append(lines, "    add  x1, x28, x1")
+	}
+
 	lines = append(lines,
-		"    sub  sp, sp, #64",
-		"    stp  x29, x30, [sp, #48]",
-		"    add  x29, sp, #48",
-		fmt.Sprintf("    str  %s, [sp, #16]", s1Q),
+		"    sub  sp, sp, #128",
+		"    stp  x29, x30, [sp, #112]",
+		"    add  x29, sp, #112",
+		"    stp  x8,  x9,  [sp, #32]",
+		"    stp  x10, x11, [sp, #48]",
+		"    stp  x12, x13, [sp, #64]",
+		"    stp  x14, x15, [sp, #80]",
+		fmt.Sprintf("    str  %s, [sp, #0]", s1Q),
+		"    add  x2, sp, #0",
 	)
 
 	if s2Reg, okS2 := s2.(x86asm.Reg); okS2 {
 		if _, _, _, s2LowV, _, _, _, okS2Desc := getVectorDesc(s2Reg); okS2Desc {
 			s2Q := "q" + strings.TrimPrefix(s2LowV, "v")
 			lines = append(lines,
-				fmt.Sprintf("    str  %s, [sp, #32]", s2Q),
-				"    add  x1, sp, #32",
+				fmt.Sprintf("    str  %s, [sp, #16]", s2Q),
+				"    add  x1, sp, #16",
 			)
 		}
-	} else if mem, okMem := s2.(x86asm.Mem); okMem {
-		lines = append(lines, computeEffAddr(mem, nextPC, "x1")...)
-		lines = append(lines, "    add  x1, x28, x1")
 	}
 
 	lines = append(lines, l.emitLoadCtxPtr("x0")...)
 	lines = append(lines,
-		"    add  x2, sp, #16",
 		fmt.Sprintf("    mov  w3, #%d", immVal&0xff),
 		"    bl   _recomp_vpcmpistri",
+		"    ldp  x8,  x9,  [sp, #32]",
+		"    ldp  x10, x11, [sp, #48]",
+		"    ldp  x12, x13, [sp, #64]",
+		"    ldp  x14, x15, [sp, #80]",
 	)
 	lines = append(lines, l.emitLoadCtxPtr("x17")...)
 	lines = append(lines,
@@ -841,14 +865,15 @@ func (l *Arm64Lifter) liftPcmpistri(inst disasm.Instruction, nextPC uint64, line
 		"    ldrb w16, [x17, #0x9a]", // sf -> N (bit 31)
 		"    ldrb w18, [x17, #0x99]", // zf -> Z (bit 30)
 		"    orr  w16, w18, w16, lsl #1",
-		"    ldrb w18, [x17, #0x98]", // cf -> C (bit 29)
+		"    ldrb w18, [x17, #0x98]", // cf
+		"    eor  w18, w18, #1",      // ARM64 C = NOT x86 CF (C=1 means no carry / above or equal)
 		"    orr  w16, w18, w16, lsl #1",
 		"    ldrb w18, [x17, #0x9b]", // of -> V (bit 28)
 		"    orr  w16, w18, w16, lsl #1",
 		"    lsl  w16, w16, #28",
 		"    msr  nzcv, x16",
-		"    ldp  x29, x30, [sp, #48]",
-		"    add  sp, sp, #64",
+		"    ldp  x29, x30, [sp, #112]",
+		"    add  sp, sp, #128",
 	)
 	return lines, nil
 }
@@ -872,33 +897,44 @@ func (l *Arm64Lifter) liftPcmpestri(inst disasm.Instruction, nextPC uint64, line
 	}
 
 	s1Q := "q" + strings.TrimPrefix(s1LowV, "v")
+
+	if mem, okMem := s2.(x86asm.Mem); okMem {
+		lines = append(lines, computeEffAddr(mem, nextPC, "x1")...)
+		lines = append(lines, "    add  x1, x28, x1")
+	}
+
 	lines = append(lines,
-		"    sub  sp, sp, #64",
-		"    stp  x29, x30, [sp, #48]",
-		"    add  x29, sp, #48",
-		fmt.Sprintf("    str  %s, [sp, #16]", s1Q),
+		"    sub  sp, sp, #128",
+		"    stp  x29, x30, [sp, #112]",
+		"    add  x29, sp, #112",
+		"    stp  x8,  x9,  [sp, #32]",
+		"    stp  x10, x11, [sp, #48]",
+		"    stp  x12, x13, [sp, #64]",
+		"    stp  x14, x15, [sp, #80]",
+		fmt.Sprintf("    str  %s, [sp, #0]", s1Q),
+		"    add  x2, sp, #0",
 	)
 
 	if s2Reg, okS2 := s2.(x86asm.Reg); okS2 {
 		if _, _, _, s2LowV, _, _, _, okS2Desc := getVectorDesc(s2Reg); okS2Desc {
 			s2Q := "q" + strings.TrimPrefix(s2LowV, "v")
 			lines = append(lines,
-				fmt.Sprintf("    str  %s, [sp, #32]", s2Q),
-				"    add  x1, sp, #32",
+				fmt.Sprintf("    str  %s, [sp, #16]", s2Q),
+				"    add  x1, sp, #16",
 			)
 		}
-	} else if mem, okMem := s2.(x86asm.Mem); okMem {
-		lines = append(lines, computeEffAddr(mem, nextPC, "x1")...)
-		lines = append(lines, "    add  x1, x28, x1")
 	}
 
 	lines = append(lines, l.emitLoadCtxPtr("x0")...)
 	lines = append(lines,
 		"    str  x19, [x0, #0]",
 		"    str  x22, [x0, #16]",
-		"    add  x2, sp, #16",
 		fmt.Sprintf("    mov  w3, #%d", immVal&0xff),
 		"    bl   _recomp_vpcmpe_stri",
+		"    ldp  x8,  x9,  [sp, #32]",
+		"    ldp  x10, x11, [sp, #48]",
+		"    ldp  x12, x13, [sp, #64]",
+		"    ldp  x14, x15, [sp, #80]",
 	)
 	lines = append(lines, l.emitLoadCtxPtr("x17")...)
 	lines = append(lines,
@@ -906,14 +942,15 @@ func (l *Arm64Lifter) liftPcmpestri(inst disasm.Instruction, nextPC uint64, line
 		"    ldrb w16, [x17, #0x9a]", // sf -> N (bit 31)
 		"    ldrb w18, [x17, #0x99]", // zf -> Z (bit 30)
 		"    orr  w16, w18, w16, lsl #1",
-		"    ldrb w18, [x17, #0x98]", // cf -> C (bit 29)
+		"    ldrb w18, [x17, #0x98]", // cf
+		"    eor  w18, w18, #1",      // ARM64 C = NOT x86 CF (C=1 means no carry / above or equal)
 		"    orr  w16, w18, w16, lsl #1",
 		"    ldrb w18, [x17, #0x9b]", // of -> V (bit 28)
 		"    orr  w16, w18, w16, lsl #1",
 		"    lsl  w16, w16, #28",
 		"    msr  nzcv, x16",
-		"    ldp  x29, x30, [sp, #48]",
-		"    add  sp, sp, #64",
+		"    ldp  x29, x30, [sp, #112]",
+		"    add  sp, sp, #128",
 	)
 	return lines, nil
 }

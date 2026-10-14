@@ -129,6 +129,10 @@ func (e *AsmEmitter) EmitAll(outDir string) ([]string, error) {
 		return nil, fmt.Errorf("failed to emit guest_modules.c: %w", err)
 	}
 	buildFiles = append(buildFiles, modPath)
+	synthPath := strings.TrimSuffix(modPath, ".c") + "_synth.s"
+	if _, err := os.Stat(synthPath); err == nil {
+		buildFiles = append(buildFiles, synthPath)
+	}
 
 	return buildFiles, nil
 }
@@ -341,31 +345,19 @@ func (e *AsmEmitter) EmitTrampoline(path string) error {
 .p2align 2
 
 // Global pointer to active GuestContext
-.globl _g_current_guest_ctx
-.data
-.p2align 3
-_g_current_guest_ctx:
-    .quad 0
-
-.text
-.p2align 2
-
 // void recomp_enter_guest(GuestContext *ctx, uint64_t target_fn)
 // x0 = ctx, x1 = target_fn
 .globl _recomp_enter_guest
 _recomp_enter_guest:
-    // 1. Save host callee-saved registers and frame pointer
-    stp x29, x30, [sp, #-96]!
+    // 1. Save host callee-saved registers, frame pointer, and ctx on host stack
+    stp x29, x30, [sp, #-112]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
     stp x25, x26, [sp, #64]
     stp x27, x28, [sp, #80]
-
-    // Save active ctx pointer
-    adrp x2, _g_current_guest_ctx@PAGE
-    str  x0, [x2, _g_current_guest_ctx@PAGEOFF]
+    str x0,       [sp, #96]
 
     // 2. Load guest registers from GuestContext (x0)
     ldr x19, [x0, #0x0]   // rax
@@ -390,9 +382,8 @@ _recomp_enter_guest:
     // 3. Jump to target guest function (x1)
     blr x1
 
-    // 4. On return: save guest registers back to GuestContext
-    adrp x2, _g_current_guest_ctx@PAGE
-    ldr  x0, [x2, _g_current_guest_ctx@PAGEOFF]
+    // 4. On return: save guest registers back to GuestContext (from thread host stack)
+    ldr  x0, [sp, #96]
     str x19, [x0, #0x0]   // rax
     str x21, [x0, #0x8]   // rcx
     str x22, [x0, #0x10]  // rdx
@@ -416,7 +407,7 @@ _recomp_enter_guest:
     ldp x23, x24, [sp, #48]
     ldp x25, x26, [sp, #64]
     ldp x27, x28, [sp, #80]
-    ldp x29, x30, [sp], #96
+    ldp x29, x30, [sp], #112
     ret
 
 // _recomp_call_shim: calls a host C shim from guest assembly
@@ -432,9 +423,9 @@ _recomp_call_shim:
     stp q4, q5, [sp, #96]
     stp q6, q7, [sp, #128]
 
-    // Load active ctx into x1
-    adrp x1, _g_current_guest_ctx@PAGE
-    ldr  x1, [x1, _g_current_guest_ctx@PAGEOFF]
+    // Load active thread ctx into x1 from [x28, x27 + 0x70] (thread-local TCB)
+    add  x1, x27, #0x70
+    ldr  x1, [x28, x1]
 
     // Sync registers to ctx before calling shim
     str x19, [x1, #0x0]   // rax
@@ -459,9 +450,9 @@ _recomp_call_shim:
     ldr x2, [sp, #16]
     blr x2
 
-    // Reload active ctx
-    adrp x1, _g_current_guest_ctx@PAGE
-    ldr  x1, [x1, _g_current_guest_ctx@PAGEOFF]
+    // Reload active thread ctx from [x28, x27 + 0x70]
+    add  x1, x27, #0x70
+    ldr  x1, [x28, x1]
 
     // Reload return value (rax, rdx) and caller-saved registers
     ldr x19, [x1, #0x0]   // rax
@@ -504,10 +495,11 @@ _recomp_indirect_call:
     cbz  x16, 99f
     br   x16
 99:
-    stp x29, x30, [sp, #-16]!
+    stp x29, x30, [sp, #-32]!
     mov x29, sp
-    adrp x2, _g_current_guest_ctx@PAGE
-    ldr  x2, [x2, _g_current_guest_ctx@PAGEOFF]
+    str x0, [sp, #16]
+    add x2, x27, #0x70
+    ldr x2, [x28, x2]
     cbz  x2, 98f
     str x19, [x2, #0x0]   // rax
     str x21, [x2, #0x8]   // rcx
@@ -527,12 +519,12 @@ _recomp_indirect_call:
     str x15, [x2, #0x78]  // r15
 
 98:
-    mov x1, x0
+    ldr x1, [sp, #16]
     mov x0, x2
     bl   _recomp_dispatch_external
 
-    adrp x2, _g_current_guest_ctx@PAGE
-    ldr  x0, [x2, _g_current_guest_ctx@PAGEOFF]
+    add x0, x27, #0x70
+    ldr x0, [x28, x0]
     cbz  x0, 97f
     ldr x19, [x0, #0x0]   // rax
     ldr x21, [x0, #0x8]   // rcx
@@ -554,7 +546,7 @@ _recomp_indirect_call:
     ldr x28, [x0, #0x330] // mem_base
 
 97:
-    ldp x29, x30, [sp], #16
+    ldp x29, x30, [sp], #32
     ret
 
 // _recomp_indirect_jump: jumps to a guest function via dispatch
@@ -576,10 +568,11 @@ _recomp_indirect_jump:
     cbz  x16, 99f
     br   x16
 99:
-    stp x29, x30, [sp, #-16]!
+    stp x29, x30, [sp, #-32]!
     mov x29, sp
-    adrp x2, _g_current_guest_ctx@PAGE
-    ldr  x2, [x2, _g_current_guest_ctx@PAGEOFF]
+    str x0, [sp, #16]
+    add x2, x27, #0x70
+    ldr x2, [x28, x2]
     cbz  x2, 98f
     str x19, [x2, #0x0]   // rax
     str x21, [x2, #0x8]   // rcx
@@ -599,12 +592,12 @@ _recomp_indirect_jump:
     str x15, [x2, #0x78]  // r15
 
 98:
-    mov x1, x0
+    ldr x1, [sp, #16]
     mov x0, x2
     bl   _recomp_dispatch_external
 
-    adrp x2, _g_current_guest_ctx@PAGE
-    ldr  x0, [x2, _g_current_guest_ctx@PAGEOFF]
+    add x0, x27, #0x70
+    ldr x0, [x28, x0]
     cbz  x0, 97f
     ldr x19, [x0, #0x0]   // rax
     ldr x21, [x0, #0x8]   // rcx
@@ -626,7 +619,7 @@ _recomp_indirect_jump:
     ldr x28, [x0, #0x330] // mem_base
 
 97:
-    ldp x29, x30, [sp], #16
+    ldp x29, x30, [sp], #32
     ret
 `
 	return writeFileIfChanged(path, []byte(content))
@@ -704,19 +697,191 @@ int main(int argc, char **argv) {
 	return writeFileIfChanged(path, []byte(content))
 }
 
-// EmitGuestModules writes the runtime export tables used by sceKernelDlsym.
+// EmitGuestModules writes the runtime export tables, synthetic shims, and unwind registrations.
 func (e *AsmEmitter) EmitGuestModules(path string) error {
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
 
-	fmt.Fprintf(w, "#include \"recomp_runtime.h\"\n#include \"ps4_sysmodule.h\"\n\nvoid recomp_register_guest_modules(void) {\n")
-	for _, mod := range e.Modules {
-		fmt.Fprintf(w, "    // Module %s\n", mod.FileName)
-	}
-	fmt.Fprintf(w, "}\n")
+	fmt.Fprintf(w, "#include \"recomp_runtime.h\"\n#include \"ps4_sysmodule.h\"\n\n")
 
+	// 1. Sort shimMap keys
+	var sortedShimAddrs []uint64
+	for addr := range e.shimMap {
+		sortedShimAddrs = append(sortedShimAddrs, addr)
+	}
+	slices.Sort(sortedShimAddrs)
+
+	shimAddr := make(map[string]uint64)
+	for _, addr := range sortedShimAddrs {
+		shim := e.shimMap[addr]
+		for name, target := range CanonicalShims {
+			if target == shim {
+				if _, exists := shimAddr[name]; !exists {
+					shimAddr[name] = addr
+				}
+			}
+		}
+	}
+
+	nextSynth := uint64(0x1000)
+	if e.elf != nil {
+		nextSynth = (e.elf.MaxVAddr + 0xFFF) &^ 0xFFF
+		if nextSynth < 0x1000 {
+			nextSynth = 0x1000
+		}
+	}
+
+	type synthEntry struct {
+		addr uint64
+		shim string
+	}
+	var synthList []synthEntry
+	var synthRegs []string
+
+	shimNames := make([]string, 0, len(CanonicalShims))
+	for name := range CanonicalShims {
+		shimNames = append(shimNames, name)
+	}
+	slices.Sort(shimNames)
+
+	for _, name := range shimNames {
+		if _, ok := shimAddr[name]; ok {
+			continue
+		}
+		shimAddr[name] = nextSynth
+		shimFn := CanonicalShims[name]
+		synthList = append(synthList, synthEntry{addr: nextSynth, shim: shimFn})
+		synthRegs = append(synthRegs, fmt.Sprintf("    extern void fn_0x%x(GuestContext *ctx);\n    recomp_register_fn(0x%xULL, fn_0x%x);\n", nextSynth, nextSynth, nextSynth))
+		nextSynth += 16
+	}
+
+	// Forward declarations and weak fallback implementations for host shims
+	uniqueShims := make(map[string]bool)
+	uniqueShims["shim_unresolved_stub"] = true
+	for _, target := range CanonicalShims {
+		uniqueShims[target] = true
+	}
+	sortedShims := make([]string, 0, len(uniqueShims))
+	for s := range uniqueShims {
+		sortedShims = append(sortedShims, s)
+	}
+	slices.Sort(sortedShims)
+
+	w.WriteString("// Forward declarations and weak fallback implementations for host shims\n")
+	for _, s := range sortedShims {
+		fmt.Fprintf(w, "void %s(GuestContext *ctx);\n", s)
+	}
+	w.WriteString("\n// Weak fallback implementations\n")
+	for _, s := range sortedShims {
+		if s == "shim_unresolved_stub" {
+			continue
+		}
+		fmt.Fprintf(w, "__attribute__((weak)) void %s(GuestContext *ctx) { recomp_unimplemented_shim(ctx, %q); }\n", s, s)
+	}
+	w.WriteString("\n")
+
+	w.WriteString("static const RecompModuleExport recomp_host_shim_exports[] = {\n")
+	for _, name := range shimNames {
+		fmt.Fprintf(w, "    { %q, 0x%xULL },\n", name, shimAddr[name])
+	}
+	w.WriteString("    { NULL, 0 }\n};\n\n")
+
+	for i, mod := range e.Modules {
+		fmt.Fprintf(w, "static const RecompModuleExport recomp_module_exports_%d[] = {\n", i)
+		for _, exp := range mod.Exports {
+			fmt.Fprintf(w, "    { %q, 0x%xULL },\n", exp.Name, exp.Address)
+		}
+		w.WriteString("    { NULL, 0 }\n};\n\n")
+
+		if len(mod.Init) > 0 {
+			fmt.Fprintf(w, "static const uint64_t recomp_module_init_%d[] = {\n", i)
+			for _, addr := range mod.Init {
+				fmt.Fprintf(w, "    0x%xULL,\n", addr)
+			}
+			w.WriteString("};\n\n")
+		}
+	}
+
+	w.WriteString("void recomp_register_guest_modules(void) {\n")
+	for _, line := range synthRegs {
+		w.WriteString(line)
+	}
+	hostNames := []string{"libc.prx", "libSceLibcInternal.prx", "libkernel.prx", "libSceFios2.prx"}
+	for _, name := range hostNames {
+		fmt.Fprintf(w, "    recomp_module_register(%q, recomp_host_shim_exports);\n", name)
+	}
+
+	if e.elf != nil {
+		mainName := e.elf.FileName
+		if mainName == "" {
+			mainName = "eboot.bin"
+		}
+		startAddr := e.elf.OrigMinVAddr
+		endAddr := e.elf.OrigMaxVAddr
+		if endAddr == 0 {
+			endAddr = e.elf.MaxVAddr
+		}
+		fmt.Fprintf(w, "    static const RecompModuleUnwindInfo eboot_unwind = {\n"+
+			"        .name = %q,\n"+
+			"        .start_addr = 0x%xULL,\n"+
+			"        .end_addr = 0x%xULL,\n"+
+			"        .seg0_addr = 0x%xULL,\n"+
+			"        .seg0_size = 0x%xULL,\n"+
+			"        .eh_frame_hdr_addr = 0x%xULL,\n"+
+			"        .eh_frame_hdr_size = 0x%xULL,\n"+
+			"        .eh_frame_addr = 0x%xULL,\n"+
+			"        .eh_frame_size = 0x%xULL,\n"+
+			"    };\n"+
+			"    recomp_module_register_unwind_info(&eboot_unwind);\n",
+			mainName, startAddr, endAddr, e.elf.Seg0Addr, e.elf.Seg0Size,
+			e.elf.EHFrameHdrAddr, e.elf.EHFrameHdrSize, e.elf.EHFrameAddr, e.elf.EHFrameSize)
+	}
+
+	for i, mod := range e.Modules {
+		names := uniqueModuleNames(mod.FileName, mod.Aliases)
+		for _, name := range names {
+			fmt.Fprintf(w, "    recomp_module_register(%q, recomp_module_exports_%d);\n", name, i)
+			if len(mod.Init) > 0 {
+				fmt.Fprintf(w, "    recomp_module_register_init(%q, recomp_module_init_%d, %d);\n", name, i, len(mod.Init))
+			}
+		}
+		fmt.Fprintf(w, "    static const RecompModuleUnwindInfo mod_%d_unwind = {\n"+
+			"        .name = %q,\n"+
+			"        .start_addr = 0x%xULL,\n"+
+			"        .end_addr = 0x%xULL,\n"+
+			"        .seg0_addr = 0x%xULL,\n"+
+			"        .seg0_size = 0x%xULL,\n"+
+			"        .eh_frame_hdr_addr = 0x%xULL,\n"+
+			"        .eh_frame_hdr_size = 0x%xULL,\n"+
+			"        .eh_frame_addr = 0x%xULL,\n"+
+			"        .eh_frame_size = 0x%xULL,\n"+
+			"    };\n"+
+			"    recomp_module_register_unwind_info(&mod_%d_unwind);\n",
+			i, mod.FileName, mod.StartAddr, mod.EndAddr, mod.Seg0Addr, mod.Seg0Size,
+			mod.EHFrameHdrAddr, mod.EHFrameHdrSize, mod.EHFrameAddr, mod.EHFrameSize, i)
+	}
+
+	w.WriteString("}\n")
 	if err := w.Flush(); err != nil {
 		return err
 	}
-	return writeFileIfChanged(path, buf.Bytes())
+	if err := writeFileIfChanged(path, buf.Bytes()); err != nil {
+		return err
+	}
+
+	// 2. Write synth_shims.s
+	synthPath := strings.TrimSuffix(path, ".c") + "_synth.s"
+	var sBuf bytes.Buffer
+	sw := bufio.NewWriter(&sBuf)
+	sw.WriteString("// Synthetic shims ARM64 bridge\n.text\n.p2align 2\n\n")
+	for _, entry := range synthList {
+		fmt.Fprintf(sw, ".globl _fn_0x%x\n_fn_0x%x:\n", entry.addr, entry.addr)
+		fmt.Fprintf(sw, "    adrp x0, _%s@PAGE\n", entry.shim)
+		fmt.Fprintf(sw, "    add  x0, x0, _%s@PAGEOFF\n", entry.shim)
+		fmt.Fprintf(sw, "    b    _recomp_call_shim\n\n")
+	}
+	if err := sw.Flush(); err != nil {
+		return err
+	}
+	return writeFileIfChanged(synthPath, sBuf.Bytes())
 }

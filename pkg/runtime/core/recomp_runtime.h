@@ -39,8 +39,10 @@ void recomp_unimplemented_shim(GuestContext *ctx, const char *shim_name);
 void shim_unresolved_stub(GuestContext *ctx);
 void recomp_unsupported_instruction(uint64_t rip, uint64_t fn_entry, const char *inst_str);
 
-// Main thread initialization
+// Main thread and TLS context helpers
 void recomp_init_main_thread(GuestContext *ctx);
+GuestContext *recomp_get_current_ctx(void);
+void recomp_set_current_ctx(GuestContext *ctx);
 
 // Subsystem teardown and lifecycle
 void recomp_free_thread_context(GuestContext *ctx);

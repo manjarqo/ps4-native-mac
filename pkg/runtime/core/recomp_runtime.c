@@ -16,6 +16,14 @@ recomp_fn_t **g_dispatch_l1[DISPATCH_LEVEL_SIZE] = {0};
 _Thread_local GuestContext *g_current_ctx = NULL;
 pthread_mutex_t g_heap_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+GuestContext *recomp_get_current_ctx(void) {
+  return g_current_ctx;
+}
+
+void recomp_set_current_ctx(GuestContext *ctx) {
+  g_current_ctx = ctx;
+}
+
 static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
   if (g_current_ctx) {
     fprintf(stderr,
@@ -288,6 +296,7 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
   ctx->fs_base = tcb_addr;
   MEM_U64(tcb_addr) = tcb_addr;
   MEM_U64(tcb_addr + 0x28ULL) = 0x595e9fbd94fda766ULL;
+  MEM_U64(tcb_addr + 0x70ULL) = (uint64_t)ctx;
   ctx->mxcsr = 0x1f80;
   ctx->fpu_cw = 0x037f;
 
@@ -1029,6 +1038,8 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   GuestContext *t_ctx = (GuestContext *)calloc(1, sizeof(GuestContext));
   if (!t_ctx)
     return NULL;
+
+  *(uint64_t *)(parent->mem_base + tcb_base + 0x70ULL) = (uint64_t)t_ctx;
 
   t_ctx->mem_base = parent->mem_base;
   t_ctx->mem_size = parent->mem_size;

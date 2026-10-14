@@ -349,8 +349,12 @@ func computeEffAddr(mem x86asm.Mem, nextPC uint64, targetReg string) []string {
 		} else if disp < 0 && -disp <= 4095 {
 			lines = append(lines, fmt.Sprintf("    sub %s, %s, #%d", targetReg, targetReg, -disp))
 		} else {
-			lines = append(lines, loadImm64("x17", uint64(disp))...)
-			lines = append(lines, fmt.Sprintf("    add %s, %s, x17", targetReg, targetReg))
+			scratch := "x7"
+			if targetReg == "x7" {
+				scratch = "x6"
+			}
+			lines = append(lines, loadImm64(scratch, uint64(disp))...)
+			lines = append(lines, fmt.Sprintf("    add %s, %s, %s", targetReg, targetReg, scratch))
 		}
 	}
 
@@ -681,9 +685,13 @@ func (l *Arm64Lifter) LiftInstructionToBuf(inst disasm.Instruction, nextPC uint6
 			lines = append(lines, "    brk #0 // unmapped lea dst")
 			return lines, nil
 		}
-		lines = append(lines, computeEffAddr(mem, nextPC, desc.X)...)
+		lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 		if desc.Size == 4 {
-			lines = append(lines, fmt.Sprintf("    mov %s, %s", desc.W, desc.W))
+			lines = append(lines, fmt.Sprintf("    mov %s, w16", desc.W))
+		} else if desc.Size == 2 {
+			lines = append(lines, fmt.Sprintf("    bfi %s, x16, #0, #16", desc.X))
+		} else {
+			lines = append(lines, fmt.Sprintf("    mov %s, x16", desc.X))
 		}
 		return lines, nil
 

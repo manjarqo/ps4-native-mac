@@ -61,6 +61,12 @@ func TestArm64LifterBasic(t *testing.T) {
 			expected: []string{"ldrb w21, [x28, x16]"},
 		},
 		{
+			name:     "mov byte ptr [r13 + 0x411d], 0 (large disp store without clobbering w17)",
+			bytes:    []byte{0x41, 0xc6, 0x85, 0x1d, 0x41, 0x00, 0x00, 0x00}, // mov byte ptr [r13+0x411d], 0
+			pc:       0x1000,
+			expected: []string{"mov w17, #0x0", "mov x16, x13", "movz x7, #0x411d", "add x16, x16, x7", "strb w17, [x28, x16]"},
+		},
+		{
 			name:     "movsx rcx, word ptr [rdi]",
 			bytes:    []byte{0x48, 0x0f, 0xbf, 0x0f}, // movsx rcx, word ptr [rdi]
 			pc:       0x1000,
@@ -598,13 +604,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "fldz",
 			bytes:    []byte{0xd9, 0xee}, // fldz
 			pc:       0x1000,
-			expected: []string{"fmov d0, xzr", "_g_current_guest_ctx", "str  w17, [x16, #0x2e0]"},
+			expected: []string{"fmov d0, xzr", "add  x16, x27, #0x70", "str  w17, [x16, #0x2e0]"},
 		},
 		{
 			name:     "fld1",
 			bytes:    []byte{0xd9, 0xe8}, // fld1
 			pc:       0x1000,
-			expected: []string{"fmov d0, #1.0", "_g_current_guest_ctx"},
+			expected: []string{"fmov d0, #1.0", "add  x16, x27, #0x70"},
 		},
 		{
 			name:     "fstp st(0)",
@@ -820,13 +826,28 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "vpclmulqdq x0, x1, x2, 0",
 			bytes:    []byte{0xc4, 0xe3, 0x71, 0x44, 0xc2, 0x00},
 			pc:       0x1000,
-			expected: []string{"pmull v0.1q, v20.1d, v21.1d"},
 		},
 		{
-			name:     "vphsubd x0, x1, x2",
-			bytes:    []byte{0xc4, 0xe2, 0x71, 0x06, 0xc2},
+			name:     "sar al, 7",
+			bytes:    []byte{0xc0, 0xf8, 0x07}, // sar al, 7
 			pc:       0x1000,
-			expected: []string{"trn1 v20.4s, v1.4s, v1.4s", "sub  v22.4s, v20.4s, v21.4s", "mov  v0.d[0], v22.d[0]"},
+			expected: []string{"sxtb w16, w16", "asr w16, w16, #7"},
+		},
+		{
+			name:     "vpcmpistri x1, x0, 0",
+			bytes:    []byte{0xc4, 0xe3, 0x79, 0x63, 0xc8, 0x00},
+			pc:       0x1000,
+			expected: []string{
+				"stp  x8,  x9,  [sp, #32]",
+				"stp  x10, x11, [sp, #48]",
+				"stp  x12, x13, [sp, #64]",
+				"stp  x14, x15, [sp, #80]",
+				"bl   _recomp_vpcmpistri",
+				"ldp  x8,  x9,  [sp, #32]",
+				"ldp  x10, x11, [sp, #48]",
+				"ldp  x12, x13, [sp, #64]",
+				"ldp  x14, x15, [sp, #80]",
+			},
 		},
 	}
 

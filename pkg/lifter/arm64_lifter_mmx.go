@@ -10,8 +10,8 @@ import (
 // Helper to load context pointer into a GPR (e.g. x16).
 func (l *Arm64Lifter) emitLoadCtxPtr(reg string) []string {
 	return []string{
-		fmt.Sprintf("    adrp %s, _g_current_guest_ctx@PAGE", reg),
-		fmt.Sprintf("    ldr  %s, [%s, _g_current_guest_ctx@PAGEOFF]", reg, reg),
+		fmt.Sprintf("    add  %s, x27, #0x70", reg),
+		fmt.Sprintf("    ldr  %s, [x28, %s]", reg, reg),
 	}
 }
 

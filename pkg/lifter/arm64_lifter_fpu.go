@@ -23,8 +23,8 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 	// Helper to load context pointer into a GPR (e.g. x16)
 	loadCtxPtr := func(reg string) []string {
 		return []string{
-			fmt.Sprintf("    adrp %s, _g_current_guest_ctx@PAGE", reg),
-			fmt.Sprintf("    ldr  %s, [%s, _g_current_guest_ctx@PAGEOFF]", reg, reg),
+			fmt.Sprintf("    add  %s, x27, #0x70", reg),
+			fmt.Sprintf("    ldr  %s, [x28, %s]", reg, reg),
 		}
 	}
 
@@ -557,10 +557,20 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 	case x86asm.FCOS:
 		lines = append(lines, loadFpuSt("d0", 0)...)
 		lines = append(lines,
-			"    stp  x29, x30, [sp, #-16]!",
-			"    mov  x29, sp",
+			"    sub  sp, sp, #96",
+			"    stp  x29, x30, [sp, #80]",
+			"    add  x29, sp, #80",
+			"    stp  x8,  x9,  [sp, #0]",
+			"    stp  x10, x11, [sp, #16]",
+			"    stp  x12, x13, [sp, #32]",
+			"    stp  x14, x15, [sp, #48]",
 			"    bl   _cos",
-			"    ldp  x29, x30, [sp], #16",
+			"    ldp  x8,  x9,  [sp, #0]",
+			"    ldp  x10, x11, [sp, #16]",
+			"    ldp  x12, x13, [sp, #32]",
+			"    ldp  x14, x15, [sp, #48]",
+			"    ldp  x29, x30, [sp, #80]",
+			"    add  sp, sp, #96",
 		)
 		lines = append(lines, storeFpuSt("d0", 0)...)
 		return lines, nil

@@ -418,10 +418,26 @@ func (l *Arm64Lifter) liftCmpTest(inst disasm.Instruction, nextPC uint64, lines 
 			if srcReg, okSrc := src.(x86asm.Reg); okSrc {
 				descSrc, okSrcD := arm64RegMap[srcReg]
 				if okSrcD {
-					if descDst.Size == 4 {
-						lines = append(lines, fmt.Sprintf("    %s %s, %s", armOp, descDst.W, descSrc.W))
-					} else {
+					if descDst.Size == 8 {
 						lines = append(lines, fmt.Sprintf("    %s %s, %s", armOp, descDst.X, descSrc.X))
+					} else if descDst.Size == 4 {
+						lines = append(lines, fmt.Sprintf("    %s %s, %s", armOp, descDst.W, descSrc.W))
+					} else if descDst.Size == 2 {
+						lines = append(lines,
+							fmt.Sprintf("    sxth w16, %s", descDst.W),
+							fmt.Sprintf("    sxth w17, %s", descSrc.W),
+							fmt.Sprintf("    %s w16, w17", armOp),
+						)
+					} else { // Size == 1
+						rc1, _ := readRegTo(dstReg, "x16", "w16")
+						rc2, _ := readRegTo(srcReg, "x17", "w17")
+						lines = append(lines, rc1...)
+						lines = append(lines, rc2...)
+						lines = append(lines,
+							"    sxtb w16, w16",
+							"    sxtb w17, w17",
+							fmt.Sprintf("    %s w16, w17", armOp),
+						)
 					}
 					return lines, nil
 				}
@@ -443,31 +459,42 @@ func (l *Arm64Lifter) liftCmpTest(inst disasm.Instruction, nextPC uint64, lines 
 						lines = append(lines, loadImm32("w16", uint32(val))...)
 						lines = append(lines, fmt.Sprintf("    %s %s, w16", armOp, descDst.W))
 					}
-				} else {
+				} else if descDst.Size == 2 {
+					sval := uint32(int32(int16(val)))
+					lines = append(lines, fmt.Sprintf("    sxth w17, %s", descDst.W))
+					lines = append(lines, loadImm32("w16", sval)...)
+					lines = append(lines, fmt.Sprintf("    %s w17, w16", armOp))
+				} else { // Size == 1
 					rc, _ := readRegTo(dstReg, "x17", "w17")
 					lines = append(lines, rc...)
-					uval := uint32(val)
-					if descDst.Size == 1 {
-						uval &= 0xff
-					} else {
-						uval &= 0xffff
-					}
-					if armOp == "cmp" && uval <= 4095 {
-						lines = append(lines, fmt.Sprintf("    cmp w17, #%d", uval))
-					} else {
-						lines = append(lines, loadImm32("w16", uval)...)
-						lines = append(lines, fmt.Sprintf("    %s w17, w16", armOp))
-					}
+					sval := uint32(int32(int8(val)))
+					lines = append(lines, "    sxtb w17, w17")
+					lines = append(lines, loadImm32("w16", sval)...)
+					lines = append(lines, fmt.Sprintf("    %s w17, w16", armOp))
 				}
 				return lines, nil
 			}
 
 			if mem, okMem := src.(x86asm.Mem); okMem {
 				lines = append(lines, readMemTo(mem, nextPC, descDst.Size, "x16", "w16")...)
-				if descDst.Size == 4 {
-					lines = append(lines, fmt.Sprintf("    %s %s, w16", armOp, descDst.W))
-				} else {
+				if descDst.Size == 8 {
 					lines = append(lines, fmt.Sprintf("    %s %s, x16", armOp, descDst.X))
+				} else if descDst.Size == 4 {
+					lines = append(lines, fmt.Sprintf("    %s %s, w16", armOp, descDst.W))
+				} else if descDst.Size == 2 {
+					lines = append(lines,
+						fmt.Sprintf("    sxth w17, %s", descDst.W),
+						"    sxth w16, w16",
+						fmt.Sprintf("    %s w17, w16", armOp),
+					)
+				} else { // Size == 1
+					rc1, _ := readRegTo(dstReg, "x17", "w17")
+					lines = append(lines, rc1...)
+					lines = append(lines,
+						"    sxtb w17, w17",
+						"    sxtb w16, w16",
+						fmt.Sprintf("    %s w17, w16", armOp),
+					)
 				}
 				return lines, nil
 			}
@@ -487,28 +514,46 @@ func (l *Arm64Lifter) liftCmpTest(inst disasm.Instruction, nextPC uint64, lines 
 					lines = append(lines, loadImm64("x17", uint64(val))...)
 					lines = append(lines, fmt.Sprintf("    %s x16, x17", armOp))
 				}
-			} else {
-				uval := uint32(val)
-				if sz == 1 {
-					uval &= 0xff
-				} else if sz == 2 {
-					uval &= 0xffff
-				}
-				if armOp == "cmp" && uval <= 4095 {
-					lines = append(lines, fmt.Sprintf("    cmp w16, #%d", uval))
+			} else if sz == 4 {
+				if armOp == "cmp" && val >= 0 && val <= 4095 {
+					lines = append(lines, fmt.Sprintf("    cmp w16, #%d", val))
 				} else {
-					lines = append(lines, loadImm32("w17", uval)...)
+					lines = append(lines, loadImm32("w17", uint32(val))...)
 					lines = append(lines, fmt.Sprintf("    %s w16, w17", armOp))
 				}
+			} else if sz == 2 {
+				sval := uint32(int32(int16(val)))
+				lines = append(lines, "    sxth w16, w16")
+				lines = append(lines, loadImm32("w17", sval)...)
+				lines = append(lines, fmt.Sprintf("    %s w16, w17", armOp))
+			} else { // sz == 1
+				sval := uint32(int32(int8(val)))
+				lines = append(lines, "    sxtb w16, w16")
+				lines = append(lines, loadImm32("w17", sval)...)
+				lines = append(lines, fmt.Sprintf("    %s w16, w17", armOp))
 			}
 			return lines, nil
 		}
 		if srcReg, okSrc := src.(x86asm.Reg); okSrc {
 			if descSrc, okSrcD := arm64RegMap[srcReg]; okSrcD {
-				if sz == 4 || sz == 1 || sz == 2 {
-					lines = append(lines, fmt.Sprintf("    %s w16, %s", armOp, descSrc.W))
-				} else {
+				if sz == 8 {
 					lines = append(lines, fmt.Sprintf("    %s x16, %s", armOp, descSrc.X))
+				} else if sz == 4 {
+					lines = append(lines, fmt.Sprintf("    %s w16, %s", armOp, descSrc.W))
+				} else if sz == 2 {
+					lines = append(lines,
+						"    sxth w16, w16",
+						fmt.Sprintf("    sxth w17, %s", descSrc.W),
+						fmt.Sprintf("    %s w16, w17", armOp),
+					)
+				} else { // sz == 1
+					rc, _ := readRegTo(srcReg, "x17", "w17")
+					lines = append(lines, rc...)
+					lines = append(lines,
+						"    sxtb w16, w16",
+						"    sxtb w17, w17",
+						fmt.Sprintf("    %s w16, w17", armOp),
+					)
 				}
 				return lines, nil
 			}
@@ -658,6 +703,13 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 					}
 					rc, _ := readRegTo(reg, "x16", "w16")
 					lines = append(lines, rc...)
+					if op == x86asm.SAR {
+						if desc.Size == 1 {
+							lines = append(lines, "    sxtb w16, w16")
+						} else if desc.Size == 2 {
+							lines = append(lines, "    sxth w16, w16")
+						}
+					}
 					if shiftVal > 0 {
 						lines = append(lines, fmt.Sprintf("    %s w16, w16, #%d", armOp, shiftVal))
 					}
@@ -674,6 +726,13 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 			} else {
 				rc, _ := readRegTo(reg, "x16", "w16")
 				lines = append(lines, rc...)
+				if op == x86asm.SAR {
+					if desc.Size == 1 {
+						lines = append(lines, "    sxtb w16, w16")
+					} else if desc.Size == 2 {
+						lines = append(lines, "    sxth w16, w16")
+					}
+				}
 				lines = append(lines, fmt.Sprintf("    %s w16, w16, w21", armOp))
 				wc, _ := writeRegFrom(reg, "x16", "w16")
 				lines = append(lines, wc...)
@@ -701,6 +760,13 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 				if op == x86asm.ROL {
 					shiftVal = (bitSize - (shiftVal % bitSize)) % bitSize
 				}
+				if op == x86asm.SAR {
+					if sz == 1 {
+						lines = append(lines, "    sxtb w17, w17")
+					} else if sz == 2 {
+						lines = append(lines, "    sxth w17, w17")
+					}
+				}
 				if shiftVal > 0 {
 					lines = append(lines, fmt.Sprintf("    %s w17, w17, #%d", armOp, shiftVal))
 				}
@@ -709,6 +775,13 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 			if sz == 8 {
 				lines = append(lines, fmt.Sprintf("    %s x17, x17, x21", armOp))
 			} else {
+				if op == x86asm.SAR {
+					if sz == 1 {
+						lines = append(lines, "    sxtb w17, w17")
+					} else if sz == 2 {
+						lines = append(lines, "    sxth w17, w17")
+					}
+				}
 				lines = append(lines, fmt.Sprintf("    %s w17, w17, w21", armOp))
 			}
 		}
