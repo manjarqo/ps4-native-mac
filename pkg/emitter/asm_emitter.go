@@ -682,6 +682,8 @@ int main(int argc, char **argv) {
 
     recomp_init_process_param(ctx, 0x%xULL);
 
+    recomp_init_tls(ctx, 0x%xULL, 0x%xULL, 0x%xULL, 0x%xULL);
+
     recomp_setup_entry_args(ctx, argc, argv, 0x%xULL);
 
     printf("[ps4-recomp] Executing %%s (0x%%x) via ARM64 assembly...\n", %q, (unsigned int)0x%xULL);
@@ -692,7 +694,7 @@ int main(int argc, char **argv) {
     recomp_free_runtime(ctx);
     return 0;
 }
-`, vfsInitArg, e.elf.ProcParamAddr, entryAddr, entryName, entryAddr, entryAddr, entryAddr)
+`, vfsInitArg, e.elf.ProcParamAddr, e.elf.TLSVaddr, e.elf.TLSFilesz, e.elf.TLSMemsz, e.elf.TLSAlign, entryAddr, entryName, entryAddr, entryAddr, entryAddr)
 
 	return writeFileIfChanged(path, []byte(content))
 }

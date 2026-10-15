@@ -113,6 +113,13 @@ typedef struct GuestContext {
 
   // Active exception unwinding frame stack
   UnwindFrame *unwind_frame;
+
+  // ELF PT_TLS and Static TLS Layout
+  uint64_t tls_vaddr;
+  uint64_t tls_filesz;
+  uint64_t tls_memsz;
+  uint64_t tls_align;
+  uint64_t static_tls_size;
 } GuestContext;
 
 #define SHIM_RETURN()                                                          \

@@ -170,6 +170,29 @@ type Arm64Lifter struct {
 	currentFn     *disasm.Function
 	unsuppCounter uint64
 	labelCounter  uint64
+	lastFlagOp    x86asm.Op
+}
+
+func isSubFlagOp(op x86asm.Op) bool {
+	switch op {
+	case x86asm.CMP, x86asm.SUB, x86asm.BT, x86asm.BTS, x86asm.BTR, x86asm.BTC, x86asm.NEG, x86asm.CLC, x86asm.STC, x86asm.CMC:
+		return true
+	default:
+		return false
+	}
+}
+
+func isAddFlagOp(op x86asm.Op) bool {
+	switch op {
+	case x86asm.ADD, x86asm.ADC:
+		return true
+	default:
+		return false
+	}
+}
+
+func isFlagSettingOp(op x86asm.Op) bool {
+	return isSubFlagOp(op) || isAddFlagOp(op) || op == x86asm.SBB
 }
 
 // NewArm64Lifter creates a new ARM64 assembly lifter.
@@ -618,7 +641,21 @@ func cmovccCond(op x86asm.Op) (string, bool) {
 
 // LiftInstructionToBuf translates a single x86 instruction into ARM64 assembly instructions.
 func (l *Arm64Lifter) LiftInstructionToBuf(inst disasm.Instruction, nextPC uint64, fn *disasm.Function, dst []string) ([]string, error) {
-	l.currentFn = fn
+	lines, err := l.liftInstructionInternal(inst, nextPC, fn, dst)
+	if err == nil {
+		op := inst.Inst.Op
+		if isFlagSettingOp(op) && !inst.SkipFlags {
+			l.lastFlagOp = op
+		}
+	}
+	return lines, err
+}
+
+func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC uint64, fn *disasm.Function, dst []string) ([]string, error) {
+	if fn != l.currentFn {
+		l.currentFn = fn
+		l.lastFlagOp = 0
+	}
 	op := inst.Inst.Op
 	args := inst.Inst.Args
 	lines := dst

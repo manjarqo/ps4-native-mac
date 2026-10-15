@@ -291,8 +291,9 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
     image_end = 0x10000ULL;
   }
 
-  // Set up FS segment (Thread Control Block for TLS) right above image
-  uint64_t tcb_addr = image_end;
+  // Reserve 64KB for Static TLS block immediately before TCB
+  uint64_t tls_area = image_end;
+  uint64_t tcb_addr = tls_area + 0x10000ULL;
   ctx->fs_base = tcb_addr;
   MEM_U64(tcb_addr) = tcb_addr;
   MEM_U64(tcb_addr + 0x28ULL) = 0x595e9fbd94fda766ULL;
@@ -460,6 +461,10 @@ GuestContext *recomp_init_runtime_file(const char *image_filename,
     }
   }
   fclose(fp);
+
+  // Guard guest NULL page (0x0 .. 0x10000) against invalid reads/writes
+  mprotect(ctx->mem_base, 0x10000, PROT_NONE);
+
   return ctx;
 }
 
@@ -531,6 +536,41 @@ void recomp_init_process_param(GuestContext *ctx, uint64_t proc_param_addr) {
         recomp_call_guest(ctx, new_setup_addr);
       }
     }
+  }
+}
+
+void recomp_init_tls(GuestContext *ctx, uint64_t tls_vaddr, uint64_t tls_filesz, uint64_t tls_memsz, uint64_t tls_align) {
+  if (!ctx) return;
+  uint64_t align = tls_align ? tls_align : 16;
+  if (align < 16) align = 16;
+  uint64_t static_tls_size = (tls_memsz + (align - 1)) & ~(align - 1);
+  if (static_tls_size < 0x100ULL) {
+    static_tls_size = 0x100ULL;
+  }
+  ctx->tls_vaddr = tls_vaddr;
+  ctx->tls_filesz = tls_filesz;
+  ctx->tls_memsz = tls_memsz;
+  ctx->tls_align = tls_align;
+  ctx->static_tls_size = static_tls_size;
+  if (ctx->process_ctx) {
+    ctx->process_ctx->tls_vaddr = tls_vaddr;
+    ctx->process_ctx->tls_filesz = tls_filesz;
+    ctx->process_ctx->tls_memsz = tls_memsz;
+    ctx->process_ctx->tls_align = tls_align;
+    ctx->process_ctx->static_tls_size = static_tls_size;
+  }
+
+  // Populate main thread static TLS block [ctx->fs_base - static_tls_size, ctx->fs_base)
+  if (ctx->mem_base && ctx->fs_base >= static_tls_size) {
+    uint8_t *dest = ctx->mem_base + ctx->fs_base - static_tls_size;
+    memset(dest, 0, static_tls_size);
+    if (tls_filesz > 0 && tls_vaddr > 0 && tls_vaddr + tls_filesz <= ctx->mem_size) {
+      memcpy(dest, ctx->mem_base + tls_vaddr, tls_filesz);
+    }
+    printf("[ps4-recomp] TLS initialized: vaddr=0x%llx filesz=0x%llx memsz=0x%llx align=%llu static_tls_size=0x%llx (fs_base=0x%llx)\n",
+           (unsigned long long)tls_vaddr, (unsigned long long)tls_filesz,
+           (unsigned long long)tls_memsz, (unsigned long long)tls_align,
+           (unsigned long long)static_tls_size, (unsigned long long)ctx->fs_base);
   }
 }
 
@@ -1021,15 +1061,25 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
     stack_size = 2 * 1024 * 1024; // 2MB default stack
   GuestContext *proc = parent->process_ctx ? parent->process_ctx : parent;
 
-  // Allocate stack and TCB (64KB) via VM extent allocator
-  size_t alloc_total = stack_size + 0x10000ULL;
+  uint64_t tls_size = proc->static_tls_size ? proc->static_tls_size : 0x1000ULL;
+  tls_size = (tls_size + 0xFFFULL) & ~0xFFFULL;
+
+  // Allocate stack, TLS area and TCB (64KB) via VM extent allocator
+  size_t alloc_total = stack_size + tls_size + 0x10000ULL;
   uint64_t stack_base = recomp_vm_alloc(proc, alloc_total);
   if (stack_base == (uint64_t)-1) {
     fprintf(stderr,
             "[ps4-recomp] FATAL: out of guest memory for new thread stack\n");
     return NULL;
   }
-  uint64_t tcb_base = stack_base + stack_size;
+  uint64_t tcb_base = stack_base + stack_size + tls_size;
+
+  // Initialize Static TLS block for new thread [tcb_base - tls_size, tcb_base)
+  uint8_t *dest = parent->mem_base + tcb_base - tls_size;
+  memset(dest, 0, tls_size);
+  if (proc->tls_filesz > 0 && proc->tls_vaddr > 0 && proc->tls_vaddr + proc->tls_filesz <= parent->mem_size) {
+    memcpy(dest, parent->mem_base + proc->tls_vaddr, proc->tls_filesz);
+  }
 
   // Initialize FS TCB base and stack canary
   *(uint64_t *)(parent->mem_base + tcb_base) = tcb_base;
@@ -1051,6 +1101,11 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   t_ctx->rsp = (stack_base + stack_size - 0x100ULL) & ~0xFFULL;
   t_ctx->rbp = t_ctx->rsp;
   t_ctx->fpu_cw = 0x037F;
+  t_ctx->tls_vaddr = proc->tls_vaddr;
+  t_ctx->tls_filesz = proc->tls_filesz;
+  t_ctx->tls_memsz = proc->tls_memsz;
+  t_ctx->tls_align = proc->tls_align;
+  t_ctx->static_tls_size = proc->static_tls_size;
 
   return t_ctx;
 }

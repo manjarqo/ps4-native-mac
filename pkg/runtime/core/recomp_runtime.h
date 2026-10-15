@@ -13,6 +13,7 @@ extern "C" {
 GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image, size_t image_size, const char *prog_name);
 GuestContext *recomp_init_runtime_file(const char *image_filename, size_t requested_mem_sz, const char *prog_name);
 void recomp_init_process_param(GuestContext *ctx, uint64_t proc_param_addr);
+void recomp_init_tls(GuestContext *ctx, uint64_t tls_vaddr, uint64_t tls_filesz, uint64_t tls_memsz, uint64_t tls_align);
 void recomp_setup_entry_args(GuestContext *ctx, int argc, char **argv, uint64_t entry_addr);
 void recomp_dispatch_external(GuestContext *ctx, uint64_t target);
 void recomp_free_runtime(GuestContext *ctx);

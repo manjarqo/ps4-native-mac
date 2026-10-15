@@ -139,6 +139,18 @@ func TestArm64LifterBasic(t *testing.T) {
 			expected: []string{"adcs x19, x19, x20"},
 		},
 		{
+			name:     "adc r14, 0",
+			bytes:    []byte{0x49, 0x83, 0xd6, 0x00}, // adc r14, 0
+			pc:       0x1000,
+			expected: []string{"cset x16, cc", "adds x14, x14, x16"},
+		},
+		{
+			name:     "adc eax, 0",
+			bytes:    []byte{0x83, 0xd0, 0x00}, // adc eax, 0
+			pc:       0x1000,
+			expected: []string{"cset w16, cc", "adds w19, w19, w16"},
+		},
+		{
 			name:     "bt eax, 13",
 			bytes:    []byte{0x0f, 0xba, 0xe0, 0x0d}, // bt eax, 13
 			pc:       0x1000,
@@ -544,7 +556,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "cmpxchg16b [rax]",
 			bytes:    []byte{0x48, 0x0f, 0xc7, 0x08}, // cmpxchg16b [rax]
 			pc:       0x1000,
-			expected: []string{"ldaxp x0, x1, [x16]", "stlxp w2, x14, x15, [x16]"},
+			expected: []string{"ldaxp x0, x1, [x16]", "stlxp w2, x20, x21, [x16]"},
 		},
 		{
 			name:     "clc",
@@ -853,6 +865,7 @@ func TestArm64LifterBasic(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			lifter.lastFlagOp = 0
 			inst, err := x86asm.Decode(tc.bytes, 64)
 			if err != nil {
 				t.Fatalf("failed to decode: %v", err)

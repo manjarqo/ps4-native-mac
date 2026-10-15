@@ -1230,12 +1230,197 @@ func (l *Arm64Lifter) liftXchg(inst disasm.Instruction, nextPC uint64, lines []s
 
 // liftAdcSbb handles ADC and SBB operations.
 func (l *Arm64Lifter) liftAdcSbb(inst disasm.Instruction, nextPC uint64, isSbb bool, lines []string) ([]string, error) {
-	armOp := "adcs"
-	if isSbb {
-		armOp = "sbcs"
-	}
 	dst := inst.Inst.Args[0]
 	src := inst.Inst.Args[1]
+
+	// In x86, ADC adds dst + src + CF.
+	// For subtractive flag operations (CMP, SUB, BT, NEG, CLC, STC), or when adding immediate 0
+	// (the standard x86 compiler idiom for conditional increment from comparison borrow):
+	// ARM64 condition 'cc' (Carry Clear) represents x86 CF == 1 (borrow).
+	// For additive flag operations (ADD, ADC) or standalone multi-precision register additions:
+	// ARM64 condition 'cs' (Carry Set) represents x86 CF == 1 (overflow/carry),
+	// which matches native ARM64 'adcs'.
+	isImm0 := false
+	if imm, okImm := src.(x86asm.Imm); okImm && int64(imm) == 0 {
+		isImm0 = true
+	}
+	useCc := !isSbb && (isSubFlagOp(l.lastFlagOp) || (l.lastFlagOp == 0 && isImm0))
+
+	armOpAdd := "adds"
+	if inst.SkipFlags {
+		armOpAdd = "add"
+	}
+
+	if useCc {
+		// Reg <- Imm / Reg <- Reg / Reg <- Mem
+		if dstReg, okDst := dst.(x86asm.Reg); okDst {
+			descDst, okDstD := arm64RegMap[dstReg]
+			if okDstD {
+				// Reg <- Imm
+				if imm, okImm := src.(x86asm.Imm); okImm {
+					val := int64(imm)
+					if descDst.Size == 8 {
+						lines = append(lines, "    cset x16, cc")
+						if val == 0 {
+							lines = append(lines, fmt.Sprintf("    %s %s, %s, x16", armOpAdd, descDst.X, descDst.X))
+						} else {
+							lines = append(lines, loadImm64("x17", uint64(val))...)
+							lines = append(lines, "    add x16, x17, x16")
+							lines = append(lines, fmt.Sprintf("    %s %s, %s, x16", armOpAdd, descDst.X, descDst.X))
+						}
+						return lines, nil
+					} else if descDst.Size == 4 {
+						lines = append(lines, "    cset w16, cc")
+						if val == 0 {
+							lines = append(lines, fmt.Sprintf("    %s %s, %s, w16", armOpAdd, descDst.W, descDst.W))
+						} else {
+							lines = append(lines, loadImm32("w17", uint32(val))...)
+							lines = append(lines, "    add w16, w17, w16")
+							lines = append(lines, fmt.Sprintf("    %s %s, %s, w16", armOpAdd, descDst.W, descDst.W))
+						}
+						return lines, nil
+					} else {
+						rcDst, _ := readRegTo(dstReg, "x16", "w16")
+						lines = append(lines, rcDst...)
+						lines = append(lines, "    cset w7, cc")
+						if val != 0 {
+							lines = append(lines, loadImm32("w17", uint32(val))...)
+							lines = append(lines, "    add w7, w17, w7")
+						}
+						lines = append(lines, fmt.Sprintf("    %s w16, w16, w7", armOpAdd))
+						wcDst, _ := writeRegFrom(dstReg, "x16", "w16")
+						lines = append(lines, wcDst...)
+						return lines, nil
+					}
+				}
+
+				// Reg <- Reg
+				if srcReg, okSrc := src.(x86asm.Reg); okSrc {
+					descSrc, okSrcD := arm64RegMap[srcReg]
+					if okSrcD {
+						if descDst.Size == 8 && descSrc.Size == 8 {
+							lines = append(lines, "    cset x16, cc")
+							lines = append(lines, fmt.Sprintf("    add x16, %s, x16", descSrc.X))
+							lines = append(lines, fmt.Sprintf("    %s %s, %s, x16", armOpAdd, descDst.X, descDst.X))
+							return lines, nil
+						} else if descDst.Size == 4 && descSrc.Size == 4 {
+							lines = append(lines, "    cset w16, cc")
+							lines = append(lines, fmt.Sprintf("    add w16, %s, w16", descSrc.W))
+							lines = append(lines, fmt.Sprintf("    %s %s, %s, w16", armOpAdd, descDst.W, descDst.W))
+							return lines, nil
+						} else {
+							rcDst, _ := readRegTo(dstReg, "x16", "w16")
+							rcSrc, _ := readRegTo(srcReg, "x17", "w17")
+							lines = append(lines, rcDst...)
+							lines = append(lines, rcSrc...)
+							lines = append(lines, "    cset w7, cc")
+							lines = append(lines, "    add w17, w17, w7")
+							lines = append(lines, fmt.Sprintf("    %s w16, w16, w17", armOpAdd))
+							wcDst, _ := writeRegFrom(dstReg, "x16", "w16")
+							lines = append(lines, wcDst...)
+							return lines, nil
+						}
+					}
+				}
+
+				// Reg <- Mem
+				if mem, okMem := src.(x86asm.Mem); okMem {
+					if descDst.Size == 8 {
+						lines = append(lines, "    cset x7, cc")
+						lines = append(lines, readMemTo(mem, nextPC, 8, "x16", "w16")...)
+						lines = append(lines, "    add x16, x16, x7")
+						lines = append(lines, fmt.Sprintf("    %s %s, %s, x16", armOpAdd, descDst.X, descDst.X))
+						return lines, nil
+					} else if descDst.Size == 4 {
+						lines = append(lines, "    cset w7, cc")
+						lines = append(lines, readMemTo(mem, nextPC, 4, "x16", "w16")...)
+						lines = append(lines, "    add w16, w16, w7")
+						lines = append(lines, fmt.Sprintf("    %s %s, %s, w16", armOpAdd, descDst.W, descDst.W))
+						return lines, nil
+					} else {
+						lines = append(lines, "    cset w7, cc")
+						lines = append(lines, readMemTo(mem, nextPC, descDst.Size, "x16", "w16")...)
+						rcDst, _ := readRegTo(dstReg, "x17", "w17")
+						lines = append(lines, rcDst...)
+						lines = append(lines, "    add w16, w16, w7")
+						lines = append(lines, fmt.Sprintf("    %s w17, w17, w16", armOpAdd))
+						wcDst, _ := writeRegFrom(dstReg, "x17", "w17")
+						lines = append(lines, wcDst...)
+						return lines, nil
+					}
+				}
+			}
+		}
+
+		// Mem <- Imm / Mem <- Reg
+		if mem, okMem := dst.(x86asm.Mem); okMem {
+			sz := defMemSz(inst)
+			if sz == 8 {
+				lines = append(lines, "    cset x7, cc")
+				lines = append(lines, readMemTo(mem, nextPC, 8, "x17", "w17")...)
+				if imm, okImm := src.(x86asm.Imm); okImm {
+					val := int64(imm)
+					if val != 0 {
+						lines = append(lines, loadImm64("x0", uint64(val))...)
+						lines = append(lines, "    add x7, x0, x7")
+					}
+					lines = append(lines, fmt.Sprintf("    %s x17, x17, x7", armOpAdd))
+					lines = append(lines, "    str x17, [x28, x16]")
+					return lines, nil
+				} else if srcReg, okSrc := src.(x86asm.Reg); okSrc {
+					if descSrc, okSrcD := arm64RegMap[srcReg]; okSrcD {
+						lines = append(lines, fmt.Sprintf("    add x7, %s, x7", descSrc.X))
+						lines = append(lines, fmt.Sprintf("    %s x17, x17, x7", armOpAdd))
+						lines = append(lines, "    str x17, [x28, x16]")
+						return lines, nil
+					}
+				}
+			} else {
+				lines = append(lines, "    cset w7, cc")
+				lines = append(lines, readMemTo(mem, nextPC, sz, "x17", "w17")...)
+				if imm, okImm := src.(x86asm.Imm); okImm {
+					val := int64(imm)
+					if val != 0 {
+						lines = append(lines, loadImm32("w0", uint32(val))...)
+						lines = append(lines, "    add w7, w0, w7")
+					}
+					lines = append(lines, fmt.Sprintf("    %s w17, w17, w7", armOpAdd))
+				} else if srcReg, okSrc := src.(x86asm.Reg); okSrc {
+					if descSrc, okSrcD := arm64RegMap[srcReg]; okSrcD {
+						lines = append(lines, fmt.Sprintf("    add w7, %s, w7", descSrc.W))
+						lines = append(lines, fmt.Sprintf("    %s w17, w17, w7", armOpAdd))
+					}
+				}
+				switch sz {
+				case 1:
+					lines = append(lines, "    strb w17, [x28, x16]")
+				case 2:
+					lines = append(lines, "    strh w17, [x28, x16]")
+				default:
+					lines = append(lines, "    str w17, [x28, x16]")
+				}
+				return lines, nil
+			}
+		}
+	}
+
+	// Native ARM64 adcs / sbcs for:
+	// - SBB (where ARM64 sbcs natively computes Xn - Xm - (1-C), matching borrow)
+	// - ADC following ADD / ADC (multi-precision arithmetic)
+	armOp := "adcs"
+	if isSbb {
+		if inst.SkipFlags {
+			armOp = "sbc"
+		} else {
+			armOp = "sbcs"
+		}
+	} else {
+		if inst.SkipFlags {
+			armOp = "adc"
+		} else {
+			armOp = "adcs"
+		}
+	}
 
 	// Reg <- Reg
 	if dstReg, okDst := dst.(x86asm.Reg); okDst {
@@ -1911,20 +2096,18 @@ func (l *Arm64Lifter) liftCmpxchg16b(inst disasm.Instruction, nextPC uint64, lin
 	lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 	lines = append(lines, "    add x16, x28, x16") // absolute host pointer in x16
 
-	// Load desired value into x14:x15 (RCX:RBX)
+	// Desired value is in RCX:RBX (x21:x20)
 	// RAX is in x19, RDX is in x22
 	// RBX is in x20, RCX is in x21
 	lines = append(lines,
-		"    mov x14, x20", // low desired (RBX)
-		"    mov x15, x21", // high desired (RCX)
 		fmt.Sprintf("%s:", loopLabel),
 		"    ldaxp x0, x1, [x16]", // x0 = mem_lo, x1 = mem_hi
 		"    cmp x0, x19",         // compare mem_lo with RAX
 		fmt.Sprintf("    b.ne %s", failLabel),
 		"    cmp x1, x22",         // compare mem_hi with RDX
 		fmt.Sprintf("    b.ne %s", failLabel),
-		// Equal: attempt atomic store
-		"    stlxp w2, x14, x15, [x16]",
+		// Equal: attempt atomic store of RCX:RBX (x21:x20)
+		"    stlxp w2, x20, x21, [x16]",
 		fmt.Sprintf("    cbnz w2, %s", loopLabel), // retry if exclusive store failed
 		// Success: ZF = 1
 		"    cmp xzr, xzr", // sets ZF=1
