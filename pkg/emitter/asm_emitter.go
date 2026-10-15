@@ -286,6 +286,7 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 			}
 
 			fmt.Fprintf(w, "\nL_fn_0x%x_loc_0x%x:\n", addr, blockAddr)
+			e.lifter.ResetFlags()
 
 			for _, inst := range block.Insts {
 				nextPC := inst.Address + uint64(inst.Inst.Len)

@@ -288,8 +288,14 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 						lines = append(lines, wcD...)
 					} else if descDst.Size == 4 {
 						lines = append(lines, fmt.Sprintf("    %s %s, %s, %s", armOp, descDst.W, descDst.W, descSrc.W))
+						if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
+							lines = append(lines, fmt.Sprintf("    tst %s, %s", descDst.W, descDst.W))
+						}
 					} else {
 						lines = append(lines, fmt.Sprintf("    %s %s, %s, %s", armOp, descDst.X, descDst.X, descSrc.X))
+						if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
+							lines = append(lines, fmt.Sprintf("    tst %s, %s", descDst.X, descDst.X))
+						}
 					}
 					return lines, nil
 				}
@@ -312,12 +318,18 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 						lines = append(lines, loadImm32("w16", uint32(val))...)
 						lines = append(lines, fmt.Sprintf("    %s %s, %s, w16", armOp, descDst.W, descDst.W))
 					}
+					if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
+						lines = append(lines, fmt.Sprintf("    tst %s, %s", descDst.W, descDst.W))
+					}
 				} else {
 					if isAddSub && val >= 0 && val <= 4095 {
 						lines = append(lines, fmt.Sprintf("    %s %s, %s, #%d", armOp, descDst.X, descDst.X, val))
 					} else {
 						lines = append(lines, loadImm64("x16", uint64(val))...)
 						lines = append(lines, fmt.Sprintf("    %s %s, %s, x16", armOp, descDst.X, descDst.X))
+					}
+					if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
+						lines = append(lines, fmt.Sprintf("    tst %s, %s", descDst.X, descDst.X))
 					}
 				}
 				return lines, nil
@@ -333,8 +345,14 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 					lines = append(lines, wcD...)
 				} else if descDst.Size == 4 {
 					lines = append(lines, fmt.Sprintf("    %s %s, %s, w16", armOp, descDst.W, descDst.W))
+					if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
+						lines = append(lines, fmt.Sprintf("    tst %s, %s", descDst.W, descDst.W))
+					}
 				} else {
 					lines = append(lines, fmt.Sprintf("    %s %s, %s, x16", armOp, descDst.X, descDst.X))
+					if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
+						lines = append(lines, fmt.Sprintf("    tst %s, %s", descDst.X, descDst.X))
+					}
 				}
 				return lines, nil
 			}
@@ -363,6 +381,13 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 					lines = append(lines, fmt.Sprintf("    %s x17, x17, x0", armOp))
 				}
 			}
+			if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
+				if sz == 4 {
+					lines = append(lines, "    tst w17, w17")
+				} else {
+					lines = append(lines, "    tst x17, x17")
+				}
+			}
 			switch sz {
 			case 1:
 				lines = append(lines, "    strb w17, [x28, x16]")
@@ -381,6 +406,13 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 					lines = append(lines, fmt.Sprintf("    %s w17, w17, %s", armOp, descSrc.W))
 				} else {
 					lines = append(lines, fmt.Sprintf("    %s x17, x17, %s", armOp, descSrc.X))
+				}
+				if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
+					if sz == 4 {
+						lines = append(lines, "    tst w17, w17")
+					} else {
+						lines = append(lines, "    tst x17, x17")
+					}
 				}
 				switch sz {
 				case 1:
@@ -672,6 +704,8 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 		armOp = "ror"
 	}
 
+	updateFlags := !inst.SkipFlags && (op == x86asm.SHL || op == x86asm.SHR || op == x86asm.SAR)
+
 	if reg, ok := dst.(x86asm.Reg); ok {
 		if desc, okDesc := arm64RegMap[reg]; okDesc {
 			if imm, okImm := shiftArg.(x86asm.Imm); okImm {
@@ -683,6 +717,9 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 					}
 					if shiftVal > 0 {
 						lines = append(lines, fmt.Sprintf("    %s %s, %s, #%d", armOp, desc.X, desc.X, shiftVal))
+						if updateFlags {
+							lines = append(lines, fmt.Sprintf("    tst %s, %s", desc.X, desc.X))
+						}
 					}
 					return lines, nil
 				} else if desc.Size == 4 {
@@ -692,15 +729,45 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 					}
 					if shiftVal > 0 {
 						lines = append(lines, fmt.Sprintf("    %s %s, %s, #%d", armOp, desc.W, desc.W, shiftVal))
+						if updateFlags {
+							lines = append(lines, fmt.Sprintf("    tst %s, %s", desc.W, desc.W))
+						}
+					}
+					return lines, nil
+				} else if desc.Size == 2 && (op == x86asm.ROL || op == x86asm.ROR) {
+					shiftVal &= 15
+					if op == x86asm.ROL {
+						shiftVal = (16 - shiftVal) & 15
+					}
+					if shiftVal > 0 {
+						rc, _ := readRegTo(reg, "x16", "w16")
+						lines = append(lines, rc...)
+						lines = append(lines, "    orr w16, w16, w16, lsl #16")
+						lines = append(lines, fmt.Sprintf("    ror w16, w16, #%d", shiftVal))
+						lines = append(lines, "    uxth w16, w16")
+						wc, _ := writeRegFrom(reg, "x16", "w16")
+						lines = append(lines, wc...)
+					}
+					return lines, nil
+				} else if desc.Size == 1 && (op == x86asm.ROL || op == x86asm.ROR) {
+					shiftVal &= 7
+					if op == x86asm.ROL {
+						shiftVal = (8 - shiftVal) & 7
+					}
+					if shiftVal > 0 {
+						rc, _ := readRegTo(reg, "x16", "w16")
+						lines = append(lines, rc...)
+						lines = append(lines, "    orr w16, w16, w16, lsl #8")
+						lines = append(lines, "    orr w16, w16, w16, lsl #16")
+						lines = append(lines, fmt.Sprintf("    ror w16, w16, #%d", shiftVal))
+						lines = append(lines, "    uxtb w16, w16")
+						wc, _ := writeRegFrom(reg, "x16", "w16")
+						lines = append(lines, wc...)
 					}
 					return lines, nil
 				} else {
-					// 8-bit or 16-bit
-					bitSize := desc.Size * 8
+					// 8-bit or 16-bit SHL/SHR/SAR
 					shiftVal &= 31
-					if op == x86asm.ROL {
-						shiftVal = (bitSize - (shiftVal % bitSize)) % bitSize
-					}
 					rc, _ := readRegTo(reg, "x16", "w16")
 					lines = append(lines, rc...)
 					if op == x86asm.SAR {
@@ -712,6 +779,13 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 					}
 					if shiftVal > 0 {
 						lines = append(lines, fmt.Sprintf("    %s w16, w16, #%d", armOp, shiftVal))
+						if updateFlags {
+							if desc.Size == 1 {
+								lines = append(lines, "    sxtb w17, w16", "    tst w17, w17")
+							} else {
+								lines = append(lines, "    sxth w17, w16", "    tst w17, w17")
+							}
+						}
 					}
 					wc, _ := writeRegFrom(reg, "x16", "w16")
 					lines = append(lines, wc...)
@@ -720,9 +794,54 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 			}
 			// Variable shift (CL in x21 / w21)
 			if desc.Size == 8 {
-				lines = append(lines, fmt.Sprintf("    %s %s, %s, x21", armOp, desc.X, desc.X))
+				if op == x86asm.ROL {
+					lines = append(lines, "    neg x16, x21")
+					lines = append(lines, fmt.Sprintf("    ror %s, %s, x16", desc.X, desc.X))
+				} else {
+					lines = append(lines, fmt.Sprintf("    %s %s, %s, x21", armOp, desc.X, desc.X))
+					if updateFlags {
+						lines = append(lines, fmt.Sprintf("    tst %s, %s", desc.X, desc.X))
+					}
+				}
 			} else if desc.Size == 4 {
-				lines = append(lines, fmt.Sprintf("    %s %s, %s, w21", armOp, desc.W, desc.W))
+				if op == x86asm.ROL {
+					lines = append(lines, "    neg w16, w21")
+					lines = append(lines, fmt.Sprintf("    ror %s, %s, w16", desc.W, desc.W))
+				} else {
+					lines = append(lines, fmt.Sprintf("    %s %s, %s, w21", armOp, desc.W, desc.W))
+					if updateFlags {
+						lines = append(lines, fmt.Sprintf("    tst %s, %s", desc.W, desc.W))
+					}
+				}
+			} else if desc.Size == 2 && (op == x86asm.ROL || op == x86asm.ROR) {
+				rc, _ := readRegTo(reg, "x16", "w16")
+				lines = append(lines, rc...)
+				if op == x86asm.ROL {
+					lines = append(lines, "    neg w17, w21")
+					lines = append(lines, "    and w17, w17, #15")
+				} else {
+					lines = append(lines, "    and w17, w21, #15")
+				}
+				lines = append(lines, "    orr w16, w16, w16, lsl #16")
+				lines = append(lines, "    ror w16, w16, w17")
+				lines = append(lines, "    uxth w16, w16")
+				wc, _ := writeRegFrom(reg, "x16", "w16")
+				lines = append(lines, wc...)
+			} else if desc.Size == 1 && (op == x86asm.ROL || op == x86asm.ROR) {
+				rc, _ := readRegTo(reg, "x16", "w16")
+				lines = append(lines, rc...)
+				if op == x86asm.ROL {
+					lines = append(lines, "    neg w17, w21")
+					lines = append(lines, "    and w17, w17, #7")
+				} else {
+					lines = append(lines, "    and w17, w21, #7")
+				}
+				lines = append(lines, "    orr w16, w16, w16, lsl #8")
+				lines = append(lines, "    orr w16, w16, w16, lsl #16")
+				lines = append(lines, "    ror w16, w16, w17")
+				lines = append(lines, "    uxtb w16, w16")
+				wc, _ := writeRegFrom(reg, "x16", "w16")
+				lines = append(lines, wc...)
 			} else {
 				rc, _ := readRegTo(reg, "x16", "w16")
 				lines = append(lines, rc...)
@@ -734,6 +853,13 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 					}
 				}
 				lines = append(lines, fmt.Sprintf("    %s w16, w16, w21", armOp))
+				if updateFlags {
+					if desc.Size == 1 {
+						lines = append(lines, "    sxtb w17, w16", "    tst w17, w17")
+					} else {
+						lines = append(lines, "    sxth w17, w16", "    tst w17, w17")
+					}
+				}
 				wc, _ := writeRegFrom(reg, "x16", "w16")
 				lines = append(lines, wc...)
 			}
@@ -753,13 +879,44 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 				}
 				if shiftVal > 0 {
 					lines = append(lines, fmt.Sprintf("    %s x17, x17, #%d", armOp, shiftVal))
+					if updateFlags {
+						lines = append(lines, "    tst x17, x17")
+					}
 				}
-			} else {
-				bitSize := sz * 8
+			} else if sz == 4 {
 				shiftVal &= 31
 				if op == x86asm.ROL {
-					shiftVal = (bitSize - (shiftVal % bitSize)) % bitSize
+					shiftVal = (32 - shiftVal) & 31
 				}
+				if shiftVal > 0 {
+					lines = append(lines, fmt.Sprintf("    %s w17, w17, #%d", armOp, shiftVal))
+					if updateFlags {
+						lines = append(lines, "    tst w17, w17")
+					}
+				}
+			} else if sz == 2 && (op == x86asm.ROL || op == x86asm.ROR) {
+				shiftVal &= 15
+				if op == x86asm.ROL {
+					shiftVal = (16 - shiftVal) & 15
+				}
+				if shiftVal > 0 {
+					lines = append(lines, "    orr w17, w17, w17, lsl #16")
+					lines = append(lines, fmt.Sprintf("    ror w17, w17, #%d", shiftVal))
+					lines = append(lines, "    uxth w17, w17")
+				}
+			} else if sz == 1 && (op == x86asm.ROL || op == x86asm.ROR) {
+				shiftVal &= 7
+				if op == x86asm.ROL {
+					shiftVal = (8 - shiftVal) & 7
+				}
+				if shiftVal > 0 {
+					lines = append(lines, "    orr w17, w17, w17, lsl #8")
+					lines = append(lines, "    orr w17, w17, w17, lsl #16")
+					lines = append(lines, fmt.Sprintf("    ror w17, w17, #%d", shiftVal))
+					lines = append(lines, "    uxtb w17, w17")
+				}
+			} else {
+				shiftVal &= 31
 				if op == x86asm.SAR {
 					if sz == 1 {
 						lines = append(lines, "    sxtb w17, w17")
@@ -769,11 +926,58 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 				}
 				if shiftVal > 0 {
 					lines = append(lines, fmt.Sprintf("    %s w17, w17, #%d", armOp, shiftVal))
+					if updateFlags {
+						if sz == 1 {
+							lines = append(lines, "    sxtb w0, w17", "    tst w0, w0")
+						} else {
+							lines = append(lines, "    sxth w0, w17", "    tst w0, w0")
+						}
+					}
 				}
 			}
 		} else {
+			// Variable shift (CL in x21 / w21)
 			if sz == 8 {
-				lines = append(lines, fmt.Sprintf("    %s x17, x17, x21", armOp))
+				if op == x86asm.ROL {
+					lines = append(lines, "    neg x16, x21")
+					lines = append(lines, "    ror x17, x17, x16")
+				} else {
+					lines = append(lines, fmt.Sprintf("    %s x17, x17, x21", armOp))
+					if updateFlags {
+						lines = append(lines, "    tst x17, x17")
+					}
+				}
+			} else if sz == 4 {
+				if op == x86asm.ROL {
+					lines = append(lines, "    neg w16, w21")
+					lines = append(lines, "    ror w17, w17, w16")
+				} else {
+					lines = append(lines, fmt.Sprintf("    %s w17, w17, w21", armOp))
+					if updateFlags {
+						lines = append(lines, "    tst w17, w17")
+					}
+				}
+			} else if sz == 2 && (op == x86asm.ROL || op == x86asm.ROR) {
+				if op == x86asm.ROL {
+					lines = append(lines, "    neg w16, w21")
+					lines = append(lines, "    and w16, w16, #15")
+				} else {
+					lines = append(lines, "    and w16, w21, #15")
+				}
+				lines = append(lines, "    orr w17, w17, w17, lsl #16")
+				lines = append(lines, "    ror w17, w17, w16")
+				lines = append(lines, "    uxth w17, w17")
+			} else if sz == 1 && (op == x86asm.ROL || op == x86asm.ROR) {
+				if op == x86asm.ROL {
+					lines = append(lines, "    neg w16, w21")
+					lines = append(lines, "    and w16, w16, #7")
+				} else {
+					lines = append(lines, "    and w16, w21, #7")
+				}
+				lines = append(lines, "    orr w17, w17, w17, lsl #8")
+				lines = append(lines, "    orr w17, w17, w17, lsl #16")
+				lines = append(lines, "    ror w17, w17, w16")
+				lines = append(lines, "    uxtb w17, w17")
 			} else {
 				if op == x86asm.SAR {
 					if sz == 1 {
@@ -783,6 +987,13 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 					}
 				}
 				lines = append(lines, fmt.Sprintf("    %s w17, w17, w21", armOp))
+				if updateFlags {
+					if sz == 1 {
+						lines = append(lines, "    sxtb w0, w17", "    tst w0, w0")
+					} else {
+						lines = append(lines, "    sxth w0, w17", "    tst w0, w0")
+					}
+				}
 			}
 		}
 		lines = append(lines, writeMemFrom(mem, nextPC, sz, "x17", "w17")...)

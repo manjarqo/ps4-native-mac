@@ -885,3 +885,168 @@ func TestArm64LifterBasic(t *testing.T) {
 		})
 	}
 }
+
+func TestAddJccCarryPolarity(t *testing.T) {
+	lifter := NewArm64Lifter(nil)
+	fn := &disasm.Function{
+		EntryAddr: 0x1000,
+		EndAddr:   0x2000,
+		Blocks: map[uint64]*disasm.BasicBlock{
+			0x1000: {StartAddr: 0x1000},
+			0x1012: {StartAddr: 0x1012},
+		},
+	}
+
+	// 1. ADD r15, rax: 49 01 c7
+	addInst, err := x86asm.Decode([]byte{0x49, 0x01, 0xc7}, 64)
+	if err != nil {
+		t.Fatalf("decode add failed: %v", err)
+	}
+	dAdd := disasm.Instruction{Address: 0x1000, Inst: addInst}
+	_, err = lifter.LiftInstructionToBuf(dAdd, 0x1003, fn, nil)
+	if err != nil {
+		t.Fatalf("lift add failed: %v", err)
+	}
+
+	// 2. JAE +13: 73 0d -> after ADD, no carry (CF=0) must be b.cc, NOT b.cs!
+	jaeInst, err := x86asm.Decode([]byte{0x73, 0x0d}, 64)
+	if err != nil {
+		t.Fatalf("decode jae failed: %v", err)
+	}
+	dJae := disasm.Instruction{Address: 0x1003, Inst: jaeInst}
+	lines, err := lifter.LiftInstructionToBuf(dJae, 0x1005, fn, nil)
+	if err != nil {
+		t.Fatalf("lift jae failed: %v", err)
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "b.cc") {
+		t.Errorf("expected b.cc for JAE following ADD, got:\n%s", joined)
+	}
+	if strings.Contains(joined, "b.cs") {
+		t.Errorf("unexpected b.cs for JAE following ADD, got:\n%s", joined)
+	}
+
+	// 3. Reset and lift CMP followed by JAE -> after CMP, A >= B (no borrow) must be b.cs!
+	lifter.ResetFlags()
+	cmpInst, err := x86asm.Decode([]byte{0x49, 0x39, 0xc7}, 64) // cmp r15, rax
+	if err != nil {
+		t.Fatalf("decode cmp failed: %v", err)
+	}
+	dCmp := disasm.Instruction{Address: 0x1000, Inst: cmpInst}
+	_, err = lifter.LiftInstructionToBuf(dCmp, 0x1003, fn, nil)
+	if err != nil {
+		t.Fatalf("lift cmp failed: %v", err)
+	}
+
+	linesCmp, err := lifter.LiftInstructionToBuf(dJae, 0x1005, fn, nil)
+	if err != nil {
+		t.Fatalf("lift jae after cmp failed: %v", err)
+	}
+	joinedCmp := strings.Join(linesCmp, "\n")
+	if !strings.Contains(joinedCmp, "b.cs") {
+		t.Errorf("expected b.cs for JAE following CMP, got:\n%s", joinedCmp)
+	}
+}
+
+func TestRolRorVariableAndImmediate(t *testing.T) {
+	lifter := NewArm64Lifter(map[uint64]bool{0x1000: true})
+	fn := &disasm.Function{EntryAddr: 0x1000}
+
+	tests := []struct {
+		name     string
+		bytes    []byte
+		contains []string
+	}{
+		{
+			name:     "rol r10d, cl (variable 32-bit)",
+			bytes:    []byte{0x41, 0xd3, 0xc2}, // rol r10d, cl
+			contains: []string{"neg w16, w21", "ror w10, w10, w16"},
+		},
+		{
+			name:     "rol r9d, cl (variable 32-bit)",
+			bytes:    []byte{0x41, 0xd3, 0xc1}, // rol r9d, cl
+			contains: []string{"neg w16, w21", "ror w9, w9, w16"},
+		},
+		{
+			name:     "rol rax, cl (variable 64-bit)",
+			bytes:    []byte{0x48, 0xd3, 0xc0}, // rol rax, cl
+			contains: []string{"neg x16, x21", "ror x19, x19, x16"},
+		},
+		{
+			name:     "ror r10d, cl (variable 32-bit)",
+			bytes:    []byte{0x41, 0xd3, 0xca}, // ror r10d, cl
+			contains: []string{"ror w10, w10, w21"},
+		},
+		{
+			name:     "rol r10d, 5 (imm 32-bit)",
+			bytes:    []byte{0x41, 0xc1, 0xc2, 0x05}, // rol r10d, 5
+			contains: []string{"ror w10, w10, #27"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			inst, err := x86asm.Decode(tc.bytes, 64)
+			if err != nil {
+				t.Fatalf("decode failed: %v", err)
+			}
+			dInst := disasm.Instruction{Address: 0x1000, Inst: inst}
+			lines, err := lifter.LiftInstructionToBuf(dInst, 0x1004, fn, nil)
+			if err != nil {
+				t.Fatalf("lift failed: %v", err)
+			}
+			joined := strings.Join(lines, "\n")
+			for _, expected := range tc.contains {
+				if !strings.Contains(joined, expected) {
+					t.Errorf("expected %q in output:\n%s", expected, joined)
+				}
+			}
+		})
+	}
+}
+
+func TestShiftFlagUpdates(t *testing.T) {
+	lifter := NewArm64Lifter(map[uint64]bool{0x1000: true})
+	fn := &disasm.Function{
+		EntryAddr: 0x1000,
+		EndAddr:   0x2000,
+		Blocks: map[uint64]*disasm.BasicBlock{
+			0x1000: {StartAddr: 0x1000},
+			0x1016: {StartAddr: 0x1016},
+		},
+	}
+
+	// 1. SHR rdx, 0x20: 48 c1 ea 20
+	shrInst, err := x86asm.Decode([]byte{0x48, 0xc1, 0xea, 0x20}, 64)
+	if err != nil {
+		t.Fatalf("decode shr failed: %v", err)
+	}
+	dShr := disasm.Instruction{Address: 0x1000, Inst: shrInst, SkipFlags: false}
+	linesShr, err := lifter.LiftInstructionToBuf(dShr, 0x1004, fn, nil)
+	if err != nil {
+		t.Fatalf("lift shr failed: %v", err)
+	}
+	joinedShr := strings.Join(linesShr, "\n")
+	if !strings.Contains(joinedShr, "lsr x22, x22, #32") {
+		t.Errorf("expected lsr x22, x22, #32, got:\n%s", joinedShr)
+	}
+	if !strings.Contains(joinedShr, "tst x22, x22") {
+		t.Errorf("expected tst x22, x22, got:\n%s", joinedShr)
+	}
+
+	// 2. JNE +16: 75 10
+	jneInst, err := x86asm.Decode([]byte{0x75, 0x10}, 64)
+	if err != nil {
+		t.Fatalf("decode jne failed: %v", err)
+	}
+	dJne := disasm.Instruction{Address: 0x1004, Inst: jneInst}
+	linesJne, err := lifter.LiftInstructionToBuf(dJne, 0x1006, fn, nil)
+	if err != nil {
+		t.Fatalf("lift jne failed: %v", err)
+	}
+	joinedJne := strings.Join(linesJne, "\n")
+	if !strings.Contains(joinedJne, "b.ne") {
+		t.Errorf("expected b.ne for JNE following SHR, got:\n%s", joinedJne)
+	}
+}
+
