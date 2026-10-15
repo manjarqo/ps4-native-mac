@@ -349,11 +349,14 @@ func (l *Arm64Lifter) liftAvxScalarMove(inst disasm.Instruction, nextPC uint64, 
 					if s2Reg, ok2 := src2.(x86asm.Reg); ok2 {
 						if _, _, _, s1LowV, _, _, _, okS1 := getVectorDesc(s1Reg); okS1 {
 							if _, _, _, s2LowV, _, _, _, okS2 := getVectorDesc(s2Reg); okS2 {
-								lines = append(lines, fmt.Sprintf("    mov %s.16b, %s.16b", dLowV, s1LowV))
 								if isDouble {
-									lines = append(lines, fmt.Sprintf("    mov %s.d[0], %s.d[0]", dLowV, s2LowV))
+									lines = append(lines, fmt.Sprintf("    mov v30.16b, %s.16b", s2LowV))
+									lines = append(lines, fmt.Sprintf("    mov %s.16b, %s.16b", dLowV, s1LowV))
+									lines = append(lines, fmt.Sprintf("    mov %s.d[0], v30.d[0]", dLowV))
 								} else {
-									lines = append(lines, fmt.Sprintf("    mov %s.s[0], %s.s[0]", dLowV, s2LowV))
+									lines = append(lines, fmt.Sprintf("    mov v30.16b, %s.16b", s2LowV))
+									lines = append(lines, fmt.Sprintf("    mov %s.16b, %s.16b", dLowV, s1LowV))
+									lines = append(lines, fmt.Sprintf("    mov %s.s[0], v30.s[0]", dLowV))
 								}
 								lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", dHighV))
 								return lines, nil
@@ -383,7 +386,7 @@ func (l *Arm64Lifter) liftAvxScalarAlu(inst disasm.Instruction, nextPC uint64, a
 	src1Reg, okSrc1 := inst.Inst.Args[1].(x86asm.Reg)
 	src2 := inst.Inst.Args[2]
 
-	_, _, _, dLowV, dHighV, dLowS, dLowD, okD := getVectorDesc(dstReg)
+	_, _, _, dLowV, dHighV, _, _, okD := getVectorDesc(dstReg)
 	_, _, _, s1LowV, _, s1LowS, s1LowD, okS1 := getVectorDesc(src1Reg)
 	if !okDst || !okSrc1 || !okD || !okS1 {
 		lines = append(lines, l.emitUnsupported(inst, "unsupported avx scalar alu dst/src1")...)
@@ -409,12 +412,21 @@ func (l *Arm64Lifter) liftAvxScalarAlu(inst disasm.Instruction, nextPC uint64, a
 		return lines, nil
 	}
 
-	// Copy lanes 1..3 from src1 into dst
-	lines = append(lines, fmt.Sprintf("    mov %s.16b, %s.16b", dLowV, s1LowV))
+	// 1. Perform ALU into temporary d30/s30 to avoid clobbering src2 if dstReg == src2
 	if isDouble {
-		lines = append(lines, fmt.Sprintf("    %s %s, %s, %s", armOp, dLowD, s1LowD, s2D))
+		lines = append(lines, fmt.Sprintf("    %s d30, %s, %s", armOp, s1LowD, s2D))
 	} else {
-		lines = append(lines, fmt.Sprintf("    %s %s, %s, %s", armOp, dLowS, s1LowS, s2S))
+		lines = append(lines, fmt.Sprintf("    %s s30, %s, %s", armOp, s1LowS, s2S))
+	}
+
+	// 2. Copy lanes 1..3 from src1 into dst
+	lines = append(lines, fmt.Sprintf("    mov %s.16b, %s.16b", dLowV, s1LowV))
+
+	// 3. Insert computed scalar into lane 0 of dst
+	if isDouble {
+		lines = append(lines, fmt.Sprintf("    mov %s.d[0], v30.d[0]", dLowV))
+	} else {
+		lines = append(lines, fmt.Sprintf("    mov %s.s[0], v30.s[0]", dLowV))
 	}
 	lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", dHighV))
 	return lines, nil

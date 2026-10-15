@@ -977,7 +977,8 @@ func definesAllFlags(op x86asm.Op) bool {
 	switch op {
 	case x86asm.ADD, x86asm.SUB, x86asm.CMP, x86asm.TEST,
 		x86asm.AND, x86asm.OR, x86asm.XOR,
-		x86asm.NEG, x86asm.SHL, x86asm.SHR, x86asm.SAR:
+		x86asm.NEG, x86asm.SHL, x86asm.SHR, x86asm.SAR,
+		x86asm.TZCNT, x86asm.LZCNT, x86asm.BSF, x86asm.BSR:
 		return true
 	default:
 		return false

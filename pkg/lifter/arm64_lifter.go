@@ -175,7 +175,8 @@ type Arm64Lifter struct {
 
 func isSubFlagOp(op x86asm.Op) bool {
 	switch op {
-	case x86asm.CMP, x86asm.SUB, x86asm.BT, x86asm.BTS, x86asm.BTR, x86asm.BTC, x86asm.NEG, x86asm.CLC, x86asm.STC, x86asm.CMC:
+	case x86asm.CMP, x86asm.SUB, x86asm.BT, x86asm.BTS, x86asm.BTR, x86asm.BTC, x86asm.NEG, x86asm.CLC, x86asm.STC, x86asm.CMC,
+		x86asm.TZCNT, x86asm.LZCNT:
 		return true
 	default:
 		return false
@@ -194,7 +195,8 @@ func isAddFlagOp(op x86asm.Op) bool {
 func isLogicalFlagOp(op x86asm.Op) bool {
 	switch op {
 	case x86asm.TEST, x86asm.AND, x86asm.OR, x86asm.XOR,
-		x86asm.SHL, x86asm.SHR, x86asm.SAR:
+		x86asm.SHL, x86asm.SHR, x86asm.SAR,
+		x86asm.BSF, x86asm.BSR:
 		return true
 	default:
 		return false
@@ -865,9 +867,23 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 						if descDst.Size == 4 {
 							lines = append(lines, fmt.Sprintf("    rbit w16, %s", descSrc.W))
 							lines = append(lines, fmt.Sprintf("    clz %s, w16", descDst.W))
+							if !inst.SkipFlags {
+								if inst.Inst.Op == x86asm.TZCNT {
+									lines = append(lines, fmt.Sprintf("    cmp %s, #1", descSrc.W))
+								} else {
+									lines = append(lines, fmt.Sprintf("    tst %s, %s", descSrc.W, descSrc.W))
+								}
+							}
 						} else {
 							lines = append(lines, fmt.Sprintf("    rbit x16, %s", descSrc.X))
 							lines = append(lines, fmt.Sprintf("    clz %s, x16", descDst.X))
+							if !inst.SkipFlags {
+								if inst.Inst.Op == x86asm.TZCNT {
+									lines = append(lines, fmt.Sprintf("    cmp %s, #1", descSrc.X))
+								} else {
+									lines = append(lines, fmt.Sprintf("    tst %s, %s", descSrc.X, descSrc.X))
+								}
+							}
 						}
 						return lines, nil
 					}
@@ -876,9 +892,23 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 					if descDst.Size == 4 {
 						lines = append(lines, "    rbit w16, w17")
 						lines = append(lines, fmt.Sprintf("    clz %s, w16", descDst.W))
+						if !inst.SkipFlags {
+							if inst.Inst.Op == x86asm.TZCNT {
+								lines = append(lines, "    cmp w17, #1")
+							} else {
+								lines = append(lines, "    tst w17, w17")
+							}
+						}
 					} else {
 						lines = append(lines, "    rbit x16, x17")
 						lines = append(lines, fmt.Sprintf("    clz %s, x16", descDst.X))
+						if !inst.SkipFlags {
+							if inst.Inst.Op == x86asm.TZCNT {
+								lines = append(lines, "    cmp x17, #1")
+							} else {
+								lines = append(lines, "    tst x17, x17")
+							}
+						}
 					}
 					return lines, nil
 				}
@@ -896,10 +926,16 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 							lines = append(lines, fmt.Sprintf("    clz w16, %s", descSrc.W))
 							lines = append(lines, fmt.Sprintf("    mov %s, #31", descDst.W))
 							lines = append(lines, fmt.Sprintf("    sub %s, %s, w16", descDst.W, descDst.W))
+							if !inst.SkipFlags {
+								lines = append(lines, fmt.Sprintf("    tst %s, %s", descSrc.W, descSrc.W))
+							}
 						} else {
 							lines = append(lines, fmt.Sprintf("    clz x16, %s", descSrc.X))
 							lines = append(lines, fmt.Sprintf("    mov %s, #63", descDst.X))
 							lines = append(lines, fmt.Sprintf("    sub %s, %s, x16", descDst.X, descDst.X))
+							if !inst.SkipFlags {
+								lines = append(lines, fmt.Sprintf("    tst %s, %s", descSrc.X, descSrc.X))
+							}
 						}
 						return lines, nil
 					}
@@ -909,10 +945,16 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 						lines = append(lines, "    clz w16, w17")
 						lines = append(lines, fmt.Sprintf("    mov %s, #31", descDst.W))
 						lines = append(lines, fmt.Sprintf("    sub %s, %s, w16", descDst.W, descDst.W))
+						if !inst.SkipFlags {
+							lines = append(lines, "    tst w17, w17")
+						}
 					} else {
 						lines = append(lines, "    clz x16, x17")
 						lines = append(lines, fmt.Sprintf("    mov %s, #63", descDst.X))
 						lines = append(lines, fmt.Sprintf("    sub %s, %s, x16", descDst.X, descDst.X))
+						if !inst.SkipFlags {
+							lines = append(lines, "    tst x17, x17")
+						}
 					}
 					return lines, nil
 				}
@@ -928,8 +970,14 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 					if descSrc, okSrc := arm64RegMap[srcReg]; okSrc {
 						if descDst.Size == 4 {
 							lines = append(lines, fmt.Sprintf("    clz %s, %s", descDst.W, descSrc.W))
+							if !inst.SkipFlags {
+								lines = append(lines, fmt.Sprintf("    cmp %s, #1", descSrc.W))
+							}
 						} else {
 							lines = append(lines, fmt.Sprintf("    clz %s, %s", descDst.X, descSrc.X))
+							if !inst.SkipFlags {
+								lines = append(lines, fmt.Sprintf("    cmp %s, #1", descSrc.X))
+							}
 						}
 						return lines, nil
 					}
@@ -937,8 +985,14 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 					lines = append(lines, readMemTo(mem, nextPC, descDst.Size, "x17", "w17")...)
 					if descDst.Size == 4 {
 						lines = append(lines, fmt.Sprintf("    clz %s, w17", descDst.W))
+						if !inst.SkipFlags {
+							lines = append(lines, "    cmp w17, #1")
+						}
 					} else {
 						lines = append(lines, fmt.Sprintf("    clz %s, x17", descDst.X))
+						if !inst.SkipFlags {
+							lines = append(lines, "    cmp x17, #1")
+						}
 					}
 					return lines, nil
 				}

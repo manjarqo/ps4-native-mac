@@ -1050,3 +1050,76 @@ func TestShiftFlagUpdates(t *testing.T) {
 	}
 }
 
+func TestTzcntLzcntBsfBsrFlags(t *testing.T) {
+	lifter := NewArm64Lifter(map[uint64]bool{0x1000: true})
+	fn := &disasm.Function{
+		EntryAddr: 0x1000,
+		EndAddr:   0x2000,
+		Blocks: map[uint64]*disasm.BasicBlock{
+			0x1000: {StartAddr: 0x1000},
+			0x1016: {StartAddr: 0x1016},
+		},
+	}
+
+	// 1. TZCNT R8L, EDX: f3 44 0f bc c2
+	tzcntInst, err := x86asm.Decode([]byte{0xf3, 0x44, 0x0f, 0xbc, 0xc2}, 64)
+	if err != nil {
+		t.Fatalf("decode tzcnt failed: %v", err)
+	}
+	dTzcnt := disasm.Instruction{Address: 0x1000, Inst: tzcntInst, SkipFlags: false}
+	linesTzcnt, err := lifter.LiftInstructionToBuf(dTzcnt, 0x1005, fn, nil)
+	if err != nil {
+		t.Fatalf("lift tzcnt failed: %v", err)
+	}
+	joinedTzcnt := strings.Join(linesTzcnt, "\n")
+	if !strings.Contains(joinedTzcnt, "cmp w22, #1") {
+		t.Errorf("expected 'cmp w22, #1' in TZCNT output, got:\n%s", joinedTzcnt)
+	}
+
+	// 2. CMOVAE ECX, EAX: 0f 43 c8
+	cmovaeInst, err := x86asm.Decode([]byte{0x0f, 0x43, 0xc8}, 64)
+	if err != nil {
+		t.Fatalf("decode cmovae failed: %v", err)
+	}
+	dCmovae := disasm.Instruction{Address: 0x1005, Inst: cmovaeInst}
+	linesCmovae, err := lifter.LiftInstructionToBuf(dCmovae, 0x1008, fn, nil)
+	if err != nil {
+		t.Fatalf("lift cmovae failed: %v", err)
+	}
+	joinedCmovae := strings.Join(linesCmovae, "\n")
+	if !strings.Contains(joinedCmovae, "csel w21, w19, w21, cs") {
+		t.Errorf("expected 'csel w21, w19, w21, cs' for CMOVAE after TZCNT, got:\n%s", joinedCmovae)
+	}
+
+	// 3. LZCNT R8L, EDX: f3 44 0f bd c2
+	lzcntInst, err := x86asm.Decode([]byte{0xf3, 0x44, 0x0f, 0xbd, 0xc2}, 64)
+	if err != nil {
+		t.Fatalf("decode lzcnt failed: %v", err)
+	}
+	dLzcnt := disasm.Instruction{Address: 0x1008, Inst: lzcntInst, SkipFlags: false}
+	linesLzcnt, err := lifter.LiftInstructionToBuf(dLzcnt, 0x100d, fn, nil)
+	if err != nil {
+		t.Fatalf("lift lzcnt failed: %v", err)
+	}
+	joinedLzcnt := strings.Join(linesLzcnt, "\n")
+	if !strings.Contains(joinedLzcnt, "cmp w22, #1") {
+		t.Errorf("expected 'cmp w22, #1' in LZCNT output, got:\n%s", joinedLzcnt)
+	}
+
+	// 4. BSF EAX, EDX: 0f bc c2
+	bsfInst, err := x86asm.Decode([]byte{0x0f, 0xbc, 0xc2}, 64)
+	if err != nil {
+		t.Fatalf("decode bsf failed: %v", err)
+	}
+	dBsf := disasm.Instruction{Address: 0x100d, Inst: bsfInst, SkipFlags: false}
+	linesBsf, err := lifter.LiftInstructionToBuf(dBsf, 0x1010, fn, nil)
+	if err != nil {
+		t.Fatalf("lift bsf failed: %v", err)
+	}
+	joinedBsf := strings.Join(linesBsf, "\n")
+	if !strings.Contains(joinedBsf, "tst w22, w22") {
+		t.Errorf("expected 'tst w22, w22' in BSF output, got:\n%s", joinedBsf)
+	}
+}
+
+
