@@ -489,16 +489,20 @@ func readMemTo(mem x86asm.Mem, nextPC uint64, size int, targetX string, targetW 
 // writeMemFrom generates instructions to write from ARM register to guest memory.
 func writeMemFrom(mem x86asm.Mem, nextPC uint64, size int, srcX string, srcW string) []string {
 	var lines []string
-	lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
+	addrReg := "x16"
+	if srcX == "x16" || srcW == "w16" {
+		addrReg = "x17"
+	}
+	lines = append(lines, computeEffAddr(mem, nextPC, addrReg)...)
 	switch size {
 	case 1:
-		lines = append(lines, fmt.Sprintf("    strb %s, [x28, x16]", srcW))
+		lines = append(lines, fmt.Sprintf("    strb %s, [x28, %s]", srcW, addrReg))
 	case 2:
-		lines = append(lines, fmt.Sprintf("    strh %s, [x28, x16]", srcW))
+		lines = append(lines, fmt.Sprintf("    strh %s, [x28, %s]", srcW, addrReg))
 	case 4:
-		lines = append(lines, fmt.Sprintf("    str %s, [x28, x16]", srcW))
+		lines = append(lines, fmt.Sprintf("    str %s, [x28, %s]", srcW, addrReg))
 	default:
-		lines = append(lines, fmt.Sprintf("    str %s, [x28, x16]", srcX))
+		lines = append(lines, fmt.Sprintf("    str %s, [x28, %s]", srcX, addrReg))
 	}
 	return lines
 }

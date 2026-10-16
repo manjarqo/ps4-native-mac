@@ -412,7 +412,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "pop qword [rax]",
 			bytes:    []byte{0x8f, 0x00}, // pop [rax]
 			pc:       0x1000,
-			expected: []string{"ldr x16, [x28, x26]", "add x26, x26, #8", "str x16, [x28, x16]"},
+			expected: []string{"ldr x16, [x28, x26]", "add x26, x26, #8", "str x16, [x28, x17]"},
 		},
 		{
 			name:     "div dword [rcx]",
@@ -424,13 +424,19 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "mul qword [rcx]",
 			bytes:    []byte{0x48, 0xf7, 0x21}, // mul qword [rcx]
 			pc:       0x1000,
-			expected: []string{"ldr x17, [x28, x16]", "umulh x22, x19, x17", "mul x19, x19, x17"},
+			expected: []string{"ldr x17, [x28, x16]", "mul x16, x19, x17", "umulh x22, x19, x17", "mov x19, x16"},
+		},
+		{
+			name:     "mul r8b",
+			bytes:    []byte{0x41, 0xf6, 0xe0}, // mul r8b
+			pc:       0x1000,
+			expected: []string{"and w17, w19, #0xff", "mul w16, w17, w16", "bfi x19, x16, #0, #16"},
 		},
 		{
 			name:     "not qword [rdx]",
 			bytes:    []byte{0x48, 0xf7, 0x12}, // not qword [rdx]
 			pc:       0x1000,
-			expected: []string{"ldr x16, [x28, x16]", "mvn x16, x16", "str x16, [x28, x16]"},
+			expected: []string{"ldr x16, [x28, x16]", "mvn x16, x16", "str x16, [x28, x17]"},
 		},
 		{
 			name:     "bts rax, 5",
@@ -859,6 +865,30 @@ func TestArm64LifterBasic(t *testing.T) {
 				"ldp  x10, x11, [sp, #48]",
 				"ldp  x12, x13, [sp, #64]",
 				"ldp  x14, x15, [sp, #80]",
+			},
+		},
+		{
+			name:     "setae byte [rbp - 0x10]",
+			bytes:    []byte{0x0f, 0x93, 0x45, 0xf0},
+			pc:       0x1000,
+			expected: []string{
+				"cset w16, cs",
+				"sub x17, x17, #16",
+				"strb w16, [x28, x17]",
+			},
+		},
+		{
+			name:     "or al, [rbp - 0x10]",
+			bytes:    []byte{0x0a, 0x45, 0xf0},
+			pc:       0x1000,
+			expected: []string{
+				"sub x16, x16, #16",
+				"ldrb w16, [x28, x16]",
+				"and w17, w19, #0xff",
+				"orr w17, w17, w16",
+				"bfi x19, x17, #0, #8",
+				"sxtb w16, w17",
+				"tst w16, w16",
 			},
 		},
 	}

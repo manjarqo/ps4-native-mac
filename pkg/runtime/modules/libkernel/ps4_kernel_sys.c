@@ -443,8 +443,38 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     // Save full guest state to restore after exception handler returns
     GuestContext saved_ctx = *ctx;
 
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+    if (ucontext_raw) {
+        arm_thread_state64_t *state = (arm_thread_state64_t *)&(((ucontext_t *)ucontext_raw)->uc_mcontext->__ss);
+        uint64_t host_x26 = state->__x[26];
+        if (state->__x[28] == (uint64_t)ctx->mem_base &&
+            host_x26 >= 0x10000ULL && host_x26 < ctx->mem_size) {
+            saved_ctx.rax = state->__x[19];
+            saved_ctx.rbx = state->__x[20];
+            saved_ctx.rcx = state->__x[21];
+            saved_ctx.rdx = state->__x[22];
+            saved_ctx.rsi = state->__x[23];
+            saved_ctx.rdi = state->__x[24];
+            saved_ctx.rbp = state->__x[25];
+            saved_ctx.rsp = host_x26;
+            saved_ctx.r8  = state->__x[8];
+            saved_ctx.r9  = state->__x[9];
+            saved_ctx.r10 = state->__x[10];
+            saved_ctx.r11 = state->__x[11];
+            saved_ctx.r12 = state->__x[12];
+            saved_ctx.r13 = state->__x[13];
+            saved_ctx.r14 = state->__x[14];
+            saved_ctx.r15 = state->__x[15];
+        }
+    }
+#endif
+
+    if (saved_ctx.rsp < 0x10000ULL || saved_ctx.rsp > ctx->mem_size) {
+        return;
+    }
+
     // Allocate Orbis ucontext structure on the guest stack
-    uint64_t ucontext_guest_addr = (ctx->rsp - 0x200ULL) & ~0xfULL;
+    uint64_t ucontext_guest_addr = (saved_ctx.rsp - 0x200ULL) & ~0xfULL;
     if (ucontext_guest_addr + 0x200ULL <= ctx->mem_size) {
         memset(ctx->mem_base + ucontext_guest_addr, 0, 0x200);
         // In FreeBSD/Orbis x86_64 ucontext_t:

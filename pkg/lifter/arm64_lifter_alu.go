@@ -286,6 +286,13 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 						lines = append(lines, fmt.Sprintf("    %s w17, w17, w16", armOp))
 						wcD, _ := writeRegFrom(dstReg, "x17", "w17")
 						lines = append(lines, wcD...)
+						if updateFlags && (op == x86asm.OR || op == x86asm.XOR || op == x86asm.AND) {
+							if descDst.Size == 1 {
+								lines = append(lines, "    sxtb w16, w17", "    tst w16, w16")
+							} else {
+								lines = append(lines, "    sxth w16, w17", "    tst w16, w16")
+							}
+						}
 					} else if descDst.Size == 4 {
 						lines = append(lines, fmt.Sprintf("    %s %s, %s, %s", armOp, descDst.W, descDst.W, descSrc.W))
 						if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
@@ -311,6 +318,13 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 					lines = append(lines, fmt.Sprintf("    %s w17, w17, w16", armOp))
 					wcD, _ := writeRegFrom(dstReg, "x17", "w17")
 					lines = append(lines, wcD...)
+					if updateFlags && (op == x86asm.OR || op == x86asm.XOR || op == x86asm.AND) {
+						if descDst.Size == 1 {
+							lines = append(lines, "    sxtb w16, w17", "    tst w16, w16")
+						} else {
+							lines = append(lines, "    sxth w16, w17", "    tst w16, w16")
+						}
+					}
 				} else if descDst.Size == 4 {
 					if isAddSub && val >= 0 && val <= 4095 {
 						lines = append(lines, fmt.Sprintf("    %s %s, %s, #%d", armOp, descDst.W, descDst.W, val))
@@ -343,6 +357,13 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 					lines = append(lines, fmt.Sprintf("    %s w17, w17, w16", armOp))
 					wcD, _ := writeRegFrom(dstReg, "x17", "w17")
 					lines = append(lines, wcD...)
+					if updateFlags && (op == x86asm.OR || op == x86asm.XOR || op == x86asm.AND) {
+						if descDst.Size == 1 {
+							lines = append(lines, "    sxtb w16, w17", "    tst w16, w16")
+						} else {
+							lines = append(lines, "    sxth w16, w17", "    tst w16, w16")
+						}
+					}
 				} else if descDst.Size == 4 {
 					lines = append(lines, fmt.Sprintf("    %s %s, %s, w16", armOp, descDst.W, descDst.W))
 					if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
@@ -366,7 +387,7 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 		isAddSub := armOp == "add" || armOp == "adds" || armOp == "sub" || armOp == "subs"
 		if imm, okImm := src.(x86asm.Imm); okImm {
 			val := int64(imm)
-			if sz == 4 {
+			if sz == 1 || sz == 2 || sz == 4 {
 				if isAddSub && val >= 0 && val <= 4095 {
 					lines = append(lines, fmt.Sprintf("    %s w17, w17, #%d", armOp, val))
 				} else {
@@ -381,8 +402,12 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 					lines = append(lines, fmt.Sprintf("    %s x17, x17, x0", armOp))
 				}
 			}
-			if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
-				if sz == 4 {
+			if updateFlags && (op == x86asm.OR || op == x86asm.XOR || op == x86asm.AND) {
+				if sz == 1 {
+					lines = append(lines, "    sxtb w0, w17", "    tst w0, w0")
+				} else if sz == 2 {
+					lines = append(lines, "    sxth w0, w17", "    tst w0, w0")
+				} else if sz == 4 {
 					lines = append(lines, "    tst w17, w17")
 				} else {
 					lines = append(lines, "    tst x17, x17")
@@ -402,13 +427,17 @@ func (l *Arm64Lifter) liftAlu(inst disasm.Instruction, nextPC uint64, lines []st
 		}
 		if srcReg, okSrc := src.(x86asm.Reg); okSrc {
 			if descSrc, okSrcD := arm64RegMap[srcReg]; okSrcD {
-				if sz == 4 {
+				if sz == 1 || sz == 2 || sz == 4 {
 					lines = append(lines, fmt.Sprintf("    %s w17, w17, %s", armOp, descSrc.W))
 				} else {
 					lines = append(lines, fmt.Sprintf("    %s x17, x17, %s", armOp, descSrc.X))
 				}
-				if updateFlags && (op == x86asm.OR || op == x86asm.XOR) {
-					if sz == 4 {
+				if updateFlags && (op == x86asm.OR || op == x86asm.XOR || op == x86asm.AND) {
+					if sz == 1 {
+						lines = append(lines, "    sxtb w0, w17", "    tst w0, w0")
+					} else if sz == 2 {
+						lines = append(lines, "    sxth w0, w17", "    tst w0, w0")
+					} else if sz == 4 {
 						lines = append(lines, "    tst w17, w17")
 					} else {
 						lines = append(lines, "    tst x17, x17")
@@ -1065,26 +1094,58 @@ func (l *Arm64Lifter) liftImul(inst disasm.Instruction, nextPC uint64, lines []s
 	if args[0] != nil && args[1] == nil {
 		if reg, ok := args[0].(x86asm.Reg); ok {
 			if desc, okDesc := arm64RegMap[reg]; okDesc {
-				if desc.Size == 4 {
+				switch desc.Size {
+				case 1:
+					rc, _ := readRegTo(reg, "x16", "w16")
+					lines = append(lines, rc...)
+					lines = append(lines, "    sxtb w16, w16")
+					lines = append(lines, "    sxtb w17, w19")
+					lines = append(lines, "    mul w16, w17, w16")
+					lines = append(lines, "    bfi x19, x16, #0, #16")
+				case 2:
+					rc, _ := readRegTo(reg, "x16", "w16")
+					lines = append(lines, rc...)
+					lines = append(lines, "    sxth w16, w16")
+					lines = append(lines, "    sxth w17, w19")
+					lines = append(lines, "    mul w16, w17, w16")
+					lines = append(lines, "    bfi x19, x16, #0, #16")
+					lines = append(lines, "    lsr w17, w16, #16")
+					lines = append(lines, "    bfi x22, x17, #0, #16")
+				case 4:
 					lines = append(lines, fmt.Sprintf("    smull x16, w19, %s", desc.W))
 					lines = append(lines, "    mov w19, w16")
 					lines = append(lines, "    lsr x22, x16, #32")
-				} else {
+				default: // 8
+					lines = append(lines, fmt.Sprintf("    mul x16, x19, %s", desc.X))
 					lines = append(lines, fmt.Sprintf("    smulh x22, x19, %s", desc.X))
-					lines = append(lines, fmt.Sprintf("    mul x19, x19, %s", desc.X))
+					lines = append(lines, "    mov x19, x16")
 				}
 				return lines, nil
 			}
 		} else if mem, ok := args[0].(x86asm.Mem); ok {
 			sz := defMemSz(inst)
 			lines = append(lines, readMemTo(mem, nextPC, sz, "x17", "w17")...)
-			if sz == 4 {
+			switch sz {
+			case 1:
+				lines = append(lines, "    sxtb w17, w17")
+				lines = append(lines, "    sxtb w16, w19")
+				lines = append(lines, "    mul w16, w16, w17")
+				lines = append(lines, "    bfi x19, x16, #0, #16")
+			case 2:
+				lines = append(lines, "    sxth w17, w17")
+				lines = append(lines, "    sxth w16, w19")
+				lines = append(lines, "    mul w16, w16, w17")
+				lines = append(lines, "    bfi x19, x16, #0, #16")
+				lines = append(lines, "    lsr w17, w16, #16")
+				lines = append(lines, "    bfi x22, x17, #0, #16")
+			case 4:
 				lines = append(lines, "    smull x16, w19, w17")
 				lines = append(lines, "    mov w19, w16")
 				lines = append(lines, "    lsr x22, x16, #32")
-			} else {
+			default: // 8
+				lines = append(lines, "    mul x16, x19, x17")
 				lines = append(lines, "    smulh x22, x19, x17")
-				lines = append(lines, "    mul x19, x19, x17")
+				lines = append(lines, "    mov x19, x16")
 			}
 			return lines, nil
 		}
@@ -1098,26 +1159,54 @@ func (l *Arm64Lifter) liftImul(inst disasm.Instruction, nextPC uint64, lines []s
 func (l *Arm64Lifter) liftMul(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	if reg, ok := inst.Inst.Args[0].(x86asm.Reg); ok {
 		if desc, okDesc := arm64RegMap[reg]; okDesc {
-			if desc.Size == 4 {
+			switch desc.Size {
+			case 1:
+				rc, _ := readRegTo(reg, "x16", "w16")
+				lines = append(lines, rc...)
+				lines = append(lines, "    and w17, w19, #0xff")
+				lines = append(lines, "    mul w16, w17, w16")
+				lines = append(lines, "    bfi x19, x16, #0, #16")
+			case 2:
+				rc, _ := readRegTo(reg, "x16", "w16")
+				lines = append(lines, rc...)
+				lines = append(lines, "    and w17, w19, #0xffff")
+				lines = append(lines, "    mul w16, w17, w16")
+				lines = append(lines, "    bfi x19, x16, #0, #16")
+				lines = append(lines, "    lsr w17, w16, #16")
+				lines = append(lines, "    bfi x22, x17, #0, #16")
+			case 4:
 				lines = append(lines, fmt.Sprintf("    umull x16, w19, %s", desc.W))
 				lines = append(lines, "    mov w19, w16")
 				lines = append(lines, "    lsr x22, x16, #32")
-			} else {
+			default: // 8
+				lines = append(lines, fmt.Sprintf("    mul x16, x19, %s", desc.X))
 				lines = append(lines, fmt.Sprintf("    umulh x22, x19, %s", desc.X))
-				lines = append(lines, fmt.Sprintf("    mul x19, x19, %s", desc.X))
+				lines = append(lines, "    mov x19, x16")
 			}
 			return lines, nil
 		}
 	} else if mem, ok := inst.Inst.Args[0].(x86asm.Mem); ok {
 		sz := defMemSz(inst)
 		lines = append(lines, readMemTo(mem, nextPC, sz, "x17", "w17")...)
-		if sz == 4 {
+		switch sz {
+		case 1:
+			lines = append(lines, "    and w16, w19, #0xff")
+			lines = append(lines, "    mul w16, w16, w17")
+			lines = append(lines, "    bfi x19, x16, #0, #16")
+		case 2:
+			lines = append(lines, "    and w16, w19, #0xffff")
+			lines = append(lines, "    mul w16, w16, w17")
+			lines = append(lines, "    bfi x19, x16, #0, #16")
+			lines = append(lines, "    lsr w17, w16, #16")
+			lines = append(lines, "    bfi x22, x17, #0, #16")
+		case 4:
 			lines = append(lines, "    umull x16, w19, w17")
 			lines = append(lines, "    mov w19, w16")
 			lines = append(lines, "    lsr x22, x16, #32")
-		} else {
+		default: // 8
+			lines = append(lines, "    mul x16, x19, x17")
 			lines = append(lines, "    umulh x22, x19, x17")
-			lines = append(lines, "    mul x19, x19, x17")
+			lines = append(lines, "    mov x19, x16")
 		}
 		return lines, nil
 	}
@@ -1135,11 +1224,37 @@ func (l *Arm64Lifter) liftDiv(inst disasm.Instruction, nextPC uint64, lines []st
 
 	if reg, ok := inst.Inst.Args[0].(x86asm.Reg); ok {
 		if desc, okDesc := arm64RegMap[reg]; okDesc {
-			if desc.Size == 4 {
+			switch desc.Size {
+			case 1:
+				rc, _ := readRegTo(reg, "x17", "w17")
+				lines = append(lines, rc...)
+				if isSigned {
+					lines = append(lines, "    sxth w16, w19")
+					lines = append(lines, "    sxtb w17, w17")
+				} else {
+					lines = append(lines, "    uxth w16, w19")
+				}
+				lines = append(lines, fmt.Sprintf("    %s w0, w16, w17", divOp))
+				lines = append(lines, "    msub w1, w0, w17, w16")
+				lines = append(lines, "    bfi x19, x0, #0, #8")
+				lines = append(lines, "    bfi x19, x1, #8, #8")
+			case 2:
+				rc, _ := readRegTo(reg, "x17", "w17")
+				lines = append(lines, rc...)
+				lines = append(lines, "    and w16, w19, #0xffff")
+				lines = append(lines, "    bfi w16, w22, #16, #16")
+				if isSigned {
+					lines = append(lines, "    sxth w17, w17")
+				}
+				lines = append(lines, fmt.Sprintf("    %s w0, w16, w17", divOp))
+				lines = append(lines, "    msub w1, w0, w17, w16")
+				lines = append(lines, "    bfi x19, x0, #0, #16")
+				lines = append(lines, "    bfi x22, x1, #0, #16")
+			case 4:
 				lines = append(lines, fmt.Sprintf("    %s w16, w19, %s", divOp, desc.W))
 				lines = append(lines, fmt.Sprintf("    msub w22, w16, %s, w19", desc.W))
 				lines = append(lines, "    mov w19, w16")
-			} else {
+			default: // 8
 				lines = append(lines, fmt.Sprintf("    %s x16, x19, %s", divOp, desc.X))
 				lines = append(lines, fmt.Sprintf("    msub x22, x16, %s, x19", desc.X))
 				lines = append(lines, "    mov x19, x16")
@@ -1149,11 +1264,33 @@ func (l *Arm64Lifter) liftDiv(inst disasm.Instruction, nextPC uint64, lines []st
 	} else if mem, ok := inst.Inst.Args[0].(x86asm.Mem); ok {
 		sz := defMemSz(inst)
 		lines = append(lines, readMemTo(mem, nextPC, sz, "x17", "w17")...)
-		if sz == 4 {
+		switch sz {
+		case 1:
+			if isSigned {
+				lines = append(lines, "    sxth w16, w19")
+				lines = append(lines, "    sxtb w17, w17")
+			} else {
+				lines = append(lines, "    uxth w16, w19")
+			}
+			lines = append(lines, fmt.Sprintf("    %s w0, w16, w17", divOp))
+			lines = append(lines, "    msub w1, w0, w17, w16")
+			lines = append(lines, "    bfi x19, x0, #0, #8")
+			lines = append(lines, "    bfi x19, x1, #8, #8")
+		case 2:
+			lines = append(lines, "    and w16, w19, #0xffff")
+			lines = append(lines, "    bfi w16, w22, #16, #16")
+			if isSigned {
+				lines = append(lines, "    sxth w17, w17")
+			}
+			lines = append(lines, fmt.Sprintf("    %s w0, w16, w17", divOp))
+			lines = append(lines, "    msub w1, w0, w17, w16")
+			lines = append(lines, "    bfi x19, x0, #0, #16")
+			lines = append(lines, "    bfi x22, x1, #0, #16")
+		case 4:
 			lines = append(lines, fmt.Sprintf("    %s w16, w19, w17", divOp))
 			lines = append(lines, "    msub w22, w16, w17, w19")
 			lines = append(lines, "    mov w19, w16")
-		} else {
+		default: // 8
 			lines = append(lines, fmt.Sprintf("    %s x16, x19, x17", divOp))
 			lines = append(lines, "    msub x22, x16, x17, x19")
 			lines = append(lines, "    mov x19, x16")
