@@ -1040,9 +1040,84 @@ void shim___tls_get_addr(GuestContext *ctx) {
 // PS4_STALL_WATCHDOG=<ms>: when no frame has been presented for <ms> milliseconds, print what
 // every guest thread is executing (guest block address and host function), so long frames can
 // be attributed to a thread and a guest function.
+// PS4_STALL_PROFILE=<ms>: from <ms> into a stall until the next frame, sample every guest
+// thread every millisecond and print the most frequent functions per thread at its end.
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <time.h>
+#include <mach/mach_vm.h>
+#include "ps4_stall_profile.h"
+
+static StallProfile *g_stall_prof;
+static uint64_t g_prof_for; // present time of the stall being profiled (0: none)
+
+// dladdr scans the ~64k local symbols of the executable linearly (~60 us per call), which
+// would make one sampling round of all threads take ~10 ms instead of fitting in the 1 ms
+// period. Results are cached per pc in a fixed table; only the watchdog thread uses it.
+#define STALL_SYM_CACHE 16384
+static struct {
+  uint64_t pc, start;
+  const char *name; // NULL: dladdr found no symbol
+} g_stall_sym_cache[STALL_SYM_CACHE];
+
+static int stall_symbolize(uint64_t pc, uint64_t *start, const char **name) {
+  const uint64_t h = (pc * 0x9E3779B97F4A7C15ull) >> 50; // 14 bits
+  if (g_stall_sym_cache[h].pc != pc) {
+    Dl_info di;
+    const int ok = dladdr((void *)pc, &di) && di.dli_sname;
+    g_stall_sym_cache[h].pc = pc;
+    g_stall_sym_cache[h].start = ok ? (uint64_t)(uintptr_t)di.dli_saddr : 0;
+    g_stall_sym_cache[h].name = ok ? di.dli_sname : NULL;
+  }
+  if (!g_stall_sym_cache[h].name) return 0;
+  *start = g_stall_sym_cache[h].start;
+  *name = g_stall_sym_cache[h].name;
+  return 1;
+}
+
+// One sample of every guest thread: PC, LR and the saved return addresses along the
+// frame-pointer chain. Threads are suspended only while their registers and stack are read;
+// nothing that can take a lock (malloc, dladdr) runs while one is suspended.
+static void stall_profile_sample_all(void) {
+  struct {
+    pthread_t th;
+    char name[32];
+  } list[STALL_PROFILE_MAX_THREADS];
+  int n = 0;
+  pthread_mutex_lock(&g_threads_mutex);
+  for (RecompThread *t = g_threads; t && n < STALL_PROFILE_MAX_THREADS; t = t->next) {
+    if (t->finished || !t->ctx) continue;
+    list[n].th = t->host_thread;
+    snprintf(list[n].name, sizeof(list[n].name), "%s", t->name[0] ? t->name : "unnamed");
+    n++;
+  }
+  pthread_mutex_unlock(&g_threads_mutex);
+  for (int i = 0; i < n; i++) {
+    const mach_port_t port = pthread_mach_thread_np(list[i].th);
+    if (port == MACH_PORT_NULL || thread_suspend(port) != KERN_SUCCESS) continue;
+    uint64_t pcs[STALL_PROFILE_DEPTH];
+    int np = 0;
+    arm_thread_state64_t st;
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
+      pcs[np++] = (uint64_t)arm_thread_state64_get_pc(st);
+      pcs[np++] = (uint64_t)arm_thread_state64_get_lr(st);
+      uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st);
+      while (np < STALL_PROFILE_DEPTH && fp && !(fp & 15)) {
+        uint64_t frame[2];
+        mach_vm_size_t got = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), fp, sizeof(frame), (mach_vm_address_t)(uintptr_t)frame,
+                                   &got) != KERN_SUCCESS || got != sizeof(frame) || !frame[1])
+          break;
+        pcs[np++] = frame[1];
+        if (frame[0] <= fp) break; // the chain grows toward the stack base
+        fp = frame[0];
+      }
+    }
+    thread_resume(port);
+    if (np) stall_profile_add(g_stall_prof, i, list[i].name, pcs, np);
+  }
+}
 
 static _Atomic uint64_t g_last_present_ns;
 
@@ -1070,17 +1145,33 @@ static void stall_dump_threads(double stalled_ms) {
   pthread_mutex_unlock(&g_threads_mutex);
 }
 
+static long g_stall_dump_ms, g_stall_prof_ms;
+
 static void *stall_watchdog_main(void *arg) {
-  const uint64_t limit_ns = (uint64_t)(uintptr_t)arg * 1000000ull;
+  (void)arg;
+  const uint64_t dump_ns = (uint64_t)g_stall_dump_ms * 1000000ull;
+  const uint64_t prof_ns = (uint64_t)g_stall_prof_ms * 1000000ull;
   uint64_t reported_for = 0;
   for (;;) {
-    usleep(5000);
+    usleep(prof_ns ? 1000 : 5000);
     const uint64_t last = g_last_present_ns;
     if (!last) continue;
     const uint64_t now = stall_now_ns();
-    if (now - last > limit_ns && reported_for != last) {
+    if (dump_ns && now - last > dump_ns && reported_for != last) {
       reported_for = last;
       stall_dump_threads((double)(now - last) / 1e6);
+    }
+    if (!prof_ns) continue;
+    if (g_prof_for && g_prof_for != last) { // a frame ended the stall being profiled
+      stall_profile_report(g_stall_prof, stderr, (double)(last - g_prof_for) / 1e6, 6);
+      g_prof_for = 0;
+    }
+    if (now - last > prof_ns) {
+      if (g_prof_for != last) {
+        stall_profile_reset(g_stall_prof);
+        g_prof_for = last;
+      }
+      stall_profile_sample_all();
     }
   }
   return NULL;
@@ -1092,10 +1183,14 @@ void ps4_stall_watchdog_note_present(void) {
   if (!started) {
     started = 1;
     const char *e = getenv("PS4_STALL_WATCHDOG");
-    const long ms = e ? atol(e) : 0;
-    if (ms > 0) {
+    const char *p = getenv("PS4_STALL_PROFILE");
+    g_stall_dump_ms = e ? atol(e) : 0;
+    g_stall_prof_ms = p ? atol(p) : 0;
+    if (g_stall_prof_ms > 0) g_stall_prof = stall_profile_create(stall_symbolize);
+    if (g_stall_prof_ms > 0 && !g_stall_prof) g_stall_prof_ms = 0;
+    if (g_stall_dump_ms > 0 || g_stall_prof_ms > 0) {
       pthread_t th;
-      pthread_create(&th, NULL, stall_watchdog_main, (void *)(uintptr_t)ms);
+      pthread_create(&th, NULL, stall_watchdog_main, NULL);
       pthread_detach(th);
     }
   }
