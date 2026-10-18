@@ -478,6 +478,12 @@ int32_t scePadReadState(int32_t handle, OrbisPadData *data) {
       clock_gettime(CLOCK_MONOTONIC, &now);
       long ms = (now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000;
       if (pad_clock_frames) ms = (long)(g_ps4_videoout_flip_count * 1000 / 30);
+      // marks the start of the scripted part of a run (the walking benchmark measures after it)
+      static int announced = 0;
+      if (!announced && ms >= steps[0].t) {
+        announced = 1;
+        fprintf(stderr, "[pad] script started at %ld ms\n", ms);
+      }
       for (int i = 0; i < nsteps; i++) {
         if (ms >= steps[i].t && ms < steps[i].t + steps[i].dur) {
           buttons |= steps[i].mask;

@@ -4647,6 +4647,15 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
             if (last_present > 0) {
                 const double dt = (now_t - last_present) * 1000.0;
                 intervals.push_back((float)dt);
+                // PS4_GNM_LOG_LONG_FRAMES=<ms>: one line per frame longer than <ms> (walking
+                // benchmark: counts long frames inside its own time window)
+                static const double long_ms = [] {
+                    const char* v = getenv("PS4_GNM_LOG_LONG_FRAMES");
+                    return v ? atof(v) : 0.0;
+                }();
+                if (long_ms > 0 && dt > long_ms)
+                    fprintf(stderr, "[gnm-draw] long frame %.1f ms (present %llu)\n", dt,
+                            (unsigned long long)S.present_idx + 1);
                 if (dt > 50.0)
                     fprintf(stderr, "[gnm-draw] hitch: frame %.1f ms; shaders %u (%.1f ms: gcn %.1f, metal %.1f), pipelines %u (%.1f ms), "
                                     "texture uploads %u (%.1f ms), gpu waits %.1f ms, draws waiting for shaders %u\n",
