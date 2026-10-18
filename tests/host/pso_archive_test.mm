@@ -24,7 +24,7 @@ static int Fail(const char* what) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) return Fail("usage: pso_archive_test <write|read|budget|corrupt> <dir> <nonce>");
+    if (argc != 4) return Fail("usage: pso_archive_test <write|read|budget|corrupt|stale> <dir> <nonce>");
     const std::string mode = argv[1], dir = argv[2], nonce = argv[3];
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -42,6 +42,24 @@ int main(int argc, char** argv) {
         if (mode == "corrupt") {
             FILE* f = fopen(archive.c_str(), "wb");
             fputs("not an archive", f);
+            fclose(f);
+        }
+        long long old_index_size = 0;
+        if (mode == "stale") {
+            // Pretend the archive was written on another OS build: flip a byte of the header's
+            // kern.osversion field (bytes 16..79 of the index).
+            const std::string idx = dir + "/pipelines_archived.bin";
+            struct stat ist;
+            if (stat(idx.c_str(), &ist) != 0) return Fail("stale: no index to patch");
+            old_index_size = ist.st_size;
+            FILE* f = fopen(idx.c_str(), "r+b");
+            if (!f) return Fail("stale: open index");
+            unsigned char b = 0;
+            fseek(f, 16, SEEK_SET);
+            if (fread(&b, 1, 1, f) != 1) return Fail("stale: read index");
+            b ^= 0x5a;
+            fseek(f, 16, SEEK_SET);
+            fwrite(&b, 1, 1, f);
             fclose(f);
         }
         const uint64_t budget = mode == "budget" ? 1 : (64ull << 20);
@@ -79,6 +97,12 @@ int main(int argc, char** argv) {
             if (![dev newComputePipelineStateWithDescriptor:cd options:MTLPipelineOptionFailOnBinaryArchiveMiss
                                                  reflection:nil error:&e])
                 return Fail("compute pipeline not served from the archive");
+        } else if (mode == "stale") {
+            struct stat st;
+            if (ps4gnm_pso_archive::Contains(1) || ps4gnm_pso_archive::Contains(2)) return Fail("stale index survived");
+            if (stat(archive.c_str(), &st) == 0) return Fail("stale archive file not deleted");
+            if (stat((dir + "/pipelines_archived.bin").c_str(), &st) != 0 || st.st_size >= old_index_size)
+                return Fail("index not recreated with only a header");
         } else if (mode == "budget" || mode == "corrupt") {
             if (ps4gnm_pso_archive::Contains(1)) return Fail("old index survived");
             ps4gnm_pso_archive::Attach(rd);

@@ -1,16 +1,18 @@
 // Persistent Metal binary archive of the game's pipelines (their GPU code), so a pipeline built
-// in an earlier session loads in about a millisecond even when the system Metal cache no
-// longer has it (that cache is tied to the executable; every rebuild of the game drops it).
+// in an earlier session loads in about a millisecond. Earlier measurements showed the system
+// Metal pipeline cache is not reliable across rebuilds of the game; this archive does not
+// depend on it.
 #pragma once
 #import <Metal/Metal.h>
 #include <cstdint>
 #include <string>
 
 namespace ps4gnm_pso_archive {
-// Opens or creates <dir>/pipelines.metalar and its key index <dir>/pipelines_archived.bin. A
-// file larger than budget_bytes, unreadable, or incompatible with this OS/GPU is deleted and a
-// new archive started. Returns false (archive disabled) only when Metal cannot create one, or
-// with PS4_GNM_NO_PSO_ARCHIVE=1.
+// Opens or creates <dir>/pipelines.metalar and its key index <dir>/pipelines_archived.bin. The
+// index starts with a header (OS build, GPU name and registry ID). An archive larger than
+// budget_bytes, unreadable, or whose index header differs from this OS/GPU is deleted and a
+// new archive started; leftover pipelines.metalar.tmp* files are removed. Returns false (archive disabled) only when Metal cannot create one, or
+// with PS4_GNM_NO_PSO_ARCHIVE=1 (only the value "1").
 bool Open(id<MTLDevice> dev, const std::string& dir, uint64_t budget_bytes);
 bool Enabled();
 // Makes pipeline creation look in the archive first (descriptor.binaryArchives).

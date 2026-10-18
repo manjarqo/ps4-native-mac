@@ -10,13 +10,12 @@ G="$R/pkg/runtime/modules/libSceGnmDriver"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"
-# A fresh shader per suite run (nonce), and the read run from a copy of the binary at a new path.
-# Neither defeats the system pipeline cache (tried: path copy, re-sign, changed cdhash), so the
-# read run relies on the attached-archive and never-archived-pipeline-misses assertions instead.
+# A fresh shader per suite run (nonce) keeps pipeline caches of earlier runs from satisfying it.
 NONCE=$(( $(date +%s) % 100000 * 10 + RANDOM % 10 ))
 "$T/pso_archive_test" write "$A" $NONCE
-mkdir "$T/rd"; cp "$T/pso_archive_test" "$T/rd/pso_archive_test_read_$$"
-"$T/rd/pso_archive_test_read_$$" read "$A" $NONCE
+"$T/pso_archive_test" read "$A" $NONCE
+"$T/pso_archive_test" stale "$A" $NONCE
+"$T/pso_archive_test" write "$A" $NONCE
 "$T/pso_archive_test" budget "$A" $NONCE
 "$T/pso_archive_test" write "$A" $NONCE
 "$T/pso_archive_test" corrupt "$A" $NONCE
