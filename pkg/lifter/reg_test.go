@@ -54,6 +54,14 @@ func TestLiftNewInstructions(t *testing.T) {
 			contains: []string{"/* pause/prefetch */"},
 		},
 		{
+			name: "PAUSE",
+			inst: disasm.Instruction{
+				Address: 0x1004,
+				Inst:    x86asm.Inst{Op: x86asm.PAUSE, Len: 2},
+			},
+			contains: []string{"RECOMP_SPIN_PAUSE();"},
+		},
+		{
 			name: "INSB",
 			inst: disasm.Instruction{
 				Address: 0x1003,
@@ -71,7 +79,7 @@ func TestLiftNewInstructions(t *testing.T) {
 					Len:    2,
 				},
 			},
-			contains: []string{"memmove(ctx->mem_base + ctx->rdi"},
+			contains: []string{"memmove(d, s, n)"},
 		},
 		{
 			name: "VADDPS",
@@ -143,7 +151,7 @@ func TestLiftNewInstructions(t *testing.T) {
 					Len:  4,
 				},
 			},
-			contains: []string{"ctx->xmm[0].s32[0] = (int32_t)roundf(src.f32[0]);"},
+			contains: []string{"ctx->xmm[0].s32[0] = x86_cvt_f32_i32(src.f32[0]);"},
 		},
 		{
 			name: "VPAVGB",
@@ -383,7 +391,7 @@ func TestLiftNewInstructions(t *testing.T) {
 					Len:  4,
 				},
 			},
-			contains: []string{"llrintf(ctx->xmm[1].f32[0])"},
+			contains: []string{"x86_cvt_f32_i"},
 		},
 		{
 			name: "VCVTSD2SI",
@@ -395,7 +403,7 @@ func TestLiftNewInstructions(t *testing.T) {
 					Len:  4,
 				},
 			},
-			contains: []string{"llrint(ctx->xmm[2].f64[0])"},
+			contains: []string{"x86_cvt_f64_i"},
 		},
 		{
 			name: "VEXTRACTF128_lo",
@@ -527,7 +535,7 @@ func TestLiftNewInstructions(t *testing.T) {
 					Len:  4,
 				},
 			},
-			contains: []string{"ctx->xmm[0] = ctx->xmm[1];", "if (s2 < s1) ctx->xmm[0].f32[0] = s2;", "memset(&ctx->ymmh[0], 0, 16);"},
+			contains: []string{"ctx->xmm[0] = ctx->xmm[1];", "ctx->xmm[0].f32[0] = (s1 < s2) ? s1 : s2;", "memset(&ctx->ymmh[0], 0, 16);"},
 		},
 		{
 			name: "VMAXSS",
@@ -539,7 +547,7 @@ func TestLiftNewInstructions(t *testing.T) {
 					Len:  4,
 				},
 			},
-			contains: []string{"ctx->xmm[0] = ctx->xmm[1];", "if (s2 > s1) ctx->xmm[0].f32[0] = s2;", "memset(&ctx->ymmh[0], 0, 16);"},
+			contains: []string{"ctx->xmm[0] = ctx->xmm[1];", "ctx->xmm[0].f32[0] = (s1 > s2) ? s1 : s2;", "memset(&ctx->ymmh[0], 0, 16);"},
 		},
 		{
 			name: "VORPS",
@@ -691,7 +699,7 @@ func TestLiftNewInstructions(t *testing.T) {
 					Len:  4,
 				},
 			},
-			contains: []string{"(int32_t)truncf(src.f32[0])"},
+			contains: []string{"x86_cvtt_f32_i32(src.f32[0])"},
 		},
 		{
 			name: "VPMOVZXWD",

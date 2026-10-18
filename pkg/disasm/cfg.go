@@ -32,7 +32,7 @@ type Function struct {
 	EntryAddr  uint64
 	EndAddr    uint64
 	Blocks     map[uint64]*BasicBlock
-	BlockOrder []uint64 // Topologically or address-sorted block start addresses
+	BlockOrder []uint64            // Topologically or address-sorted block start addresses
 	JumpTables map[uint64][]uint64 // Map of indirect jump PC -> target addresses
 }
 
@@ -690,177 +690,226 @@ func (d *Disassembler) disasmBranchFollowing(entryAddr uint64) (*Function, []uin
 	capped := false
 	var capReason string
 	var capPC uint64
-	for head := 0; head < len(blockQueue); head++ {
-		if len(instAtAddr) >= maxFnInsts {
-			capped = true
-			capReason = fmt.Sprintf("function instruction count (%d) >= cap (%d)", len(instAtAddr), maxFnInsts)
-			capPC = blockQueue[head]
-			break
+	// Switch tables whose length could not be proven are scanned until the
+	// entries stop looking like code addresses, which can overrun into the
+	// next table and yield targets in the middle of real instructions. Their
+	// targets are added only after all other code is decoded, and the scan is
+	// cut at the first entry that lands inside an already decoded instruction.
+	type weakSwitch struct {
+		pc, from uint64
+		targets  []uint64
+	}
+	var weak []weakSwitch
+	insideDecoded := func(target uint64) bool {
+		for back := uint64(1); back < 16 && back <= target; back++ {
+			if in, ok := instAtAddr[target-back]; ok && uint64(in.Inst.Len) > back {
+				return true
+			}
 		}
-		blockStart = blockQueue[head]
-		pc := blockStart
-		var curBlock []Instruction
-
-		for pc < fnEnd && d.inCode(pc) {
-			if pc >= uint64(len(d.elf.MemoryImage)) {
-				break
-			}
-
-			inst, err := x86asm.Decode(d.elf.MemoryImage[pc:], 64)
-			if err != nil || inst.Len == 0 {
-				break
-			}
-			if inst.Op == 0 {
-				inst.Op = x86asm.UD2
-			}
-			if isPrivileged(inst.Op) {
-				d.PrivilegedStops++
-				break
-			}
-
-			wrapped := Instruction{
-				Address: pc,
-				Inst:    inst,
-			}
-			instAtAddr[pc] = wrapped
-			curBlock = append(curBlock, wrapped)
-
-			nextPC := pc + uint64(inst.Len)
-
-			isBranch := false
-			isTerminal := false
-
-			switch inst.Op {
-			case x86asm.JMP:
-				isBranch = true
-				isTerminal = true
-				if rel, ok := inst.Args[0].(x86asm.Rel); ok {
-					edge(uint64(int64(nextPC) + int64(rel)))
-				} else {
-					findTableAddr := func(reg x86asm.Reg) (uint64, bool) {
-						visited := make(map[uint64]bool)
-						queue := append([]uint64(nil), blockPreds[blockStart]...)
-						for _, q := range queue {
-							visited[q] = true
-						}
-						depth := 0
-						for len(queue) > 0 && depth < 16 {
-							depth++
-							var nextQueue []uint64
-							for _, pred := range queue {
-								insts := blockInsts[pred]
-								for i := len(insts) - 1; i >= 0; i-- {
-									dst, target, isLEA := leaRIPTarget(insts[i])
-									if isLEA && sameGPR(dst, reg) {
-										return target, true
-									}
-								}
-								for _, p := range blockPreds[pred] {
-									if !visited[p] {
-										visited[p] = true
-										nextQueue = append(nextQueue, p)
-									}
-								}
-							}
-							queue = nextQueue
-						}
-						return 0, false
-					}
-
-					findCount := func(idxReg x86asm.Reg) (int, bool) {
-						visited := make(map[uint64]bool)
-						queue := append([]uint64(nil), blockPreds[blockStart]...)
-						for _, q := range queue {
-							visited[q] = true
-						}
-						depth := 0
-						for len(queue) > 0 && depth < 16 {
-							depth++
-							var nextQueue []uint64
-							for _, pred := range queue {
-								insts := blockInsts[pred]
-								if c := switchTableCount(insts, idxReg); c > 0 {
-									return c, true
-								}
-								for _, p := range blockPreds[pred] {
-									if !visited[p] {
-										visited[p] = true
-										nextQueue = append(nextQueue, p)
-									}
-								}
-							}
-							queue = nextQueue
-						}
-						return 0, false
-					}
-
-					if sw, ok := d.ResolveJumpTable(curBlock, findTableAddr, findCount, entryAddr, fnEnd); ok && len(sw.Targets) > 0 {
-						fn.JumpTables[pc] = sw.Targets
-						for _, target := range sw.Targets {
-							edge(target)
-						}
-					}
-				}
-			case x86asm.RET:
-				isTerminal = true
-			case x86asm.UD2:
-				isTerminal = true
-			case x86asm.CALL:
-				// Call does not terminate the basic block unless target is noreturn.
-				if rel, ok := inst.Args[0].(x86asm.Rel); ok {
-					target := uint64(int64(nextPC) + int64(rel))
-					discoveredCalls = append(discoveredCalls, target)
-					if d.isNoReturn(target) {
-						isTerminal = true
-					}
-				} else if mem, ok := inst.Args[0].(x86asm.Mem); ok && mem.Base == x86asm.RIP {
-					disp := int64(int32(mem.Disp))
-					target := uint64(int64(nextPC) + disp)
-					if d.isNoReturn(target) {
-						isTerminal = true
-					}
-				}
-			case x86asm.LEA:
-				if mem, ok := inst.Args[1].(x86asm.Mem); ok && mem.Base == x86asm.RIP {
-					disp := int64(int32(mem.Disp))
-					target := uint64(int64(nextPC) + disp)
-					if d.seedableFunc(target) {
-						discoveredCalls = append(discoveredCalls, target)
-					}
-				}
-			default:
-				if isJcc(inst.Op) {
-					isBranch = true
-					if rel, ok := inst.Args[0].(x86asm.Rel); ok {
-						edge(uint64(int64(nextPC) + int64(rel)))
-					}
-					if inside(nextPC) {
-						edge(nextPC)
-					}
-				}
-			}
-
-			pc = nextPC
-			if isTerminal || isBranch {
-				break
-			}
-			if pc-blockStart >= maxBlockBytes {
-				// Block splitting: do not truncate function or drop code.
-				// Split the oversized block by enqueuing a fallthrough edge
-				// to the next PC and terminate the current block.
-				if inside(pc) {
-					edge(pc)
-				}
-				break
-			}
+		return false
+	}
+	head := 0
+	for {
+		for ; head < len(blockQueue); head++ {
 			if len(instAtAddr) >= maxFnInsts {
 				capped = true
 				capReason = fmt.Sprintf("function instruction count (%d) >= cap (%d)", len(instAtAddr), maxFnInsts)
-				capPC = pc
+				capPC = blockQueue[head]
 				break
 			}
+			blockStart = blockQueue[head]
+			pc := blockStart
+			var curBlock []Instruction
+
+			for pc < fnEnd && d.inCode(pc) {
+				if pc >= uint64(len(d.elf.MemoryImage)) {
+					break
+				}
+
+				inst, err := x86asm.Decode(d.elf.MemoryImage[pc:], 64)
+				if err != nil || inst.Len == 0 {
+					break
+				}
+				if inst.Op == 0 {
+					inst.Op = x86asm.UD2
+				}
+				if isPrivileged(inst.Op) {
+					d.PrivilegedStops++
+					break
+				}
+
+				wrapped := Instruction{
+					Address: pc,
+					Inst:    inst,
+				}
+				instAtAddr[pc] = wrapped
+				curBlock = append(curBlock, wrapped)
+
+				nextPC := pc + uint64(inst.Len)
+
+				isBranch := false
+				isTerminal := false
+
+				switch inst.Op {
+				case x86asm.JMP:
+					isBranch = true
+					isTerminal = true
+					if rel, ok := inst.Args[0].(x86asm.Rel); ok {
+						edge(uint64(int64(nextPC) + int64(rel)))
+					} else {
+						findTableAddr := func(reg x86asm.Reg) (uint64, bool) {
+							visited := make(map[uint64]bool)
+							queue := append([]uint64(nil), blockPreds[blockStart]...)
+							for _, q := range queue {
+								visited[q] = true
+							}
+							depth := 0
+							for len(queue) > 0 && depth < 16 {
+								depth++
+								var nextQueue []uint64
+								for _, pred := range queue {
+									insts := blockInsts[pred]
+									for i := len(insts) - 1; i >= 0; i-- {
+										dst, target, isLEA := leaRIPTarget(insts[i])
+										if isLEA && sameGPR(dst, reg) {
+											return target, true
+										}
+									}
+									for _, p := range blockPreds[pred] {
+										if !visited[p] {
+											visited[p] = true
+											nextQueue = append(nextQueue, p)
+										}
+									}
+								}
+								queue = nextQueue
+							}
+							return 0, false
+						}
+
+						findCount := func(idxReg x86asm.Reg) (int, bool) {
+							visited := make(map[uint64]bool)
+							queue := append([]uint64(nil), blockPreds[blockStart]...)
+							for _, q := range queue {
+								visited[q] = true
+							}
+							depth := 0
+							for len(queue) > 0 && depth < 16 {
+								depth++
+								var nextQueue []uint64
+								for _, pred := range queue {
+									insts := blockInsts[pred]
+									c, killed := switchTableCountKill(insts, idxReg)
+									if c > 0 {
+										return c, true
+									}
+									if killed {
+										continue
+									}
+									for _, p := range blockPreds[pred] {
+										if !visited[p] {
+											visited[p] = true
+											nextQueue = append(nextQueue, p)
+										}
+									}
+								}
+								queue = nextQueue
+							}
+							return 0, false
+						}
+
+						if sw, ok := d.ResolveJumpTable(curBlock, findTableAddr, findCount, entryAddr, fnEnd); ok && len(sw.Targets) > 0 && sw.Count <= 0 {
+							weak = append(weak, weakSwitch{pc: pc, from: blockStart, targets: sw.Targets})
+						} else if ok && len(sw.Targets) > 0 {
+							fn.JumpTables[pc] = sw.Targets
+							for _, target := range sw.Targets {
+								edge(target)
+							}
+						}
+					}
+				case x86asm.RET:
+					isTerminal = true
+				case x86asm.UD2:
+					isTerminal = true
+				case x86asm.CALL:
+					// Call does not terminate the basic block unless target is noreturn.
+					if rel, ok := inst.Args[0].(x86asm.Rel); ok {
+						target := uint64(int64(nextPC) + int64(rel))
+						discoveredCalls = append(discoveredCalls, target)
+						if d.isNoReturn(target) {
+							isTerminal = true
+						}
+					} else if mem, ok := inst.Args[0].(x86asm.Mem); ok && mem.Base == x86asm.RIP {
+						disp := int64(int32(mem.Disp))
+						target := uint64(int64(nextPC) + disp)
+						if d.isNoReturn(target) {
+							isTerminal = true
+						}
+					}
+				case x86asm.LEA:
+					if mem, ok := inst.Args[1].(x86asm.Mem); ok && mem.Base == x86asm.RIP {
+						disp := int64(int32(mem.Disp))
+						target := uint64(int64(nextPC) + disp)
+						if d.seedableFunc(target) {
+							discoveredCalls = append(discoveredCalls, target)
+						}
+					}
+				default:
+					if isJcc(inst.Op) {
+						isBranch = true
+						if rel, ok := inst.Args[0].(x86asm.Rel); ok {
+							edge(uint64(int64(nextPC) + int64(rel)))
+						}
+						if inside(nextPC) {
+							edge(nextPC)
+						}
+					}
+				}
+
+				pc = nextPC
+				if isTerminal || isBranch {
+					break
+				}
+				if pc-blockStart >= maxBlockBytes {
+					// Block splitting: do not truncate function or drop code.
+					// Split the oversized block by enqueuing a fallthrough edge
+					// to the next PC and terminate the current block.
+					if inside(pc) {
+						edge(pc)
+					}
+					break
+				}
+				if len(instAtAddr) >= maxFnInsts {
+					capped = true
+					capReason = fmt.Sprintf("function instruction count (%d) >= cap (%d)", len(instAtAddr), maxFnInsts)
+					capPC = pc
+					break
+				}
+			}
+			blockInsts[blockStart] = curBlock
 		}
-		blockInsts[blockStart] = curBlock
+		if capped || len(weak) == 0 {
+			break
+		}
+		pending := weak
+		weak = nil
+		for _, w := range pending {
+			var accepted []uint64
+			for _, t := range w.targets {
+				if _, ok := instAtAddr[t]; !ok && insideDecoded(t) {
+					break
+				}
+				accepted = append(accepted, t)
+			}
+			if len(accepted) == 0 {
+				continue
+			}
+			fn.JumpTables[w.pc] = accepted
+			blockStart = w.from
+			for _, t := range accepted {
+				edge(t)
+			}
+		}
 	}
 	if capped {
 		d.CapHits++

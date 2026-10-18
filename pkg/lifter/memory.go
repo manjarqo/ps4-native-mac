@@ -89,23 +89,38 @@ func MemAddrExpr(mem x86asm.Mem, nextPC uint64) (string, error) {
 	return strings.Join(parts, " + "), nil
 }
 
+// isStackAddr reports whether an address expression is stack/frame relative.
+// Such accesses are thread-private and keep plain loads/stores; everything
+// else is lowered with acquire/release ordering (see MEM_LD*/MEM_ST* in
+// recomp_context.h) so lock-free guest code keeps x86 TSO guarantees on arm64.
+func isStackAddr(addrExpr string) bool {
+	return strings.HasPrefix(addrExpr, "ctx->rsp") || strings.HasPrefix(addrExpr, "ctx->rbp")
+}
+
 // MemReadExpr returns a C expression to read an integer/pointer of `size` bytes (1, 2, 4, 8) from `addrExpr`.
 func MemReadExpr(addrExpr string, size int) (string, error) {
+	plain := isStackAddr(addrExpr)
+	pick := func(bits int) string {
+		if plain {
+			return fmt.Sprintf("MEM_U%d(%s)", bits, addrExpr)
+		}
+		return fmt.Sprintf("MEM_LD%d(%s)", bits, addrExpr)
+	}
 	switch size {
 	case 1:
-		return "MEM_U8(" + addrExpr + ")", nil
+		return pick(8), nil
 	case 2:
-		return "MEM_U16(" + addrExpr + ")", nil
+		return pick(16), nil
 	case 4:
-		return "MEM_U32(" + addrExpr + ")", nil
+		return pick(32), nil
 	case 6:
 		// 48-bit far pointer (16-bit selector + 32-bit offset) in flat 64-bit address space
-		return "(uint64_t)MEM_U32(" + addrExpr + ")", nil
+		return "(uint64_t)" + pick(32), nil
 	case 8:
-		return "MEM_U64(" + addrExpr + ")", nil
+		return pick(64), nil
 	case 10:
 		// 80-bit far pointer (16-bit selector + 64-bit offset) in flat 64-bit address space
-		return "MEM_U64(" + addrExpr + ")", nil
+		return pick(64), nil
 	default:
 		return "", fmt.Errorf("unsupported memory read size: %d", size)
 	}
@@ -113,16 +128,16 @@ func MemReadExpr(addrExpr string, size int) (string, error) {
 
 // MemWriteStmt returns a C statement to write `valExpr` of `size` bytes to `addrExpr`.
 func MemWriteStmt(addrExpr string, size int, valExpr string) (string, error) {
+	plain := isStackAddr(addrExpr)
+	var bits int
 	switch size {
-	case 1:
-		return "MEM_U8(" + addrExpr + ") = (uint8_t)(" + valExpr + ");", nil
-	case 2:
-		return "MEM_U16(" + addrExpr + ") = (uint16_t)(" + valExpr + ");", nil
-	case 4:
-		return "MEM_U32(" + addrExpr + ") = (uint32_t)(" + valExpr + ");", nil
-	case 8:
-		return "MEM_U64(" + addrExpr + ") = (uint64_t)(" + valExpr + ");", nil
+	case 1, 2, 4, 8:
+		bits = size * 8
 	default:
 		return "", fmt.Errorf("unsupported memory write size: %d", size)
 	}
+	if plain {
+		return fmt.Sprintf("MEM_U%d(%s) = (uint%d_t)(%s);", bits, addrExpr, bits, valExpr), nil
+	}
+	return fmt.Sprintf("MEM_ST%d(%s, (uint%d_t)(%s));", bits, addrExpr, bits, valExpr), nil
 }

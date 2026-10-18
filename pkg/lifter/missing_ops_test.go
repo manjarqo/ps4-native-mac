@@ -91,7 +91,7 @@ func TestMissingOpsLifting(t *testing.T) {
 					Len:  6,
 				},
 			},
-			contains: "sum = p0 + p1 + p2 + p3",
+			contains: "sum = (p0 + p1) + (p2 + p3)",
 		},
 		{
 			name: "VRCPPS",
@@ -268,7 +268,7 @@ func TestMissingOpsLifting(t *testing.T) {
 					Len:      3,
 				},
 			},
-			contains: "trunc(fpu_pop(ctx))",
+			contains: "fpu_to_i64(trunc(FPU_ST(0)))",
 		},
 		{
 			name: "FCOMP",

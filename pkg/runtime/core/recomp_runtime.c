@@ -51,6 +51,29 @@ static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
         }
       }
     }
+    if (g_current_ctx->mem_base) {
+      // Guest backtrace: likely return addresses found on the stack, plus the
+      // frame-pointer chain.
+      fprintf(stderr, "Guest thread_id=%llu; code addresses on stack:", (unsigned long long)g_current_ctx->thread_id);
+      uint64_t *sp = (uint64_t *)(g_current_ctx->mem_base + g_current_ctx->rsp);
+      int shown = 0;
+      for (int i = 0; i < 512 && shown < 24; i++) {
+        if ((uint64_t)(g_current_ctx->rsp + i * 8 + 8) > g_current_ctx->mem_size) break;
+        uint64_t v = sp[i];
+        if (v >= 0x10000 && v < 0x1474000) {
+          // Return addresses point into the middle of a function.
+          fprintf(stderr, " %llx", (unsigned long long)v);
+          shown++;
+        }
+      }
+      fprintf(stderr, "\nGuest RBP chain:");
+      uint64_t bp = g_current_ctx->rbp;
+      for (int k = 0; k < 16 && bp && bp + 16 <= g_current_ctx->mem_size; k++) {
+        fprintf(stderr, " %llx", (unsigned long long)*(uint64_t *)(g_current_ctx->mem_base + bp + 8));
+        bp = *(uint64_t *)(g_current_ctx->mem_base + bp);
+      }
+      fprintf(stderr, "\n");
+    }
 #if defined(__APPLE__) && defined(__arm64__)
     uint64_t host_pc = ((ucontext_t *)ucontext)->uc_mcontext->__ss.__pc;
     fprintf(stderr, "Host PC: 0x%llx\n", (unsigned long long)host_pc);
@@ -259,6 +282,8 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
 
   ctx->mem_base = mem;
   ctx->mem_size = guest_mem_sz;
+  fprintf(stderr, "[ps4-recomp] guest memory at host %p (0x%llx bytes)\n", (void *)mem,
+          (unsigned long long)guest_mem_sz);
 
   ctx->fpu_cw = 0x037F; // Standard x87 control word default
 
@@ -362,6 +387,49 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
   return ctx;
 }
 
+// Debug aid: PS4_WATCH=<hex guest addr>[:<len>] polls that guest range from a host thread
+// (~every 50 us) and logs every change with the video flip count, to find out when (and by
+// whom: CPU or GPU) memory gets clobbered.
+#include <pthread.h>
+#include <time.h>
+extern volatile uint64_t g_ps4_videoout_flip_count;
+static uint8_t *g_watch_ptr;
+static size_t g_watch_len;
+static void *watch_thread(void *arg) {
+  (void)arg;
+  uint8_t prev[256], cur[256];
+  memcpy(prev, g_watch_ptr, g_watch_len);
+  for (;;) {
+    struct timespec ts = {0, 50000};
+    nanosleep(&ts, NULL);
+    memcpy(cur, g_watch_ptr, g_watch_len);
+    if (memcmp(cur, prev, g_watch_len) != 0) {
+      fprintf(stderr, "[watch] flip %llu: changed:", (unsigned long long)g_ps4_videoout_flip_count);
+      for (size_t i = 0; i < g_watch_len; i += 4)
+        fprintf(stderr, " %08x", *(uint32_t *)(cur + i));
+      fprintf(stderr, "\n");
+      memcpy(prev, cur, g_watch_len);
+    }
+  }
+  return NULL;
+}
+static void start_watch(GuestContext *ctx) {
+  const char *w = getenv("PS4_WATCH");
+  if (!w || !ctx || !ctx->mem_base) return;
+  char *end;
+  uint64_t addr = strtoull(w, &end, 16);
+  size_t len = 16;
+  if (*end == ':') len = (size_t)strtoul(end + 1, NULL, 0);
+  if (len > 256) len = 256;
+  len &= ~(size_t)3;
+  if (!len || addr >= ctx->mem_size) return;
+  g_watch_ptr = ctx->mem_base + addr;
+  g_watch_len = len;
+  pthread_t t;
+  pthread_create(&t, NULL, watch_thread, NULL);
+  fprintf(stderr, "[watch] watching guest 0x%llx len %zu\n", (unsigned long long)addr, len);
+}
+
 GuestContext *recomp_init_runtime_file(const char *image_filename,
                                        size_t requested_mem_sz,
                                        const char *prog_name) {
@@ -441,6 +509,7 @@ GuestContext *recomp_init_runtime_file(const char *image_filename,
     }
   }
   fclose(fp);
+  start_watch(ctx);
   return ctx;
 }
 
@@ -891,12 +960,17 @@ GuestVMExtent *recomp_vm_find(GuestContext *ctx, uint64_t addr) {
   return NULL;
 }
 
+void ps4_direct_mem_on_unmap(GuestContext *ctx, uint64_t addr, size_t size);
+
 int recomp_vm_free(GuestContext *ctx, uint64_t addr, size_t size) {
   if (!ctx || addr == 0 || size == 0)
     return -1;
   GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
   uint64_t aligned_addr = addr & ~4095ULL;
   size_t aligned_size = (size + 4095ULL) & ~4095ULL;
+
+  // Detach any physically aliased direct-memory pages first (before MADV_DONTNEED).
+  ps4_direct_mem_on_unmap(proc, aligned_addr, aligned_size);
 
   pthread_mutex_lock(&proc->vm_mutex);
 

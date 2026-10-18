@@ -4,6 +4,15 @@
 #include <sched.h>
 #include <signal.h>
 
+// scePthread* report failures as SCE kernel errors (0x80020000 | errno),
+// while the POSIX shims they forward to return plain errno values.
+#define SCE_PTHREAD_ERR(ctx)                                                   \
+  do {                                                                         \
+    uint32_t e_ = (uint32_t)(ctx)->rax;                                        \
+    if (e_ != 0 && e_ < 0x100)                                                 \
+      (ctx)->rax = 0x80020000ULL | e_;                                         \
+  } while (0)
+
 // Multi-threading runtime support
 typedef struct RecompPthreadAttr {
   uint32_t sched_policy;
@@ -66,6 +75,15 @@ RecompThread *recomp_find_thread(uint64_t handle) {
   return NULL;
 }
 
+RecompThread *recomp_get_current_thread(void) {
+  return g_current_thread;
+}
+
+// Fiber host threads run on behalf of whichever guest thread resumed them.
+void recomp_set_current_thread(RecompThread *t) {
+  g_current_thread = t;
+}
+
 static inline RecompThread *find_thread(uint64_t handle) {
   return recomp_find_thread(handle);
 }
@@ -91,6 +109,49 @@ void recomp_init_main_thread(GuestContext *ctx) {
   g_main_thread_obj.ctx = ctx;
   g_current_thread = &g_main_thread_obj;
   register_thread(&g_main_thread_obj);
+}
+
+// Orders `finished` against `detached` so exactly one side releases a
+// detached thread's resources.
+static pthread_mutex_t g_detach_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Common end of a guest thread, whether its entry returned or it called
+// scePthreadExit: TLS destructors, then release the guest stack and context
+// of detached threads (joinable ones are released by join).
+static void recomp_thread_epilogue(RecompThread *t, GuestContext *ctx) {
+  fprintf(stderr, "[ps4-thread] Thread exited: id=%d, name='%s', ret=0x%llx\n",
+          ctx->thread_id, t->name[0] ? t->name : "unnamed", (unsigned long long)t->ret_val);
+
+  // Run registered pthread TLS key destructors
+  GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
+  for (int iter = 0; iter < 4; iter++) {
+    bool has_active = false;
+    for (int k = 0; k < 128; k++) {
+      uint64_t val = ctx->tls_keys[k];
+      uint64_t dtor = proc->tls_destructors[k];
+      if (val != 0 && dtor != 0) {
+        ctx->tls_keys[k] = 0;
+        has_active = true;
+        ctx->rdi = val;
+        ctx->rsp -= 8;
+        MEM_U64(ctx->rsp) = 0xdeadbeefULL;
+        ctx->rip = dtor;
+        recomp_dispatch(ctx, dtor);
+      }
+    }
+    if (!has_active) break;
+  }
+
+  pthread_mutex_lock(&g_detach_mutex);
+  t->finished = true;
+  bool release = t->detached;
+  pthread_mutex_unlock(&g_detach_mutex);
+
+  if (release) {
+    unregister_thread(t);
+    recomp_free_thread_context(ctx);
+    free(t);
+  }
 }
 
 static void *recomp_host_thread_runner(void *arg) {
@@ -121,36 +182,7 @@ static void *recomp_host_thread_runner(void *arg) {
   recomp_dispatch(ctx, t->start_routine);
 
   t->ret_val = ctx->rax;
-  fprintf(stderr, "[ps4-thread] Thread exited: id=%d, name='%s', ret=0x%llx\n",
-          ctx->thread_id, t->name[0] ? t->name : "unnamed", (unsigned long long)t->ret_val);
-
-  // Run registered pthread TLS key destructors
-  GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
-  for (int iter = 0; iter < 4; iter++) {
-    bool has_active = false;
-    for (int k = 0; k < 128; k++) {
-      uint64_t val = ctx->tls_keys[k];
-      uint64_t dtor = proc->tls_destructors[k];
-      if (val != 0 && dtor != 0) {
-        ctx->tls_keys[k] = 0;
-        has_active = true;
-        ctx->rdi = val;
-        ctx->rsp -= 8;
-        MEM_U64(ctx->rsp) = 0xdeadbeefULL;
-        ctx->rip = dtor;
-        recomp_dispatch(ctx, dtor);
-      }
-    }
-    if (!has_active) break;
-  }
-
-  t->finished = true;
-
-  if (t->detached) {
-    unregister_thread(t);
-    recomp_free_thread_context(ctx);
-    free(t);
-  }
+  recomp_thread_epilogue(t, ctx);
   return NULL;
 }
 
@@ -247,8 +279,17 @@ void shim_pthread_detach(GuestContext *ctx) {
   uint64_t handle = ctx->rdi;
   RecompThread *t = find_thread(handle);
   if (t) {
-    t->detached = true;
     pthread_detach(t->host_thread);
+    pthread_mutex_lock(&g_detach_mutex);
+    bool release = t->finished && !t->detached && t->ctx && t != &g_main_thread_obj;
+    t->detached = true;
+    pthread_mutex_unlock(&g_detach_mutex);
+    if (release) {
+      // Already exited: nobody else will free it.
+      unregister_thread(t);
+      recomp_free_thread_context(t->ctx);
+      free(t);
+    }
   }
   ctx->rax = 0;
   SHIM_RETURN();
@@ -629,16 +670,22 @@ void shim_scePthreadCreate(GuestContext *ctx) {
 
 void shim_scePthreadJoin(GuestContext *ctx) {
   shim_pthread_join(ctx);
+  SCE_PTHREAD_ERR(ctx);
 }
 
 void shim_scePthreadDetach(GuestContext *ctx) {
   shim_pthread_detach(ctx);
+  SCE_PTHREAD_ERR(ctx);
 }
 
 void shim_scePthreadExit(GuestContext *ctx) {
-  if (g_current_thread) {
-    g_current_thread->finished = true;
-    g_current_thread->ret_val = ctx->rdi;
+  RecompThread *t = g_current_thread;
+  if (t && t->ctx == ctx && t != &g_main_thread_obj) {
+    t->ret_val = ctx->rdi;
+    recomp_thread_epilogue(t, ctx);
+  } else if (t) {
+    t->finished = true;
+    t->ret_val = ctx->rdi;
   }
   pthread_exit(NULL);
 }
@@ -693,18 +740,22 @@ void shim_scePthreadGetaffinity(GuestContext *ctx) {
 // scePthread attribute shims
 void shim_scePthreadAttrInit(GuestContext *ctx) {
   shim_pthread_attr_init(ctx);
+  SCE_PTHREAD_ERR(ctx);
 }
 
 void shim_scePthreadAttrDestroy(GuestContext *ctx) {
   shim_pthread_attr_destroy(ctx);
+  SCE_PTHREAD_ERR(ctx);
 }
 
 void shim_scePthreadAttrSetstacksize(GuestContext *ctx) {
   shim_pthread_attr_setstacksize(ctx);
+  SCE_PTHREAD_ERR(ctx);
 }
 
 void shim_scePthreadAttrSetdetachstate(GuestContext *ctx) {
   shim_pthread_attr_setdetachstate(ctx);
+  SCE_PTHREAD_ERR(ctx);
 }
 
 void shim_scePthreadAttrSetschedpolicy(GuestContext *ctx) {
@@ -951,6 +1002,7 @@ void shim_scePthreadSetschedparam(GuestContext *ctx) {
 // scePthread TLS shims
 void shim_scePthreadKeyCreate(GuestContext *ctx) {
   shim_pthread_key_create(ctx);
+  SCE_PTHREAD_ERR(ctx);
 }
 
 void shim_scePthreadKeyDelete(GuestContext *ctx) {
@@ -966,6 +1018,7 @@ void shim_scePthreadKeyDelete(GuestContext *ctx) {
 
 void shim_scePthreadSetspecific(GuestContext *ctx) {
   shim_pthread_setspecific(ctx);
+  SCE_PTHREAD_ERR(ctx);
 }
 
 void shim_scePthreadGetspecific(GuestContext *ctx) {
@@ -981,4 +1034,69 @@ void shim___tls_get_addr(GuestContext *ctx) {
     ctx->rax = ctx->fs_base;
   }
   SHIM_RETURN();
+}
+
+// ---- Frame stall watchdog (diagnostics) -----------------------------------------------
+// PS4_STALL_WATCHDOG=<ms>: when no frame has been presented for <ms> milliseconds, print what
+// every guest thread is executing (guest block address and host function), so long frames can
+// be attributed to a thread and a guest function.
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <time.h>
+
+static _Atomic uint64_t g_last_present_ns;
+
+static uint64_t stall_now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+static void stall_dump_threads(double stalled_ms) {
+  fprintf(stderr, "[stall] no frame for %.0f ms; guest threads:\n", stalled_ms);
+  pthread_mutex_lock(&g_threads_mutex);
+  for (RecompThread *t = g_threads; t; t = t->next) {
+    if (t->finished || !t->ctx) continue;
+    const char *sym = "?";
+    uint64_t pc = 0;
+    mach_port_t port = pthread_mach_thread_np(t->host_thread);
+    arm_thread_state64_t st;
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    if (port != MACH_PORT_NULL &&
+        thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
+      pc = (uint64_t)arm_thread_state64_get_pc(st);
+      Dl_info di;
+      if (dladdr((void *)pc, &di) && di.dli_sname) sym = di.dli_sname;
+    }
+    fprintf(stderr, "[stall]   %-28s guest rip 0x%llx  host %s\n", t->name[0] ? t->name : "unnamed",
+            (unsigned long long)t->ctx->rip, sym);
+  }
+  pthread_mutex_unlock(&g_threads_mutex);
+}
+
+static void *stall_watchdog_main(void *arg) {
+  const uint64_t limit_ns = (uint64_t)(uintptr_t)arg * 1000000ull;
+  uint64_t reported_for = 0;
+  for (;;) {
+    usleep(5000);
+    const uint64_t last = g_last_present_ns;
+    if (!last) continue;
+    const uint64_t now = stall_now_ns();
+    if (now - last > limit_ns && reported_for != last) {
+      reported_for = last;
+      stall_dump_threads((double)(now - last) / 1e6);
+    }
+  }
+  return NULL;
+}
+
+void ps4_stall_watchdog_note_present(void) {
+  static int started = 0;
+  g_last_present_ns = stall_now_ns();
+  if (!started) {
+    started = 1;
+    const char *e = getenv("PS4_STALL_WATCHDOG");
+    const long ms = e ? atol(e) : 0;
+    if (ms > 0) {
+      pthread_t th;
+      pthread_create(&th, NULL, stall_watchdog_main, (void *)(uintptr_t)ms);
+      pthread_detach(th);
+    }
+  }
 }

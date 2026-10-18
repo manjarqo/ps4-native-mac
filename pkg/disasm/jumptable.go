@@ -110,6 +110,36 @@ func leaRIPTarget(inst Instruction) (x86asm.Reg, uint64, bool) {
 	return dst, target, true
 }
 
+// traceLEA walks backwards from window[before-1] looking for the RIP-relative
+// LEA that produced reg, following plain 64-bit register copies (mov reg, src)
+// and stopping at any other write. It returns the register the value came from
+// when no LEA is found in the window, so callers can continue the search in
+// predecessor blocks.
+func traceLEA(window []Instruction, before int, reg x86asm.Reg) (uint64, bool, x86asm.Reg) {
+	if reg == 0 {
+		return 0, false, 0
+	}
+	cur := reg
+	for i := before - 1; i >= 0; i-- {
+		if dst, target, isLEA := leaRIPTarget(window[i]); isLEA && sameGPR(dst, cur) {
+			return target, true, cur
+		}
+		inst := window[i].Inst
+		if inst.Op == x86asm.MOV {
+			dst, ok0 := inst.Args[0].(x86asm.Reg)
+			src, ok1 := inst.Args[1].(x86asm.Reg)
+			if ok0 && ok1 && sameGPR(dst, cur) && dst >= x86asm.RAX && dst <= x86asm.R15 {
+				cur = src
+				continue
+			}
+		}
+		if modifiesReg(inst, cur) {
+			return 0, false, 0
+		}
+	}
+	return 0, false, cur
+}
+
 // matchPICSwitch recognizes the Clang/GCC x86-64 PIC switch idiom ending at
 // the last instruction of window (an indirect JMP):
 //
@@ -314,32 +344,13 @@ func matchJumpTable(
 	}
 
 	var tableAddr, codeBase uint64
-	foundTable, foundBase := false, false
-	for i := addIdx - 1; i >= 0; i-- {
-		if i == loadIdx {
-			continue
-		}
-		dst, target, isLEA := leaRIPTarget(window[i])
-		if !isLEA {
-			continue
-		}
-		if !foundTable && tableReg != 0 && sameGPR(dst, tableReg) {
-			tableAddr = target
-			foundTable = true
-		}
-		if !foundBase && baseReg != 0 && sameGPR(dst, baseReg) {
-			codeBase = target
-			foundBase = true
-		}
-		if foundTable && (foundBase || sameGPR(baseReg, tableReg)) {
-			break
-		}
+	tableAddr, foundTable, tableSrc := traceLEA(window, loadIdx, tableReg)
+	codeBase, foundBase, baseSrc := traceLEA(window, addIdx, baseReg)
+	if !foundTable && tableSrc != 0 && findTableAddr != nil {
+		tableAddr, foundTable = findTableAddr(tableSrc)
 	}
-	if !foundTable && tableReg != 0 && findTableAddr != nil {
-		tableAddr, foundTable = findTableAddr(tableReg)
-	}
-	if !foundBase && baseReg != 0 && !sameGPR(baseReg, tableReg) && findTableAddr != nil {
-		codeBase, foundBase = findTableAddr(baseReg)
+	if !foundBase && baseSrc != 0 && !sameGPR(baseReg, tableReg) && findTableAddr != nil {
+		codeBase, foundBase = findTableAddr(baseSrc)
 	}
 	if !foundTable {
 		return none, false
@@ -419,9 +430,47 @@ func matchPICSwitch(
 	}, true
 }
 
+// copiedFrom reports whether idxReg was set by `mov idxReg, src` before
+// window[at] with src unchanged up to window[at] and idxReg unchanged up to the
+// the check (the caller guarantees the rest), i.e. a bounds check on src at window[at] also bounds idxReg
+// (`mov ebx, edx; cmp edx, 0xe; ja default; ... [rcx+4*rbx]`).
+func copiedFrom(window []Instruction, at int, idxReg, src x86asm.Reg) bool {
+	if gprFamily(src) == 0 || sameGPR(src, idxReg) {
+		return false
+	}
+	for k := at - 1; k >= 0; k-- {
+		inst := window[k].Inst
+		if inst.Op == x86asm.MOV {
+			if d, ok := inst.Args[0].(x86asm.Reg); ok && sameGPR(d, idxReg) {
+				if s, ok := inst.Args[1].(x86asm.Reg); ok && sameGPR(s, src) {
+					for m := k + 1; m < at; m++ {
+						if modifiesReg(window[m].Inst, idxReg) || modifiesReg(window[m].Inst, src) {
+							return false
+						}
+					}
+					return true
+				}
+			}
+		}
+		if modifiesReg(inst, src) || modifiesReg(inst, idxReg) {
+			return false
+		}
+	}
+	return false
+}
+
 // switchTableCount discovers table length from bounds checks (cmp/sub/and/bextr/bzhi).
 func switchTableCount(window []Instruction, idxReg x86asm.Reg) int {
-	for i := len(window) - 1; i >= 0; i-- {
+	n, _ := switchTableCountKill(window, idxReg)
+	return n
+}
+
+// switchTableCountKill is switchTableCount that also reports whether the scan
+// stopped at a write to the index register; bounds checks in blocks before
+// such a write test an obsolete value and must not be used.
+func switchTableCountKill(window []Instruction, idxReg x86asm.Reg) (int, bool) {
+	i := len(window) - 1
+	for ; i >= 0; i-- {
 		inst := window[i].Inst
 
 		// 1. Bitwise extraction: BEXTR dst, src, ctrl (BMI1)
@@ -436,7 +485,7 @@ func switchTableCount(window []Instruction, idxReg x86asm.Reg) int {
 								if imm, ok := instImm(prev.Args[1]); ok {
 									length := (uint64(imm) >> 8) & 0xff
 									if length > 0 && length <= 12 {
-										return 1 << length
+										return 1 << length, false
 									}
 								}
 								break
@@ -458,7 +507,7 @@ func switchTableCount(window []Instruction, idxReg x86asm.Reg) int {
 						if prev.Op == x86asm.MOV {
 							if pDst, ok := prev.Args[0].(x86asm.Reg); ok && sameGPR(pDst, idxR) {
 								if imm, ok := instImm(prev.Args[1]); ok && imm > 0 && imm <= 12 {
-									return 1 << imm
+									return 1 << imm, false
 								}
 								break
 							}
@@ -474,7 +523,7 @@ func switchTableCount(window []Instruction, idxReg x86asm.Reg) int {
 			if dst, ok := inst.Args[0].(x86asm.Reg); ok && sameGPR(dst, idxReg) {
 				if imm, ok := instImm(inst.Args[1]); ok && imm > 0 && imm < maxJumpTableEntries {
 					if (imm & (imm + 1)) == 0 {
-						return int(imm + 1)
+						return int(imm + 1), false
 					}
 				}
 				break
@@ -492,14 +541,14 @@ func switchTableCount(window []Instruction, idxReg x86asm.Reg) int {
 				if prev.Op != x86asm.CMP && prev.Op != x86asm.SUB {
 					break
 				}
-				if dst, ok := prev.Args[0].(x86asm.Reg); ok && sameGPR(dst, idxReg) {
+				if dst, ok := prev.Args[0].(x86asm.Reg); ok && (sameGPR(dst, idxReg) || copiedFrom(window, j, idxReg, dst)) {
 					if imm, ok := instImm(prev.Args[1]); ok && imm >= 0 && imm < maxJumpTableEntries {
 						n := int(imm)
 						if inst.Op == x86asm.JA {
 							n++
 						}
 						if n > 0 && n <= maxJumpTableEntries {
-							return n
+							return n, false
 						}
 					}
 				}
@@ -514,14 +563,14 @@ func switchTableCount(window []Instruction, idxReg x86asm.Reg) int {
 				if prev.Op != x86asm.CMP {
 					break
 				}
-				if src, ok := prev.Args[1].(x86asm.Reg); ok && sameGPR(src, idxReg) {
-					if imm, ok := instImm(prev.Args[0]); ok && imm >= 0 && imm < maxJumpTableEntries {
+				if src, ok := prev.Args[0].(x86asm.Reg); ok && (sameGPR(src, idxReg) || copiedFrom(window, j, idxReg, src)) {
+					if imm, ok := instImm(prev.Args[1]); ok && imm >= 0 && imm < maxJumpTableEntries {
 						n := int(imm)
-						if inst.Op == x86asm.JB {
+						if inst.Op == x86asm.JBE {
 							n++
 						}
 						if n > 0 && n <= maxJumpTableEntries {
-							return n
+							return n, false
 						}
 					}
 				}
@@ -542,7 +591,7 @@ func switchTableCount(window []Instruction, idxReg x86asm.Reg) int {
 		}
 	}
 
-	return 0
+	return 0, i >= 0
 }
 
 // readResolvedTargets reads all target addresses from the recovered jump table.

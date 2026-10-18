@@ -47,6 +47,21 @@ void recomp_register_guest_modules(void);
 void recomp_module_start(GuestContext *ctx, int32_t handle);
 uint64_t recomp_resolve_symbol(const char *module_name, const char *symbol);
 
+// Module enumeration for sceKernelGetModuleList / sceKernelGetModuleInfo.
+// Entry 0 is always the main executable (handle 0); registered PRXs follow
+// (a handle is assigned on first enumeration, same one LoadStartModule returns).
+typedef struct RecompModuleSnapshot {
+  int32_t handle;
+  char name[256];
+  int has_range;
+  uint64_t start_addr;
+  uint64_t end_addr;
+  uint64_t seg0_addr;
+  uint64_t seg0_size;
+} RecompModuleSnapshot;
+
+int recomp_module_snapshot(RecompModuleSnapshot *out, int max);
+
 int32_t sceKernelLoadStartModule(const char *name, size_t argc,
                                  const void *argv, uint32_t flags, void *opt,
                                  int *res);

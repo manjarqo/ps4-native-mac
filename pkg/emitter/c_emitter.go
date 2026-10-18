@@ -926,9 +926,17 @@ func (e *CEmitter) EmitMainRunner(path string) (err error) {
 
 extern void recomp_init_dispatch_table(void);
 
-int main(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
+typedef struct {
+    int argc;
+    char **argv;
+} GuestMainArgs;
+
+// Guest code runs on a secondary host thread so the host main thread stays free
+// for AppKit (window creation, event pumping, dialogs).
+static void *guest_main(void *p) {
+    GuestMainArgs *a = (GuestMainArgs *)p;
+    int argc = a->argc;
+    char **argv = a->argv;
     printf("[ps4-recomp] Initializing runtime...\n");
     ps4_vfs_init(%s);
     recomp_init_dispatch_table();
@@ -937,7 +945,7 @@ int main(int argc, char **argv) {
     GuestContext *ctx = recomp_init_runtime_file("guest_image.bin", 0, prog_name);
     if (!ctx) {
         fprintf(stderr, "[ps4-recomp] Failed to allocate guest memory or load guest_image.bin\n");
-        return 1;
+        exit(1);
     }
 
     recomp_init_process_param(ctx, 0x%xULL);
@@ -964,9 +972,33 @@ int main(int argc, char **argv) {
 
     printf("[ps4-recomp] Execution complete.\n");
     recomp_free_runtime(ctx);
+    exit(0);
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    static GuestMainArgs args;
+    args.argc = argc;
+    args.argv = argv;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 64 * 1024 * 1024);
+    // Startup settings (language, PS4 Pro mode, upscaling, FPS HUD) are resolved before the
+    // guest starts; the dialog needs the application directory for the language list.
+    ps4_vfs_init(%s);
+    ps4_host_settings_init();
+    pthread_t guest_thread;
+    if (pthread_create(&guest_thread, &attr, guest_main, &args) != 0) {
+        fprintf(stderr, "[ps4-recomp] Failed to start guest thread\n");
+        return 1;
+    }
+    pthread_attr_destroy(&attr);
+    ps4_host_run_main_loop();
     return 0;
 }
-`, vfsInitArg, e.elf.ProcParamAddr, entryName, e.formatInitArray(), entryAddr, entryName, entryAddr, entryAddr)
+`, vfsInitArg, e.elf.ProcParamAddr, entryName, e.formatInitArray(), entryAddr, entryName, entryAddr, entryAddr, vfsInitArg)
 
 	return writeFileIfChanged(path, []byte(content))
 }

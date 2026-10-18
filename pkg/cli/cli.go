@@ -341,6 +341,10 @@ func Execute(args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed scanning runtime files: %w", err)
 	}
+	if gcnInc, _ := findGcnRecompiler(); gcnInc != "" && !seenInc[gcnInc] {
+		seenInc[gcnInc] = true
+		runtimeIncludeDirs = append(runtimeIncludeDirs, gcnInc)
+	}
 	spirvInc, _ := findSpirvCross()
 	if spirvInc != "" && !seenInc[spirvInc] {
 		seenInc[spirvInc] = true
@@ -476,7 +480,9 @@ func generateNinjaBuild(cFiles []string, outDir string, includeDirs []string, ta
 	}
 	incFlags = append(incFlags, ftCflags...)
 
-	cflags := []string{"-O" + optLevel, "-fvisibility=hidden", "-Wno-parentheses-equality"}
+	// -ffp-contract=off: x86 SSE/AVX(no FMA) never fuses multiply-add; letting clang contract
+	// lifted a*b+c into an arm64 FMA changes rounding of guest float math.
+	cflags := []string{"-O" + optLevel, "-ffp-contract=off", "-fvisibility=hidden", "-Wno-parentheses-equality"}
 	if asan {
 		cflags = append(cflags, "-fsanitize=address,undefined", "-fno-omit-frame-pointer")
 	}
@@ -517,9 +523,12 @@ func generateNinjaBuild(cFiles []string, outDir string, includeDirs []string, ta
 	}
 	if runtime.GOOS == "darwin" {
 		ldflags = append(ldflags, "-target", "arm64-apple-darwin", "-Wl,-dead_strip", "-Wl,-x",
-			"-framework", "Metal", "-framework", "Cocoa", "-framework", "QuartzCore", "-framework", "GameController", "-framework", "AudioToolbox")
+			"-framework", "Metal", "-framework", "Cocoa", "-framework", "QuartzCore", "-framework", "GameController", "-framework", "AudioToolbox", "-framework", "ImageIO", "-framework", "MetalFX", "-framework", "VideoToolbox", "-framework", "CoreMedia", "-framework", "CoreVideo")
 	} else {
 		ldflags = append(ldflags, "-Wl,--gc-sections", "-Wl,-s", "-lpthread", "-lm")
+	}
+	if _, gcnLib := findGcnRecompiler(); gcnLib != "" {
+		ldflags = append(ldflags, gcnLib)
 	}
 	_, spirvLib := findSpirvCross()
 	if spirvLib != "" {
@@ -649,6 +658,7 @@ func compileParallel(cFiles []string, outDir string, includeDirs []string, targe
 
 				clangArgs := []string{
 					"-O" + optLevel,
+					"-ffp-contract=off",
 					"-fvisibility=hidden",
 					"-Wno-parentheses-equality",
 					"-I" + outDir,
@@ -707,9 +717,12 @@ func compileParallel(cFiles []string, outDir string, includeDirs []string, targe
 	}
 	if runtime.GOOS == "darwin" {
 		linkArgs = append(linkArgs, "-target", "arm64-apple-darwin", "-Wl,-dead_strip", "-Wl,-x",
-			"-framework", "Metal", "-framework", "Cocoa", "-framework", "QuartzCore", "-framework", "GameController", "-framework", "AudioToolbox")
+			"-framework", "Metal", "-framework", "Cocoa", "-framework", "QuartzCore", "-framework", "GameController", "-framework", "AudioToolbox", "-framework", "ImageIO", "-framework", "MetalFX", "-framework", "VideoToolbox", "-framework", "CoreMedia", "-framework", "CoreVideo")
 	} else {
 		linkArgs = append(linkArgs, "-Wl,--gc-sections", "-Wl,-s", "-lpthread", "-lm")
+	}
+	if _, gcnLib := findGcnRecompiler(); gcnLib != "" {
+		linkArgs = append(linkArgs, gcnLib)
 	}
 	_, spirvLib := findSpirvCross()
 	if spirvLib != "" {
@@ -1108,6 +1121,31 @@ func packageAppBundle(cfg *Config, appName, compiledBin string) (string, error) 
 	return bundleDir, nil
 }
 
+// findGcnRecompiler locates the GCN shader recompiler library (shadPS4's
+// shader_recompiler packaged in 3rdparty/gcn-recompiler): include dir and the
+// prebuilt static library.
+func findGcnRecompiler() (string, string) {
+	candidates := []string{
+		"3rdparty/gcn-recompiler",
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, "3rdparty", "gcn-recompiler"),
+			filepath.Join(exeDir, "..", "3rdparty", "gcn-recompiler"),
+		)
+	}
+	for _, dir := range candidates {
+		libPath := filepath.Join(dir, "libgcn_recompiler.a")
+		if _, err := os.Stat(libPath); err == nil {
+			absInc, _ := filepath.Abs(filepath.Join(dir, "include"))
+			absLib, _ := filepath.Abs(libPath)
+			return absInc, absLib
+		}
+	}
+	return "", ""
+}
+
 func findSpirvCross() (string, string) {
 	candidates := []string{
 		"3rdparty/spirv-cross",
@@ -1184,4 +1222,3 @@ func findMinimp3() string {
 	}
 	return ""
 }
-

@@ -43,8 +43,14 @@ static char *discover_app_root(const char *hint) {
             char test_path[1024];
             snprintf(test_path, sizeof(test_path), "%s/../Resources", dir);
             char canonical_res[1024];
+            // Only when the bundle actually carries the game files (built with resources
+            // copied in); otherwise the compile-time application directory is used.
             if (realpath(test_path, canonical_res) != NULL && access(canonical_res, F_OK) == 0) {
-                return strdup(canonical_res);
+                char eboot_path[1100];
+                snprintf(eboot_path, sizeof(eboot_path), "%s/eboot.bin", canonical_res);
+                if (access(eboot_path, F_OK) == 0) {
+                    return strdup(canonical_res);
+                }
             }
 
             // Check <exe_dir>/assets

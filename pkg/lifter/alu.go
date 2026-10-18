@@ -254,32 +254,46 @@ func (l *Lifter) liftShift(inst disasm.Instruction, dst, countArg x86asm.Arg, de
 		return nil, err
 	}
 	cType := uintType(sz)
+	bits := sz * 8
+	countMask := 0x1f
+	if sz == 8 {
+		countMask = 0x3f
+	}
 	var lines []string
 	lines = append(
 		lines,
-		fmt.Sprintf("    { %s a = (%s)(%s); uint8_t count = ((uint8_t)(%s)) & 0x3f; %s res;", cType, cType, dstRead, countRead, cType),
+		fmt.Sprintf("    { %s a = (%s)(%s); uint8_t count = ((uint8_t)(%s)) & 0x%x; %s res;", cType, cType, dstRead, countRead, countMask, cType),
 	)
 
+	// x86 leaves all flags untouched when the masked count is zero; otherwise
+	// CF is the last bit shifted out and OF is defined for single-bit shifts.
+	var cfExpr, ofExpr string
 	switch op {
 	case x86asm.SHL:
-		lines = append(lines, "      res = a << count;")
-		if !inst.SkipFlags {
-			lines = append(lines, fmt.Sprintf("      set_flags_logic_u%d(ctx, res);", sz*8))
-		}
+		lines = append(lines, fmt.Sprintf("      res = (%s)((uint64_t)a << count);", cType))
+		cfExpr = fmt.Sprintf("(count <= %d) ? (uint8_t)(((uint64_t)a >> (%d - count)) & 1) : 0", bits, bits)
+		ofExpr = fmt.Sprintf("(uint8_t)(((res >> %d) & 1) ^ ctx->cf)", bits-1)
 	case x86asm.SHR:
-		lines = append(lines, "      res = a >> count;")
-		if !inst.SkipFlags {
-			lines = append(lines, fmt.Sprintf("      set_flags_logic_u%d(ctx, res);", sz*8))
-		}
+		lines = append(lines, fmt.Sprintf("      res = (count < %d) ? (%s)(a >> count) : 0;", bits, cType))
+		cfExpr = fmt.Sprintf("(count <= %d) ? (uint8_t)((a >> (count - 1)) & 1) : 0", bits)
+		ofExpr = fmt.Sprintf("(uint8_t)((a >> %d) & 1)", bits-1)
 	case x86asm.SAR:
 		signedType := intType(sz)
 		lines = append(
 			lines,
-			fmt.Sprintf("      res = (%s)(((%s)a) >> count);", cType, signedType),
+			fmt.Sprintf("      res = (%s)(((%s)a) >> (count < %d ? count : %d));", cType, signedType, bits, bits-1),
 		)
-		if !inst.SkipFlags {
-			lines = append(lines, fmt.Sprintf("      set_flags_logic_u%d(ctx, res);", sz*8))
-		}
+		cfExpr = fmt.Sprintf("(uint8_t)((((%s)a) >> (count - 1 < %d ? count - 1 : %d)) & 1)", signedType, bits, bits-1)
+		ofExpr = "0"
+	}
+	if !inst.SkipFlags {
+		lines = append(lines,
+			"      if (count) {",
+			fmt.Sprintf("        set_flags_logic_u%d(ctx, res);", bits),
+			"        ctx->cf = "+cfExpr+";",
+			"        if (count == 1) ctx->of = "+ofExpr+";",
+			"      }",
+		)
 	}
 	lines, err = l.appendOperandWrite(lines, dst, sz, "res", nextPC)
 	if err != nil {
@@ -914,11 +928,19 @@ func (l *Lifter) liftDiv(src x86asm.Arg, defMemSz int, nextPC uint64) ([]string,
 	}
 	if sz == 8 {
 		return []string{
-			"    { unsigned __int128 dividend = ((unsigned __int128)ctx->rdx << 64) | ctx->rax;",
-			fmt.Sprintf("      uint64_t divisor = (uint64_t)(%s);", sRead),
+			// The 128-by-64 division is a slow libcall (__udivmodti4); compilers zero RDX before
+			// almost every DIV, so a native 64-bit division covers the common case.
+			fmt.Sprintf("    { uint64_t divisor = (uint64_t)(%s);", sRead),
 			"      if (divisor != 0) {",
-			"        ctx->rax = (uint64_t)(dividend / divisor);",
-			"        ctx->rdx = (uint64_t)(dividend % divisor);",
+			"        if (ctx->rdx == 0) {",
+			"          uint64_t n = ctx->rax;",
+			"          ctx->rax = n / divisor;",
+			"          ctx->rdx = n % divisor;",
+			"        } else {",
+			"          unsigned __int128 dividend = ((unsigned __int128)ctx->rdx << 64) | ctx->rax;",
+			"          ctx->rax = (uint64_t)(dividend / divisor);",
+			"          ctx->rdx = (uint64_t)(dividend % divisor);",
+			"        }",
 			"      }",
 			"    }",
 		}, nil
@@ -973,11 +995,19 @@ func (l *Lifter) liftIdiv(src x86asm.Arg, defMemSz int, nextPC uint64) ([]string
 	}
 	if sz == 8 {
 		return []string{
-			"    { __int128 dividend = ((__int128)(int64_t)ctx->rdx << 64) | ctx->rax;",
-			fmt.Sprintf("      int64_t divisor = (int64_t)(%s);", sRead),
+			// Fast path when RDX is the sign extension of RAX (CQO before IDIV): a native 64-bit
+			// division, except INT64_MIN / -1, which overflows int64_t.
+			fmt.Sprintf("    { int64_t divisor = (int64_t)(%s);", sRead),
 			"      if (divisor != 0) {",
-			"        ctx->rax = (uint64_t)(int64_t)(dividend / divisor);",
-			"        ctx->rdx = (uint64_t)(int64_t)(dividend % divisor);",
+			"        int64_t n = (int64_t)ctx->rax;",
+			"        if (ctx->rdx == (uint64_t)(n >> 63) && !(n == INT64_MIN && divisor == -1)) {",
+			"          ctx->rax = (uint64_t)(n / divisor);",
+			"          ctx->rdx = (uint64_t)(n % divisor);",
+			"        } else {",
+			"          __int128 dividend = ((__int128)(int64_t)ctx->rdx << 64) | ctx->rax;",
+			"          ctx->rax = (uint64_t)(int64_t)(dividend / divisor);",
+			"          ctx->rdx = (uint64_t)(int64_t)(dividend % divisor);",
+			"        }",
 			"      }",
 			"    }",
 		}, nil
@@ -1354,8 +1384,9 @@ func (l *Lifter) liftRdtsc() []string {
 	return []string{
 		"    {",
 		"      uint64_t tsc = recomp_rdtsc();",
-		"      ctx->rax = (ctx->rax & ~0xFFFFFFFFULL) | (uint32_t)tsc;",
-		"      ctx->rdx = (ctx->rdx & ~0xFFFFFFFFULL) | (uint32_t)(tsc >> 32);",
+		// RDTSC writes EAX/EDX, which zero-extends into RAX/RDX in 64-bit mode.
+		"      ctx->rax = (uint32_t)tsc;",
+		"      ctx->rdx = (uint32_t)(tsc >> 32);",
 		"    }",
 	}
 }

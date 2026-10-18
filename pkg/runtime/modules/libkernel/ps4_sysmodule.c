@@ -493,3 +493,68 @@ void shim_sceKernelDlsym(GuestContext *ctx) {
     ctx->rax = (uint64_t)(int64_t)ret;
     SHIM_RETURN();
 }
+
+int recomp_module_snapshot(RecompModuleSnapshot *out, int max) {
+    if (!out || max <= 0) {
+        return 0;
+    }
+    int n = 0;
+    pthread_mutex_lock(&g_sysmodule_mutex);
+
+    RecompModuleSnapshot *m = &out[n++];
+    memset(m, 0, sizeof(*m));
+    m->handle = 0;
+    if (g_unwind_modules_count > 0) {
+        const RecompModuleUnwindInfo *u = &g_unwind_modules[0];
+        snprintf(m->name, sizeof(m->name), "%s", u->name ? path_basename(u->name) : "eboot.bin");
+        m->has_range = 1;
+        m->start_addr = u->start_addr;
+        m->end_addr = u->end_addr;
+        m->seg0_addr = u->seg0_addr;
+        m->seg0_size = u->seg0_size;
+    } else {
+        snprintf(m->name, sizeof(m->name), "eboot.bin");
+    }
+
+    for (int i = 0; i < g_prx_count && n < max; i++) {
+        if (!g_prx[i].in_use) {
+            continue;
+        }
+        const RecompModuleUnwindInfo *u = NULL;
+        for (int j = 1; j < g_unwind_modules_count; j++) {
+            if (g_unwind_modules[j].name && module_names_match(g_unwind_modules[j].name, g_prx[i].filename)) {
+                u = &g_unwind_modules[j];
+                break;
+            }
+        }
+        // Aliases of the same recompiled PRX share an address range: list it once.
+        int dup = 0;
+        if (u) {
+            for (int k = 1; k < n; k++) {
+                if (out[k].has_range && out[k].start_addr == u->start_addr) {
+                    dup = 1;
+                    break;
+                }
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        if (g_prx[i].handle == 0) {
+            g_prx[i].handle = g_next_handle++;
+        }
+        m = &out[n++];
+        memset(m, 0, sizeof(*m));
+        m->handle = g_prx[i].handle;
+        snprintf(m->name, sizeof(m->name), "%s", g_prx[i].filename);
+        if (u) {
+            m->has_range = 1;
+            m->start_addr = u->start_addr;
+            m->end_addr = u->end_addr;
+            m->seg0_addr = u->seg0_addr;
+            m->seg0_size = u->seg0_size;
+        }
+    }
+    pthread_mutex_unlock(&g_sysmodule_mutex);
+    return n;
+}

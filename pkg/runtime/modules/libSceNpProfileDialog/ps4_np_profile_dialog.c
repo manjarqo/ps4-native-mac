@@ -124,3 +124,19 @@ void shim_sceNpProfileDialogTerminate(GuestContext *ctx) {
     ctx->rax = (uint64_t)sceNpProfileDialogTerminate();
     SHIM_RETURN();
 }
+
+// Legacy (non-A) sceNpProfileDialogOpen. SceNpProfileDialogParam:
+//   baseParam(0x30) size_t size; mode; userId; SceNpOnlineId targetOnlineId(20);
+//   void *userData (0x58); reserved[32]
+// Only userData matters for the offline (auto-finish) dialog.
+void shim_sceNpProfileDialogOpen(GuestContext *ctx) {
+    if (!ctx->rdi) {
+        ctx->rax = (uint64_t)(int64_t)(int32_t)0x80b8000d; // ARG_NULL
+        SHIM_RETURN();
+    }
+    OrbisNpProfileDialogParamA p;
+    memset(&p, 0, sizeof(p));
+    p.userData = *(void **)(ctx->mem_base + ctx->rdi + 0x58);
+    ctx->rax = (uint64_t)(int64_t)sceNpProfileDialogOpenA(&p);
+    SHIM_RETURN();
+}

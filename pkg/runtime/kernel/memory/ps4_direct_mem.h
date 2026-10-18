@@ -33,6 +33,7 @@ typedef struct OrbisDirectMemoryQueryInfo {
 } OrbisDirectMemoryQueryInfo;
 
 int ps4_direct_mem_init(void);
+void ps4_direct_mem_on_unmap(GuestContext *ctx, uint64_t addr, size_t size);
 void ps4_direct_mem_destroy(void);
 
 // Direct Memory

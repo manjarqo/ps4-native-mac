@@ -48,6 +48,11 @@ void ps4_sync_destroy(void);
 void ps4_videoout_destroy(void);
 void ps4_equeue_destroy(void);
 void ps4_metal_screen_destroy(void);
+void ps4_host_run_main_loop(void);
+// Startup settings (libSceSystemService/ps4_settings.m): resolved once before the guest starts.
+void ps4_host_settings_init(void);
+void ps4_stall_watchdog_note_present(void); // frame stall diagnostics (PS4_STALL_WATCHDOG)
+int ps4_host_setting_pro_mode(void);
 void ps4_keyboard_destroy(void);
 void ps4_vfs_destroy(void);
 void ps4_aio_destroy(void);

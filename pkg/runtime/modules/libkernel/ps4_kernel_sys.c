@@ -1,3 +1,4 @@
+#include "recomp_runtime.h"
 #include "ps4_kernel_sys.h"
 #include "ps4_sysmodule.h"
 #include <stdio.h>
@@ -55,12 +56,12 @@ uint64_t sceKernelGetProcessTime(void) {
 }
 
 uint64_t sceKernelGetTscFrequency(void) {
-    return 2130000000ULL; // 2.13 GHz (PS4 Pro / Neo clock frequency)
+    return RECOMP_TSC_FREQ; // 2.13 GHz (PS4 Pro / Neo clock frequency)
 }
 
 uint64_t sceKernelReadTsc(void) {
-    // 2.13 GHz ticks = (ns * 213) / 100
-    return (sceKernelGetProcessTimeCounter() * 213ULL) / 100ULL;
+    // Same counter as the lifted RDTSC instruction.
+    return recomp_rdtsc();
 }
 
 int32_t sceKernelGettimeofday(OrbisKernelTimeval *tv) {
@@ -85,16 +86,27 @@ int32_t sceKernelGetCpumode(void) {
     return 1; // 7-core high-performance gaming mode
 }
 
+// PS4 Pro (Neo) mode: 4K checkerboard targets and Neo-only shaders. Comes from the startup
+// settings (on by default; PS4_PRO=0|1 overrides; the older PS4_NEO_MODE=0|1 still works).
+static int ps4_neo_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("PS4_NEO_MODE");
+        mode = (e && *e) ? (e[0] == '1') : (ps4_host_setting_pro_mode() != 0);
+    }
+    return mode;
+}
+
 int32_t sceKernelIsNeoMode(void) {
-    return 1; // PlayStation 4 Pro (Neo) mode enabled
+    return ps4_neo_mode();
 }
 
 int32_t sceKernelHasNeoMode(void) {
-    return 1;
+    return ps4_neo_mode();
 }
 
 int32_t sceKernelIsAuthenticNeo(void) {
-    return 1;
+    return ps4_neo_mode();
 }
 
 int32_t sceKernelGetSystemSwVersion(OrbisKernelSwVersion *version) {

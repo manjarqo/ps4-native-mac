@@ -8,6 +8,7 @@
 #include "ps4_gnmdriver.h"
 #include "ps4_videoout.h"
 #include "ps4_gnm_metal.h"
+#include "ps4_equeue.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,7 +151,10 @@ static inline uint32_t *clear_context_state(uint32_t *cmdbuf) {
     return cmdbuf + 2;
 }
 
+static void gnm_remember_ctx(GuestContext *ctx);
+
 void ps4_gnmdriver_init(GuestContext *ctx) {
+    gnm_remember_ctx(ctx);
     pthread_mutex_lock(&g_gnm_mutex);
     if (!g_gnm_initialized) {
         memset(g_owners, 0, sizeof(g_owners));
@@ -627,25 +631,137 @@ int32_t sceGnmDestroyWorkloadStream(void) {
     return ORBIS_GNM_OK;
 }
 
+// ---------------------------------------------------------------------------
+// Compute (ASC/MEC) queues. sceGnmMapComputeQueue returns a 1-based virtual queue id
+// (vqid); sceGnmDingDong(vqid, next_offs_dw) tells the CP that the ring now holds packets
+// up to next_offs_dw. Packets between the previous and the new offset are processed
+// synchronously (labels / RELEASE_MEM interrupts), mirroring shadPS4's asc_queues logic.
+// ---------------------------------------------------------------------------
+#define GNM_MAX_COMPUTE_QUEUES (PS4_GNM_NUM_COMPUTE_PIPES * PS4_GNM_NUM_QUEUES_PER_PIPE)
+
+typedef struct GnmComputeQueue {
+    bool in_use;
+    uint32_t pipe_id;
+    uint32_t queue_id;
+    uint64_t ring_base_addr;   // guest address
+    uint32_t ring_size_dw;
+    uint32_t *read_ptr;        // host pointer into guest memory (may be NULL)
+    uint32_t next_offs_dw;     // offset (dw) up to which packets were consumed
+} GnmComputeQueue;
+
+static pthread_mutex_t g_gnm_compute_mutex = PTHREAD_MUTEX_INITIALIZER;
+static GnmComputeQueue g_compute_queues[GNM_MAX_COMPUTE_QUEUES];
+static GuestContext *g_gnm_proc_ctx = NULL; // process-wide context (mem_base/mem_size)
+
+static void gnm_remember_ctx(GuestContext *ctx) {
+    if (!ctx) return;
+    GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
+    __atomic_store_n(&g_gnm_proc_ctx, proc, __ATOMIC_RELEASE);
+}
+
+static void gnm_process_ring_span(GuestContext *ctx, GnmComputeQueue *q, uint32_t from_dw, uint32_t size_dw) {
+    if (!ctx || !ctx->mem_base || size_dw == 0) return;
+    uint64_t addr = q->ring_base_addr + (uint64_t)from_dw * 4u;
+    if (addr == 0 || addr >= ctx->mem_size || (uint64_t)size_dw * 4u > ctx->mem_size - addr) return;
+    const uint32_t *words = (const uint32_t *)(ctx->mem_base + addr);
+    ps4_gnm_metal_process_compute_packets(ctx, words, size_dw, q->pipe_id, (uint32_t)(q - g_compute_queues), q->read_ptr, q->ring_size_dw, from_dw);
+}
+
+void ps4_gnm_dingdong(GuestContext *ctx, uint32_t gnm_vqid, uint32_t next_offs_dw) {
+    if (gnm_vqid == 0 || gnm_vqid > GNM_MAX_COMPUTE_QUEUES) return;
+    if (ctx) {
+        gnm_remember_ctx(ctx);
+    } else {
+        ctx = __atomic_load_n(&g_gnm_proc_ctx, __ATOMIC_ACQUIRE);
+    }
+    if (!ctx) return;
+
+    static bool s_logged_first_dingdong = false;
+
+    pthread_mutex_lock(&g_gnm_compute_mutex);
+    GnmComputeQueue *q = &g_compute_queues[gnm_vqid - 1];
+    if (!q->in_use || q->ring_size_dw == 0) {
+        pthread_mutex_unlock(&g_gnm_compute_mutex);
+        return;
+    }
+    if (next_offs_dw > q->ring_size_dw) next_offs_dw %= q->ring_size_dw;
+
+    uint32_t offs = q->next_offs_dw;
+    if (next_offs_dw != offs) {
+        if (!s_logged_first_dingdong) {
+            s_logged_first_dingdong = true;
+            fprintf(stderr, "[ps4-gnm] first DingDong: vqid=%u pipe=%u queue=%u offs %u -> %u (ring %u dw)\n",
+                    gnm_vqid, q->pipe_id, q->queue_id, offs, next_offs_dw, q->ring_size_dw);
+        }
+        if (next_offs_dw < offs && next_offs_dw != 0) {
+            // Submission wrapped around the end of the ring: process the tail first.
+            gnm_process_ring_span(ctx, q, offs, q->ring_size_dw - offs);
+            offs = 0;
+        }
+        uint32_t end = next_offs_dw ? next_offs_dw : q->ring_size_dw;
+        if (end > offs) {
+            gnm_process_ring_span(ctx, q, offs, end - offs);
+        }
+        q->next_offs_dw = next_offs_dw;
+        if (q->read_ptr) {
+            __atomic_store_n(q->read_ptr, next_offs_dw % q->ring_size_dw, __ATOMIC_SEQ_CST);
+        }
+    }
+    pthread_mutex_unlock(&g_gnm_compute_mutex);
+}
+
 void sceGnmDingDong(uint32_t gnm_vqid, uint32_t next_offs_dw) {
-    (void)gnm_vqid;
-    (void)next_offs_dw;
+    ps4_gnm_dingdong(NULL, gnm_vqid, next_offs_dw);
 }
 
 void sceGnmDingDongForWorkload(uint32_t gnm_vqid, uint32_t next_offs_dw, uint64_t workload_id) {
-    (void)gnm_vqid;
-    (void)next_offs_dw;
     (void)workload_id;
+    ps4_gnm_dingdong(NULL, gnm_vqid, next_offs_dw);
 }
 
 // Compute queues & events
 int32_t sceGnmMapComputeQueue(uint32_t pipe_id, uint32_t queue_id, uint64_t ring_base_addr, uint32_t ring_size_dw, uint32_t *read_ptr_addr) {
-    (void)pipe_id;
-    (void)queue_id;
-    (void)ring_base_addr;
-    (void)ring_size_dw;
-    (void)read_ptr_addr;
-    return ORBIS_GNM_OK;
+    if (pipe_id >= PS4_GNM_NUM_COMPUTE_PIPES) return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_PIPE_ID;
+    if (queue_id >= PS4_GNM_NUM_QUEUES_PER_PIPE) return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_QUEUE_ID;
+    if ((ring_base_addr % 256) != 0) return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_RING_BASE_ADDR;
+    if (ring_size_dw == 0 || (ring_size_dw & (ring_size_dw - 1)) != 0) return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_RING_SIZE;
+    if (((uintptr_t)read_ptr_addr % 4) != 0) return ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_READ_PTR_ADDR;
+
+    pthread_mutex_lock(&g_gnm_compute_mutex);
+    int slot = -1;
+    for (int i = 0; i < (int)GNM_MAX_COMPUTE_QUEUES; i++) {
+        if (g_compute_queues[i].in_use && g_compute_queues[i].pipe_id == pipe_id && g_compute_queues[i].queue_id == queue_id) {
+            slot = i; // remap of the same hardware queue
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < (int)GNM_MAX_COMPUTE_QUEUES; i++) {
+            if (!g_compute_queues[i].in_use) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_gnm_compute_mutex);
+        return ORBIS_GNM_ERROR_COMPUTEQUEUE_INTERNAL;
+    }
+    GnmComputeQueue *q = &g_compute_queues[slot];
+    q->in_use = true;
+    q->pipe_id = pipe_id;
+    q->queue_id = queue_id;
+    q->ring_base_addr = ring_base_addr;
+    q->ring_size_dw = ring_size_dw;
+    q->read_ptr = read_ptr_addr;
+    q->next_offs_dw = 0;
+    if (read_ptr_addr) *read_ptr_addr = 0;
+    pthread_mutex_unlock(&g_gnm_compute_mutex);
+
+    int32_t vqid = slot + 1; // DingDong expects [1..64]
+    printf("[ps4-gnm] ASC pipe %u queue %u mapped to vqid %d (ring 0x%llx, %u dw)\n",
+           pipe_id, queue_id, vqid, (unsigned long long)ring_base_addr, ring_size_dw);
+    return vqid;
 }
 
 int32_t sceGnmMapComputeQueueWithPriority(uint32_t pipe_id, uint32_t queue_id, uint64_t ring_base_addr, uint32_t ring_size_dw, uint32_t *read_ptr_addr, uint32_t pipePriority) {
@@ -654,8 +770,13 @@ int32_t sceGnmMapComputeQueueWithPriority(uint32_t pipe_id, uint32_t queue_id, u
 }
 
 int32_t sceGnmUnmapComputeQueue(uint32_t pipe_id, uint32_t queue_id) {
-    (void)pipe_id;
-    (void)queue_id;
+    pthread_mutex_lock(&g_gnm_compute_mutex);
+    for (int i = 0; i < (int)GNM_MAX_COMPUTE_QUEUES; i++) {
+        if (g_compute_queues[i].in_use && g_compute_queues[i].pipe_id == pipe_id && g_compute_queues[i].queue_id == queue_id) {
+            memset(&g_compute_queues[i], 0, sizeof(g_compute_queues[i]));
+        }
+    }
+    pthread_mutex_unlock(&g_gnm_compute_mutex);
     return ORBIS_GNM_OK;
 }
 
@@ -678,22 +799,101 @@ int32_t sceGnmGetLastWaitedAddress(void) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// GPU interrupt -> equeue plumbing (EVFILT_GRAPHICS_CORE).
+// sceGnmAddEqEvent(eq, id, udata) registers interest in interrupt `id`
+// (0x40 = GfxEop, 0..6 = Compute0..6 RelMem). When the PM4 processor raises that interrupt
+// (EVENT_WRITE_EOP / RELEASE_MEM with int_sel != 0), an event with ident = id,
+// filter = EVFILT_GRAPHICS_CORE, data = id (the event type, see sceGnmGetEqEventType)
+// and the registered udata is triggered on every registered queue.
+// ---------------------------------------------------------------------------
+#define GNM_MAX_EQ_REGS 64
+
+typedef struct GnmEqReg {
+    bool in_use;
+    OrbisKernelEqueue eq;
+    uint64_t id;
+    uint64_t udata; // opaque guest value, copied back verbatim into the guest event
+} GnmEqReg;
+
+static pthread_mutex_t g_gnm_eq_mutex = PTHREAD_MUTEX_INITIALIZER;
+static GnmEqReg g_eq_regs[GNM_MAX_EQ_REGS];
+
 int32_t sceGnmAddEqEvent(uint64_t eq, uint64_t id, void *udata) {
-    (void)eq;
-    (void)id;
-    (void)udata;
+    OrbisKernelEqueue q = (OrbisKernelEqueue)(int32_t)eq;
+    if (!ps4_equeue_exists(q)) {
+        return (int32_t)ORBIS_KERNEL_ERROR_EBADF;
+    }
+
+    pthread_mutex_lock(&g_gnm_eq_mutex);
+    int slot = -1;
+    for (int i = 0; i < GNM_MAX_EQ_REGS; i++) {
+        if (g_eq_regs[i].in_use && g_eq_regs[i].eq == q && g_eq_regs[i].id == id) {
+            slot = i; // re-add updates udata (kqueue EV_ADD semantics)
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < GNM_MAX_EQ_REGS; i++) {
+            if (!g_eq_regs[i].in_use) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_gnm_eq_mutex);
+        fprintf(stderr, "[ps4-gnm] sceGnmAddEqEvent: registration table full\n");
+        return (int32_t)0x8002000c; // ORBIS_KERNEL_ERROR_ENOMEM
+    }
+    g_eq_regs[slot].in_use = true;
+    g_eq_regs[slot].eq = q;
+    g_eq_regs[slot].id = id;
+    g_eq_regs[slot].udata = (uint64_t)(uintptr_t)udata;
+    pthread_mutex_unlock(&g_gnm_eq_mutex);
+
+    printf("[ps4-gnm] sceGnmAddEqEvent(eq=%d, id=0x%llx, udata=0x%llx)\n",
+           q, (unsigned long long)id, (unsigned long long)(uintptr_t)udata);
     return ORBIS_GNM_OK;
 }
 
 int32_t sceGnmDeleteEqEvent(uint64_t eq, uint64_t id) {
-    (void)eq;
-    (void)id;
+    OrbisKernelEqueue q = (OrbisKernelEqueue)(int32_t)eq;
+    if (!ps4_equeue_exists(q)) {
+        return (int32_t)ORBIS_KERNEL_ERROR_EBADF;
+    }
+    pthread_mutex_lock(&g_gnm_eq_mutex);
+    for (int i = 0; i < GNM_MAX_EQ_REGS; i++) {
+        if (g_eq_regs[i].in_use && g_eq_regs[i].eq == q && g_eq_regs[i].id == id) {
+            memset(&g_eq_regs[i], 0, sizeof(g_eq_regs[i]));
+        }
+    }
+    pthread_mutex_unlock(&g_gnm_eq_mutex);
+    ps4_equeue_remove_events(q, id, ORBIS_KERNEL_EVFILT_GRAPHICS_CORE);
     return ORBIS_GNM_OK;
 }
 
 int32_t sceGnmGetEqEventType(const void *ev) {
-    (void)ev;
-    return 0;
+    // shadPS4: returns sceKernelGetEventData(ev); the trigger stores the event type there.
+    if (!ev) return 0;
+    return (int32_t)((const OrbisKernelEvent *)ev)->data;
+}
+
+void ps4_gnm_signal_interrupt(uint32_t irq_id) {
+    GnmEqReg hits[GNM_MAX_EQ_REGS];
+    int n = 0;
+    pthread_mutex_lock(&g_gnm_eq_mutex);
+    for (int i = 0; i < GNM_MAX_EQ_REGS; i++) {
+        if (g_eq_regs[i].in_use && g_eq_regs[i].id == (uint64_t)irq_id) {
+            hits[n++] = g_eq_regs[i];
+        }
+    }
+    pthread_mutex_unlock(&g_gnm_eq_mutex);
+
+    for (int i = 0; i < n; i++) {
+        ps4_equeue_trigger_event(hits[i].eq, hits[i].id, ORBIS_KERNEL_EVFILT_GRAPHICS_CORE,
+                                 (int64_t)hits[i].id, (void *)(uintptr_t)hits[i].udata);
+    }
 }
 
 // Diagnostics & validation
@@ -1224,22 +1424,24 @@ void shim_sceGnmDestroyWorkloadStream(GuestContext *ctx) {
 }
 
 void shim_sceGnmDingDong(GuestContext *ctx) {
-    sceGnmDingDong((uint32_t)ctx->rdi, (uint32_t)ctx->rsi);
+    ps4_gnm_dingdong(ctx, (uint32_t)ctx->rdi, (uint32_t)ctx->rsi);
     SHIM_RETURN();
 }
 
 void shim_sceGnmDingDongForWorkload(GuestContext *ctx) {
-    sceGnmDingDongForWorkload((uint32_t)ctx->rdi, (uint32_t)ctx->rsi, ctx->rdx);
+    ps4_gnm_dingdong(ctx, (uint32_t)ctx->rdi, (uint32_t)ctx->rsi);
     SHIM_RETURN();
 }
 
 void shim_sceGnmMapComputeQueue(GuestContext *ctx) {
+    gnm_remember_ctx(ctx);
     uint32_t *read_ptr = (uint32_t *)recomp_guest_to_host(ctx, ctx->r8);
     ctx->rax = (uint64_t)(int64_t)sceGnmMapComputeQueue((uint32_t)ctx->rdi, (uint32_t)ctx->rsi, ctx->rdx, (uint32_t)ctx->rcx, read_ptr);
     SHIM_RETURN();
 }
 
 void shim_sceGnmMapComputeQueueWithPriority(GuestContext *ctx) {
+    gnm_remember_ctx(ctx);
     uint32_t *read_ptr = (uint32_t *)recomp_guest_to_host(ctx, ctx->r8);
     ctx->rax = (uint64_t)(int64_t)sceGnmMapComputeQueueWithPriority((uint32_t)ctx->rdi, (uint32_t)ctx->rsi, ctx->rdx, (uint32_t)ctx->rcx, read_ptr, (uint32_t)ctx->r9);
     SHIM_RETURN();
@@ -1274,7 +1476,8 @@ void shim_sceGnmGetLastWaitedAddress(GuestContext *ctx) {
 }
 
 void shim_sceGnmAddEqEvent(GuestContext *ctx) {
-    void *udata = recomp_guest_to_host(ctx, ctx->rdx);
+    // udata is returned verbatim to the guest in the event: keep it a guest value.
+    void *udata = (void *)(uintptr_t)ctx->rdx;
     ctx->rax = (uint64_t)(int64_t)sceGnmAddEqEvent(ctx->rdi, ctx->rsi, udata);
     SHIM_RETURN();
 }
@@ -1450,7 +1653,7 @@ int32_t sceGnmDrawIndexAuto(uint32_t *cmdbuf, uint32_t size, uint32_t index_coun
     if (!cmdbuf || size != 7 || (flags & 0x1ffffffe) != 0) {
         return -1;
     }
-    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDEX_AUTO, 2, 0, 0);
+    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDEX_AUTO, 1, 0, 0); // count = body dwords - 1
     cmdbuf[1] = index_count;
     cmdbuf[2] = 2u;
     write_trailing_nop(cmdbuf + 3, 3);
@@ -1460,7 +1663,7 @@ int32_t sceGnmDrawIndexAuto(uint32_t *cmdbuf, uint32_t size, uint32_t index_coun
 int32_t sceGnmDrawIndexOffset(uint32_t *cmdbuf, uint32_t size, uint32_t index_offset, uint32_t index_count, uint32_t flags) {
     if (!cmdbuf || size != 9) return -1;
     uint32_t pred = (flags & 1) ? 1 : 0;
-    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDEX_OFFSET_2, 4, 0, pred);
+    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDEX_OFFSET_2, 3, 0, pred);
     cmdbuf[1] = index_count;
     cmdbuf[2] = index_offset;
     cmdbuf[3] = index_count;
@@ -1472,7 +1675,7 @@ int32_t sceGnmDrawIndexOffset(uint32_t *cmdbuf, uint32_t size, uint32_t index_of
 int32_t sceGnmDrawIndexIndirect(uint32_t *cmdbuf, uint32_t size, uint32_t data_offset, uint32_t shader_stage, uint32_t vertex_sgpr_offset, uint32_t instance_sgpr_offset, uint32_t flags) {
     if (!cmdbuf || size != 9 || shader_stage >= 7 || vertex_sgpr_offset >= 0x10 || instance_sgpr_offset >= 0x10) return -1;
     uint32_t pred = (flags & 1) ? 1 : 0;
-    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDEX_INDIRECT, 4, 0, pred);
+    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDEX_INDIRECT, 3, 0, pred);
     uint32_t sgpr_offset = indirect_sgpr_offsets[shader_stage];
     cmdbuf[1] = data_offset;
     cmdbuf[2] = (vertex_sgpr_offset == 0) ? 0 : (vertex_sgpr_offset & 0xffffu) + sgpr_offset;
@@ -1485,7 +1688,7 @@ int32_t sceGnmDrawIndexIndirect(uint32_t *cmdbuf, uint32_t size, uint32_t data_o
 int32_t sceGnmDrawIndirect(uint32_t *cmdbuf, uint32_t size, uint32_t data_offset, uint32_t shader_stage, uint32_t vertex_sgpr_offset, uint32_t instance_sgpr_offset, uint32_t flags) {
     if (!cmdbuf || size != 9 || shader_stage >= 7 || vertex_sgpr_offset >= 0x10 || instance_sgpr_offset >= 0x10) return -1;
     uint32_t pred = (flags & 1) ? 1 : 0;
-    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDIRECT, 4, 0, pred);
+    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDIRECT, 3, 0, pred);
     uint32_t sgpr_offset = indirect_sgpr_offsets[shader_stage];
     cmdbuf[1] = data_offset;
     cmdbuf[2] = (vertex_sgpr_offset == 0) ? 0 : (vertex_sgpr_offset & 0xffffu) + sgpr_offset;
@@ -1497,11 +1700,11 @@ int32_t sceGnmDrawIndirect(uint32_t *cmdbuf, uint32_t size, uint32_t data_offset
 
 int32_t sceGnmDrawIndexIndirectCountMulti(uint32_t *cmdbuf, uint32_t size, uint32_t data_offset, uint32_t max_count, uint64_t count_addr, uint32_t shader_stage, uint32_t vertex_sgpr_offset, uint32_t instance_sgpr_offset, uint32_t flags) {
     if (!cmdbuf || size != 16 || vertex_sgpr_offset >= 0x10 || instance_sgpr_offset >= 0x10) return -1;
-    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_NOP, 2, 0, 0);
+    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_NOP, 1, 0, 0);
     cmdbuf[1] = 0;
     cmdbuf[2] = 0;
     uint32_t pred = (flags & 1) ? 1 : 0;
-    cmdbuf[3] = PM4_TYPE3_HEADER(0x3a, 9, 0, pred);
+    cmdbuf[3] = PM4_TYPE3_HEADER(0x3a, 8, 0, pred);
     uint32_t sgpr_offset = (shader_stage < 7) ? indirect_sgpr_offsets[shader_stage] : 0;
     cmdbuf[4] = data_offset;
     cmdbuf[5] = (vertex_sgpr_offset == 0) ? 0 : (vertex_sgpr_offset & 0xffffu) + sgpr_offset;
@@ -1522,7 +1725,7 @@ int32_t sceGnmDrawIndirectCountMulti(void) {
 int32_t sceGnmDrawIndexIndirectMulti(uint32_t *cmdbuf, uint32_t size, uint32_t data_offset, uint32_t max_count, uint32_t shader_stage, uint32_t vertex_sgpr_offset, uint32_t instance_sgpr_offset, uint32_t flags) {
     if (!cmdbuf || size != 11 || vertex_sgpr_offset >= 0x10 || instance_sgpr_offset >= 0x10) return -1;
     uint32_t pred = (flags & 1) ? 1 : 0;
-    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDEX_INDIRECT_MULTI, 6, 0, pred);
+    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDEX_INDIRECT_MULTI, 5, 0, pred);
     uint32_t sgpr_offset = (shader_stage < 7) ? indirect_sgpr_offsets[shader_stage] : 0;
     cmdbuf[1] = data_offset;
     cmdbuf[2] = (vertex_sgpr_offset == 0) ? 0 : (vertex_sgpr_offset & 0xffffu) + sgpr_offset;
@@ -1545,7 +1748,7 @@ int32_t sceGnmDrawOpaqueAuto(void) {
 int32_t sceGnmDispatchDirect(uint32_t *cmdbuf, uint32_t size, uint32_t threads_x, uint32_t threads_y, uint32_t threads_z, uint32_t flags) {
     if (!cmdbuf || size != 9) return -1;
     uint32_t pred = (flags & 1) ? 1 : 0;
-    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DISPATCH_DIRECT, 4, 1, pred);
+    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DISPATCH_DIRECT, 3, 1, pred);
     cmdbuf[1] = threads_x;
     cmdbuf[2] = threads_y;
     cmdbuf[3] = threads_z;
@@ -1557,7 +1760,7 @@ int32_t sceGnmDispatchDirect(uint32_t *cmdbuf, uint32_t size, uint32_t threads_x
 int32_t sceGnmDispatchIndirect(uint32_t *cmdbuf, uint32_t size, uint32_t data_offset, uint32_t flags) {
     if (!cmdbuf || size != 7) return -1;
     uint32_t pred = (flags & 1) ? 1 : 0;
-    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DISPATCH_INDIRECT, 2, 1, pred);
+    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DISPATCH_INDIRECT, 1, 1, pred);
     cmdbuf[1] = data_offset;
     cmdbuf[2] = (flags & 0x18) + 1;
     write_trailing_nop(cmdbuf + 3, 3);
@@ -2137,5 +2340,42 @@ void shim_sceGnmRequestFlipAndSubmitDone(GuestContext *ctx) {
 void shim_sceGnmRequestFlipAndSubmitDoneForWorkload(GuestContext *ctx) {
     (void)ctx;
     ctx->rax = (uint64_t)(int64_t)sceGnmRequestFlipAndSubmitDoneForWorkload();
+    SHIM_RETURN();
+}
+
+// sceGnmDrawIndirectMulti(uint32_t *cmdbuf, uint32_t size, uint32_t data_offset,
+//     uint32_t max_count, uint32_t shader_stage, uint32_t vertex_sgpr_offset,
+//     uint32_t instance_sgpr_offset, uint32_t flags)
+// Emits DRAW_INDIRECT_MULTI (6 payload dwords) followed by a 3 dword NOP, like the
+// system library (11 dwords total).
+int32_t sceGnmDrawIndirectMulti(uint32_t *cmdbuf, uint32_t size, uint32_t data_offset, uint32_t max_count,
+                                uint32_t shader_stage, uint32_t vertex_sgpr_offset,
+                                uint32_t instance_sgpr_offset, uint32_t flags) {
+    if (!cmdbuf || size != 11 || shader_stage >= 7 || vertex_sgpr_offset >= 0x10 || instance_sgpr_offset >= 0x10)
+        return -1;
+    uint32_t pred = (flags & 1) ? 1 : 0;
+    cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_DRAW_INDIRECT_MULTI, 5, 0, pred);
+    uint32_t sgpr_offset = indirect_sgpr_offsets[shader_stage];
+    cmdbuf[1] = data_offset;
+    cmdbuf[2] = (vertex_sgpr_offset == 0) ? 0 : (vertex_sgpr_offset & 0xffffu) + sgpr_offset;
+    cmdbuf[3] = (instance_sgpr_offset == 0) ? 0 : (instance_sgpr_offset & 0xffffu) + sgpr_offset;
+    cmdbuf[4] = max_count;
+    cmdbuf[5] = 16; // sizeof(DrawIndirectArgs)
+    cmdbuf[6] = 2;  // draw initiator: auto index
+    write_trailing_nop(cmdbuf + 7, 3);
+    return ORBIS_GNM_OK;
+}
+
+void shim_sceGnmDrawIndirectMulti(GuestContext *ctx) {
+    uint32_t *cmdbuf = (uint32_t *)recomp_guest_to_host(ctx, ctx->rdi);
+    uint32_t instance_sgpr = 0;
+    uint32_t flags = 0;
+    if (ctx->rsp && ctx->mem_base) {
+        instance_sgpr = *(uint32_t *)recomp_guest_to_host(ctx, ctx->rsp + 8);
+        flags = *(uint32_t *)recomp_guest_to_host(ctx, ctx->rsp + 16);
+    }
+    ctx->rax = (uint64_t)(int64_t)sceGnmDrawIndirectMulti(cmdbuf, (uint32_t)ctx->rsi, (uint32_t)ctx->rdx,
+                                                          (uint32_t)ctx->rcx, (uint32_t)ctx->r8, (uint32_t)ctx->r9,
+                                                          instance_sgpr, flags);
     SHIM_RETURN();
 }

@@ -582,7 +582,7 @@ func (l *Lifter) liftVroundpd(dst, src, immArg x86asm.Arg, nextPC uint64) ([]str
 		return nil, fmt.Errorf("vroundpd invalid operands")
 	}
 	mode := uint8(imm) & 3
-	roundFunc := "round"
+	roundFunc := "rint" // mode 0: round to nearest even
 	switch mode {
 	case 1:
 		roundFunc = "floor"
@@ -651,7 +651,7 @@ func (l *Lifter) liftVdpps(dst, src1, src2, immArg x86asm.Arg, nextPC uint64) ([
 		fmt.Sprintf("      float p1 = (0x%02x & 0x20) ? (s1.f32[1] * s2.f32[1]) : 0.0f;", imm8),
 		fmt.Sprintf("      float p2 = (0x%02x & 0x40) ? (s1.f32[2] * s2.f32[2]) : 0.0f;", imm8),
 		fmt.Sprintf("      float p3 = (0x%02x & 0x80) ? (s1.f32[3] * s2.f32[3]) : 0.0f;", imm8),
-		"      float sum = p0 + p1 + p2 + p3;",
+		"      float sum = (p0 + p1) + (p2 + p3); /* DPPS adds pairwise */",
 		"      xmm_reg_t res = {0};",
 		fmt.Sprintf("      if (0x%02x & 0x01) res.f32[0] = sum;", imm8),
 		fmt.Sprintf("      if (0x%02x & 0x02) res.f32[1] = sum;", imm8),
@@ -968,7 +968,7 @@ func (l *Lifter) liftPcmpExtra(op x86asm.Op, dst, src1, src2 x86asm.Arg, nextPC 
 	return lines, nil
 }
 
-// liftPmulExtra handles VPMULUDQ, VPMULDQ, VPMULHW, VPMULHUW
+// liftPmulExtra handles VPMULUDQ, VPMULDQ, VPMULHW, VPMULHUW, VPMULHRSW and VPSIGNB/W/D
 func (l *Lifter) liftPmulExtra(op x86asm.Op, dst, src1, src2 x86asm.Arg, nextPC uint64) ([]string, error) {
 	dstReg, ok1 := dst.(x86asm.Reg)
 	src1Reg, ok2 := src1.(x86asm.Reg)
@@ -1006,6 +1006,22 @@ func (l *Lifter) liftPmulExtra(op x86asm.Op, dst, src1, src2 x86asm.Arg, nextPC 
 	case x86asm.VPMULHUW:
 		for i := 0; i < 8; i++ {
 			lines = append(lines, fmt.Sprintf("      res.u16[%d] = (uint16_t)(((uint32_t)s1.u16[%d] * (uint32_t)s2.u16[%d]) >> 16);", i, i, i))
+		}
+	case x86asm.VPMULHRSW:
+		for i := 0; i < 8; i++ {
+			lines = append(lines, fmt.Sprintf("      res.s16[%d] = (int16_t)(((((int32_t)s1.s16[%d] * (int32_t)s2.s16[%d]) >> 14) + 1) >> 1);", i, i, i))
+		}
+	case x86asm.VPSIGNB:
+		for i := 0; i < 16; i++ {
+			lines = append(lines, fmt.Sprintf("      res.u8[%d] = s2.s8[%d] < 0 ? (uint8_t)(0u - s1.u8[%d]) : (s2.s8[%d] == 0 ? 0 : s1.u8[%d]);", i, i, i, i, i))
+		}
+	case x86asm.VPSIGNW:
+		for i := 0; i < 8; i++ {
+			lines = append(lines, fmt.Sprintf("      res.u16[%d] = s2.s16[%d] < 0 ? (uint16_t)(0u - s1.u16[%d]) : (s2.s16[%d] == 0 ? 0 : s1.u16[%d]);", i, i, i, i, i))
+		}
+	case x86asm.VPSIGND:
+		for i := 0; i < 4; i++ {
+			lines = append(lines, fmt.Sprintf("      res.u32[%d] = s2.s32[%d] < 0 ? (0u - s1.u32[%d]) : (s2.s32[%d] == 0 ? 0 : s1.u32[%d]);", i, i, i, i, i))
 		}
 	}
 

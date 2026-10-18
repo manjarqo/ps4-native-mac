@@ -480,7 +480,7 @@ func (l *Lifter) liftPshift(shiftOp string, dst, countArg x86asm.Arg, nextPC uin
 	} else if imm, ok := countArg.(x86asm.Imm); ok {
 		cntExpr = fmt.Sprintf("%d", imm)
 	} else {
-		cRead, _, err := l.getOperandRead(countArg, 1, nextPC)
+		cRead, _, err := l.getOperandRead(countArg, 8, nextPC) // m128 count: low quadword
 		if err != nil {
 			return nil, err
 		}
@@ -488,7 +488,7 @@ func (l *Lifter) liftPshift(shiftOp string, dst, countArg x86asm.Arg, nextPC uin
 	}
 	infoDst := regMap[dstReg]
 	return []string{
-		fmt.Sprintf("    { uint32_t shift = (uint32_t)(%s);", cntExpr),
+		fmt.Sprintf("    { uint64_t shift = (uint64_t)(%s);", cntExpr),
 		"      if (shift < 32) {",
 		fmt.Sprintf("        ctx->%s.u32[0] %s= shift; ctx->%s.u32[1] %s= shift;", infoDst.BaseReg, shiftOp, infoDst.BaseReg, shiftOp),
 		fmt.Sprintf("        ctx->%s.u32[2] %s= shift; ctx->%s.u32[3] %s= shift;", infoDst.BaseReg, shiftOp, infoDst.BaseReg, shiftOp),
@@ -647,7 +647,8 @@ func (l *Lifter) liftMinMax3Op(isMin bool, isDouble bool, dstReg, src1Reg x86asm
 		}
 		lines = append(lines,
 			fmt.Sprintf("      ctx->%s = ctx->%s;", infoDst.BaseReg, infoSrc1.BaseReg),
-			fmt.Sprintf("      if (s2 %s s1) ctx->%s.f64[0] = s2;", cmpOp, infoDst.BaseReg),
+			// x86: dst = (s1 OP s2) ? s1 : s2 (src2 wins for NaN and equal operands)
+			fmt.Sprintf("      ctx->%s.f64[0] = (s1 %s s2) ? s1 : s2;", infoDst.BaseReg, cmpOp),
 			fmt.Sprintf("      memset(&ctx->ymmh[%d], 0, 16);", int(dstReg-x86asm.X0)),
 			"    }",
 		)
@@ -671,7 +672,7 @@ func (l *Lifter) liftMinMax3Op(isMin bool, isDouble bool, dstReg, src1Reg x86asm
 		}
 		lines = append(lines,
 			fmt.Sprintf("      ctx->%s = ctx->%s;", infoDst.BaseReg, infoSrc1.BaseReg),
-			fmt.Sprintf("      if (s2 %s s1) ctx->%s.f32[0] = s2;", cmpOp, infoDst.BaseReg),
+			fmt.Sprintf("      ctx->%s.f32[0] = (s1 %s s2) ? s1 : s2;", infoDst.BaseReg, cmpOp),
 			fmt.Sprintf("      memset(&ctx->ymmh[%d], 0, 16);", int(dstReg-x86asm.X0)),
 			"    }",
 		)
@@ -768,11 +769,11 @@ func (l *Lifter) liftPackedF32(op string, dst, src x86asm.Arg, nextPC uint64) ([
 		}
 	case "min":
 		for i := 0; i < 4; i++ {
-			lines = append(lines, fmt.Sprintf("      if (src.f32[%d] < ctx->%s.f32[%d]) ctx->%s.f32[%d] = src.f32[%d];", i, infoDst.BaseReg, i, infoDst.BaseReg, i, i))
+			lines = append(lines, fmt.Sprintf("      ctx->%s.f32[%d] = (ctx->%s.f32[%d] < src.f32[%d]) ? ctx->%s.f32[%d] : src.f32[%d];", infoDst.BaseReg, i, infoDst.BaseReg, i, i, infoDst.BaseReg, i, i))
 		}
 	case "max":
 		for i := 0; i < 4; i++ {
-			lines = append(lines, fmt.Sprintf("      if (src.f32[%d] > ctx->%s.f32[%d]) ctx->%s.f32[%d] = src.f32[%d];", i, infoDst.BaseReg, i, infoDst.BaseReg, i, i))
+			lines = append(lines, fmt.Sprintf("      ctx->%s.f32[%d] = (ctx->%s.f32[%d] > src.f32[%d]) ? ctx->%s.f32[%d] : src.f32[%d];", infoDst.BaseReg, i, infoDst.BaseReg, i, i, infoDst.BaseReg, i, i))
 		}
 	}
 	lines = append(lines, "    }")
@@ -872,8 +873,8 @@ func (l *Lifter) liftCvtps2dq(dst, src x86asm.Arg, nextPC uint64) ([]string, err
 		}
 		for i := 0; i < 4; i++ {
 			lines = append(lines,
-				fmt.Sprintf("      ctx->xmm[%d].s32[%d] = (int32_t)roundf(src_lo.f32[%d]);", dIdx, i, i),
-				fmt.Sprintf("      ctx->ymmh[%d].s32[%d] = (int32_t)roundf(src_hi.f32[%d]);", dIdx, i, i),
+				fmt.Sprintf("      ctx->xmm[%d].s32[%d] = x86_cvt_f32_i32(src_lo.f32[%d]);", dIdx, i, i),
+				fmt.Sprintf("      ctx->ymmh[%d].s32[%d] = x86_cvt_f32_i32(src_hi.f32[%d]);", dIdx, i, i),
 			)
 		}
 		lines = append(lines, "    }")
@@ -899,7 +900,7 @@ func (l *Lifter) liftCvtps2dq(dst, src x86asm.Arg, nextPC uint64) ([]string, err
 		return nil, fmt.Errorf("cvtps2dq invalid src")
 	}
 	for i := 0; i < 4; i++ {
-		lines = append(lines, fmt.Sprintf("      ctx->%s.s32[%d] = (int32_t)roundf(src.f32[%d]);", infoDst.BaseReg, i, i))
+		lines = append(lines, fmt.Sprintf("      ctx->%s.s32[%d] = x86_cvt_f32_i32(src.f32[%d]);", infoDst.BaseReg, i, i))
 	}
 	lines = append(lines, fmt.Sprintf("      memset(&ctx->ymmh[%d], 0, 16);", dIdx), "    }")
 	return lines, nil
@@ -1279,14 +1280,14 @@ func (l *Lifter) liftPackedF64(opStr string, dst, src x86asm.Arg, nextPC uint64)
 	case "min":
 		lines = append(
 			lines,
-			fmt.Sprintf("      if (src.f64[0] < ctx->%s.f64[0]) ctx->%s.f64[0] = src.f64[0];", infoDst.BaseReg, infoDst.BaseReg),
-			fmt.Sprintf("      if (src.f64[1] < ctx->%s.f64[1]) ctx->%s.f64[1] = src.f64[1];", infoDst.BaseReg, infoDst.BaseReg),
+			fmt.Sprintf("      ctx->%s.f64[0] = (ctx->%s.f64[0] < src.f64[0]) ? ctx->%s.f64[0] : src.f64[0];", infoDst.BaseReg, infoDst.BaseReg, infoDst.BaseReg),
+			fmt.Sprintf("      ctx->%s.f64[1] = (ctx->%s.f64[1] < src.f64[1]) ? ctx->%s.f64[1] : src.f64[1];", infoDst.BaseReg, infoDst.BaseReg, infoDst.BaseReg),
 		)
 	case "max":
 		lines = append(
 			lines,
-			fmt.Sprintf("      if (src.f64[0] > ctx->%s.f64[0]) ctx->%s.f64[0] = src.f64[0];", infoDst.BaseReg, infoDst.BaseReg),
-			fmt.Sprintf("      if (src.f64[1] > ctx->%s.f64[1]) ctx->%s.f64[1] = src.f64[1];", infoDst.BaseReg, infoDst.BaseReg),
+			fmt.Sprintf("      ctx->%s.f64[0] = (ctx->%s.f64[0] > src.f64[0]) ? ctx->%s.f64[0] : src.f64[0];", infoDst.BaseReg, infoDst.BaseReg, infoDst.BaseReg),
+			fmt.Sprintf("      ctx->%s.f64[1] = (ctx->%s.f64[1] > src.f64[1]) ? ctx->%s.f64[1] : src.f64[1];", infoDst.BaseReg, infoDst.BaseReg, infoDst.BaseReg),
 		)
 	}
 	lines = append(lines, "    }")
@@ -1678,6 +1679,7 @@ func (l *Lifter) liftPshuflw(dst, src, immArg x86asm.Arg, nextPC uint64) ([]stri
 		fmt.Sprintf("      ctx->%s.u16[1] = w1;", infoDst.BaseReg),
 		fmt.Sprintf("      ctx->%s.u16[2] = w2;", infoDst.BaseReg),
 		fmt.Sprintf("      ctx->%s.u16[3] = w3;", infoDst.BaseReg),
+		fmt.Sprintf("      ctx->%s.u64[1] = src.u64[1];", infoDst.BaseReg), // high quadword copied from src
 		"    }",
 	)
 	return lines, nil
@@ -1720,14 +1722,21 @@ func (l *Lifter) liftCvtFloatToInt(trunc, isDouble bool, dst, src x86asm.Arg, de
 		return nil, fmt.Errorf("cvttsd2si invalid src")
 	}
 
-	conv := srcExpr
-	if !trunc {
-		if isDouble {
-			conv = fmt.Sprintf("llrint(%s)", srcExpr)
-		} else {
-			conv = fmt.Sprintf("llrintf(%s)", srcExpr)
-		}
+	helper := "x86_cvt"
+	if trunc {
+		helper = "x86_cvtt"
 	}
+	if isDouble {
+		helper += "_f64"
+	} else {
+		helper += "_f32"
+	}
+	if sz == 8 {
+		helper += "_i64"
+	} else {
+		helper += "_i32"
+	}
+	conv := fmt.Sprintf("%s(%s)", helper, srcExpr)
 	writeStmts, err := l.getOperandWrite(dst, sz, fmt.Sprintf("(%s)(%s)", castType, conv), nextPC)
 	if err != nil {
 		return nil, err
@@ -2051,7 +2060,7 @@ func (l *Lifter) liftPshiftW(op x86asm.Op, dst, countArg x86asm.Arg, nextPC uint
 	} else if imm, ok := countArg.(x86asm.Imm); ok {
 		cntExpr = fmt.Sprintf("%d", imm)
 	} else {
-		cRead, _, err := l.getOperandRead(countArg, 1, nextPC)
+		cRead, _, err := l.getOperandRead(countArg, 8, nextPC) // m128 count: low quadword
 		if err != nil {
 			return nil, err
 		}
@@ -2062,7 +2071,7 @@ func (l *Lifter) liftPshiftW(op x86asm.Op, dst, countArg x86asm.Arg, nextPC uint
 		mIdx := mmxIdx(dstReg)
 		lines := []string{
 			"    {",
-			fmt.Sprintf("      uint32_t shift = (uint32_t)(%s);", cntExpr),
+			fmt.Sprintf("      uint64_t shift = (uint64_t)(%s);", cntExpr),
 		}
 		switch op {
 		case x86asm.PSLLW:
@@ -2098,7 +2107,7 @@ func (l *Lifter) liftPshiftW(op x86asm.Op, dst, countArg x86asm.Arg, nextPC uint
 
 	lines := []string{
 		"    {",
-		fmt.Sprintf("      uint32_t shift = (uint32_t)(%s);", cntExpr),
+		fmt.Sprintf("      uint64_t shift = (uint64_t)(%s);", cntExpr),
 	}
 	switch op {
 	case x86asm.PSLLW:
@@ -2144,7 +2153,7 @@ func (l *Lifter) liftPsrad(dst, countArg x86asm.Arg, nextPC uint64) ([]string, e
 	} else if imm, ok := countArg.(x86asm.Imm); ok {
 		cntExpr = fmt.Sprintf("%d", imm)
 	} else {
-		cRead, _, err := l.getOperandRead(countArg, 1, nextPC)
+		cRead, _, err := l.getOperandRead(countArg, 8, nextPC) // m128 count: low quadword
 		if err != nil {
 			return nil, err
 		}
@@ -2153,7 +2162,7 @@ func (l *Lifter) liftPsrad(dst, countArg x86asm.Arg, nextPC uint64) ([]string, e
 
 	return []string{
 		"    {",
-		fmt.Sprintf("      uint32_t shift = (uint32_t)(%s);", cntExpr),
+		fmt.Sprintf("      uint64_t shift = (uint64_t)(%s);", cntExpr),
 		"      if (shift >= 32) shift = 31;",
 		fmt.Sprintf("      for (int i = 0; i < 4; i++) ctx->%s.s32[i] >>= shift;", infoDst.BaseReg),
 		"    }",
@@ -2173,7 +2182,7 @@ func (l *Lifter) liftPshiftQ(shiftOp string, dst, countArg x86asm.Arg, nextPC ui
 	} else if imm, ok := countArg.(x86asm.Imm); ok {
 		cntExpr = fmt.Sprintf("%d", imm)
 	} else {
-		cRead, _, err := l.getOperandRead(countArg, 1, nextPC)
+		cRead, _, err := l.getOperandRead(countArg, 8, nextPC) // m128 count: low quadword
 		if err != nil {
 			return nil, err
 		}
@@ -2182,7 +2191,7 @@ func (l *Lifter) liftPshiftQ(shiftOp string, dst, countArg x86asm.Arg, nextPC ui
 
 	return []string{
 		"    {",
-		fmt.Sprintf("      uint32_t shift = (uint32_t)(%s);", cntExpr),
+		fmt.Sprintf("      uint64_t shift = (uint64_t)(%s);", cntExpr),
 		"      if (shift < 64) {",
 		fmt.Sprintf("        ctx->%s.u64[0] %s= shift; ctx->%s.u64[1] %s= shift;", infoDst.BaseReg, shiftOp, infoDst.BaseReg, shiftOp),
 		"      } else {",
@@ -2344,11 +2353,11 @@ func (l *Lifter) liftMinMax(isMin bool, isDouble bool, dst, src x86asm.Arg, next
 
 	if isDouble {
 		return []string{
-			fmt.Sprintf("    { double s = %s; if (s %s ctx->%s.f64[0]) ctx->%s.f64[0] = s; }", sExpr, cmpOp, infoDst.BaseReg, infoDst.BaseReg),
+			fmt.Sprintf("    { double s = %s; double d = ctx->%s.f64[0]; ctx->%s.f64[0] = (d %s s) ? d : s; }", sExpr, infoDst.BaseReg, infoDst.BaseReg, cmpOp),
 		}, nil
 	}
 	return []string{
-		fmt.Sprintf("    { float s = %s; if (s %s ctx->%s.f32[0]) ctx->%s.f32[0] = s; }", sExpr, cmpOp, infoDst.BaseReg, infoDst.BaseReg),
+		fmt.Sprintf("    { float s = %s; float d = ctx->%s.f32[0]; ctx->%s.f32[0] = (d %s s) ? d : s; }", sExpr, infoDst.BaseReg, infoDst.BaseReg, cmpOp),
 	}, nil
 }
 
@@ -2487,6 +2496,7 @@ func (l *Lifter) liftPshufhw(dst, src, immArg x86asm.Arg, nextPC uint64) ([]stri
 		fmt.Sprintf("      ctx->%s.u16[5] = w5;", infoDst.BaseReg),
 		fmt.Sprintf("      ctx->%s.u16[6] = w6;", infoDst.BaseReg),
 		fmt.Sprintf("      ctx->%s.u16[7] = w7;", infoDst.BaseReg),
+		fmt.Sprintf("      ctx->%s.u64[0] = src.u64[0];", infoDst.BaseReg), // low quadword copied from src
 		"    }",
 	)
 	return lines, nil
@@ -2495,7 +2505,7 @@ func (l *Lifter) liftPshufhw(dst, src, immArg x86asm.Arg, nextPC uint64) ([]stri
 func (l *Lifter) liftVexOp(op x86asm.Op, args x86asm.Args, defMemSz int, nextPC uint64) ([]string, error) {
 	// 2-operand moves
 	switch op {
-	case x86asm.VMOVAPS, x86asm.VMOVUPS, x86asm.VMOVUPD, x86asm.VMOVAPD, x86asm.VMOVDQA, x86asm.VMOVDQU, x86asm.VMOVNTPS, x86asm.VMOVNTDQ, x86asm.VMOVNTDQA, x86asm.VMOVNTPD:
+	case x86asm.VMOVAPS, x86asm.VMOVUPS, x86asm.VMOVUPD, x86asm.VMOVAPD, x86asm.VMOVDQA, x86asm.VMOVDQU, x86asm.VLDDQU, x86asm.VMOVNTPS, x86asm.VMOVNTDQ, x86asm.VMOVNTDQA, x86asm.VMOVNTPD:
 		return l.liftVectorMove(args[0], args[1], nextPC)
 	case x86asm.VEXTRACTF128, x86asm.VEXTRACTI128:
 		return l.liftVextract128(args[0], args[1], args[2], nextPC)
@@ -2809,7 +2819,8 @@ func (l *Lifter) liftVexOp(op x86asm.Op, args x86asm.Args, defMemSz int, nextPC 
 		return l.liftVpmovmskb(args[0], args[1], nextPC)
 	case x86asm.VPCMPEQQ, x86asm.VPCMPGTB, x86asm.VPCMPGTW:
 		return l.liftPcmpExtra(op, args[0], args[1], args[2], nextPC)
-	case x86asm.VPMULUDQ, x86asm.VPMULDQ, x86asm.VPMULHW, x86asm.VPMULHUW:
+	case x86asm.VPMULUDQ, x86asm.VPMULDQ, x86asm.VPMULHW, x86asm.VPMULHUW,
+		x86asm.VPMULHRSW, x86asm.VPSIGNB, x86asm.VPSIGNW, x86asm.VPSIGND:
 		return l.liftPmulExtra(op, args[0], args[1], args[2], nextPC)
 	case x86asm.VPACKUSDW:
 		return l.liftVpackusdw(args[0], args[1], args[2], nextPC)
@@ -3006,7 +3017,7 @@ func (l *Lifter) liftVexOp(op x86asm.Op, args x86asm.Args, defMemSz int, nextPC 
 		case 3:
 			roundFunc = "trunc"
 		default:
-			roundFunc = "round"
+			roundFunc = "rint" // mode 0: round to nearest even
 		}
 		return []string{
 			"    {",
@@ -3052,7 +3063,7 @@ func (l *Lifter) liftVexOp(op x86asm.Op, args x86asm.Args, defMemSz int, nextPC 
 		case 3:
 			roundFunc = "truncf"
 		default:
-			roundFunc = "roundf"
+			roundFunc = "rintf" // mode 0: round to nearest even
 		}
 		return []string{
 			"    {",
@@ -3155,7 +3166,7 @@ func (l *Lifter) liftVexShift(op x86asm.Op, is256 bool, dstReg, src1Reg x86asm.R
 		return nil, fmt.Errorf("unsupported vex shift count: %v", countArg)
 	}
 
-	lines = append(lines, fmt.Sprintf("      uint32_t shift = (uint32_t)(%s);", cntExpr))
+	lines = append(lines, fmt.Sprintf("      uint64_t shift = (uint64_t)(%s); // full 64-bit count: >= width clears", cntExpr))
 	lines = append(lines, fmt.Sprintf("      xmm_reg_t s1_lo = ctx->xmm[%d];", s1Idx))
 	if is256 {
 		lines = append(lines, fmt.Sprintf("      xmm_reg_t s1_hi = ctx->ymmh[%d];", s1Idx))

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "ps4_pad.h"
 
@@ -294,6 +295,101 @@ void ps4_pad_handle_key(unsigned short keyCode, int isDown) {
   pthread_mutex_unlock(&g_pad_mutex);
 }
 
+// Debug aid for driving headless runs interactively: PS4_PAD_CTL=<file> is polled
+// for appended lines while the game runs. Commands are executed one after another:
+//   p <hexmask> <dur_ms> [<lx> <ly> [<rx> <ry>]]  hold buttons/sticks for dur_ms
+//   w <ms>                                       wait (neutral pad)
+//   shot                                         save a screenshot of the next frame
+//                                                (needs PS4_SCREENSHOT_DIR)
+//   dumprt / dumpdraws                           write the GPU render targets of the next
+//                                                frame / the color target after each of its
+//                                                draws (needs PS4_SCREENSHOT_DIR)
+//   trace                                        log the GPU work of the next frame
+// Stick values are 0..255 (128 = center); -1 keeps the stick untouched.
+extern volatile int g_ps4_screenshot_request;
+extern volatile int g_ps4_gnm_dump_request;
+typedef struct { long dur; uint32_t mask; int lx, ly, rx, ry; } PadCtlCmd;
+static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, uint8_t *rx, uint8_t *ry) {
+  static int init;
+  static FILE *f;
+  static char line[256];
+  static size_t line_len;
+  static PadCtlCmd queue[512];
+  static int q_head, q_tail;
+  static int active;
+  static PadCtlCmd cur;
+  static uint64_t cur_end_us;
+  if (!init) {
+    init = 1;
+    const char *path = getenv("PS4_PAD_CTL");
+    if (path) {
+      f = fopen(path, "a+");
+      if (f) fseek(f, 0, SEEK_END);
+      else fprintf(stderr, "[pad] cannot open control file %s\n", path);
+    }
+  }
+  if (!f) return;
+  int c;
+  clearerr(f);
+  while ((c = fgetc(f)) != EOF) {
+    if (c != '\n') {
+      if (line_len + 1 < sizeof(line)) line[line_len++] = (char)c;
+      continue;
+    }
+    line[line_len] = 0;
+    line_len = 0;
+    PadCtlCmd cmd = {0, 0, -1, -1, -1, -1};
+    if (strncmp(line, "shot", 4) == 0) {
+      g_ps4_screenshot_request = 1;
+      continue;
+    } else if (strncmp(line, "dumprt", 6) == 0) {
+      g_ps4_gnm_dump_request |= 1;
+      continue;
+    } else if (strncmp(line, "dumpdraws", 9) == 0) {
+      g_ps4_gnm_dump_request |= 2;
+      continue;
+    } else if (strncmp(line, "trace", 5) == 0) {
+      g_ps4_gnm_dump_request |= 4;
+      continue;
+    } else if (line[0] == 'w') {
+      cmd.dur = strtol(line + 1, NULL, 10);
+    } else if (line[0] == 'p') {
+      char *e = line + 1;
+      cmd.mask = (uint32_t)strtoul(e, &e, 16);
+      cmd.dur = strtol(e, &e, 10);
+      int v[4] = {-1, -1, -1, -1};
+      for (int k = 0; k < 4; k++) {
+        char *e2;
+        long x = strtol(e, &e2, 10);
+        if (e2 == e) break;
+        v[k] = (int)x;
+        e = e2;
+      }
+      cmd.lx = v[0]; cmd.ly = v[1]; cmd.rx = v[2]; cmd.ry = v[3];
+    } else {
+      continue;
+    }
+    if ((q_tail + 1) % 512 != q_head) {
+      queue[q_tail] = cmd;
+      q_tail = (q_tail + 1) % 512;
+    }
+  }
+  const uint64_t now = get_time_micros();
+  if (active && now >= cur_end_us) active = 0;
+  if (!active && q_head != q_tail) {
+    cur = queue[q_head];
+    q_head = (q_head + 1) % 512;
+    cur_end_us = now + (uint64_t)(cur.dur > 0 ? cur.dur : 0) * 1000;
+    active = 1;
+  }
+  if (!active) return;
+  *buttons |= cur.mask;
+  if (cur.lx >= 0) *lx = (uint8_t)cur.lx;
+  if (cur.ly >= 0) *ly = (uint8_t)cur.ly;
+  if (cur.rx >= 0) *rx = (uint8_t)cur.rx;
+  if (cur.ry >= 0) *ry = (uint8_t)cur.ry;
+}
+
 int32_t scePadReadState(int32_t handle, OrbisPadData *data) {
   if (!data)
     return -EINVAL;
@@ -315,17 +411,95 @@ int32_t scePadReadState(int32_t handle, OrbisPadData *data) {
 
   memset(data, 0, sizeof(OrbisPadData));
 
+  extern volatile uint64_t g_ps4_videoout_flip_count;
   uint32_t buttons = g_key_buttons;
+  // Debug clock for AUTOPRESS/SCRIPT: wall time since the first pad read, or with
+  // PS4_PAD_CLOCK=frames, submitted video flips converted to ms at 30 fps (so scripts
+  // stay in sync with the game when the host runs slowly).
+  static int pad_clock_frames = -1;
+  if (pad_clock_frames < 0) {
+    const char *c = getenv("PS4_PAD_CLOCK");
+    pad_clock_frames = (c && strcmp(c, "frames") == 0) ? 1 : 0;
+  }
+  {
+    // Debug aid for headless runs: PS4_PAD_AUTOPRESS=<hex button mask> holds
+    // those buttons for 300 ms every 4 s (e.g. 0x4000 = Cross).
+    static int autopress_init;
+    static uint32_t autopress_mask;
+    static struct timespec autopress_t0;
+    static long autopress_until = -1;
+    if (!autopress_init) {
+      autopress_init = 1;
+      const char *env = getenv("PS4_PAD_AUTOPRESS");
+      if (env) autopress_mask = (uint32_t)strtoul(env, NULL, 16);
+      // PS4_PAD_AUTOPRESS_UNTIL=<ms>: stop auto-pressing after this time (lets a
+      // PS4_PAD_SCRIPT drive menus afterwards without stray presses).
+      const char *until = getenv("PS4_PAD_AUTOPRESS_UNTIL");
+      if (until) autopress_until = strtol(until, NULL, 10);
+      clock_gettime(CLOCK_MONOTONIC, &autopress_t0);
+    }
+    if (autopress_mask) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      long ms = (now.tv_sec - autopress_t0.tv_sec) * 1000 + (now.tv_nsec - autopress_t0.tv_nsec) / 1000000;
+      if (pad_clock_frames) ms = (long)(g_ps4_videoout_flip_count * 1000 / 30);
+      if (ms % 4000 < 300 && (autopress_until < 0 || ms < autopress_until)) buttons |= autopress_mask;
+    }
+  }
   uint8_t lx = g_key_lx;
   uint8_t ly = g_key_ly;
+  {
+    // Debug aid: PS4_PAD_SCRIPT="<t_ms>:<hex mask>[:<dur_ms>[:<lx>:<ly>]],..." presses the
+    // buttons (and optionally sets the left stick) at absolute times since the first pad
+    // read, e.g. "60000:8:200,61000:4000" = Options at 60 s, Cross at 61 s.
+    typedef struct { long t, dur; uint32_t mask; int lx, ly; } PadStep;
+    static PadStep steps[256];
+    static int nsteps = -1;
+    static struct timespec t0;
+    if (nsteps < 0) {
+      nsteps = 0;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      const char *env = getenv("PS4_PAD_SCRIPT");
+      while (env && *env && nsteps < 256) {
+        PadStep st = {0, 200, 0, -1, -1};
+        char *end;
+        st.t = strtol(env, &end, 10);
+        if (*end == ':') st.mask = (uint32_t)strtoul(end + 1, &end, 16);
+        if (*end == ':') st.dur = strtol(end + 1, &end, 10);
+        if (*end == ':') st.lx = (int)strtol(end + 1, &end, 10);
+        if (*end == ':') st.ly = (int)strtol(end + 1, &end, 10);
+        steps[nsteps++] = st;
+        env = strchr(end, ',');
+        if (env) env++;
+      }
+    }
+    if (nsteps > 0) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      long ms = (now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000;
+      if (pad_clock_frames) ms = (long)(g_ps4_videoout_flip_count * 1000 / 30);
+      for (int i = 0; i < nsteps; i++) {
+        if (ms >= steps[i].t && ms < steps[i].t + steps[i].dur) {
+          buttons |= steps[i].mask;
+          if (steps[i].lx >= 0) lx = (uint8_t)steps[i].lx;
+          if (steps[i].ly >= 0) ly = (uint8_t)steps[i].ly;
+        }
+      }
+    }
+  }
   uint8_t rx = g_key_rx;
   uint8_t ry = g_key_ry;
   uint8_t l2 = g_key_l2;
   uint8_t r2 = g_key_r2;
+  ps4_pad_control_file(&buttons, &lx, &ly, &rx, &ry);
 
   @autoreleasepool {
     GCController *controller = nil;
-    NSArray<GCController *> *controllers = [GCController controllers];
+    // Automated background runs (PS4_BACKGROUND_WINDOW) take input only from the scripts above:
+    // they must neither react to the user's gamepad nor have it override scripted sticks.
+    static int background = -1;
+    if (background < 0) background = getenv("PS4_BACKGROUND_WINDOW") != NULL;
+    NSArray<GCController *> *controllers = background ? @[] : [GCController controllers];
     if (controllers.count > 0) {
       controller = controllers.firstObject;
     }

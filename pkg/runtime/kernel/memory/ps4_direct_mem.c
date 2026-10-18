@@ -5,6 +5,10 @@
 #include <pthread.h>
 #include <errno.h>
 #include <sys/mman.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 
 typedef struct DirectMemBlock {
     off_t phys_offset;
@@ -17,6 +21,134 @@ typedef struct DirectMemBlock {
 
 static DirectMemBlock *g_direct_blocks = NULL;
 static pthread_mutex_t g_direct_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// ---------------------------------------------------------------------------------
+// Physical backing for direct memory. Every direct-memory page lives at
+// g_phys_base + physAddr (a lazily committed host region); sceKernelMapDirectMemory
+// aliases guest virtual ranges onto it (mach_vm_remap, shared), so the same physical
+// pages can be mapped at several guest addresses, unmapped and re-mapped elsewhere
+// with their contents intact (Naughty Dog's memory linearizer relies on this).
+// ---------------------------------------------------------------------------------
+typedef struct DirectMapping {
+    uint64_t vaddr;
+    uint64_t size;
+    uint64_t phys;
+    struct DirectMapping *next;
+} DirectMapping;
+
+static DirectMapping *g_dmaps = NULL; // protected by g_direct_mutex
+static uint8_t *g_phys_base = NULL;
+static size_t g_phys_size = 0;
+
+void ps4_gnm_guest_remapped(uint64_t addr, uint64_t size) __attribute__((weak));
+
+static void dm_phys_init(void) {
+    if (g_phys_base || getenv("PS4_NO_PHYS_ALIAS")) return;
+    size_t sz = 128ULL << 30; // virtual only; pages are committed on first touch
+    void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "[ps4-mem] WARNING: cannot reserve physical backing (%d); direct memory aliasing disabled\n", errno);
+        return;
+    }
+    g_phys_base = (uint8_t *)p;
+    g_phys_size = sz;
+}
+
+// Map guest [vaddr, vaddr+len) onto physical [phys, phys+len). Caller holds g_direct_mutex.
+static int dm_alias(GuestContext *ctx, uint64_t vaddr, uint64_t phys, size_t len) {
+#if defined(__APPLE__)
+    GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
+    if (!g_phys_base || ((vaddr | phys | len) & 0x3fffULL) || phys + len > g_phys_size ||
+        vaddr + len > proc->mem_size)
+        return -1;
+    mach_vm_address_t target = (mach_vm_address_t)(uintptr_t)(proc->mem_base + vaddr);
+    vm_prot_t cur = 0, max = 0;
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &target, len, 0,
+                                     VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                                     (mach_vm_address_t)(uintptr_t)(g_phys_base + phys), FALSE,
+                                     &cur, &max, VM_INHERIT_SHARE);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "[ps4-mem] mach_vm_remap(va=0x%llx phys=0x%llx len=0x%zx) failed: %d\n",
+                (unsigned long long)vaddr, (unsigned long long)phys, len, kr);
+        return -1;
+    }
+    DirectMapping *m = (DirectMapping *)calloc(1, sizeof(*m));
+    if (m) {
+        m->vaddr = vaddr;
+        m->size = len;
+        m->phys = phys;
+        m->next = g_dmaps;
+        g_dmaps = m;
+    }
+    if (ps4_gnm_guest_remapped) ps4_gnm_guest_remapped(vaddr, len);
+    return 0;
+#else
+    (void)ctx; (void)vaddr; (void)phys; (void)len;
+    return -1;
+#endif
+}
+
+// Called by recomp_vm_free (without vm_mutex held): detach guest [addr, addr+size) from
+// physical memory so the virtual range no longer aliases it.
+void ps4_direct_mem_on_unmap(GuestContext *ctx, uint64_t addr, size_t size) {
+    if (!ctx || size == 0) return;
+    GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
+    uint64_t end = addr + size;
+    pthread_mutex_lock(&g_direct_mutex);
+    DirectMapping **pp = &g_dmaps;
+    while (*pp) {
+        DirectMapping *m = *pp;
+        uint64_t mend = m->vaddr + m->size;
+        if (m->vaddr >= end || mend <= addr) { pp = &m->next; continue; }
+        uint64_t ostart = m->vaddr > addr ? m->vaddr : addr;
+        uint64_t oend = mend < end ? mend : end;
+        // Replace the overlap with fresh private zero pages.
+        mmap(proc->mem_base + ostart, oend - ostart, PROT_READ | PROT_WRITE,
+             MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (ps4_gnm_guest_remapped) ps4_gnm_guest_remapped(ostart, oend - ostart);
+        if (ostart > m->vaddr && oend < mend) {
+            DirectMapping *tail = (DirectMapping *)calloc(1, sizeof(*tail));
+            if (tail) {
+                tail->vaddr = oend;
+                tail->size = mend - oend;
+                tail->phys = m->phys + (oend - m->vaddr);
+                tail->next = m->next;
+                m->next = tail;
+            }
+            m->size = ostart - m->vaddr;
+            pp = &m->next;
+        } else if (ostart > m->vaddr) {
+            m->size = ostart - m->vaddr;
+            pp = &m->next;
+        } else if (oend < mend) {
+            m->phys += oend - m->vaddr;
+            m->size = mend - oend;
+            m->vaddr = oend;
+            pp = &m->next;
+        } else {
+            *pp = m->next;
+            free(m);
+        }
+    }
+    pthread_mutex_unlock(&g_direct_mutex);
+}
+
+// Physical address backing guest address `addr`, if it is mapped direct memory.
+static bool dm_lookup(uint64_t addr, uint64_t *start, uint64_t *end, uint64_t *phys) {
+    bool ok = false;
+    pthread_mutex_lock(&g_direct_mutex);
+    for (DirectMapping *m = g_dmaps; m; m = m->next) {
+        if (addr >= m->vaddr && addr < m->vaddr + m->size) {
+            *start = m->vaddr;
+            *end = m->vaddr + m->size;
+            *phys = m->phys;
+            ok = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_direct_mutex);
+    return ok;
+}
 static int g_direct_inited = 0;
 
 static size_t get_total_direct_mem_size(void) {
@@ -49,6 +181,7 @@ int ps4_direct_mem_init(void) {
         g_direct_blocks->next = NULL;
         g_direct_blocks->prev = NULL;
         g_direct_inited = 1;
+        dm_phys_init();
     }
     pthread_mutex_unlock(&g_direct_mutex);
     return 0;
@@ -208,7 +341,9 @@ int sceKernelMapDirectMemory(GuestContext *ctx, void **addrInOut, size_t length,
     DirectMemBlock *curr = g_direct_blocks;
     DirectMemBlock *found = NULL;
     while (curr) {
-        if (!curr->is_free && curr->phys_offset == physAddr) {
+        // Any sub-range of an allocated block may be mapped (not only its start).
+        if (!curr->is_free && physAddr >= curr->phys_offset &&
+            (uint64_t)physAddr + length <= (uint64_t)curr->phys_offset + curr->size) {
             found = curr;
             break;
         }
@@ -216,7 +351,7 @@ int sceKernelMapDirectMemory(GuestContext *ctx, void **addrInOut, size_t length,
     }
 
     if (!found) {
-        fprintf(stderr, "[ps4-mem] ERROR: sceKernelMapDirectMemory: physAddr 0x%llx not found or free!\n", (unsigned long long)physAddr);
+        fprintf(stderr, "[ps4-mem] ERROR: sceKernelMapDirectMemory: physAddr 0x%llx (len 0x%zx) not in an allocated block!\n", (unsigned long long)physAddr, length);
         pthread_mutex_unlock(&g_direct_mutex);
         return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
     }
@@ -241,6 +376,10 @@ int sceKernelMapDirectMemory(GuestContext *ctx, void **addrInOut, size_t length,
 
     found->mapped_guest_vaddr = vaddr;
     *addrInOut = (void *)vaddr;
+    if (dm_alias(ctx, vaddr, (uint64_t)physAddr, (length + 0x3fffULL) & ~0x3fffULL) != 0 && g_phys_base) {
+        fprintf(stderr, "[ps4-mem] WARNING: direct mapping 0x%llx (phys 0x%llx) is not physically aliased\n",
+                (unsigned long long)vaddr, (unsigned long long)physAddr);
+    }
 
     printf("[ps4-mem] sceKernelMapDirectMemory SUCCESS: out=%p\n", (void *)vaddr);
     fflush(stdout);
@@ -429,6 +568,15 @@ int sceKernelVirtualQuery(GuestContext *ctx, const void *addr, int flags, OrbisK
     info->isDirectMemory = (strstr(extent->name, "direct") != NULL) ? 1 : 0;
     info->isPooledMemory = (strstr(extent->name, "pool") != NULL) ? 1 : 0;
     strncpy(info->name, extent->name, sizeof(info->name) - 1);
+    uint64_t ds, de, dp;
+    if (dm_lookup(vaddr, &ds, &de, &dp)) {
+        info->start = (void *)ds;
+        info->end = (void *)de;
+        info->offset = (off_t)dp;
+        info->isDirectMemory = 1;
+        info->isFlexibleMemory = 0;
+        info->isCommitted = 1;
+    }
 
     return 0;
 }

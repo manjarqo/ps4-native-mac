@@ -24,6 +24,18 @@ extern "C" {
 #define ORBIS_GNM_ERROR_INVALID_ARGS                  ((int32_t)0x80d11000)
 #define ORBIS_GNM_ERROR_INVALID_VALUE                 ((int32_t)0x80d11000)
 #define ORBIS_GNM_ERROR_CAPTURE_RAZOR_NOT_LOADED      ((int32_t)0x80d12000)
+#define ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_PIPE_ID        ((int32_t)0x80d17000)
+#define ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_QUEUE_ID       ((int32_t)0x80d17001)
+#define ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_RING_SIZE      ((int32_t)0x80d17002)
+#define ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_RING_BASE_ADDR ((int32_t)0x80d17003)
+#define ORBIS_GNM_ERROR_COMPUTEQUEUE_INVALID_READ_PTR_ADDR  ((int32_t)0x80d17004)
+#define ORBIS_GNM_ERROR_COMPUTEQUEUE_INTERNAL               ((int32_t)0x80d170ff)
+
+// GNM equeue event types / interrupt ids (EVFILT_GRAPHICS_CORE idents, cf. shadPS4 GnmEventType)
+#define PS4_GNM_EVENT_COMPUTE0_RELMEM 0x00u // ..0x06 = Compute0..6 RelMem (irq id == compute pipe id)
+#define PS4_GNM_EVENT_GFX_EOP         0x40u
+#define PS4_GNM_NUM_COMPUTE_PIPES     7u
+#define PS4_GNM_NUM_QUEUES_PER_PIPE   8u
 
 // PM4 Opcodes (AMD GCN Type-3 Packets)
 #define PM4_IT_NOP                        0x10
@@ -184,6 +196,12 @@ int32_t sceGnmGetLastWaitedAddress(void);
 int32_t sceGnmAddEqEvent(uint64_t eq, uint64_t id, void *udata);
 int32_t sceGnmDeleteEqEvent(uint64_t eq, uint64_t id);
 int32_t sceGnmGetEqEventType(const void *ev);
+
+// Internal: deliver a GPU interrupt (PS4_GNM_EVENT_GFX_EOP or a compute pipe id) to every
+// equeue registered for it via sceGnmAddEqEvent. Safe to call from the PM4 processor.
+void ps4_gnm_signal_interrupt(uint32_t irq_id);
+// Internal: DingDong with an explicit context (used by the shim).
+void ps4_gnm_dingdong(GuestContext *ctx, uint32_t gnm_vqid, uint32_t next_offs_dw);
 
 // Diagnostics & Validation (Retail behavior)
 int32_t sceGnmValidateGetVersion(void);

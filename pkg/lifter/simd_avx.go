@@ -639,7 +639,13 @@ func (l *Lifter) liftMovs(inst x86asm.Inst, width int) []string {
 	if instHasRep(inst) {
 		return []string{
 			fmt.Sprintf("    { size_t n = (size_t)ctx->rcx * %dULL;", width),
-			"      memmove(ctx->mem_base + ctx->rdi, ctx->mem_base + ctx->rsi, n);",
+			"      uint8_t *d = ctx->mem_base + ctx->rdi; const uint8_t *s = ctx->mem_base + ctx->rsi;",
+			"      if (d > s && d < s + n) {",
+			"        // Forward element copy: overlapping REP MOVS replicates the source pattern.",
+			fmt.Sprintf("        for (size_t i = 0; i < n; i += %d) memcpy(d + i, s + i, %d);", width, width),
+			"      } else {",
+			"        memmove(d, s, n);",
+			"      }",
 			"      ctx->rdi += n; ctx->rsi += n; ctx->rcx = 0;",
 			"    }",
 		}
@@ -906,15 +912,14 @@ func (l *Lifter) liftVcmpss(dst, src1, src2, immArg x86asm.Arg, nextPC uint64) (
 	infoDst := regMap[dstReg]
 	infoSrc1 := regMap[src1Reg]
 	pred := uint8(imm)
-	lines := []string{
-		fmt.Sprintf("    ctx->%s = ctx->%s;", infoDst.BaseReg, infoSrc1.BaseReg),
-		"    {",
-	}
+	// Read src2 before writing dst: dst may alias src2 (vcmpltss xmm1, xmm0, xmm1).
+	lines := []string{"    {"}
 	s2, err := l.loadXmmArg(src2, nextPC, "s2")
 	if err != nil {
 		return nil, err
 	}
 	lines = append(lines, s2...)
+	lines = append(lines, fmt.Sprintf("      ctx->%s = ctx->%s;", infoDst.BaseReg, infoSrc1.BaseReg))
 	cond := cmppsPredicate(pred, fmt.Sprintf("ctx->%s.f32[0]", infoDst.BaseReg), "s2.f32[0]")
 	lines = append(
 		lines,
@@ -966,15 +971,14 @@ func (l *Lifter) liftVcmpsd(dst, src1, src2, immArg x86asm.Arg, nextPC uint64) (
 	infoDst := regMap[dstReg]
 	infoSrc1 := regMap[src1Reg]
 	pred := uint8(imm)
-	lines := []string{
-		fmt.Sprintf("    ctx->%s = ctx->%s;", infoDst.BaseReg, infoSrc1.BaseReg),
-		"    {",
-	}
+	// Read src2 before writing dst: dst may alias src2 (vcmpltss xmm1, xmm0, xmm1).
+	lines := []string{"    {"}
 	s2, err := l.loadXmmArg(src2, nextPC, "s2")
 	if err != nil {
 		return nil, err
 	}
 	lines = append(lines, s2...)
+	lines = append(lines, fmt.Sprintf("      ctx->%s = ctx->%s;", infoDst.BaseReg, infoSrc1.BaseReg))
 	cond := cmppsPredicate(pred, fmt.Sprintf("ctx->%s.f64[0]", infoDst.BaseReg), "s2.f64[0]")
 	lines = append(
 		lines,
@@ -1067,7 +1071,8 @@ func (l *Lifter) liftMovhlps(dst, src1, src2 x86asm.Arg) ([]string, error) {
 	info1 := regMap[s1]
 	info2 := regMap[s2]
 	return []string{
-		fmt.Sprintf("    { uint64_t lo = ctx->%s.u64[1]; uint64_t hi = ctx->%s.u64[1];", info1.BaseReg, info2.BaseReg),
+		// dst[63:0] = src2[127:64], dst[127:64] = src1[127:64]
+		fmt.Sprintf("    { uint64_t lo = ctx->%s.u64[1]; uint64_t hi = ctx->%s.u64[1];", info2.BaseReg, info1.BaseReg),
 		fmt.Sprintf("      ctx->%s.u64[0] = lo; ctx->%s.u64[1] = hi;", infoDst.BaseReg, infoDst.BaseReg),
 		"    }",
 	}, nil
@@ -1462,7 +1467,7 @@ func (l *Lifter) liftRoundps(dst, src, immArg x86asm.Arg, nextPC uint64) ([]stri
 	case 3:
 		roundFunc = "truncf"
 	default:
-		roundFunc = "roundf"
+		roundFunc = "rintf" // mode 0: round to nearest even
 	}
 	lines := []string{"    {"}
 
@@ -1519,8 +1524,8 @@ func (l *Lifter) liftCvttps2dq(dst, src x86asm.Arg, nextPC uint64) ([]string, er
 		lines = append(lines, s...)
 		for i := 0; i < 4; i++ {
 			lines = append(lines,
-				fmt.Sprintf("      ctx->xmm[%d].s32[%d] = (int32_t)truncf(src_lo.f32[%d]);", dIdx, i, i),
-				fmt.Sprintf("      ctx->ymmh[%d].s32[%d] = (int32_t)truncf(src_hi.f32[%d]);", dIdx, i, i),
+				fmt.Sprintf("      ctx->xmm[%d].s32[%d] = x86_cvtt_f32_i32(src_lo.f32[%d]);", dIdx, i, i),
+				fmt.Sprintf("      ctx->ymmh[%d].s32[%d] = x86_cvtt_f32_i32(src_hi.f32[%d]);", dIdx, i, i),
 			)
 		}
 		lines = append(lines, "    }")
@@ -1535,7 +1540,7 @@ func (l *Lifter) liftCvttps2dq(dst, src x86asm.Arg, nextPC uint64) ([]string, er
 	}
 	lines = append(lines, s...)
 	for i := 0; i < 4; i++ {
-		lines = append(lines, fmt.Sprintf("      ctx->%s.s32[%d] = (int32_t)truncf(src.f32[%d]);", infoDst.BaseReg, i, i))
+		lines = append(lines, fmt.Sprintf("      ctx->%s.s32[%d] = x86_cvtt_f32_i32(src.f32[%d]);", infoDst.BaseReg, i, i))
 	}
 	lines = append(lines, fmt.Sprintf("      memset(&ctx->ymmh[%d], 0, 16);", dIdx), "    }")
 	return lines, nil
