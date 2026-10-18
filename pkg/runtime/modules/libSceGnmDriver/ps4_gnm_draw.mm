@@ -457,6 +457,7 @@ struct State {
     // pipeline cache makes rebuilding them cheap, so they are built synchronously.
     std::unordered_set<uint64_t> known_psos;
     std::string pso_list_path;
+    std::unordered_set<uint64_t> msl_on_disk; // hashes of <msl_cache_dir>/<hash>.metal (CP thread)
     std::string msl_cache_dir;
     bool async_compile = true;
     std::unordered_map<std::string, id<MTLRenderPipelineState>> gfx_pipes;
@@ -534,6 +535,7 @@ State S;
 // accumulated between presents and reported for long frames (hitches).
 struct HitchStats {
     double shader_ms = 0, gcn_ms = 0, mtl_ms = 0, pso_ms = 0, upload_ms = 0, wait_ms = 0;
+    double lookup_ms = 0, fn_ms = 0; // translation cache lookup; MTLFunction creation
     uint32_t shaders = 0, psos = 0, uploads = 0, pending_draws = 0;
 };
 HitchStats g_hitch;
@@ -889,23 +891,27 @@ bool StoreMslInDiskCache(uint64_t mh, const char* msl) {
     const uint64_t fs_t0 = ps4_hitch_now_ns();
     char path[1200];
     snprintf(path, sizeof(path), "%s/%016llx.metal", S.msl_cache_dir.c_str(), (unsigned long long)mh);
-    if (access(path, F_OK) == 0) {
-        ps4gnm_shader_cache::MarkUsed(path);
-        ps4_hitch_add_ns(PS4_HITCH_SHADER_FS, ps4_hitch_now_ns() - fs_t0);
-        return false;
+    const bool is_new = S.msl_on_disk.insert(mh).second; // CP thread only, filled at startup
+    if (!is_new) {
+        ps4gnm_shader_cache::MarkUsed(path); // asynchronous
+    } else {
+        // The frame does not wait for the disk. A write still pending at quit is lost; the
+        // shader is then translated again in the next session.
+        static dispatch_queue_t writer = dispatch_queue_create("ps4.gnm.msl_cache.writer", DISPATCH_QUEUE_SERIAL);
+        auto* job = new std::pair<std::string, std::string>(path, msl);
+        dispatch_async(writer, ^{
+            char tmp[1300];
+            snprintf(tmp, sizeof(tmp), "%s.tmp%d", job->first.c_str(), (int)getpid());
+            if (FILE* f = fopen(tmp, "w")) {
+                fputs(job->second.c_str(), f);
+                fclose(f);
+                rename(tmp, job->first.c_str());
+            }
+            delete job;
+        });
     }
-    char tmp[1300];
-    snprintf(tmp, sizeof(tmp), "%s.tmp%d", path, (int)getpid());
-    FILE* f = fopen(tmp, "w");
-    if (!f) {
-        ps4_hitch_add_ns(PS4_HITCH_SHADER_FS, ps4_hitch_now_ns() - fs_t0);
-        return true;
-    }
-    fputs(msl, f);
-    fclose(f);
-    rename(tmp, path);
     ps4_hitch_add_ns(PS4_HITCH_SHADER_FS, ps4_hitch_now_ns() - fs_t0);
-    return true;
+    return is_new;
 }
 
 void StartShaderWarmup() {
@@ -930,7 +936,10 @@ void StartShaderWarmup() {
                                                             error:nil];
     __block std::vector<std::string> paths;
     for (NSString* f in files)
-        if ([f hasSuffix:@".metal"]) paths.push_back(S.msl_cache_dir + "/" + f.UTF8String);
+        if ([f hasSuffix:@".metal"]) {
+            paths.push_back(S.msl_cache_dir + "/" + f.UTF8String);
+            S.msl_on_disk.insert(strtoull(f.UTF8String, nullptr, 16));
+        }
     if (paths.empty()) return;
     fprintf(stderr, "[gnm-draw] warming up %zu cached shaders in the background\n", paths.size());
     id<MTLDevice> dev = S.dev;
@@ -1130,7 +1139,11 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
         }
         S.libs[mh] = lib;
     }
-    if (lib) s->fn = [lib newFunctionWithName:@"main0"];
+    if (lib) {
+        const double fn_t0 = CFAbsoluteTimeGetCurrent();
+        s->fn = [lib newFunctionWithName:@"main0"];
+        g_hitch.fn_ms += (CFAbsoluteTimeGetCurrent() - fn_t0) * 1000.0;
+    }
     if (!s->fn && !s->pending) {
         RLog("msl-fail", "shader 0x%llx: no main0", (unsigned long long)code_addr);
         gcn_shader_destroy(sh);
@@ -1212,7 +1225,9 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
     const bool cacheable = sc::Enabled() && sc::MakeKey(hw, sw, rt, code_addr, ReadGuest, S.ctx, &ckey);
     if (cacheable) {
         const double t0 = CFAbsoluteTimeGetCurrent();
-        if (gcn_shader* sh = sc::Lookup(ckey, code_addr, ud, ReadGuest, S.ctx)) {
+        gcn_shader* sh = sc::Lookup(ckey, code_addr, ud, ReadGuest, S.ctx);
+        g_hitch.lookup_ms += (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+        if (sh) {
             if (sc::VerifyMode()) {
                 // Debug: the cached shader must equal a fresh translation of this draw.
                 static double cache_ms = 0, gcn_ms = 0;
@@ -4690,10 +4705,10 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                 double host_ms[PS4_HITCH_KINDS];
                 for (int k = 0; k < PS4_HITCH_KINDS; ++k) host_ms[k] = ps4_hitch_take_ns(k) / 1e6;
                 if (dt > 50.0)
-                    fprintf(stderr, "[gnm-draw] hitch: frame %.1f ms; shaders %u (%.1f ms: gcn %.1f, metal %.1f), pipelines %u (%.1f ms), "
+                    fprintf(stderr, "[gnm-draw] hitch: frame %.1f ms; shaders %u (%.1f ms: gcn %.1f, metal %.1f, lookup %.1f, fn %.1f), pipelines %u (%.1f ms), "
                                     "texture uploads %u (%.1f ms), gpu waits %.1f ms, draws waiting for shaders %u; "
                                     "io %.1f, vm %.1f, mtlbuf %.1f, texlock %.1f, shader_fs %.1f ms\n",
-                            dt, g_hitch.shaders, g_hitch.shader_ms, g_hitch.gcn_ms, g_hitch.mtl_ms, g_hitch.psos, g_hitch.pso_ms, g_hitch.uploads,
+                            dt, g_hitch.shaders, g_hitch.shader_ms, g_hitch.gcn_ms, g_hitch.mtl_ms, g_hitch.lookup_ms, g_hitch.fn_ms, g_hitch.psos, g_hitch.pso_ms, g_hitch.uploads,
                             g_hitch.upload_ms, g_hitch.wait_ms, g_hitch.pending_draws, host_ms[PS4_HITCH_IO], host_ms[PS4_HITCH_VM],
                             host_ms[PS4_HITCH_MTLBUF], host_ms[PS4_HITCH_TEXLOCK], host_ms[PS4_HITCH_SHADER_FS]);
             } else {
