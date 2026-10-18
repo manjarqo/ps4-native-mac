@@ -1,4 +1,5 @@
 #include "ps4_direct_mem.h"
+#include "ps4_hitch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,10 +64,11 @@ static int dm_alias(GuestContext *ctx, uint64_t vaddr, uint64_t phys, size_t len
         return -1;
     mach_vm_address_t target = (mach_vm_address_t)(uintptr_t)(proc->mem_base + vaddr);
     vm_prot_t cur = 0, max = 0;
-    kern_return_t kr = mach_vm_remap(mach_task_self(), &target, len, 0,
-                                     VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
-                                     (mach_vm_address_t)(uintptr_t)(g_phys_base + phys), FALSE,
-                                     &cur, &max, VM_INHERIT_SHARE);
+    kern_return_t kr;
+    PS4_HITCH_TIMED(PS4_HITCH_VM, kr = mach_vm_remap(mach_task_self(), &target, len, 0,
+                                                     VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                                                     (mach_vm_address_t)(uintptr_t)(g_phys_base + phys), FALSE,
+                                                     &cur, &max, VM_INHERIT_SHARE));
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "[ps4-mem] mach_vm_remap(va=0x%llx phys=0x%llx len=0x%zx) failed: %d\n",
                 (unsigned long long)vaddr, (unsigned long long)phys, len, kr);
@@ -103,8 +105,8 @@ void ps4_direct_mem_on_unmap(GuestContext *ctx, uint64_t addr, size_t size) {
         uint64_t ostart = m->vaddr > addr ? m->vaddr : addr;
         uint64_t oend = mend < end ? mend : end;
         // Replace the overlap with fresh private zero pages.
-        mmap(proc->mem_base + ostart, oend - ostart, PROT_READ | PROT_WRITE,
-             MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+        PS4_HITCH_TIMED(PS4_HITCH_VM, mmap(proc->mem_base + ostart, oend - ostart, PROT_READ | PROT_WRITE,
+                                           MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0));
         if (ps4_gnm_guest_remapped) ps4_gnm_guest_remapped(ostart, oend - ostart);
         if (ostart > m->vaddr && oend < mend) {
             DirectMapping *tail = (DirectMapping *)calloc(1, sizeof(*tail));

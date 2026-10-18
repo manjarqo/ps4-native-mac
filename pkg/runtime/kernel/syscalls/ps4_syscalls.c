@@ -1,3 +1,4 @@
+#include "ps4_hitch.h"
 #include "recomp_runtime.h"
 #include "ps4_syscalls.h"
 #include "ps4_vfs.h"
@@ -195,7 +196,8 @@ void shim_mmap(GuestContext *ctx) {
   } else {
     // If not anonymous and valid fd, read file data into the mapped memory
     if (!(flags & 0x1000) && fd >= 0) {
-      ssize_t nread = pread(fd, ctx->mem_base + alloc_addr, len, offset);
+      ssize_t nread;
+      PS4_HITCH_TIMED(PS4_HITCH_IO, nread = pread(fd, ctx->mem_base + alloc_addr, len, offset));
       if (nread < 0) {
         fprintf(stderr, "[ps4-sys] mmap file read FAILED: fd=%d offset=%lld len=%zu errno=%d (%s)\n",
                 fd, (long long)offset, len, errno, strerror(errno));
@@ -253,7 +255,8 @@ void shim_read(GuestContext *ctx) {
   int fd = (int)ctx->rdi;
   uint64_t buf_addr = ctx->rsi;
   size_t count = (size_t)ctx->rdx;
-  ssize_t ret = read(fd, ctx->mem_base + buf_addr, count);
+  ssize_t ret;
+  PS4_HITCH_TIMED(PS4_HITCH_IO, ret = read(fd, ctx->mem_base + buf_addr, count));
   if (ret < 0) {
     set_guest_errno(ctx, errno);
   }
@@ -297,7 +300,8 @@ void shim_sceKernelPread(GuestContext *ctx) {
   size_t nbytes = (size_t)ctx->rdx;
   off_t offset = (off_t)ctx->rcx;
 
-  ssize_t ret = pread(fd, ctx->mem_base + buf_addr, nbytes, offset);
+  ssize_t ret;
+  PS4_HITCH_TIMED(PS4_HITCH_IO, ret = pread(fd, ctx->mem_base + buf_addr, nbytes, offset));
   if (ret < 0) {
     set_guest_errno(ctx, errno);
   }
@@ -327,7 +331,8 @@ void shim_sceKernelPreadv(GuestContext *ctx) {
     host_iov[i].iov_len = (size_t)guest_iov[i].iov_len;
   }
 
-  ssize_t ret = preadv(fd, host_iov, iovcnt, offset);
+  ssize_t ret;
+  PS4_HITCH_TIMED(PS4_HITCH_IO, ret = preadv(fd, host_iov, iovcnt, offset));
   if (ret < 0) {
     set_guest_errno(ctx, errno);
   }
@@ -1146,7 +1151,8 @@ void shim_syscall(GuestContext *ctx) {
     int fd = (int)ctx->rsi;
     uint64_t buf = ctx->rdx;
     size_t count = (size_t)ctx->rcx;
-    ssize_t ret = read(fd, ctx->mem_base + buf, count);
+    ssize_t ret;
+    PS4_HITCH_TIMED(PS4_HITCH_IO, ret = read(fd, ctx->mem_base + buf, count));
     if (ret < 0) set_guest_errno(ctx, errno);
     ctx->rax = (uint64_t)ret;
     SHIM_RETURN();
@@ -1258,7 +1264,8 @@ void shim_syscall(GuestContext *ctx) {
       ctx->rax = (uint64_t)-1;
     } else {
       if (!(flags & 0x1000) && fd >= 0) {
-        ssize_t nread = pread(fd, ctx->mem_base + alloc_addr, len, offset);
+        ssize_t nread;
+        PS4_HITCH_TIMED(PS4_HITCH_IO, nread = pread(fd, ctx->mem_base + alloc_addr, len, offset));
         if (nread < 0) {
           fprintf(stderr, "[ps4-sys] syscall 477 file read FAILED: fd=%d offset=%lld len=%zu errno=%d (%s)\n",
                   fd, (long long)offset, len, errno, strerror(errno));

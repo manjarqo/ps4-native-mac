@@ -56,6 +56,7 @@ extern "C" const char* ps4_vfs_get_app_root(void);
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_shader_cache.h"
 #include "ps4_metal_screen.h"
+#include "ps4_hitch.h"
 
 extern "C" int ps4_metal_screen_encode_present(void* command_buffer, void* texture);
 extern "C" uint64_t ps4_gnm_take_cp_ns(void);
@@ -569,6 +570,7 @@ struct GuestBufMru {
 GuestBufMru g_guest_buf_mru[4];
 
 void DropRemappedWindows() {
+    const uint64_t mb_t0 = ps4_hitch_now_ns();
     std::vector<std::pair<uint64_t, uint64_t>> ranges;
     {
         std::lock_guard<std::mutex> lk(g_remap_mutex);
@@ -585,6 +587,7 @@ void DropRemappedWindows() {
         else ++it;
     }
     for (auto& m : g_guest_buf_mru) m = GuestBufMru{};
+    ps4_hitch_add_ns(PS4_HITCH_MTLBUF, ps4_hitch_now_ns() - mb_t0);
 }
 
 // `out` is a strong pointer: an (implicitly autoreleasing) plain one would retain and autorelease
@@ -616,10 +619,12 @@ bool GuestBuffer(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint
     if (it != S.guest_bufs.end()) {
         b = it->second;
     } else {
+        const uint64_t mb_t0 = ps4_hitch_now_ns();
         b = [S.dev newBufferWithBytesNoCopy:ctx->mem_base + base
                                      length:end - base
                                     options:MTLResourceStorageModeShared
                                 deallocator:nil];
+        ps4_hitch_add_ns(PS4_HITCH_MTLBUF, ps4_hitch_now_ns() - mb_t0);
         if (!b) {
             RLog("guestbuf", "newBufferWithBytesNoCopy failed for 0x%llx+0x%llx",
                  (unsigned long long)base, (unsigned long long)(end - base));
@@ -880,19 +885,25 @@ void DumpMsl(const Shader* s, const char* msl) {
 // Returns true if the MSL was new (not in the disk cache yet).
 bool StoreMslInDiskCache(uint64_t mh, const char* msl) {
     if (S.msl_cache_dir.empty()) return true;
+    const uint64_t fs_t0 = ps4_hitch_now_ns();
     char path[1200];
     snprintf(path, sizeof(path), "%s/%016llx.metal", S.msl_cache_dir.c_str(), (unsigned long long)mh);
     if (access(path, F_OK) == 0) {
         ps4gnm_shader_cache::MarkUsed(path);
+        ps4_hitch_add_ns(PS4_HITCH_SHADER_FS, ps4_hitch_now_ns() - fs_t0);
         return false;
     }
     char tmp[1300];
     snprintf(tmp, sizeof(tmp), "%s.tmp%d", path, (int)getpid());
     FILE* f = fopen(tmp, "w");
-    if (!f) return true;
+    if (!f) {
+        ps4_hitch_add_ns(PS4_HITCH_SHADER_FS, ps4_hitch_now_ns() - fs_t0);
+        return true;
+    }
     fputs(msl, f);
     fclose(f);
     rename(tmp, path);
+    ps4_hitch_add_ns(PS4_HITCH_SHADER_FS, ps4_hitch_now_ns() - fs_t0);
     return true;
 }
 
@@ -4656,11 +4667,17 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                 if (long_ms > 0 && dt > long_ms)
                     fprintf(stderr, "[gnm-draw] long frame %.1f ms (present %llu)\n", dt,
                             (unsigned long long)S.present_idx + 1);
+                double host_ms[PS4_HITCH_KINDS];
+                for (int k = 0; k < PS4_HITCH_KINDS; ++k) host_ms[k] = ps4_hitch_take_ns(k) / 1e6;
                 if (dt > 50.0)
                     fprintf(stderr, "[gnm-draw] hitch: frame %.1f ms; shaders %u (%.1f ms: gcn %.1f, metal %.1f), pipelines %u (%.1f ms), "
-                                    "texture uploads %u (%.1f ms), gpu waits %.1f ms, draws waiting for shaders %u\n",
+                                    "texture uploads %u (%.1f ms), gpu waits %.1f ms, draws waiting for shaders %u; "
+                                    "io %.1f, vm %.1f, mtlbuf %.1f, texlock %.1f, shader_fs %.1f ms\n",
                             dt, g_hitch.shaders, g_hitch.shader_ms, g_hitch.gcn_ms, g_hitch.mtl_ms, g_hitch.psos, g_hitch.pso_ms, g_hitch.uploads,
-                            g_hitch.upload_ms, g_hitch.wait_ms, g_hitch.pending_draws);
+                            g_hitch.upload_ms, g_hitch.wait_ms, g_hitch.pending_draws, host_ms[PS4_HITCH_IO], host_ms[PS4_HITCH_VM],
+                            host_ms[PS4_HITCH_MTLBUF], host_ms[PS4_HITCH_TEXLOCK], host_ms[PS4_HITCH_SHADER_FS]);
+            } else {
+                for (int k = 0; k < PS4_HITCH_KINDS; ++k) ps4_hitch_take_ns(k);
             }
             last_present = now_t;
             g_hitch = HitchStats{};

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "ps4_aio.h"
+#include "ps4_hitch.h"
 #include "recomp_runtime.h"
 #include <errno.h>
 #include <pthread.h>
@@ -349,7 +350,8 @@ static void execute_read_request(GuestContext *ctx, const OrbisKernelAioRWReques
     size_t nbyte = (size_t)req->nbyte;
     off_t offset = (off_t)req->offset;
 
-    ssize_t ret = pread(fd, buf, nbyte, offset);
+    ssize_t ret;
+    PS4_HITCH_TIMED(PS4_HITCH_IO, ret = pread(fd, buf, nbyte, offset));
 
     if (req->result) {
         OrbisKernelAioResult *res = (OrbisKernelAioResult *)(ctx->mem_base + req->result);

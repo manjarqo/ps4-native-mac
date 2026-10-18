@@ -16,6 +16,7 @@
 
 #include <dispatch/dispatch.h>
 #include "ps4_gnm_resources.h"
+#include "ps4_hitch.h"
 
 #include <math.h>
 #include <string.h>
@@ -23,6 +24,22 @@
 #include <algorithm>
 
 namespace ps4gnm {
+
+namespace {
+// The texture cache lock; time spent waiting for it goes to the long-frame breakdown (texlock).
+struct TimedLock {
+    std::mutex& m;
+    explicit TimedLock(std::mutex& mu) : m(mu) {
+        if (m.try_lock()) return;
+        const uint64_t t0 = ps4_hitch_now_ns();
+        m.lock();
+        ps4_hitch_add_ns(PS4_HITCH_TEXLOCK, ps4_hitch_now_ns() - t0);
+    }
+    ~TimedLock() { m.unlock(); }
+    TimedLock(const TimedLock&) = delete;
+    TimedLock& operator=(const TimedLock&) = delete;
+};
+} // namespace
 
 // -------------------------------------------------------------------------------------
 // small helpers (C++17: no <bit>)
@@ -2787,7 +2804,7 @@ TextureCache::~TextureCache() {
 }
 
 void TextureCache::Clear() {
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     for (auto& kv : entries_) delete kv.second;
     entries_.clear();
     gpu_index_entries_ = ~size_t(0);
@@ -2910,7 +2927,7 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
     if (!img.valid || img.address == 0 || img.pixel.mtl_format == 0 || !device_) return nil;
     const SurfaceDesc sd = img.ToSurfaceDesc();
     if (sd.bpp == 0) return nil;
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
 
     const bool is3d = img.mtl_texture_type == MTLTextureType3D;
     const uint32_t width = img.width;
@@ -3074,7 +3091,7 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
 
 id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_from_guest) {
     if (!cb.bound || cb.mtl_format == 0 || !device_) return nil;
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     const uint32_t w = (cb.extent_width && cb.extent_width <= cb.pitch) ? cb.extent_width : cb.pitch;
     const uint32_t h = (cb.extent_height && cb.extent_height <= cb.height + 64) ? cb.extent_height : cb.height;
     const uint32_t layers = cb.num_slices;
@@ -3139,7 +3156,7 @@ id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_fro
 id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from) {
     if (grown_from) *grown_from = nil;
     if (!db.bound || db.mtl_format == 0 || !device_) return nil;
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     const uint64_t addr = db.z_read_address ? db.z_read_address : db.stencil_read_address;
     const uint32_t dw = (db.extent_width && db.extent_width <= db.pitch) ? db.extent_width : db.pitch;
     const uint32_t dh = (db.extent_height && db.extent_height <= db.height) ? db.extent_height : db.height;
@@ -3201,7 +3218,7 @@ id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture
 }
 
 void TextureCache::InvalidateRange(uint64_t addr, uint64_t size, bool include_rts, uint64_t write_epoch) {
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     const uint64_t end = addr + size;
     for (auto& kv : entries_) {
         Entry* e = kv.second;
@@ -3235,7 +3252,7 @@ void TextureCache::InvalidateWrites(std::vector<WriteRange>& w) {
     w.resize(n);
     std::vector<uint64_t> max_end(n); // max end of w[0..i]
     for (size_t i = 0; i < n; ++i) max_end[i] = std::max(i ? max_end[i - 1] : 0, w[i].addr + w[i].size);
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     for (auto& kv : entries_) {
         Entry* e = kv.second;
         if (e->kind != Entry::Sampled) continue;
@@ -3255,7 +3272,7 @@ void TextureCache::InvalidateWrites(std::vector<WriteRange>& w) {
 }
 
 id<MTLTexture> TextureCache::FindColorTarget(uint64_t address) const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     auto range = entries_.equal_range(address);
     for (auto it = range.first; it != range.second; ++it)
         if (it->second->kind == Entry::Color) return it->second->tex;
@@ -3263,7 +3280,7 @@ id<MTLTexture> TextureCache::FindColorTarget(uint64_t address) const {
 }
 
 id<MTLTexture> TextureCache::FindColorTarget(uint64_t address, uint32_t width, uint32_t height) const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     auto range = entries_.equal_range(address);
     for (auto it = range.first; it != range.second; ++it) {
         const Entry* e = it->second;
@@ -3274,7 +3291,7 @@ id<MTLTexture> TextureCache::FindColorTarget(uint64_t address, uint32_t width, u
 
 id<MTLTexture> TextureCache::FindDepthSibling(const DepthTarget& db, id<MTLTexture> self) const {
     if (!self) return nil;
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     const uint64_t addr = db.z_read_address ? db.z_read_address : db.stencil_read_address;
     auto range = entries_.equal_range(addr);
     for (auto it = range.first; it != range.second; ++it) {
@@ -3287,7 +3304,7 @@ id<MTLTexture> TextureCache::FindDepthSibling(const DepthTarget& db, id<MTLTextu
 }
 
 id<MTLTexture> TextureCache::FindDepthTarget(uint64_t address) const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     auto range = entries_.equal_range(address);
     for (auto it = range.first; it != range.second; ++it)
         if (it->second->kind == Entry::Depth) return it->second->tex;
@@ -3297,7 +3314,7 @@ id<MTLTexture> TextureCache::FindDepthTarget(uint64_t address) const {
 bool TextureCache::CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, id<MTLTexture>* src_out,
                                    id<MTLTexture>* dst_out, int* kind_out) {
     if (!device_ || src_addr == dst_addr) return false;
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     Entry* s = nullptr;
     auto range = entries_.equal_range(src_addr);
     for (auto it = range.first; it != range.second; ++it) {
@@ -3352,7 +3369,7 @@ bool TextureCache::CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, id<MTLT
 void TextureCache::ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<MTLTexture> tex)) const {
     std::vector<std::pair<uint64_t, std::pair<int, id<MTLTexture>>>> v;
     {
-        std::lock_guard<std::mutex> lk(mutex_);
+        TimedLock lk(mutex_);
         for (const auto& kv : entries_)
             if (kv.second->kind != Entry::Sampled && kv.second->tex)
                 v.push_back({kv.second->address, {(int)kv.second->kind, kv.second->tex}});
@@ -3361,7 +3378,7 @@ void TextureCache::ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<M
 }
 
 bool TextureCache::OverlapsGpuTexture(uint64_t addr, uint64_t size) const {
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     if (gpu_index_entries_ != entries_.size()) {
         gpu_ranges_.clear();
         for (const auto& kv : entries_) {
@@ -3387,7 +3404,7 @@ id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img) {
         return nil;
     const SurfaceDesc sd = img.ToSurfaceDesc();
     if (sd.bpp == 0) return nil;
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     const uint32_t width = img.width, height = img.height;
     const bool is_array = img.mtl_texture_type == MTLTextureType2DArray ||
                           img.mtl_texture_type == MTLTextureTypeCube ||
@@ -3487,7 +3504,7 @@ static bool ReadTextureBytes(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLTex
 bool TextureCache::ReadTextureBGRA8(id<MTLTexture> tex, DataFormat, NumberFormat, CompMapping,
                                     std::vector<uint8_t>* out) {
     if (!tex || !out) return false;
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     WaitIdleLocked();
     std::vector<uint8_t> raw;
     uint32_t row;
@@ -3500,7 +3517,7 @@ bool TextureCache::ReadTextureBGRA8(id<MTLTexture> tex, DataFormat, NumberFormat
 }
 
 bool TextureCache::WriteBackColorTarget(uint64_t address) {
-    std::lock_guard<std::mutex> lk(mutex_);
+    TimedLock lk(mutex_);
     Entry* e = nullptr;
     auto range = entries_.equal_range(address);
     for (auto it = range.first; it != range.second; ++it)

@@ -1734,3 +1734,19 @@ xmm_reg_t recomp_vaeskeygenassist(xmm_reg_t s, uint8_t rcon) {
   res.u32[3] = aes_rotword(sw3) ^ (uint32_t)rcon;
   return res;
 }
+
+// ---- Long-frame counters (ps4_hitch.h) ---------------------------------------------------
+#include "ps4_hitch.h"
+#include <stdatomic.h>
+
+static _Atomic uint64_t g_hitch_ns[PS4_HITCH_KINDS];
+
+uint64_t ps4_hitch_now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+void ps4_hitch_add_ns(int kind, uint64_t ns) {
+  if ((unsigned)kind < PS4_HITCH_KINDS) atomic_fetch_add_explicit(&g_hitch_ns[kind], ns, memory_order_relaxed);
+}
+
+uint64_t ps4_hitch_take_ns(int kind) {
+  return (unsigned)kind < PS4_HITCH_KINDS ? atomic_exchange_explicit(&g_hitch_ns[kind], 0, memory_order_relaxed) : 0;
+}
