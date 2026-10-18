@@ -267,25 +267,32 @@ int32_t sceVideoOutSubmitFlip(GuestContext *ctx, int32_t handle, int32_t bufferI
     pthread_mutex_lock(&vh->mutex);
     pthread_mutex_unlock(&g_video_table_mutex);
 
-    if (bufferIndex < 0 || bufferIndex >= vh->bufferCount) {
+    if (bufferIndex != -1 && (bufferIndex < 0 || bufferIndex >= vh->bufferCount)) {
         pthread_mutex_unlock(&vh->mutex);
         return -EINVAL;
     }
 
-    uint64_t guest_buf_vaddr = vh->buffers[bufferIndex];
-    if (ctx && guest_buf_vaddr != 0) {
-        const void *pixels = ctx->mem_base + guest_buf_vaddr;
-        int width = vh->attr.width > 0 ? (int)vh->attr.width : 1920;
-        int height = vh->attr.height > 0 ? (int)vh->attr.height : 1080;
-        size_t pitch = vh->attr.pixelPitch > 0 ? (size_t)vh->attr.pixelPitch * 4 : (size_t)width * 4;
+    if (bufferIndex >= 0 && bufferIndex < vh->bufferCount) {
+        uint64_t guest_buf_vaddr = vh->buffers[bufferIndex];
+        if (ctx && guest_buf_vaddr != 0) {
+            const void *pixels = ctx->mem_base + guest_buf_vaddr;
+            int width = vh->attr.width > 0 ? (int)vh->attr.width : 1920;
+            int height = vh->attr.height > 0 ? (int)vh->attr.height : 1080;
+            size_t pitch = vh->attr.pixelPitch > 0 ? (size_t)vh->attr.pixelPitch * 4 : (size_t)width * 4;
 
-        fprintf(stderr, "[videoout] Presenting frame %lld (buffer %d, %dx%d)\n", (long long)flipArg, bufferIndex, width, height);
-        ps4_metal_screen_present_frame(pixels, pitch, width, height);
+            fprintf(stderr, "[videoout] Presenting frame %lld (buffer %d, %dx%d)\n", (long long)flipArg, bufferIndex, width, height);
+            ps4_metal_screen_present_frame(pixels, pitch, width, height);
+        }
     }
 
     vh->flipStatus.num++;
     vh->flipStatus.flipArg = flipArg;
     vh->flipStatus.currentBuffer = bufferIndex;
+    vh->flipStatus.numFlipPending = 0;
+    vh->flipStatus.numGpuFlipPending = 0;
+
+    fprintf(stderr, "[videoout] sceVideoOutSubmitFlip: handle=%d buf=%d flipQueueReg=%d (num=%llu)\n",
+            handle, bufferIndex, vh->flipQueueRegistered, (unsigned long long)vh->flipStatus.num);
 
     if (vh->flipQueueRegistered) {
         ps4_equeue_post_event(vh->flipQueue, 0x6, ORBIS_KERNEL_EVFILT_VIDEO_OUT, (flipArg << 16) | ((uint64_t)handle & 0xffff), vh->flipQueueUdata);
@@ -307,6 +314,8 @@ int32_t sceVideoOutGetFlipStatus(int32_t handle, OrbisVideoOutFlipStatus *status
 
     pthread_mutex_lock(&vh->mutex);
     *status = vh->flipStatus;
+    fprintf(stderr, "[videoout] sceVideoOutGetFlipStatus: handle=%d num=%llu currentBuf=%d\n",
+            handle, (unsigned long long)vh->flipStatus.num, vh->flipStatus.currentBuffer);
     pthread_mutex_unlock(&vh->mutex);
 
     pthread_mutex_unlock(&g_video_table_mutex);
@@ -417,8 +426,17 @@ int32_t sceVideoOutGetResolutionStatus(int32_t handle, OrbisVideoOutResolutionSt
 }
 
 int32_t sceVideoOutIsFlipPending(int32_t handle) {
-    (void)handle;
-    return 0;
+    pthread_mutex_lock(&g_video_table_mutex);
+    VideoOutHandle *vh = find_video_handle_locked(handle);
+    if (!vh) {
+        pthread_mutex_unlock(&g_video_table_mutex);
+        return 0;
+    }
+    pthread_mutex_lock(&vh->mutex);
+    int32_t pending = vh->flipStatus.numFlipPending;
+    pthread_mutex_unlock(&vh->mutex);
+    pthread_mutex_unlock(&g_video_table_mutex);
+    return pending;
 }
 
 int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t setIndex) {

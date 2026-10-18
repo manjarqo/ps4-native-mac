@@ -25,6 +25,12 @@ typedef struct RecompModuleExport {
   uint64_t addr;
 } RecompModuleExport;
 
+typedef struct RecompModuleSegment {
+  uint64_t addr;
+  uint64_t size;
+  int32_t prot;
+} RecompModuleSegment;
+
 typedef struct RecompModuleUnwindInfo {
   const char *name;
   uint64_t start_addr;
@@ -35,6 +41,8 @@ typedef struct RecompModuleUnwindInfo {
   uint64_t eh_frame_hdr_size;
   uint64_t eh_frame_addr;
   uint64_t eh_frame_size;
+  uint32_t num_segments;
+  RecompModuleSegment segments[4];
 } RecompModuleUnwindInfo;
 
 void recomp_module_register(const char *filename,
@@ -43,6 +51,7 @@ void recomp_module_register_init(const char *filename, const uint64_t *inits,
                                  size_t count);
 void recomp_module_register_unwind_info(const RecompModuleUnwindInfo *info);
 const RecompModuleUnwindInfo *recomp_module_find_by_addr(uint64_t addr);
+const RecompModuleUnwindInfo *recomp_module_find_by_handle(int32_t handle);
 void recomp_register_guest_modules(void);
 void recomp_module_start(GuestContext *ctx, int32_t handle);
 uint64_t recomp_resolve_symbol(const char *module_name, const char *symbol);

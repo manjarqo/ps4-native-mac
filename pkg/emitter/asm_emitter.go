@@ -824,6 +824,25 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 		if endAddr == 0 {
 			endAddr = e.elf.MaxVAddr
 		}
+		numSegs := len(e.elf.Segments)
+		if numSegs > 4 {
+			numSegs = 4
+		}
+		var segsInit strings.Builder
+		for si := 0; si < numSegs; si++ {
+			s := e.elf.Segments[si]
+			prot := 0
+			if s.Flags&1 != 0 {
+				prot |= 1
+			}
+			if s.Flags&2 != 0 {
+				prot |= 2
+			}
+			if s.Flags&4 != 0 {
+				prot |= 4
+			}
+			fmt.Fprintf(&segsInit, "            { .addr = 0x%xULL, .size = 0x%xULL, .prot = %d },\n", s.Vaddr, s.Memsz, prot)
+		}
 		fmt.Fprintf(w, "    static const RecompModuleUnwindInfo eboot_unwind = {\n"+
 			"        .name = %q,\n"+
 			"        .start_addr = 0x%xULL,\n"+
@@ -834,10 +853,14 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 			"        .eh_frame_hdr_size = 0x%xULL,\n"+
 			"        .eh_frame_addr = 0x%xULL,\n"+
 			"        .eh_frame_size = 0x%xULL,\n"+
+			"        .num_segments = %d,\n"+
+			"        .segments = {\n%s"+
+			"        },\n"+
 			"    };\n"+
 			"    recomp_module_register_unwind_info(&eboot_unwind);\n",
 			mainName, startAddr, endAddr, e.elf.Seg0Addr, e.elf.Seg0Size,
-			e.elf.EHFrameHdrAddr, e.elf.EHFrameHdrSize, e.elf.EHFrameAddr, e.elf.EHFrameSize)
+			e.elf.EHFrameHdrAddr, e.elf.EHFrameHdrSize, e.elf.EHFrameAddr, e.elf.EHFrameSize,
+			numSegs, segsInit.String())
 	}
 
 	for i, mod := range e.Modules {
@@ -847,6 +870,25 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 			if len(mod.Init) > 0 {
 				fmt.Fprintf(w, "    recomp_module_register_init(%q, recomp_module_init_%d, %d);\n", name, i, len(mod.Init))
 			}
+		}
+		modNumSegs := len(mod.Segments)
+		if modNumSegs > 4 {
+			modNumSegs = 4
+		}
+		var modSegsInit strings.Builder
+		for si := 0; si < modNumSegs; si++ {
+			s := mod.Segments[si]
+			prot := 0
+			if s.Flags&1 != 0 {
+				prot |= 1
+			}
+			if s.Flags&2 != 0 {
+				prot |= 2
+			}
+			if s.Flags&4 != 0 {
+				prot |= 4
+			}
+			fmt.Fprintf(&modSegsInit, "            { .addr = 0x%xULL, .size = 0x%xULL, .prot = %d },\n", s.Vaddr, s.Memsz, prot)
 		}
 		fmt.Fprintf(w, "    static const RecompModuleUnwindInfo mod_%d_unwind = {\n"+
 			"        .name = %q,\n"+
@@ -858,10 +900,14 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 			"        .eh_frame_hdr_size = 0x%xULL,\n"+
 			"        .eh_frame_addr = 0x%xULL,\n"+
 			"        .eh_frame_size = 0x%xULL,\n"+
+			"        .num_segments = %d,\n"+
+			"        .segments = {\n%s"+
+			"        },\n"+
 			"    };\n"+
 			"    recomp_module_register_unwind_info(&mod_%d_unwind);\n",
 			i, mod.FileName, mod.StartAddr, mod.EndAddr, mod.Seg0Addr, mod.Seg0Size,
-			mod.EHFrameHdrAddr, mod.EHFrameHdrSize, mod.EHFrameAddr, mod.EHFrameSize, i)
+			mod.EHFrameHdrAddr, mod.EHFrameHdrSize, mod.EHFrameAddr, mod.EHFrameSize,
+			modNumSegs, modSegsInit.String(), i)
 	}
 
 	w.WriteString("}\n")

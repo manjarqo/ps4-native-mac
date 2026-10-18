@@ -373,8 +373,29 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
   }
 
   // Set up guest stack at top of low memory region (growing downwards)
+  ctx->stack_base = stack_floor;
+  ctx->stack_alloc_size = low_mem_limit - stack_floor;
   ctx->rsp = (low_mem_limit - 0x1000ULL) & ~0xFFULL;
   ctx->rbp = ctx->rsp;
+
+  // Register main thread stack extent in VM extents
+  GuestVMExtent *stack_extent = (GuestVMExtent *)calloc(1, sizeof(GuestVMExtent));
+  if (stack_extent) {
+    stack_extent->addr = stack_floor;
+    stack_extent->size = low_mem_limit - stack_floor;
+    stack_extent->is_free = false;
+    stack_extent->prot = PROT_READ | PROT_WRITE;
+    strncpy(stack_extent->name, "main_stack", sizeof(stack_extent->name) - 1);
+    GuestVMExtent *tail = ctx->vm_extents;
+    while (tail && tail->next)
+      tail = tail->next;
+    if (tail) {
+      tail->next = stack_extent;
+      stack_extent->prev = tail;
+    } else {
+      ctx->vm_extents = stack_extent;
+    }
+  }
 
   ctx->thread_id = 1000;
   recomp_init_main_thread(ctx);
@@ -1114,7 +1135,7 @@ void recomp_free_thread_context(GuestContext *ctx) {
   if (!ctx)
     return;
   GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
-  if (ctx->stack_base && ctx->stack_alloc_size > 0) {
+  if (ctx->stack_base && ctx->stack_alloc_size > 0 && ctx != proc) {
     recomp_vm_free(proc, ctx->stack_base, ctx->stack_alloc_size);
   }
   free(ctx);

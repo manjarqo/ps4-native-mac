@@ -29,11 +29,15 @@ typedef struct RecompThread {
   bool detached;
   int cancel_state;
   PthreadCleanupEntry *cleanup_stack;
+  uint64_t stack_base;
+  uint64_t stack_size;
   struct RecompThread *next;
 } RecompThread;
 
 void recomp_init_main_thread(GuestContext *ctx);
 RecompThread *recomp_find_thread(uint64_t handle);
+const char *recomp_get_current_thread_name(void);
+void shim_sceKernelIsStack(GuestContext *ctx);
 
 // POSIX Pthread shims
 void shim_pthread_create(GuestContext *ctx);

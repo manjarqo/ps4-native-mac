@@ -859,6 +859,7 @@ func loadCompanionModules(cfg *Config, main *elfloader.LoadedELF) ([]emitter.Gue
 			EHFrameHdrSize: mod.EHFrameHdrSize,
 			EHFrameAddr:    mod.EHFrameAddr,
 			EHFrameSize:    mod.EHFrameSize,
+			Segments:       mod.Segments,
 		})
 		fmt.Printf("             Linked module %s (%d exports, load 0x%x-0x%x)\n",
 			mod.FileName, len(exports), mod.MinVAddr, mod.MaxVAddr)

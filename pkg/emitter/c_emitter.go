@@ -31,6 +31,7 @@ type GuestModule struct {
 	EHFrameHdrSize uint64
 	EHFrameAddr    uint64
 	EHFrameSize    uint64
+	Segments       []*elfloader.Segment
 }
 
 // CEmitter emits C source files from disassembled functions.

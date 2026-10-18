@@ -636,25 +636,34 @@ typedef struct OrbisKernelModuleSegmentInfo {
     int32_t prot;
 } OrbisKernelModuleSegmentInfo;
 
-typedef struct OrbisKernelModuleInfoEx {
-    size_t size;
+typedef struct OrbisKernelModuleInfo {
+    uint64_t st_size;
     char name[256];
-    int32_t handle;
-    uint32_t flags;
+    OrbisKernelModuleSegmentInfo segments[4];
+    uint32_t num_segments;
+    uint8_t fingerprint[20];
+} OrbisKernelModuleInfo;
+
+typedef struct OrbisKernelModuleInfoEx {
+    uint64_t st_size;
+    char name[256];
+    int32_t id;
+    uint32_t tls_index;
     uint64_t tls_init_addr;
     uint32_t tls_init_size;
     uint32_t tls_size;
     uint32_t tls_offset;
     uint32_t tls_align;
-    uint64_t init_addr;
-    uint64_t fini_addr;
+    uint64_t init_proc_addr;
+    uint64_t fini_proc_addr;
+    uint64_t reserved1;
+    uint64_t reserved2;
     uint64_t eh_frame_hdr_addr;
     uint64_t eh_frame_addr;
     uint32_t eh_frame_hdr_size;
     uint32_t eh_frame_size;
     OrbisKernelModuleSegmentInfo segments[4];
-    uint32_t num_segments;
-    uint8_t fingerprint[20];
+    uint32_t segment_count;
 } OrbisKernelModuleInfoEx;
 
 typedef struct OrbisModuleInfoForUnwind {
@@ -667,31 +676,81 @@ typedef struct OrbisModuleInfoForUnwind {
     uint64_t seg0_size;
 } OrbisModuleInfoForUnwind;
 
+static void populate_segments(const RecompModuleUnwindInfo *mod, OrbisKernelModuleSegmentInfo *segs, uint32_t *count) {
+    if (mod && mod->num_segments > 0) {
+        *count = mod->num_segments > 4 ? 4 : mod->num_segments;
+        for (uint32_t i = 0; i < *count; i++) {
+            segs[i].address = mod->segments[i].addr;
+            segs[i].size = (uint32_t)mod->segments[i].size;
+            segs[i].prot = mod->segments[i].prot;
+        }
+        return;
+    }
+    if (mod && mod->start_addr == 0 && mod->end_addr >= 0x2200000ULL) {
+        // eboot.bin default segments (Code R-X, Rodata R--, Data/BSS RW-)
+        segs[0].address = mod->seg0_addr ? mod->seg0_addr : 0x0ULL;
+        segs[0].size = mod->seg0_size ? (uint32_t)mod->seg0_size : 0x1e07508;
+        segs[0].prot = 5; // PF_R | PF_X
+        segs[1].address = 0x2000000ULL;
+        segs[1].size = 0x71a50;
+        segs[1].prot = 4; // PF_R
+        segs[2].address = 0x2200000ULL;
+        segs[2].size = (uint32_t)(mod->end_addr - 0x2200000ULL);
+        segs[2].prot = 6; // PF_R | PF_W
+        *count = 3;
+        return;
+    }
+    if (mod) {
+        segs[0].address = mod->seg0_addr ? mod->seg0_addr : mod->start_addr;
+        segs[0].size = mod->seg0_size ? (uint32_t)mod->seg0_size : (uint32_t)(mod->end_addr - mod->start_addr);
+        segs[0].prot = 5;
+        *count = 1;
+        if (mod->end_addr > segs[0].address + segs[0].size) {
+            segs[1].address = segs[0].address + segs[0].size;
+            segs[1].size = (uint32_t)(mod->end_addr - segs[1].address);
+            segs[1].prot = 6;
+            *count = 2;
+        }
+        return;
+    }
+    // Fallback if mod is not found
+    segs[0].address = 0x0ULL;
+    segs[0].size = 0x1e07508;
+    segs[0].prot = 5;
+    segs[1].address = 0x2000000ULL;
+    segs[1].size = 0x71a50;
+    segs[1].prot = 4;
+    segs[2].address = 0x2200000ULL;
+    segs[2].size = 0x1e6820;
+    segs[2].prot = 6;
+    *count = 3;
+}
+
 static int fill_module_info_ex(GuestContext *ctx, uint64_t addr, uint64_t info_addr) {
     if (!info_addr || !ctx->mem_base) return 0x8002000e; // ORBIS_KERNEL_ERROR_EFAULT
     const RecompModuleUnwindInfo *mod = recomp_module_find_by_addr(addr);
     OrbisKernelModuleInfoEx *info = (OrbisKernelModuleInfoEx *)(ctx->mem_base + info_addr);
     memset(info, 0, sizeof(*info));
-    info->size = sizeof(OrbisKernelModuleInfoEx);
+    info->st_size = sizeof(OrbisKernelModuleInfoEx);
     if (mod && mod->name) {
         snprintf(info->name, sizeof(info->name), "%s", mod->name);
     } else {
         snprintf(info->name, sizeof(info->name), "eboot.bin");
     }
-    info->handle = 1;
+    info->id = 1;
     if (mod) {
         info->eh_frame_hdr_addr = mod->eh_frame_hdr_addr;
         info->eh_frame_hdr_size = (uint32_t)mod->eh_frame_hdr_size;
         info->eh_frame_addr = mod->eh_frame_addr;
         info->eh_frame_size = (uint32_t)mod->eh_frame_size;
-        info->segments[0].address = mod->seg0_addr ? mod->seg0_addr : mod->start_addr;
-        info->segments[0].size = mod->seg0_size ? (uint32_t)mod->seg0_size : (uint32_t)(mod->end_addr - mod->start_addr);
-    } else {
-        info->segments[0].address = 0x400000ULL;
-        info->segments[0].size = 0x10000000ULL;
     }
-    info->segments[0].prot = 7;
-    info->num_segments = 1;
+    populate_segments(mod, info->segments, &info->segment_count);
+    fprintf(stderr, "[ps4-kernel] GetModuleInfoFromAddr: addr=0x%llx -> mod=%s, num_segments=%u\n",
+            (unsigned long long)addr, info->name, info->segment_count);
+    for (uint32_t i = 0; i < info->segment_count; i++) {
+        fprintf(stderr, "    seg[%u]: addr=0x%llx, size=0x%x, prot=%d\n",
+                i, (unsigned long long)info->segments[i].address, info->segments[i].size, info->segments[i].prot);
+    }
     return 0;
 }
 
@@ -700,15 +759,72 @@ void shim_sceKernelInternalMemoryGetModuleSegmentInfo(GuestContext *ctx) {
     if (seg_out && ctx->mem_base) {
         const RecompModuleUnwindInfo *mod = recomp_module_find_by_addr(ctx->rsi);
         OrbisKernelModuleSegmentInfo *seg = (OrbisKernelModuleSegmentInfo *)(ctx->mem_base + seg_out);
-        if (mod) {
-            seg->address = mod->seg0_addr ? mod->seg0_addr : mod->start_addr;
-            seg->size = mod->seg0_size ? (uint32_t)mod->seg0_size : (uint32_t)(mod->end_addr - mod->start_addr);
-        } else {
-            seg->address = 0x400000ULL;
-            seg->size = 0x10000000ULL;
+        uint32_t count = 0;
+        OrbisKernelModuleSegmentInfo segs[4];
+        populate_segments(mod, segs, &count);
+        if (count > 0) {
+            *seg = segs[0];
         }
-        seg->prot = 7;
     }
+    ctx->rax = 0;
+    SHIM_RETURN();
+}
+
+void shim_sceKernelGetModuleInfo(GuestContext *ctx) {
+    int32_t handle = (int32_t)ctx->rdi;
+    uint64_t info_addr = ctx->rsi;
+    if (!info_addr || !ctx->mem_base) {
+        ctx->rax = (uint64_t)(int64_t)0x8002000e; // ORBIS_KERNEL_ERROR_EFAULT
+        SHIM_RETURN();
+    }
+    const RecompModuleUnwindInfo *mod = recomp_module_find_by_handle(handle);
+    if (!mod) {
+        ctx->rax = (uint64_t)(int64_t)0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
+        SHIM_RETURN();
+    }
+    OrbisKernelModuleInfo *info = (OrbisKernelModuleInfo *)(ctx->mem_base + info_addr);
+    memset(info, 0, sizeof(*info));
+    info->st_size = sizeof(OrbisKernelModuleInfo);
+    if (mod->name) {
+        snprintf(info->name, sizeof(info->name), "%s", mod->name);
+    } else {
+        snprintf(info->name, sizeof(info->name), "eboot.bin");
+    }
+    populate_segments(mod, info->segments, &info->num_segments);
+    ctx->rax = 0;
+    SHIM_RETURN();
+}
+
+void shim_sceKernelGetModuleInfo2(GuestContext *ctx) {
+    shim_sceKernelGetModuleInfo(ctx);
+}
+
+void shim_sceKernelGetModuleInfoInternal(GuestContext *ctx) {
+    int32_t handle = (int32_t)ctx->rdi;
+    uint64_t info_addr = ctx->rsi;
+    if (!info_addr || !ctx->mem_base) {
+        ctx->rax = (uint64_t)(int64_t)0x8002000e; // ORBIS_KERNEL_ERROR_EFAULT
+        SHIM_RETURN();
+    }
+    const RecompModuleUnwindInfo *mod = recomp_module_find_by_handle(handle);
+    if (!mod) {
+        ctx->rax = (uint64_t)(int64_t)0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
+        SHIM_RETURN();
+    }
+    OrbisKernelModuleInfoEx *info = (OrbisKernelModuleInfoEx *)(ctx->mem_base + info_addr);
+    memset(info, 0, sizeof(*info));
+    info->st_size = sizeof(OrbisKernelModuleInfoEx);
+    if (mod->name) {
+        snprintf(info->name, sizeof(info->name), "%s", mod->name);
+    } else {
+        snprintf(info->name, sizeof(info->name), "eboot.bin");
+    }
+    info->id = handle;
+    info->eh_frame_hdr_addr = mod->eh_frame_hdr_addr;
+    info->eh_frame_hdr_size = (uint32_t)mod->eh_frame_hdr_size;
+    info->eh_frame_addr = mod->eh_frame_addr;
+    info->eh_frame_size = (uint32_t)mod->eh_frame_size;
+    populate_segments(mod, info->segments, &info->segment_count);
     ctx->rax = 0;
     SHIM_RETURN();
 }
