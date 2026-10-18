@@ -1046,14 +1046,32 @@ void shim___tls_get_addr(GuestContext *ctx) {
 #include <mach/mach.h>
 #include <time.h>
 #include <mach/mach_vm.h>
+#include <pthread/qos.h>
 #include "ps4_stall_profile.h"
 
 static StallProfile *g_stall_prof;
 static uint64_t g_prof_for; // present time of the stall being profiled (0: none)
+// Profile slot of every guest thread sampled in the current stall, by thread id, so threads
+// created or exiting during the stall do not shift the slots of the others. Watchdog only.
+static uint64_t g_prof_slot_ids[STALL_PROFILE_MAX_THREADS];
+static int g_prof_nslots;
 
-// dladdr scans the ~64k local symbols of the executable linearly (~60 us per call), which
-// would make one sampling round of all threads take ~10 ms instead of fitting in the 1 ms
-// period. Results are cached per pc in a fixed table; only the watchdog thread uses it.
+static void stall_profile_begin(void) {
+  stall_profile_reset(g_stall_prof);
+  g_prof_nslots = 0;
+}
+
+static int stall_profile_slot(uint64_t thread_id) {
+  for (int i = 0; i < g_prof_nslots; i++)
+    if (g_prof_slot_ids[i] == thread_id) return i;
+  if (g_prof_nslots == STALL_PROFILE_MAX_THREADS) return -1;
+  g_prof_slot_ids[g_prof_nslots] = thread_id;
+  return g_prof_nslots++;
+}
+
+// dladdr scans the ~64k local symbols of the executable linearly (~60 us per call); a report
+// symbolizes up to 8 pcs of every stored sample, so results are cached per pc in a fixed table.
+// Only the watchdog thread uses it.
 #define STALL_SYM_CACHE 16384
 static struct {
   uint64_t pc, start;
@@ -1081,6 +1099,7 @@ static int stall_symbolize(uint64_t pc, uint64_t *start, const char **name) {
 static void stall_profile_sample_all(void) {
   struct {
     pthread_t th;
+    uint64_t id;
     char name[32];
   } list[STALL_PROFILE_MAX_THREADS];
   int n = 0;
@@ -1088,6 +1107,7 @@ static void stall_profile_sample_all(void) {
   for (RecompThread *t = g_threads; t && n < STALL_PROFILE_MAX_THREADS; t = t->next) {
     if (t->finished || !t->ctx) continue;
     list[n].th = t->host_thread;
+    list[n].id = t->thread_id;
     snprintf(list[n].name, sizeof(list[n].name), "%s", t->name[0] ? t->name : "unnamed");
     n++;
   }
@@ -1115,7 +1135,7 @@ static void stall_profile_sample_all(void) {
       }
     }
     thread_resume(port);
-    if (np) stall_profile_add(g_stall_prof, i, list[i].name, pcs, np);
+    if (np) stall_profile_add(g_stall_prof, stall_profile_slot(list[i].id), list[i].name, pcs, np);
   }
 }
 
@@ -1149,27 +1169,42 @@ static long g_stall_dump_ms, g_stall_prof_ms;
 
 static void *stall_watchdog_main(void *arg) {
   (void)arg;
+  // Sampling must keep its 1 ms period while the game keeps every core busy.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   const uint64_t dump_ns = (uint64_t)g_stall_dump_ms * 1000000ull;
   const uint64_t prof_ns = (uint64_t)g_stall_prof_ms * 1000000ull;
   uint64_t reported_for = 0;
+  uint64_t prev_wake = 0, max_gap = 0; // max_gap: longest time between wake-ups of this stall
+  // Wake-ups follow fixed deadlines, so the time a sampling round takes does not stretch the period.
+  const uint64_t period_ns = prof_ns ? 1000000ull : 5000000ull;
+  uint64_t deadline = stall_now_ns();
   for (;;) {
-    usleep(prof_ns ? 1000 : 5000);
+    deadline += period_ns;
+    const uint64_t before = stall_now_ns();
+    if (deadline > before)
+      usleep((useconds_t)((deadline - before) / 1000));
+    else
+      deadline = before; // a round overran the period: do not try to catch up
     const uint64_t last = g_last_present_ns;
     if (!last) continue;
     const uint64_t now = stall_now_ns();
+    if (g_prof_for && prev_wake && now - prev_wake > max_gap) max_gap = now - prev_wake;
+    prev_wake = now;
     if (dump_ns && now - last > dump_ns && reported_for != last) {
       reported_for = last;
       stall_dump_threads((double)(now - last) / 1e6);
     }
     if (!prof_ns) continue;
     if (g_prof_for && g_prof_for != last) { // a frame ended the stall being profiled
-      stall_profile_report(g_stall_prof, stderr, (double)(last - g_prof_for) / 1e6, 6);
+      stall_profile_report_gap(g_stall_prof, stderr, (double)(last - g_prof_for) / 1e6, 6, (double)max_gap / 1e6);
       g_prof_for = 0;
+      prev_wake = deadline = stall_now_ns(); // the report itself is not a gap of the next stall
     }
     if (now - last > prof_ns) {
       if (g_prof_for != last) {
-        stall_profile_reset(g_stall_prof);
+        stall_profile_begin();
         g_prof_for = last;
+        max_gap = 0;
       }
       stall_profile_sample_all();
     }
@@ -1186,6 +1221,8 @@ void ps4_stall_watchdog_note_present(void) {
     const char *p = getenv("PS4_STALL_PROFILE");
     g_stall_dump_ms = e ? atol(e) : 0;
     g_stall_prof_ms = p ? atol(p) : 0;
+    if (g_stall_dump_ms < 0) g_stall_dump_ms = 0;
+    if (g_stall_prof_ms < 0) g_stall_prof_ms = 0;
     if (g_stall_prof_ms > 0) g_stall_prof = stall_profile_create(stall_symbolize);
     if (g_stall_prof_ms > 0 && !g_stall_prof) g_stall_prof_ms = 0;
     if (g_stall_dump_ms > 0 || g_stall_prof_ms > 0) {
