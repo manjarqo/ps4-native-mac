@@ -754,6 +754,19 @@ public:
     };
     id<MTLTexture> GetTextureForGpuUpload(const ImageDesc& img, uint64_t write_epoch, uint64_t upload_epoch,
                                           GpuUpload* up);
+    // Like GetTexture, but a texture that needs an upload from guest memory (new or stale)
+    // whose surface is at least min_bytes is not uploaded by the CPU: `up` is filled, the
+    // texture is marked current at upload_epoch and the caller encodes the copy on the GPU.
+    // Smaller textures are uploaded by the CPU as in GetTexture. up->tex is nil when nothing
+    // is left to do.
+    id<MTLTexture> GetTextureForGpuRefresh(const ImageDesc& img, uint64_t upload_epoch, uint64_t min_bytes,
+                                           GpuUpload* up);
+    // A texture handed out for a GPU upload whose copy could not be encoded: stale again, so
+    // the next GetTexture uploads it on the CPU.
+    void MarkStale(id<MTLTexture> tex);
+    // Debug (PS4_GNM_VERIFY_GPU_UPLOAD): CPU upload of the T#'s guest memory into `dst`, which
+    // must have the cached texture's descriptor. The cache entries are not changed.
+    bool DebugCpuUploadInto(const ImageDesc& img, id<MTLTexture> dst);
 
     // Render target / depth textures (created on first use, contents loaded from guest memory
     // once when load_from_guest is true; afterwards owned by the GPU and never re-uploaded).
@@ -828,7 +841,8 @@ private:
     struct Entry;
     bool UploadLocked(Entry* e);
     bool UploadLockedImpl(Entry* e);
-    id<MTLTexture> GetTextureImpl(const ImageDesc& img, const uint64_t* gpu_epochs, GpuUpload* up);
+    id<MTLTexture> GetTextureImpl(const ImageDesc& img, const uint64_t* gpu_epochs, GpuUpload* up,
+                                  uint64_t refresh_min_bytes = 0);
     void WaitIdleLocked();
 
     id<MTLDevice> device_;

@@ -85,7 +85,7 @@ The MSL disk cache check (`access()` in `StoreMslInDiskCache`) is replaced by a 
 
 ### 6. Texture uploads on the GPU
 
-Sampled textures larger than 256 KB that need an upload from guest memory go through the existing GPU path (compute detile + blit) before the render pass or compute encoder starts, not only when a GPU write conflicts. The CPU path stays for textures below the threshold and for layouts the GPU path does not support (it reports failure and the texture is marked stale again, so the CPU path uploads it at bind time). The threshold is `PS4_GNM_GPU_UPLOAD_MIN_KB` (0: everything on the GPU, -1: off). The GPU reads guest memory when it executes, as on the PS4. A debug mode `PS4_GNM_VERIFY_GPU_UPLOAD=1` compares the GPU result byte by byte with a CPU upload of the same memory into a scratch texture.
+Sampled textures larger than 256 KB that need an upload from guest memory are copied on the GPU (compute detile + blit) in a separate upload command buffer that is committed right before the current one, so the open render pass is not split and the texture cache is looked up once per bind. The CPU path stays for textures below the threshold and for layouts the GPU path does not support (it reports failure and the texture is marked stale again, so the CPU path uploads it at bind time). The threshold is `PS4_GNM_GPU_UPLOAD_MIN_KB` (0: everything on the GPU, -1: off). The GPU reads guest memory when it executes, as on the PS4. A debug mode `PS4_GNM_VERIFY_GPU_UPLOAD=1` compares the GPU result byte by byte with a CPU upload of the same memory into a scratch texture.
 
 ### 7. Hitches without renderer work
 

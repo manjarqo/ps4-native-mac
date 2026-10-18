@@ -400,6 +400,7 @@ struct State {
 
     // recording
     id<MTLCommandBuffer> cmd = nil;
+    id<MTLCommandBuffer> upload_cmd = nil; // GPU texture uploads for the work in cmd (committed first)
     id<MTLRenderCommandEncoder> renc = nil;
     id<MTLComputeCommandEncoder> cenc = nil;
     PassKey pass;
@@ -536,7 +537,7 @@ State S;
 struct HitchStats {
     double shader_ms = 0, gcn_ms = 0, mtl_ms = 0, pso_ms = 0, upload_ms = 0, wait_ms = 0;
     double lookup_ms = 0, fn_ms = 0; // translation cache lookup; MTLFunction creation
-    uint32_t shaders = 0, psos = 0, uploads = 0, pending_draws = 0;
+    uint32_t shaders = 0, psos = 0, uploads = 0, gpu_uploads = 0, pending_draws = 0;
 };
 HitchStats g_hitch;
 
@@ -649,6 +650,7 @@ bool HasStencil(MTLPixelFormat f);
 id<MTLTexture> DepthFromMemory(const ImageDesc& img, bool encode);
 id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode);
 id<MTLComputeCommandEncoder> ComputeEncoder();
+id<MTLTexture> SampledTexture(const ImageDesc& img);
 
 void NoteGpuWrite(uint64_t addr, uint64_t size) {
     if (!size) return;
@@ -747,6 +749,11 @@ void RunFences(uint64_t upto) {
 
 void Commit() {
     EndEncoders();
+    if (S.upload_cmd) {
+        // texture copies used by the work of S.cmd: same queue, committed first
+        [S.upload_cmd commit];
+        S.upload_cmd = nil;
+    }
     if (!S.cmd) return;
     id<MTLCommandBuffer> cb = S.cmd;
     S.cmd = nil;
@@ -1807,7 +1814,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                                                       swizzle:ToMTLSwizzle(img.view_swizzle)]
                           : mc;
             } else {
-                tex = S.tex->GetTexture(img);
+                tex = SampledTexture(img);
                 static const bool texdbg3d = getenv("PS4_GNM_TEXDBG3D") != nullptr;
                 if (texdbg3d && tex && tex.textureType == MTLTextureType3D && tex.storageMode == MTLStorageModeShared) {
                     static std::unordered_set<uint64_t> seen3d;
@@ -2319,13 +2326,12 @@ void PrepareDepthCompanions(const Shader* s, const std::vector<uint32_t>& flat) 
     }
 }
 
-// Uploads a sampled texture from guest memory on the GPU, ordered after the pending GPU work
-// that writes it (guest writes up to write_epoch): tiled surfaces are gathered into a linear
-// staging buffer by a compute kernel (per-element offsets from BuildDetileMap, cached per
-// layout), then blitted into the texture like TextureCache::UploadLocked does on the CPU.
-// Returns false if nothing was encoded and the caller must fall back to draining the GPU.
-bool GpuUploadTexture(const ImageDesc& img, uint64_t write_epoch) {
-    if (!S.detile_pso || img.address >= S.ctx->mem_size) return false;
+// Encodes the copy of a texture's guest memory into up.tex on the GPU: compute detile for tiled
+// surfaces, then blit. side == nil: into the current command buffer (ends the open encoders;
+// a barrier orders the detile after the writing dispatches). side != nil: into that command
+// buffer with its own encoders; the current encoders stay open.
+bool EncodeGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up, id<MTLCommandBuffer> side) {
+    if (!S.detile_pso || !up.tex || img.address >= S.ctx->mem_size) return false;
     const SurfaceDesc sd = img.ToSurfaceDesc();
     SurfaceLayout layout;
     if (sd.bpp == 0 || (sd.bpp & 7) || !ComputeSurfaceLayout(sd, &layout) || !layout.total_size) return false;
@@ -2335,11 +2341,7 @@ bool GpuUploadTexture(const ImageDesc& img, uint64_t write_epoch) {
     if (!GuestBuffer(img.address, avail, &gbuf, &goff)) return false;
     const bool tiled = sd.tile_mode != TileMode::DisplayLinearAligned && sd.tile_mode != TileMode::DisplayLinearGeneral;
     const uint32_t bpe = sd.bpp / 8;
-
-    TextureCache::GpuUpload up;
-    id<MTLTexture> tex = S.tex->GetTextureForGpuUpload(img, write_epoch, S.write_epoch + 1, &up);
-    if (!tex) return false;
-    if (!up.tex) return true; // already current (or a GPU-owned surface)
+    id<MTLTexture> tex = up.tex;
     if (up.surf.bpp != sd.bpp || up.layout.total_size != layout.total_size) {
         RLog("gpu-upload", "texture 0x%llx: cached layout differs from the T#", (unsigned long long)img.address);
     }
@@ -2379,22 +2381,33 @@ bool GpuUploadTexture(const ImageDesc& img, uint64_t write_epoch) {
         }
         const uint32_t count = (uint32_t)(map.length / 4);
         const uint32_t params[4] = {bpe, count, (uint32_t)avail, 0};
-        id<MTLComputeCommandEncoder> enc = ComputeEncoder();
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; // order after the writing dispatches
+        id<MTLComputeCommandEncoder> enc;
+        if (side) {
+            enc = [side computeCommandEncoder];
+        } else {
+            enc = ComputeEncoder();
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; // order after the writing dispatches
+        }
         [enc setComputePipelineState:S.detile_pso];
         [enc setBuffer:gbuf offset:goff atIndex:0];
         [enc setBuffer:staging offset:0 atIndex:1];
         [enc setBuffer:map offset:0 atIndex:2];
         [enc setBytes:params length:sizeof(params) atIndex:3];
         [enc dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        g_cstate.Reset(enc); // state set behind the dispatches' back
+        if (side) [enc endEncoding];
+        else g_cstate.Reset(enc); // state set behind the dispatches' back
         src = staging;
         src_base = 0;
         src_limit = up.layout.total_size;
     }
-    EndEncoders();
-    EnsureCmd();
-    id<MTLBlitCommandEncoder> bl = [S.cmd blitCommandEncoder];
+    id<MTLBlitCommandEncoder> bl;
+    if (side) {
+        bl = [side blitCommandEncoder];
+    } else {
+        EndEncoders();
+        EnsureCmd();
+        bl = [S.cmd blitCommandEncoder];
+    }
     const bool is3d = up.tex_type == MTLTextureType3D;
     const bool is1d = up.tex_type == MTLTextureType1D || up.tex_type == MTLTextureType1DArray;
     const NSUInteger tex_slices = (tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray)
@@ -2423,9 +2436,97 @@ bool GpuUploadTexture(const ImageDesc& img, uint64_t write_epoch) {
         }
     }
     [bl endEncoding];
-    S.pending = true;
-    LogWork("GPU texture upload");
+    if (!side) {
+        S.pending = true;
+        LogWork("GPU texture upload");
+    }
     return true;
+}
+
+// Hazard path: the texture's guest memory is written by GPU work that has not completed yet,
+// so the copy goes into the current command buffer behind that work. Returns false if nothing
+// was encoded and the caller must fall back to draining the GPU.
+bool GpuUploadTexture(const ImageDesc& img, uint64_t write_epoch) {
+    if (!S.detile_pso || img.address >= S.ctx->mem_size) return false;
+    TextureCache::GpuUpload up;
+    if (!S.tex->GetTextureForGpuUpload(img, write_epoch, S.write_epoch + 1, &up)) return false;
+    if (!up.tex) return true; // already current (or a GPU-owned surface)
+    if (EncodeGpuUpload(img, up, nil)) return true;
+    S.tex->MarkStale(up.tex);
+    return false;
+}
+
+const bool g_verify_gpu_upload = getenv("PS4_GNM_VERIFY_GPU_UPLOAD") != nullptr;
+
+// Debug: compares a GPU copy with a CPU upload of the same guest memory once the GPU is done
+// (level 0, slice 0). The game rewriting the memory between encoding and execution also shows
+// as a difference, so a single report at an address needs a second look.
+void VerifyGpuUpload(const ImageDesc& img, id<MTLTexture> tex) {
+    MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+    td.textureType = tex.textureType;
+    td.pixelFormat = tex.pixelFormat;
+    td.width = tex.width;
+    td.height = tex.height;
+    td.depth = tex.depth;
+    td.mipmapLevelCount = tex.mipmapLevelCount;
+    td.arrayLength = tex.arrayLength;
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> ref = [S.dev newTextureWithDescriptor:td];
+    if (!ref || !S.tex->DebugCpuUploadInto(img, ref)) return;
+    const uint64_t addr = img.address;
+    const uint32_t bpb = img.pixel.bytes_per_block, bw = std::max(1u, img.pixel.block_width),
+                   bh = std::max(1u, img.pixel.block_height);
+    AfterGpu([tex, ref, addr, bpb, bw, bh] {
+        const NSUInteger w = tex.width, h = tex.textureType == MTLTextureType1D ? 1 : tex.height;
+        const NSUInteger row = (w + bw - 1) / bw * bpb, rows = (h + bh - 1) / bh;
+        std::vector<uint8_t> a(row * rows), b(row * rows);
+        const MTLRegion r = MTLRegionMake3D(0, 0, 0, w, h, 1);
+        [tex getBytes:a.data() bytesPerRow:row bytesPerImage:row * rows fromRegion:r mipmapLevel:0 slice:0];
+        [ref getBytes:b.data() bytesPerRow:row bytesPerImage:row * rows fromRegion:r mipmapLevel:0 slice:0];
+        static std::atomic<uint32_t> n_same{0}, n_diff{0};
+        if (a == b) {
+            n_same++;
+        } else {
+            n_diff++;
+            fprintf(stderr, "[gnm-verify] GPU upload of 0x%llx differs from the CPU upload\n", (unsigned long long)addr);
+        }
+        if ((n_same + n_diff) % 50 == 0)
+            fprintf(stderr, "[gnm-verify] GPU uploads checked: %u equal, %u different\n", n_same.load(), n_diff.load());
+    });
+}
+
+// Sampled texture for BindStage. A large texture that needs an upload from guest memory is
+// copied on the GPU in the upload command buffer (committed before the current one): the CPU
+// detile of a big texture costs milliseconds on the encoder thread. Small textures, and copies
+// that cannot be encoded, keep the CPU upload. PS4_GNM_GPU_UPLOAD_MIN_KB: threshold (default
+// 256; 0: every size; -1: off).
+id<MTLTexture> SampledTexture(const ImageDesc& img) {
+    static const int64_t min_kb = [] {
+        const char* v = getenv("PS4_GNM_GPU_UPLOAD_MIN_KB");
+        return v ? (int64_t)atoll(v) : (int64_t)256;
+    }();
+    if (min_kb < 0 || !S.detile_pso) return S.tex->GetTexture(img);
+    TextureCache::GpuUpload up;
+    id<MTLTexture> tex =
+        S.tex->GetTextureForGpuRefresh(img, S.write_epoch + 1, std::max<uint64_t>(1, (uint64_t)min_kb << 10), &up);
+    if (!up.tex) return tex;
+    if (!S.upload_cmd) {
+        S.upload_cmd = [S.queue commandBuffer];
+        S.upload_cmd.label = @"texture uploads";
+        [S.upload_cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if (done.status == MTLCommandBufferStatusError)
+                fprintf(stderr, "[gnm-draw] texture upload command buffer failed: %s\n",
+                        done.error.localizedDescription.UTF8String);
+        }];
+    }
+    if (EncodeGpuUpload(img, up, S.upload_cmd)) {
+        g_hitch.gpu_uploads++;
+        if (g_verify_gpu_upload) VerifyGpuUpload(img, up.tex);
+        return tex;
+    }
+    S.tex->MarkStale(up.tex);
+    return S.tex->GetTexture(img);
 }
 
 // Sampled textures are uploaded from guest memory by the CPU when bound. If encoded (not yet
@@ -4715,10 +4816,10 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                 for (int k = 0; k < PS4_HITCH_KINDS; ++k) host_ms[k] = ps4_hitch_take_ns(k) / 1e6;
                 if (dt > 50.0)
                     fprintf(stderr, "[gnm-draw] hitch: frame %.1f ms; shaders %u (%.1f ms: gcn %.1f, metal %.1f, lookup %.1f, fn %.1f), pipelines %u (%.1f ms), "
-                                    "texture uploads %u (%.1f ms), gpu waits %.1f ms, draws waiting for shaders %u; "
+                                    "texture uploads %u (%.1f ms), gpu uploads %u, gpu waits %.1f ms, draws waiting for shaders %u; "
                                     "io %.1f, vm %.1f, mtlbuf %.1f, texlock %.1f, shader_fs %.1f ms\n",
                             dt, g_hitch.shaders, g_hitch.shader_ms, g_hitch.gcn_ms, g_hitch.mtl_ms, g_hitch.lookup_ms, g_hitch.fn_ms, g_hitch.psos, g_hitch.pso_ms, g_hitch.uploads,
-                            g_hitch.upload_ms, g_hitch.wait_ms, g_hitch.pending_draws, host_ms[PS4_HITCH_IO], host_ms[PS4_HITCH_VM],
+                            g_hitch.upload_ms, g_hitch.gpu_uploads, g_hitch.wait_ms, g_hitch.pending_draws, host_ms[PS4_HITCH_IO], host_ms[PS4_HITCH_VM],
                             host_ms[PS4_HITCH_MTLBUF], host_ms[PS4_HITCH_TEXLOCK], host_ms[PS4_HITCH_SHADER_FS]);
             } else {
                 for (int k = 0; k < PS4_HITCH_KINDS; ++k) ps4_hitch_take_ns(k);

@@ -2922,8 +2922,44 @@ id<MTLTexture> TextureCache::GetTextureForGpuUpload(const ImageDesc& img, uint64
     return GetTextureImpl(img, epochs, up);
 }
 
-// gpu_epochs: {write_epoch, upload_epoch} for GetTextureForGpuUpload, nullptr for GetTexture.
-id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t* gpu_epochs, GpuUpload* up) {
+id<MTLTexture> TextureCache::GetTextureForGpuRefresh(const ImageDesc& img, uint64_t upload_epoch, uint64_t min_bytes,
+                                                     GpuUpload* up) {
+    const uint64_t epochs[2] = {0, upload_epoch};
+    *up = GpuUpload{};
+    return GetTextureImpl(img, epochs, up, std::max<uint64_t>(1, min_bytes));
+}
+
+void TextureCache::MarkStale(id<MTLTexture> tex) {
+    TimedLock lk(mutex_);
+    for (auto& kv : entries_)
+        if (kv.second->tex == tex) {
+            kv.second->dirty = true;
+            kv.second->gpu_upload_epoch = 0;
+            return;
+        }
+}
+
+bool TextureCache::DebugCpuUploadInto(const ImageDesc& img, id<MTLTexture> dst) {
+    TimedLock lk(mutex_);
+    auto range = entries_.equal_range(img.address);
+    for (auto it = range.first; it != range.second; ++it) {
+        Entry* e = it->second;
+        if (e->kind != Entry::Sampled || !e->tex || e->tex.pixelFormat != dst.pixelFormat ||
+            e->tex.width != dst.width || e->tex.height != dst.height || e->tex.mipmapLevelCount != dst.mipmapLevelCount)
+            continue;
+        Entry tmp = *e; // same surface and layout, other texture
+        tmp.tex = dst;
+        const bool ok = UploadLockedImpl(&tmp);
+        tmp.tex = nil;
+        return ok;
+    }
+    return false;
+}
+
+// gpu_epochs: {write_epoch, upload_epoch} for GetTextureForGpuUpload / GetTextureForGpuRefresh,
+// nullptr for GetTexture. refresh_min_bytes > 0: refresh mode (GetTextureForGpuRefresh).
+id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t* gpu_epochs, GpuUpload* up,
+                                            uint64_t refresh_min_bytes) {
     if (!img.valid || img.address == 0 || img.pixel.mtl_format == 0 || !device_) return nil;
     const SurfaceDesc sd = img.ToSurfaceDesc();
     if (sd.bpp == 0) return nil;
@@ -3028,7 +3064,14 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
             e->width == width && e->height == height && e->depth == depth && e->levels == levels &&
             e->layers == layers && e->swizzle == img.view_swizzle && e->surf.pitch == sd.pitch &&
             e->surf.tile_mode == sd.tile_mode && e->surf.is_pow2 == sd.is_pow2) {
-            if (gpu_epochs) {
+            if (refresh_min_bytes) {
+                // stale contents: big surfaces are copied on the GPU, small ones by the CPU
+                // (MSAA entries take the CPU path, which only clears their dirty flag)
+                if (e->dirty) {
+                    if (e->samples <= 1 && e->layout.total_size >= refresh_min_bytes) gpu_upload(e);
+                    else UploadLocked(e);
+                }
+            } else if (gpu_epochs) {
                 // stale unless already copied on the GPU after the pending writes
                 if ((e->dirty || e->gpu_upload_epoch <= gpu_epochs[0]) && e->samples <= 1) gpu_upload(e);
             } else if (e->dirty) {
@@ -3082,7 +3125,7 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
         return nil;
     }
     if (!msaa) {
-        if (gpu_epochs) gpu_upload(e);
+        if (gpu_epochs && (!refresh_min_bytes || e->layout.total_size >= refresh_min_bytes)) gpu_upload(e);
         else UploadLocked(e);
     }
     entries_.emplace(e->address, e);
