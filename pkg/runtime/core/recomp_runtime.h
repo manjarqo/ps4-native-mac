@@ -49,6 +49,10 @@ void ps4_videoout_destroy(void);
 void ps4_equeue_destroy(void);
 void ps4_metal_screen_destroy(void);
 void ps4_host_run_main_loop(void);
+
+// Ends the process from an exit path (window close, Cmd+Q) without running static
+// destructors: game threads and Metal completion handlers still use global state.
+void ps4_host_quit(int code) __attribute__((noreturn));
 // Startup settings (libSceSystemService/ps4_settings.m): resolved once before the guest starts.
 void ps4_host_settings_init(void);
 void ps4_stall_watchdog_note_present(void); // frame stall diagnostics (PS4_STALL_WATCHDOG)

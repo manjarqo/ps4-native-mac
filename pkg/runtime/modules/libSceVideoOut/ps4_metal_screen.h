@@ -23,6 +23,9 @@ void *ps4_metal_screen_get_command_queue(void);
 void *ps4_metal_screen_get_layer(void);
 void *ps4_metal_screen_get_texture(void);
 void ps4_metal_screen_destroy(void);
+// Debug hooks for exit tests: same paths as the window close button and Cmd+Q.
+void ps4_metal_screen_request_close(void);
+void ps4_metal_screen_request_terminate(void);
 
 #ifdef __cplusplus
 }

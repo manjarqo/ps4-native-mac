@@ -305,6 +305,7 @@ void ps4_pad_handle_key(unsigned short keyCode, int isDown) {
 //                                                frame / the color target after each of its
 //                                                draws (needs PS4_SCREENSHOT_DIR)
 //   trace                                        log the GPU work of the next frame
+//   close / terminate                            quit through the window close button / Cmd+Q
 // Stick values are 0..255 (128 = center); -1 keeps the stick untouched.
 extern volatile int g_ps4_screenshot_request;
 extern volatile int g_ps4_gnm_dump_request;
@@ -350,6 +351,14 @@ static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, ui
       continue;
     } else if (strncmp(line, "trace", 5) == 0) {
       g_ps4_gnm_dump_request |= 4;
+      continue;
+    } else if (strncmp(line, "close", 5) == 0) {
+      extern void ps4_metal_screen_request_close(void);
+      ps4_metal_screen_request_close();
+      continue;
+    } else if (strncmp(line, "terminate", 9) == 0) {
+      extern void ps4_metal_screen_request_terminate(void);
+      ps4_metal_screen_request_terminate();
       continue;
     } else if (line[0] == 'w') {
       cmd.dur = strtol(line + 1, NULL, 10);

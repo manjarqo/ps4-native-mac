@@ -18,24 +18,24 @@
 
 - (BOOL)windowShouldClose:(NSWindow *)sender {
     (void)sender;
-    exit(0);
+    ps4_host_quit(0);
     return YES;
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
     (void)notification;
-    exit(0);
+    ps4_host_quit(0);
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
     (void)sender;
-    exit(0);
+    ps4_host_quit(0);
     return YES;
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     (void)sender;
-    exit(0);
+    ps4_host_quit(0);
     return NSTerminateNow;
 }
 
@@ -813,7 +813,7 @@ static void metal_screen_pump_events_main(void) {
             if (event.type == NSEventTypeKeyDown) {
                 // Cmd+Q quits; Escape is the pad's Options button (pause menu).
                 if ((event.modifierFlags & NSEventModifierFlagCommand) && event.keyCode == 12) {
-                    exit(0);
+                    ps4_host_quit(0);
                 }
                 extern void ps4_pad_handle_key(unsigned short keyCode, int isDown);
                 ps4_pad_handle_key(event.keyCode, 1);
@@ -844,7 +844,7 @@ static void metal_screen_pump_events_main(void) {
 
         // Failsafe: if window was closed or hidden and not minimized, exit cleanly
         if (g_inited && g_window && ![g_window isVisible] && ![g_window isMiniaturized]) {
-            exit(0);
+            ps4_host_quit(0);
         }
     }
 }
@@ -884,4 +884,18 @@ void ps4_metal_screen_destroy(void) {
         g_device = nil;
         g_inited = NO;
     }
+}
+
+// Debug hooks for exit tests (PS4_PAD_CTL "close" / "terminate"): the same paths as a click on
+// the window's close button and Cmd+Q / the app menu's Quit.
+void ps4_metal_screen_request_close(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_window) [g_window performClose:nil];
+    });
+}
+
+void ps4_metal_screen_request_terminate(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSApp terminate:nil];
+    });
 }

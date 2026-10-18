@@ -3,6 +3,7 @@
 #include "ps4_vfs.h"
 
 #include <signal.h>
+#include <unistd.h>
 #if defined(__APPLE__)
 #include <execinfo.h>
 #include <libgen.h>
@@ -1749,4 +1750,18 @@ void ps4_hitch_add_ns(int kind, uint64_t ns) {
 
 uint64_t ps4_hitch_take_ns(int kind) {
   return (unsigned)kind < PS4_HITCH_KINDS ? atomic_exchange_explicit(&g_hitch_ns[kind], 0, memory_order_relaxed) : 0;
+}
+
+// ---- Quit --------------------------------------------------------------------------------
+// exit() would run static destructors while game threads and Metal completion handlers keep
+// using the objects being destroyed (crash in RunFences on a destroyed mutex). Nothing needs to
+// be written on exit except the pipeline archive; stdio buffers are flushed.
+// Mach-O static links cannot leave a weak reference undefined, so the default is an empty weak
+// definition; the pipeline archive module provides the strong one.
+__attribute__((weak)) void ps4_gnm_pso_archive_save_for_quit(double timeout_s) { (void)timeout_s; }
+
+void ps4_host_quit(int code) {
+  ps4_gnm_pso_archive_save_for_quit(2.0);
+  fflush(NULL);
+  _exit(code);
 }
