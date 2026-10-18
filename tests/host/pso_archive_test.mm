@@ -1,10 +1,12 @@
 // Host test of the pipeline archive (ps4_gnm_pipeline_archive.mm) on the real Metal device.
 // Runs as separate processes: write → read must find both pipelines in the archive without
-// compiling (MTLPipelineOptionFailOnBinaryArchiveMiss); budget and corrupt start anew.
+// compiling (MTLPipelineOptionFailOnBinaryArchiveMiss); append adds a pipeline in a later session
+// (its own file) and read2 must find all three; budget, corrupt and stale start anew.
 #import <Metal/Metal.h>
 #include "ps4_gnm_pipeline_archive.h"
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <string>
 #include <sys/stat.h>
 
@@ -18,13 +20,26 @@ static std::string ShaderSource(const std::string& nonce) {
            "kernel void cmain(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = float(i) * 2.0 + kNonce; }\n";
 }
 
+// Number of pipelines-<n>.metalar files in dir.
+static int ArchiveFiles(const std::string& dir) {
+    int n = 0;
+    if (DIR* d = opendir(dir.c_str())) {
+        while (dirent* de = readdir(d)) {
+            const size_t l = strlen(de->d_name);
+            if (strncmp(de->d_name, "pipelines-", 10) == 0 && l > 8 && strcmp(de->d_name + l - 8, ".metalar") == 0) ++n;
+        }
+        closedir(d);
+    }
+    return n;
+}
+
 static int Fail(const char* what) {
     printf("pso_archive_test: FAIL (%s)\n", what);
     return 1;
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) return Fail("usage: pso_archive_test <write|read|budget|corrupt|stale> <dir> <nonce>");
+    if (argc != 4) return Fail("usage: pso_archive_test <write|read|append|read2|budget|corrupt|stale> <dir> <nonce>");
     const std::string mode = argv[1], dir = argv[2], nonce = argv[3];
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -37,7 +52,12 @@ int main(int argc, char** argv) {
         rd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         MTLComputePipelineDescriptor* cd = [MTLComputePipelineDescriptor new];
         cd.computeFunction = [lib newFunctionWithName:@"cmain"];
-        const std::string archive = dir + "/pipelines.metalar";
+        // The pipeline a later session adds (append, read2): another fragment function.
+        id<MTLLibrary> lib3 = [dev newLibraryWithSource:@(ShaderSource(nonce + "3").c_str()) options:nil error:&e];
+        if (!lib3) return Fail("library 3");
+        MTLRenderPipelineDescriptor* rd3 = [rd copy];
+        rd3.fragmentFunction = [lib3 newFunctionWithName:@"fmain"];
+        const std::string archive = dir + "/pipelines-0.metalar";
 
         if (mode == "corrupt") {
             FILE* f = fopen(archive.c_str(), "wb");
@@ -75,14 +95,24 @@ int main(int argc, char** argv) {
             ps4gnm_pso_archive::Add(2, cd);
             if (!ps4gnm_pso_archive::SaveNow(30)) return Fail("save");
             struct stat st;
-            if (stat(archive.c_str(), &st) != 0 || st.st_size == 0) return Fail("archive file");
-        } else if (mode == "read") {
+            if (ArchiveFiles(dir) != 1 || stat(archive.c_str(), &st) != 0 || st.st_size == 0) return Fail("archive file");
+        } else if (mode == "append") {
+            if (!ps4gnm_pso_archive::Contains(1) || !ps4gnm_pso_archive::Contains(2)) return Fail("append: index lost keys");
+            if (ps4gnm_pso_archive::Contains(3)) return Fail("append: key 3 before adding it");
+            ps4gnm_pso_archive::Attach(rd3);
+            if (![dev newRenderPipelineStateWithDescriptor:rd3 error:&e]) return Fail("append: render build");
+            ps4gnm_pso_archive::Add(3, rd3);
+            if (!ps4gnm_pso_archive::SaveNow(30)) return Fail("append: save");
+            if (ArchiveFiles(dir) != 2) return Fail("append: expected a second archive file");
+        } else if (mode == "read" || mode == "read2") {
             if (!ps4gnm_pso_archive::Contains(1) || !ps4gnm_pso_archive::Contains(2)) return Fail("index lost keys");
             ps4gnm_pso_archive::Attach(rd);
             ps4gnm_pso_archive::Attach(cd);
             // FailOnBinaryArchiveMiss only has an effect with an archive attached (without one the
             // system cache or a fresh compile serves the pipeline), so check the attachment itself.
-            if (rd.binaryArchives.count != 1 || cd.binaryArchives.count != 1) return Fail("Attach did not set binaryArchives");
+            // earlier sessions' files (1 after write, 2 after append) plus this session's archive
+            const NSUInteger want = mode == "read" ? 2 : 3;
+            if (rd.binaryArchives.count != want || cd.binaryArchives.count != want) return Fail("Attach did not set binaryArchives");
             // Negative control: a pipeline that was never archived must miss, which proves the
             // success below comes from the archive and not from an option that never fails.
             MTLRenderPipelineDescriptor* other = [rd copy];
@@ -91,6 +121,13 @@ int main(int argc, char** argv) {
             if ([dev newRenderPipelineStateWithDescriptor:other options:MTLPipelineOptionFailOnBinaryArchiveMiss
                                                reflection:nil error:&e])
                 return Fail("never-archived pipeline did not miss");
+            if (mode == "read2") {
+                if (!ps4gnm_pso_archive::Contains(3)) return Fail("read2: index lost key 3");
+                ps4gnm_pso_archive::Attach(rd3);
+                if (![dev newRenderPipelineStateWithDescriptor:rd3 options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                    reflection:nil error:&e])
+                    return Fail("read2: pipeline of the later session not served from the archive");
+            }
             if (![dev newRenderPipelineStateWithDescriptor:rd options:MTLPipelineOptionFailOnBinaryArchiveMiss
                                                 reflection:nil error:&e])
                 return Fail("render pipeline not served from the archive");
@@ -100,7 +137,7 @@ int main(int argc, char** argv) {
         } else if (mode == "stale") {
             struct stat st;
             if (ps4gnm_pso_archive::Contains(1) || ps4gnm_pso_archive::Contains(2)) return Fail("stale index survived");
-            if (stat(archive.c_str(), &st) == 0) return Fail("stale archive file not deleted");
+            if (ArchiveFiles(dir) != 0) return Fail("stale archive files not deleted");
             if (stat((dir + "/pipelines_archived.bin").c_str(), &st) != 0 || st.st_size >= old_index_size)
                 return Fail("index not recreated with only a header");
         } else if (mode == "budget" || mode == "corrupt") {

@@ -14,6 +14,8 @@ A="$T/archive"; mkdir -p "$A"
 NONCE=$(( $(date +%s) % 100000 * 10 + RANDOM % 10 ))
 "$T/pso_archive_test" write "$A" $NONCE
 "$T/pso_archive_test" read "$A" $NONCE
+"$T/pso_archive_test" append "$A" $NONCE
+"$T/pso_archive_test" read2 "$A" $NONCE
 "$T/pso_archive_test" stale "$A" $NONCE
 "$T/pso_archive_test" write "$A" $NONCE
 "$T/pso_archive_test" budget "$A" $NONCE
