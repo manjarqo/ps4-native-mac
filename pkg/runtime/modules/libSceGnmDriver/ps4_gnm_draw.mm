@@ -55,6 +55,7 @@ extern "C" const char* ps4_vfs_get_app_root(void);
 #include "ps4_gnm_draw.h"
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_shader_cache.h"
+#include "ps4_gnm_pipeline_archive.h"
 #include "ps4_metal_screen.h"
 #include "ps4_hitch.h"
 
@@ -2907,13 +2908,17 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
         }
         d.vertexDescriptor = vd;
     }
+    ps4gnm_pso_archive::Attach(d);
     if (S.async_compile && !known) {
         // Build a new pipeline in the background; the draw is skipped until it is ready.
         if (S.psos_pending.insert(key).second) {
             const std::string k = key;
             [S.dev newRenderPipelineStateWithDescriptor:d
                                       completionHandler:^(id<MTLRenderPipelineState> ps_, NSError* err) {
-                                          if (ps_) RememberPipeline(stable);
+                                          if (ps_) {
+                                              RememberPipeline(stable);
+                                              ps4gnm_pso_archive::Add(stable, d);
+                                          }
                                           std::lock_guard<std::mutex> lk(S.async_mu);
                                           S.async_psos_done.push_back({k, ps_, ps_ ? nil : err.localizedDescription});
                                           S.async_psos_ready.fetch_add(1, std::memory_order_release);
@@ -2928,6 +2933,8 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
     g_hitch.pso_ms += (CFAbsoluteTimeGetCurrent() - pso_t0) * 1000.0;
     g_hitch.psos++;
     if (p && !known) RememberPipeline(stable);
+    // known pipelines missing from the archive are added once (the next session loads them fast)
+    if (p && !ps4gnm_pso_archive::Contains(stable)) ps4gnm_pso_archive::Add(stable, d);
     if (!p) {
         RLog("pso-fail", "render pipeline (VS 0x%llx PS 0x%llx) failed: %s",
              (unsigned long long)vs->code_addr, (unsigned long long)(ps ? ps->code_addr : 0),
@@ -3262,6 +3269,11 @@ bool Init(GuestContext* ctx) {
         if (!S.gds_buf) S.gds_buf = S.dummy;
         gcn_profile_default_metal(&S.profile);
         StartShaderWarmup();
+        if (!S.msl_cache_dir.empty()) {
+            const char* mb = getenv("PS4_GNM_PSO_ARCHIVE_MB");
+            const uint64_t budget = (uint64_t)(mb ? atoll(mb) : 384) << 20;
+            if (ps4gnm_pso_archive::Open(S.dev, S.msl_cache_dir, budget)) ps4gnm_pso_archive::StartPeriodicSave(300);
+        }
         if (getenv("PS4_GNM_NO_BOUNDS_EMIT")) S.profile.needs_buffer_bounds_checks = false; // debug A/B
         gcn_msl_options_default(&S.msl);
         ps4gnm_shader_cache::Start(S.profile, S.msl);
@@ -4374,8 +4386,12 @@ void DispatchEncode(DispatchRec& r) {
             MTLComputePipelineDescriptor* cpd = [MTLComputePipelineDescriptor new];
             cpd.computeFunction = cs->fn;
             if (wg > 0 && wg <= 1024) cpd.maxTotalThreadsPerThreadgroup = (NSUInteger)wg;
+            const uint64_t ck[2] = {cs->msl_hash, wg};
+            const uint64_t cstable = Fnv(ck, sizeof(ck), 0x5ca1ab1e5ca1ab1eull);
+            ps4gnm_pso_archive::Attach(cpd);
             const double cpso_t0 = CFAbsoluteTimeGetCurrent();
             pso = [S.dev newComputePipelineStateWithDescriptor:cpd options:MTLPipelineOptionNone reflection:nil error:&e];
+            if (pso && !ps4gnm_pso_archive::Contains(cstable)) ps4gnm_pso_archive::Add(cstable, cpd);
             if (!pso) pso = [S.dev newComputePipelineStateWithFunction:cs->fn error:&e];
             g_hitch.pso_ms += (CFAbsoluteTimeGetCurrent() - cpso_t0) * 1000.0;
             g_hitch.psos++;
