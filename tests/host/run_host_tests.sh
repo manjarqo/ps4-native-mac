@@ -21,4 +21,11 @@ NONCE=$(( $(date +%s) % 100000 * 10 + RANDOM % 10 ))
 "$T/pso_archive_test" budget "$A" $NONCE
 "$T/pso_archive_test" write "$A" $NONCE
 "$T/pso_archive_test" corrupt "$A" $NONCE
+# eviction: 6 one-pipeline files, then a cap of 4 files
+E="$T/evict"; mkdir -p "$E"
+for k in 0 1 2 3 4 5; do "$T/pso_archive_test" add$k "$E" $NONCE; done
+PS4_GNM_PSO_ARCHIVE_MAX_FILES=4 "$T/pso_archive_test" evict "$E" $NONCE
+"$T/pso_archive_test" evicted "$E" $NONCE
+B="$T/budgetstop"; mkdir -p "$B"
+"$T/pso_archive_test" budgetstop "$B" $NONCE
 rm -rf "$T"

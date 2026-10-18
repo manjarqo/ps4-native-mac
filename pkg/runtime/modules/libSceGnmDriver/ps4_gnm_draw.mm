@@ -3270,8 +3270,12 @@ bool Init(GuestContext* ctx) {
         gcn_profile_default_metal(&S.profile);
         StartShaderWarmup();
         if (!S.msl_cache_dir.empty()) {
+            // PS4_GNM_PSO_ARCHIVE_MB: archive size budget; not a positive number -> 384
             const char* mb = getenv("PS4_GNM_PSO_ARCHIVE_MB");
-            const uint64_t budget = (uint64_t)(mb ? atoll(mb) : 384) << 20;
+            char* mb_end = nullptr;
+            long long mb_v = mb ? strtoll(mb, &mb_end, 10) : 0;
+            if (!mb || mb_end == mb || *mb_end || mb_v <= 0 || mb_v > (1ll << 20)) mb_v = 384;
+            const uint64_t budget = (uint64_t)mb_v << 20;
             if (ps4gnm_pso_archive::Open(S.dev, S.msl_cache_dir, budget)) ps4gnm_pso_archive::StartPeriodicSave(300);
         }
         if (getenv("PS4_GNM_NO_BOUNDS_EMIT")) S.profile.needs_buffer_bounds_checks = false; // debug A/B

@@ -1,7 +1,11 @@
 // Host test of the pipeline archive (ps4_gnm_pipeline_archive.mm) on the real Metal device.
 // Runs as separate processes: write → read must find both pipelines in the archive without
 // compiling (MTLPipelineOptionFailOnBinaryArchiveMiss); append adds a pipeline in a later session
-// (its own file) and read2 must find all three; budget, corrupt and stale start anew.
+// (its own file) and read2 must find all three; budget, corrupt and stale start anew. In a fresh
+// directory, add<k> (k = 0..9) writes one file with pipeline key 100+k; evict (run with
+// PS4_GNM_PSO_ARCHIVE_MAX_FILES) must delete the oldest files and their keys and keep the newest
+// one served from the archive, evicted checks that the rewritten index kept exactly that, and
+// budgetstop (1 byte budget) must stop accepting pipelines once a file passes the budget.
 #import <Metal/Metal.h>
 #include "ps4_gnm_pipeline_archive.h"
 #include <cstdio>
@@ -39,7 +43,8 @@ static int Fail(const char* what) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) return Fail("usage: pso_archive_test <write|read|append|read2|budget|corrupt|stale> <dir> <nonce>");
+    if (argc != 4)
+        return Fail("usage: pso_archive_test <write|read|append|read2|budget|corrupt|stale|add<k>|evict|evicted|budgetstop> <dir> <nonce>");
     const std::string mode = argv[1], dir = argv[2], nonce = argv[3];
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -82,9 +87,49 @@ int main(int argc, char** argv) {
             fwrite(&b, 1, 1, f);
             fclose(f);
         }
-        const uint64_t budget = mode == "budget" ? 1 : (64ull << 20);
+        // Pipeline with key 100+k (add<k>, evict, evicted): its own fragment function.
+        auto numbered = [&](int k) {
+            id<MTLLibrary> l = [dev newLibraryWithSource:@(ShaderSource(nonce + "5" + std::to_string(k)).c_str())
+                                                 options:nil
+                                                   error:nil];
+            MTLRenderPipelineDescriptor* d = [rd copy];
+            d.fragmentFunction = [l newFunctionWithName:@"fmain"];
+            return d;
+        };
+        const uint64_t budget = mode == "budget" || mode == "budgetstop" ? 1 : (64ull << 20);
         if (!ps4gnm_pso_archive::Open(dev, dir, budget)) return Fail("open");
-        if (mode == "write") {
+        if (mode.size() == 4 && mode.compare(0, 3, "add") == 0 && isdigit((unsigned char)mode[3])) {
+            const int k = mode[3] - '0';
+            MTLRenderPipelineDescriptor* d = numbered(k);
+            ps4gnm_pso_archive::Attach(d);
+            if (![dev newRenderPipelineStateWithDescriptor:d error:&e]) return Fail("add: render build");
+            ps4gnm_pso_archive::Add(100 + k, d);
+            if (!ps4gnm_pso_archive::SaveNow(30)) return Fail("add: save");
+            if (ArchiveFiles(dir) != k + 1) return Fail("add: expected one more archive file");
+        } else if (mode == "evict" || mode == "evicted") {
+            // 6 files (add0..add5), cap 4: the oldest go until 3 (3/4 of the cap) are left.
+            if (ArchiveFiles(dir) != 3) return Fail("evict: expected 3 archive files left");
+            for (int k = 0; k < 6; ++k)
+                if (ps4gnm_pso_archive::Contains(100 + k) != (k >= 3)) return Fail("evict: wrong keys kept");
+            MTLRenderPipelineDescriptor* d = numbered(5);
+            ps4gnm_pso_archive::Attach(d);
+            if (![dev newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                reflection:nil error:&e])
+                return Fail("evict: newest pipeline not served from the archive");
+            // (a miss of an evicted pipeline cannot be checked: the system cache still has it)
+            struct stat st;
+            for (int k = 0; k < 6; ++k)
+                if ((stat((dir + "/pipelines-" + std::to_string(k) + ".metalar").c_str(), &st) == 0) != (k >= 3))
+                    return Fail("evict: wrong files kept");
+        } else if (mode == "budgetstop") {
+            ps4gnm_pso_archive::Attach(rd);
+            if (![dev newRenderPipelineStateWithDescriptor:rd error:&e]) return Fail("budgetstop: render build");
+            ps4gnm_pso_archive::Add(1, rd);
+            if (!ps4gnm_pso_archive::SaveNow(30)) return Fail("budgetstop: save");
+            if (ArchiveFiles(dir) != 1) return Fail("budgetstop: first file not written");
+            ps4gnm_pso_archive::Add(2, cd);
+            if (ps4gnm_pso_archive::Contains(2)) return Fail("budgetstop: pipeline accepted over the budget");
+        } else if (mode == "write") {
             if (ps4gnm_pso_archive::Contains(1) || ps4gnm_pso_archive::Contains(2)) return Fail("fresh archive has keys");
             ps4gnm_pso_archive::Attach(rd);
             ps4gnm_pso_archive::Attach(cd);

@@ -9,14 +9,17 @@
 
 namespace ps4gnm_pso_archive {
 // Opens the archive files written earlier (<dir>/pipelines-<n>.metalar, only read) and their key
-// index <dir>/pipelines_archived.bin, and starts a new archive for additions. Each save writes
-// the additions since the previous save into the next pipelines-<n>.metalar file; a save also
-// starts after every 64 additions. The index starts with a header (OS build, GPU name and
-// registry ID). If the files together exceed budget_bytes, there are more than 128 of them, one
-// is unreadable, or the index header differs from this OS/GPU, all of them are deleted and a new
-// archive started; leftover temporary files are removed. Returns false (archive disabled) only
-// when Metal cannot create an archive or the index cannot be written, or with
-// PS4_GNM_NO_PSO_ARCHIVE=1 (only the value "1").
+// index <dir>/pipelines_archived.bin (which records the keys of each file), and starts a new
+// archive for additions. Each save writes the additions since the previous save into the next
+// pipelines-<n>.metalar file; a save also starts after every 64 additions, the periodic save
+// only once there are 16. The index starts with a header (OS build, GPU name and registry ID);
+// on a different header or a corrupt index everything is deleted and a new archive started. With
+// more than 128 files or more than budget_bytes in them, the oldest files and their keys are
+// deleted down to 3/4 of both limits; an unreadable file is deleted with its keys. Once the files
+// pass budget_bytes during a session, no more pipelines are added. Leftover temporary files of
+// processes that no longer run are removed. Returns false (archive disabled) only when Metal
+// cannot create an archive or the index cannot be written, or with PS4_GNM_NO_PSO_ARCHIVE=1
+// (only the value "1").
 bool Open(id<MTLDevice> dev, const std::string& dir, uint64_t budget_bytes);
 bool Enabled();
 // Makes pipeline creation look in the archive first (descriptor.binaryArchives).
