@@ -763,7 +763,7 @@ public:
                                            GpuUpload* up);
     // A texture handed out for a GPU upload whose copy could not be encoded: stale again, so
     // the next GetTexture uploads it on the CPU.
-    void MarkStale(id<MTLTexture> tex);
+    void MarkStale(uint64_t address, id<MTLTexture> tex);
     // Debug (PS4_GNM_VERIFY_GPU_UPLOAD): CPU upload of the T#'s guest memory into `dst`, which
     // must have the cached texture's descriptor. The cache entries are not changed.
     bool DebugCpuUploadInto(const ImageDesc& img, id<MTLTexture> dst);

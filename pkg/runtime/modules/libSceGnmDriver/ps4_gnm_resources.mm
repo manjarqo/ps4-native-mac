@@ -2929,12 +2929,13 @@ id<MTLTexture> TextureCache::GetTextureForGpuRefresh(const ImageDesc& img, uint6
     return GetTextureImpl(img, epochs, up, std::max<uint64_t>(1, min_bytes));
 }
 
-void TextureCache::MarkStale(id<MTLTexture> tex) {
+void TextureCache::MarkStale(uint64_t address, id<MTLTexture> tex) {
     TimedLock lk(mutex_);
-    for (auto& kv : entries_)
-        if (kv.second->tex == tex) {
-            kv.second->dirty = true;
-            kv.second->gpu_upload_epoch = 0;
+    auto range = entries_.equal_range(address);
+    for (auto it = range.first; it != range.second; ++it)
+        if (it->second->tex == tex) {
+            it->second->dirty = true;
+            it->second->gpu_upload_epoch = 0;
             return;
         }
 }

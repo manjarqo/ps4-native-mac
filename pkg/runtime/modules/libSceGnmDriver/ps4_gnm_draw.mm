@@ -418,9 +418,13 @@ struct State {
     // ranges written by committed command buffers, by sequence number (dropped once completed)
     std::deque<std::pair<uint64_t, std::vector<GpuWrite>>> inflight_written;
     uint64_t write_epoch = 0; // last epoch handed out by NoteGpuWrite
+    // first write epoch of the work recorded since the last Commit (S.cmd): copies in upload_cmd
+    // run before all of it, so they are current only for writes with smaller epochs
+    uint64_t cmd_start_epoch = 1;
     // GPU texture uploads: detile maps and staging buffers per surface layout
     id<MTLComputePipelineState> detile_pso = nil;
-    std::unordered_map<uint64_t, id<MTLBuffer>> detile_maps, detile_staging;
+    std::unordered_map<uint64_t, id<MTLBuffer>> detile_maps;
+    std::unordered_map<uint32_t, id<MTLBuffer>> detile_staging; // by size class (log2 of the length)
 
     // caches
     std::unordered_map<uint64_t, std::vector<Shader*>> shaders;
@@ -757,6 +761,7 @@ void Commit() {
     if (!S.cmd) return;
     id<MTLCommandBuffer> cb = S.cmd;
     S.cmd = nil;
+    S.cmd_start_epoch = S.write_epoch + 1; // writes noted from now on belong to the next command buffer
     g_cmd_open.store(false, std::memory_order_release);
     // recycle upload chunks when the GPU is done with them
     auto chunks = std::make_shared<std::vector<id<MTLBuffer>>>();
@@ -2345,8 +2350,43 @@ bool EncodeGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up, id
     if (up.surf.bpp != sd.bpp || up.layout.total_size != layout.total_size) {
         RLog("gpu-upload", "texture 0x%llx: cached layout differs from the T#", (unsigned long long)img.address);
     }
+    // validate every copy before encoding anything: a surface the copies cannot cover completely
+    // is left to the CPU path (the caller marks the texture stale) instead of being marked
+    // current with partial contents
+    const bool is3d = up.tex_type == MTLTextureType3D;
+    const bool is1d = up.tex_type == MTLTextureType1D || up.tex_type == MTLTextureType1DArray;
+    const NSUInteger tex_slices = (tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray)
+                                      ? tex.arrayLength * 6 : tex.arrayLength;
+    const uint64_t src_size = tiled ? up.layout.total_size : avail; // bytes readable from the copy source
+    for (uint32_t m = 0; m < up.levels; ++m) {
+        bool bad = m >= up.layout.num_mips;
+        uint64_t row = 0, rows = 0, rowbytes = 0, need = 0;
+        if (!bad) {
+            const MipLayout& ml = up.layout.mips[m];
+            const uint32_t w = std::max(1u, up.width >> m), h = is1d ? 1u : std::max(1u, up.height >> m);
+            row = (uint64_t)ml.pitch * bpe;
+            const uint64_t image = row * ml.height;
+            rowbytes = (uint64_t)((w + up.block_width - 1) / up.block_width) * up.bytes_per_block;
+            rows = (h + up.block_height - 1) / up.block_height;
+            const uint32_t d = is3d ? std::max(1u, up.depth >> m) : 1u;
+            const uint32_t slices = is3d ? 1u : std::min<uint32_t>(std::min(up.layers, ml.slices), (uint32_t)tex_slices);
+            need = slices ? ml.offset + (uint64_t)(slices - 1) * image + (uint64_t)(d - 1) * image + (rows - 1) * row + rowbytes
+                          : 0;
+            bad = rowbytes > row || !rows || need > src_size;
+        }
+        if (bad) {
+            static int warned = 0;
+            if (warned++ < 16)
+                fprintf(stderr, "[gnm-tex] GPU upload of 0x%llx mip %u out of bounds (fmt %u %ux%u levels %u/%u row %llu "
+                                "rowbytes %llu rows %llu need %llu have %llu); CPU upload\n",
+                        (unsigned long long)img.address, m, img.pixel.mtl_format, up.width, up.height, up.levels,
+                        up.layout.num_mips, (unsigned long long)row, (unsigned long long)rowbytes,
+                        (unsigned long long)rows, (unsigned long long)need, (unsigned long long)src_size);
+            return false;
+        }
+    }
     id<MTLBuffer> src = gbuf;
-    uint64_t src_base = goff, src_limit = goff + avail;
+    uint64_t src_base = goff;
     if (tiled) {
         const SurfaceDesc& u = up.surf;
         const uint32_t kf[14] = {(uint32_t)u.tile_mode, u.bpp, u.num_samples, u.width, u.height, u.depth, u.pitch,
@@ -2366,18 +2406,20 @@ bool EncodeGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up, id
             if (!map) return false;
             S.detile_maps[key] = map;
         }
-        // one private staging buffer per surface; reuse across frames is ordered by Metal's
-        // hazard tracking (same buffer, same queue)
-        key ^= img.address * 0x9E3779B97F4A7C15ull;
+        // one private staging buffer per power-of-two size class, shared by all surfaces of that
+        // class: every use (detile write, blit read) is ordered by Metal's hazard tracking (same
+        // tracked buffer, same queue), also between upload_cmd and the current command buffer
+        uint32_t cls = 16; // 64 KiB minimum
+        while (cls < 40 && (1ull << cls) < up.layout.total_size) ++cls;
+        if ((1ull << cls) < up.layout.total_size) return false;
         id<MTLBuffer> staging = nil;
-        auto sit = S.detile_staging.find(key);
-        if (sit != S.detile_staging.end() && sit->second.length >= up.layout.total_size) {
+        auto sit = S.detile_staging.find(cls);
+        if (sit != S.detile_staging.end()) {
             staging = sit->second;
         } else {
-            if (S.detile_staging.size() >= 64) S.detile_staging.clear();
-            staging = [S.dev newBufferWithLength:up.layout.total_size options:MTLResourceStorageModePrivate];
+            staging = [S.dev newBufferWithLength:(NSUInteger)(1ull << cls) options:MTLResourceStorageModePrivate];
             if (!staging) return false;
-            S.detile_staging[key] = staging;
+            S.detile_staging[cls] = staging;
         }
         const uint32_t count = (uint32_t)(map.length / 4);
         const uint32_t params[4] = {bpe, count, (uint32_t)avail, 0};
@@ -2398,7 +2440,6 @@ bool EncodeGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up, id
         else g_cstate.Reset(enc); // state set behind the dispatches' back
         src = staging;
         src_base = 0;
-        src_limit = up.layout.total_size;
     }
     id<MTLBlitCommandEncoder> bl;
     if (side) {
@@ -2408,11 +2449,7 @@ bool EncodeGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up, id
         EnsureCmd();
         bl = [S.cmd blitCommandEncoder];
     }
-    const bool is3d = up.tex_type == MTLTextureType3D;
-    const bool is1d = up.tex_type == MTLTextureType1D || up.tex_type == MTLTextureType1DArray;
-    const NSUInteger tex_slices = (tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray)
-                                      ? tex.arrayLength * 6 : tex.arrayLength;
-    for (uint32_t m = 0; m < up.levels && m < up.layout.num_mips; ++m) {
+    for (uint32_t m = 0; m < up.levels; ++m) { // bounds validated above
         const MipLayout& ml = up.layout.mips[m];
         const uint32_t w = std::max(1u, up.width >> m), h = is1d ? 1u : std::max(1u, up.height >> m);
         const uint64_t row = (uint64_t)ml.pitch * bpe, image = row * ml.height;
@@ -2420,10 +2457,8 @@ bool EncodeGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up, id
         const uint64_t rows = (h + up.block_height - 1) / up.block_height;
         const uint32_t d = is3d ? std::max(1u, up.depth >> m) : 1u;
         const uint32_t slices = is3d ? 1u : std::min<uint32_t>(std::min(up.layers, ml.slices), (uint32_t)tex_slices);
-        if (rowbytes > row || !rows) break;
         for (uint32_t sl = 0; sl < slices; ++sl) {
             const uint64_t off = src_base + ml.offset + (uint64_t)sl * image;
-            if (off + (uint64_t)(d - 1) * image + (rows - 1) * row + rowbytes > src_limit) break;
             [bl copyFromBuffer:src
                        sourceOffset:off
                   sourceBytesPerRow:row
@@ -2452,16 +2487,18 @@ bool GpuUploadTexture(const ImageDesc& img, uint64_t write_epoch) {
     if (!S.tex->GetTextureForGpuUpload(img, write_epoch, S.write_epoch + 1, &up)) return false;
     if (!up.tex) return true; // already current (or a GPU-owned surface)
     if (EncodeGpuUpload(img, up, nil)) return true;
-    S.tex->MarkStale(up.tex);
+    S.tex->MarkStale(img.address, up.tex);
     return false;
 }
 
 const bool g_verify_gpu_upload = getenv("PS4_GNM_VERIFY_GPU_UPLOAD") != nullptr;
 
-// Debug: compares a GPU copy with a CPU upload of the same guest memory once the GPU is done
-// (level 0, slice 0). The game rewriting the memory between encoding and execution also shows
-// as a difference, so a single report at an address needs a second look.
-void VerifyGpuUpload(const ImageDesc& img, id<MTLTexture> tex) {
+// Debug: compares a GPU copy with a CPU upload of the same guest memory once the GPU is done,
+// over every mip level and every array/cube/depth slice the uploads write. The game rewriting
+// the memory between encoding and execution also shows as a difference, so a single report at
+// an address needs a second look.
+void VerifyGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up) {
+    id<MTLTexture> tex = up.tex;
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
     td.textureType = tex.textureType;
     td.pixelFormat = tex.pixelFormat;
@@ -2474,25 +2511,57 @@ void VerifyGpuUpload(const ImageDesc& img, id<MTLTexture> tex) {
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> ref = [S.dev newTextureWithDescriptor:td];
     if (!ref || !S.tex->DebugCpuUploadInto(img, ref)) return;
+    // subresources written by both uploads (same limits as EncodeGpuUpload / UploadLockedImpl)
+    const NSUInteger tex_slices = (tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray)
+                                      ? tex.arrayLength * 6 : tex.arrayLength;
+    std::vector<uint32_t> slices_per_level;
+    for (uint32_t m = 0; m < up.levels && m < up.layout.num_mips && m < tex.mipmapLevelCount; ++m)
+        slices_per_level.push_back(up.tex_type == MTLTextureType3D
+                                       ? 1u
+                                       : std::min<uint32_t>(std::min(up.layers, up.layout.mips[m].slices),
+                                                            (uint32_t)tex_slices));
     const uint64_t addr = img.address;
     const uint32_t bpb = img.pixel.bytes_per_block, bw = std::max(1u, img.pixel.block_width),
                    bh = std::max(1u, img.pixel.block_height);
-    AfterGpu([tex, ref, addr, bpb, bw, bh] {
-        const NSUInteger w = tex.width, h = tex.textureType == MTLTextureType1D ? 1 : tex.height;
-        const NSUInteger row = (w + bw - 1) / bw * bpb, rows = (h + bh - 1) / bh;
-        std::vector<uint8_t> a(row * rows), b(row * rows);
-        const MTLRegion r = MTLRegionMake3D(0, 0, 0, w, h, 1);
-        [tex getBytes:a.data() bytesPerRow:row bytesPerImage:row * rows fromRegion:r mipmapLevel:0 slice:0];
-        [ref getBytes:b.data() bytesPerRow:row bytesPerImage:row * rows fromRegion:r mipmapLevel:0 slice:0];
+    const uint32_t fmt = img.pixel.mtl_format, tile = (uint32_t)img.tile_mode, type = (uint32_t)up.tex_type;
+    AfterGpu([tex, ref, addr, bpb, bw, bh, fmt, tile, type, slices_per_level] {
         static std::atomic<uint32_t> n_same{0}, n_diff{0};
-        if (a == b) {
+        static std::atomic<uint64_t> n_sub{0};
+        const bool is3d = tex.textureType == MTLTextureType3D;
+        const bool is1d = tex.textureType == MTLTextureType1D || tex.textureType == MTLTextureType1DArray;
+        uint32_t bad_subs = 0, first_m = 0, first_sl = 0, subs = 0;
+        uint64_t bad_bytes = 0;
+        std::vector<uint8_t> a, b;
+        for (uint32_t m = 0; m < slices_per_level.size(); ++m) {
+            const NSUInteger w = std::max<NSUInteger>(1, tex.width >> m), h = is1d ? 1 : std::max<NSUInteger>(1, tex.height >> m);
+            const NSUInteger d = is3d ? std::max<NSUInteger>(1, tex.depth >> m) : 1;
+            const NSUInteger row = (w + bw - 1) / bw * bpb, image = row * ((h + bh - 1) / bh);
+            a.resize(image * d);
+            b.resize(image * d);
+            const MTLRegion r = MTLRegionMake3D(0, 0, 0, w, h, d);
+            for (uint32_t sl = 0; sl < slices_per_level[m]; ++sl) {
+                [tex getBytes:a.data() bytesPerRow:row bytesPerImage:image fromRegion:r mipmapLevel:m slice:sl];
+                [ref getBytes:b.data() bytesPerRow:row bytesPerImage:image fromRegion:r mipmapLevel:m slice:sl];
+                ++subs;
+                if (a == b) continue;
+                if (!bad_subs++) first_m = m, first_sl = sl;
+                for (size_t i = 0; i < a.size(); ++i) bad_bytes += a[i] != b[i];
+            }
+        }
+        n_sub += subs;
+        if (!bad_subs) {
             n_same++;
         } else {
             n_diff++;
-            fprintf(stderr, "[gnm-verify] GPU upload of 0x%llx differs from the CPU upload\n", (unsigned long long)addr);
+            fprintf(stderr, "[gnm-verify] GPU upload of 0x%llx differs from the CPU upload: fmt %u tile %u type %u "
+                            "%lux%lux%lu (depth or array length) levels %zu, %u of %u subresources (first: mip %u slice %u), %llu bytes\n",
+                    (unsigned long long)addr, fmt, tile, type, (unsigned long)tex.width, (unsigned long)tex.height,
+                    (unsigned long)(is3d ? tex.depth : tex.arrayLength), slices_per_level.size(), bad_subs, subs,
+                    first_m, first_sl, (unsigned long long)bad_bytes);
         }
         if ((n_same + n_diff) % 50 == 0)
-            fprintf(stderr, "[gnm-verify] GPU uploads checked: %u equal, %u different\n", n_same.load(), n_diff.load());
+            fprintf(stderr, "[gnm-verify] GPU uploads checked: %u equal, %u different (%llu subresources)\n",
+                    n_same.load(), n_diff.load(), (unsigned long long)n_sub.load());
     });
 }
 
@@ -2507,10 +2576,19 @@ id<MTLTexture> SampledTexture(const ImageDesc& img) {
         return v ? (int64_t)atoll(v) : (int64_t)256;
     }();
     if (min_kb < 0 || !S.detile_pso) return S.tex->GetTexture(img);
+    // upload_cmd runs before all of S.cmd: the copy is current only for the writes before S.cmd,
+    // so every write recorded in S.cmd (also earlier in this draw) still invalidates it
     TextureCache::GpuUpload up;
     id<MTLTexture> tex =
-        S.tex->GetTextureForGpuRefresh(img, S.write_epoch + 1, std::max<uint64_t>(1, (uint64_t)min_kb << 10), &up);
+        S.tex->GetTextureForGpuRefresh(img, S.cmd_start_epoch, std::max<uint64_t>(1, (uint64_t)min_kb << 10), &up);
     if (!up.tex) return tex;
+    // guest memory with GPU writes not yet executed (encoded or in flight), or overlapping a
+    // GPU-owned surface: keep the CPU upload at bind time, as before the GPU path
+    if (OverlapsPendingWrite(img.address, up.layout.total_size) ||
+        S.tex->OverlapsGpuTexture(img.address, up.layout.total_size)) {
+        S.tex->MarkStale(img.address, up.tex);
+        return S.tex->GetTexture(img);
+    }
     if (!S.upload_cmd) {
         S.upload_cmd = [S.queue commandBuffer];
         S.upload_cmd.label = @"texture uploads";
@@ -2522,10 +2600,10 @@ id<MTLTexture> SampledTexture(const ImageDesc& img) {
     }
     if (EncodeGpuUpload(img, up, S.upload_cmd)) {
         g_hitch.gpu_uploads++;
-        if (g_verify_gpu_upload) VerifyGpuUpload(img, up.tex);
+        if (g_verify_gpu_upload) VerifyGpuUpload(img, up);
         return tex;
     }
-    S.tex->MarkStale(up.tex);
+    S.tex->MarkStale(img.address, up.tex);
     return S.tex->GetTexture(img);
 }
 
