@@ -902,10 +902,17 @@ bool StoreMslInDiskCache(uint64_t mh, const char* msl) {
         dispatch_async(writer, ^{
             char tmp[1300];
             snprintf(tmp, sizeof(tmp), "%s.tmp%d", job->first.c_str(), (int)getpid());
+            bool ok = false;
             if (FILE* f = fopen(tmp, "w")) {
-                fputs(job->second.c_str(), f);
-                fclose(f);
-                rename(tmp, job->first.c_str());
+                const bool put_ok = fputs(job->second.c_str(), f) >= 0;
+                const bool close_ok = fclose(f) == 0;
+                ok = put_ok && close_ok;
+            }
+            if (ok && rename(tmp, job->first.c_str()) != 0) ok = false;
+            if (!ok) {
+                const int err = errno;
+                unlink(tmp);
+                fprintf(stderr, "[gnm-draw] msl cache write failed: %s: %s\n", job->first.c_str(), strerror(err));
             }
             delete job;
         });
@@ -938,7 +945,9 @@ void StartShaderWarmup() {
     for (NSString* f in files)
         if ([f hasSuffix:@".metal"]) {
             paths.push_back(S.msl_cache_dir + "/" + f.UTF8String);
-            S.msl_on_disk.insert(strtoull(f.UTF8String, nullptr, 16));
+            char* end = nullptr;
+            const uint64_t h = strtoull(f.UTF8String, &end, 16);
+            if (end != f.UTF8String) S.msl_on_disk.insert(h);
         }
     if (paths.empty()) return;
     fprintf(stderr, "[gnm-draw] warming up %zu cached shaders in the background\n", paths.size());
