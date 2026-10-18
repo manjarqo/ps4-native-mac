@@ -119,3 +119,82 @@ Every step can be turned off with an environment variable. The previous build (`
 - Picture: screenshots at the same frames of runs before and after, compared pairwise; for step 5 also the byte-by-byte verify mode on several runs.
 - Exit: start, quit via Cmd+Q (`[NSApp terminate:]`) and via the window close button (`performClose:`), check that no new report appears in DiagnosticReports.
 - No automated runs on the owner's live saves: only copies in their own data directories.
+
+## Addendum: cause of hitches without renderer work (2026-10-18)
+
+Scope: every stall ≥ 100 ms whose `hitch` line has 0 shaders, 0 pipelines, 0 texture uploads (io/vm/mtlbuf ≈ 0, texlock ≤ 1.4 ms in all of them). Data: the baseline (base1/base2 × spores/courtyard), the task 10/11 runs, and 8 task 12 runs on the 671e610 build with temporary diagnostics (not committed; patch and scripts in `~/ps4recomp-work/walk_bench/t12-diag/`): full call chains per thread, per-thread CPU time while sampled, CPU per process, per-frame GPU timing (commit → GPU start → done), per-frame VM statistics, and the duration of the `sceNpCheckCallback` log write.
+
+### What the job workers do
+
+`fn_0xc87c10` is the NdJob worker's idle loop: it polls the 8 job queues, executes `pause` (`RECOMP_SPIN_PAUSE`, an ISB) and, on workers 0–3, reads the TSC every round to run expired timers (0xc87df3). `__udivmodti4`/`__udivti3` are the 128-bit division in `recomp_rdtsc`. The workers sleep only when the job manager flag at `+0x59` is set; it is not, so idle workers spin. "All workers busy 85–100 % in `fn_0xc87c10`" therefore means *no job is runnable*: the frame waits for one job that is blocked, or for a thread outside the job system.
+
+The game's frame ring (32 slots at 0x1700c30, 0xa20 bytes each) has two stamps: `+0x9d0` (written by Frame Submission after it submitted the frame, 0xb49fa3) and `+0x9d8` (written by the "GPU Interrupts Handler" thread on the frame's EOP, 0xb29b34). `fn_0xb3d750` waits for a frame: first a 1 ms `sceKernelUsleep` loop until `+0x9d0` is set (waits for the CP), then a 250 ms timed condvar wait until `+0x9d8` is set (waits for the GPU). `fn_0x102e0` and Frame Submission's own loop in `fn_0xb49f60` (frame N-3) poll `+0x9d8` with 1 ms sleeps. Frame Submission waiting in `__psynch_cvwait in fn_0xc81c40` (called from `fn_0xb49f60`) is waiting for the game to queue the next frame.
+
+### Groups
+
+Counts are stalls ≥ 100 ms without renderer work. "Old runs" = 4 baseline + 8 task 10/11 runs.
+
+| Group | Signature | Old runs | Task 12 runs |
+|---|---|---|---|
+| 1. Log write on a job | one worker 85–98 % in `__write_nocancel`, the others spin | 10 (2555 ms) | 9 (2074 ms) |
+| 2. CP thread starved | Frame Submission "busy" ≥ 50 %, or a worker in the 1 ms loop of `fn_0xb3d750` (waiting for the submission) | 52 (7511 ms) | 27 (4369 ms) |
+| 3. Job workers starved | workers busy with real jobs and partly spinning, Frame Submission waits for the frame | 19 (2827 ms) | 19 (3070 ms) |
+| 4. GPU completion late | a job in the condvar wait of `fn_0xb3d750`, or Frame Submission in the `fn_0xb49f60` sleep loop | 8 (2248 ms, incl. the 1132 ms stall of t10b) | 4 (687 ms) |
+
+Baseline alone: group 1: 3 (689 ms), 2: 19 (2415 ms), 3: 7 (1017 ms), 4: 1 (124 ms).
+
+#### Group 1: `printf` in the `sceNpCheckCallback` stub
+
+- Chain (t12diag): `__write_nocancel ← __swrite ← __sfvwrite ← puts ← shim_sceNpCheckCallback ← fn_0x9a6f40 ← job fn_0x2600 ← fn_0xc87c10`. The game calls `sceNpCheckCallback` once per frame from a job the frame depends on; the stub (`modules/libSceNp/ps4_np.c`, `NP_LOG`) prints a line to stdout on every call. With stdout redirected to a file, libc flushes ~4 KB every ~140 calls. Measured duration of that `printf` (t12diag2/3): up to 303.6, 226.0, 149.4 ms; 21 calls over 5 ms in one run. Every such stall contains it.
+- A/B: the same binary with the log suppressed (t12q): 0 stalls of this group (1–5 per run otherwise).
+- Why a 4 KB write to `run.log` blocks for 100–300 ms is not proven. Likely: the internal disk is 98 % full and the system swaps 1–12 k pages per 5 s to the same disk during the run.
+- Who is affected: every benchmark and every launch from a terminal. A launch from Finder has stdout on `/dev/null`, so the owner's normal play does not have this group. It distorts every measurement, though.
+- Confidence: high (mechanism, A/B), medium (why the write blocks).
+
+#### Group 2: the CP thread does not get the CPU
+
+- In these stalls Frame Submission processes draws: inclusive shares (t12d6) `ps4draw::Draw` 82–96 %, `GetShader` 37–52 % (`BuildFlat`, `gcn_shader_find_compatible_flat`, `Shader::Info` copies), `encq::Defer` 12–45 % (`notify_one` into the encoder), `DecodeStageImages` 7–25 %. The guest job waits in `fn_0xb3d750` for the submission stamp.
+- But the thread hardly runs. CPU time of Frame Submission inside the sampled window: 6.2, 12.0, 8.6 ms in windows of 124, 152, 101 ms where it was "busy" in 56, 84, 87 % of the samples (t12d6, load 10). Same in t12d4: 3.6–13.5 ms in 43–172 ms windows. The profiler's "busy" counts a runnable thread that is not running. The workers got 0–30 % of a core in the same windows.
+- Where the CPU went (t12d6, all 3 stalls without renderer work): the game process got 145–275 ms of CPU in those windows, "Claude Helper (Renderer)" 571–642 ms (4–5 cores). Guest threads run at default priority (31); the GNM encoder, Metal threads and other apps' UI threads run at 37–47.
+- A/B (same diagnostics, log suppressed, load 11): Frame Submission at `QOS_CLASS_USER_INTERACTIVE` (t12d4ui) vs default (t12q): group 2 stalls 0 vs 7 (1004 ms); frames > 100 ms 4 vs 6; max 135 vs 368 ms; FPS 101.9 vs 102.1.
+- Why only while moving: in new areas the CP's per-draw work grows (new draws, shader permutations resolved by `GetShader`), so it needs more CPU exactly when the jobs stream and our background compile threads run. A short CPU shortage then costs one or more frames.
+- Benchmark conditions make it worse: the game window is an accessory window behind everything (`PS4_BACKGROUND_WINDOW`), the process does not opt out of App Nap or timer coalescing, and the Claude app is in front.
+- Confidence: high for the mechanism (CPU time vs samples) and for the effect of the CP's QoS. One A/B pair only. The share of outside load versus the game's own threads is not measured for the owner's play.
+
+#### Group 3: job workers do not get the CPU
+
+- With the CP raised (t12d4ui) the 5 remaining stalls (598 ms) are this group: workers "busy" 51–100 % of the samples but on the CPU only 0–62 % of the window (mostly 10–35 %). Their CPU went to the same competitors as in group 2, now with the CP ahead of them.
+- The older runs have no CPU time, so there it cannot be told whether a stall of this group is starvation or genuine serial job work.
+- Confidence: medium.
+
+#### Group 4: GPU completion late
+
+- t12diag3, 297 ms: the job waits in the condvar of `fn_0xb3d750` for the frame's EOP. A command buffer of that frame waited 290.9 ms between commit and GPU start. In the same frame the system swapped: swap-ins 2785, swap-outs 3216, decompressions 49425 pages. Free memory stayed at 50–180 MB for the whole run. Swap use was 8.5 of 9.2 GB, with a Virtualization VM (2.2 GB) and the Claude app (2.6 GB) resident next to the game (3.1 GB).
+- In all other stalls the GPU side was fast: encoder 5–27 ms per frame, commit → done ≤ 8 ms.
+- The 1132 ms stall of t10b (Frame Submission in the `fn_0xb49f60` loop waiting for frame N-3 on the GPU) belongs here. It had no GPU timing, so its cause is not proven.
+- Confidence: low–medium. Probably environmental (memory pressure on a 16 GB machine).
+
+#### Hypotheses that were tested and rejected
+
+- Atomic mutexes and coroutine fibers: with `PS4_MUTEX_LEGACY=1 PS4_FIBER_THREADS=1` (t12qlegacy vs t12q): 9 stalls (1536 ms) vs 7 (1004 ms), FPS 68.0 vs 102.1, frames > 33 ms 36 vs 27. The new primitives do not cause the stalls; the legacy ones are worse.
+- TSC: the 128-bit division is the conversion in `recomp_rdtsc`, executed by idle workers. The guest computes its timeouts from the same counter (`sceKernelGetTscFrequency` = 2.13 GHz), so the timeouts are not wrong.
+- Sleep granularity: the guest's sleep loops sleep 1 ms (`usleep(1000)`). That adds at most 1–2 ms per wait.
+- Timeout units: `shim_scePthreadCondTimedwait` takes µs and converts them correctly.
+- No hidden producer: no I/O, streaming or GPU-interrupt thread was busy or blocked in these stalls (all sampled, including host threads).
+
+### Proposed fixes
+
+1. **NP stub logging** (group 1). Component: `modules/libSceNp/ps4_np.c`. Each NP stub logs its first call only and counts the rest. A summary of the counts goes into the periodic perf output. `PS4_NP_LOG_ALL=1` restores logging of every call. The implementation plan also lists the other shims that print on every call from guest threads, and gives them the same treatment.
+2. **CP thread priority** (group 2). Component: libSceGnmDriver (`ps4_gnm_metal.mm`, the entry of `sceGnmSubmitCommandBuffers` / `sceGnmSubmitAndFlipCommandBuffers`). The guest thread that submits command buffers sets itself to `QOS_CLASS_USER_INTERACTIVE` once, at its first submit. That is the same class as the GNM encoder, and the thread only runs when it has work. Off: `PS4_GNM_CP_QOS=0`.
+3. **No App Nap, no timer coalescing** (groups 2, 3). Component: `modules/libSceVideoOut/ps4_metal_screen.m` at startup. Call `[[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:...]` and keep the activity for the lifetime of the process. Off: `PS4_NO_LATENCY_ACTIVITY=1`.
+4. **Job worker priority** (group 3). Decided by measurement, not yet proposed as a change. Candidate: NdJob worker threads at `QOS_CLASS_USER_INITIATED`, above other apps' default work and below the CP, the encoder and audio. They should not go to USER_INTERACTIVE, because idle workers spin. Switch: `PS4_GUEST_WORKER_QOS=<default|utility|initiated|interactive>`, default unchanged until measured. Cheapest experiment that settles it: one A/B pair with fixes 2+3 on, `PS4_GUEST_WORKER_QOS=initiated` vs default, both under the controlled load described below.
+5. **Profiler: CPU time per thread** (diagnostics). Component 2 gets the per-thread CPU time of the sampled window and the CPU of other processes, as in the temporary patch. "Busy" alone cannot tell work from starvation. Off: part of `PS4_STALL_PROFILE`.
+6. **Group 4.** No runtime change yet. Cheapest experiment: two walking runs with the VM stopped, comparing GPU commit → start delays and VM statistics per frame. If the delays stay, measure how much memory Metal wires in guest-memory windows (`S.guest_bufs`: 64 MiB windows, never released) and propose bounding it.
+
+### Verification
+
+- Walking benchmark, both routes, 2 runs per arm, the builds alternating (fix on/off through the switches). Runs with load > 15 are discarded. Reported per run: frames > 33/100 ms, max, and the stalls without renderer work by group. The classification script goes into `tools/` and uses the profiler's CPU time (fix 5).
+- Controlled load: the same pairs with a fixed CPU load next to the game, for example 8 × `yes > /dev/null`, plus one run with the Claude app in front as today. This reproduces groups 2 and 3 on purpose. Target: no stall over 100 ms from groups 1–3.
+- Group 1: one run with stdout to a file and logging at the default: no `__write_nocancel` stalls.
+- FPS A/B, courtyard and Sarah's house, 2 rounds alternating. The QoS changes must not lower the average FPS.
+- Screenshots of the same frames before and after: identical, because nothing in rendering changes.
