@@ -226,8 +226,11 @@ Lcall_shim_host:
     // The ctx this call stored into. A context switch inside the shim may have changed the
     // TCB slot, and x27 may name another guest thread's TCB by now.
     ldr  x1, [sp, #24]
-    ldr  x2, [sp, #32]           // guest FPCR of this call (the frame is the caller's)
-    tst  x2, #0xc00000           // unchanged unless the guest rounding mode was cleared
+    // The guest FPCR of this call (the frame is the caller's). A context switch inside the
+    // shim may have run endpoints with another FZ on this host thread, so compare.
+    ldr  x2, [sp, #32]
+    mrs  x3, fpcr
+    cmp  x2, x3
     b.eq 2f
     msr  fpcr, x2
 2:

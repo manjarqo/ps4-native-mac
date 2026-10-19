@@ -463,9 +463,9 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     if (saved_slot != (uint64_t)(uintptr_t)ctx && ps4_fiber_threads_mode()) {
         pthread_t target;
         if (ps4_fiber_endpoint_host_thread((GuestContext *)(uintptr_t)saved_slot, &target) &&
-            !pthread_equal(target, pthread_self()))
-            pthread_kill(target, SIGUSR1);
-        return;
+            !pthread_equal(target, pthread_self()) && pthread_kill(target, SIGUSR1) == 0)
+            return;
+        // No other host thread runs the endpoint (it is changing hands): handle it here.
     }
 
     // Save full guest state to restore after exception handler returns

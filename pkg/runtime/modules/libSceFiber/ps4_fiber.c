@@ -275,7 +275,11 @@ static FiberWorker *get_worker(GuestContext *ctx) {
   pthread_setspecific(g_worker_key, w);
   tl_worker = w;
   const int i = atomic_fetch_add(&g_nworkers, 1);
-  if (i < MAX_WORKERS) atomic_store(&g_workers[i], w);
+  if (i < MAX_WORKERS)
+    atomic_store(&g_workers[i], w);
+  else if (i == MAX_WORKERS)
+    fprintf(stderr, "[ps4-fiber] more than %d guest threads run fibers: guest exceptions for the "
+                    "later ones go to their own host thread, not to the fiber they run\n", MAX_WORKERS);
   return w;
 }
 
@@ -433,10 +437,11 @@ static void *fiber_host_main(void *arg) {
 // a frame that "returns" into ps4_fiber_co_trampoline with x19 = FiberHost
 // and x20 = fiber_co_main.
 // FPCR and MXCSR need no slot in the frame: a switch happens inside a shim, and
-// host code runs with the default FPCR (the shim bridge keeps the guest FPCR in
-// its frame on the switching endpoint's host stack and restores it when that
-// endpoint resumes); MXCSR is in each endpoint's own GuestContext, the one the
-// TCB slot names while it runs.
+// the shim bridge keeps the switching endpoint's guest FPCR in its frame on that
+// endpoint's host stack and writes it back when the endpoint resumes, whatever
+// FPCR (round to nearest, but the FZ of the last endpoint) the host thread has
+// then. MXCSR is in each endpoint's own GuestContext, the one the TCB slot names
+// while it runs.
 __attribute__((visibility("hidden"))) void ps4_fiber_ctx_switch(void **save_sp, void *load_sp);
 __attribute__((visibility("hidden"))) extern const char ps4_fiber_co_trampoline[];
 

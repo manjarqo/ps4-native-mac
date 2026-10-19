@@ -164,7 +164,7 @@ GUEST_FN _guest_fiber_main2
 GUEST_FN _guest_fiber_a
     STORE_REGS RES_A_ARGS
     SET_PATTERN 0xa000
-    SET_MXCSR 0xbf80                // round down, flush to zero
+    SET_MXCSR 0x9f80                // flush to zero, round to nearest: B and thread 2 have FZ 0
     STORE_REGS RES_A_PRE
     LI   x24, FIBER_B
     LI   x23, 0x5151

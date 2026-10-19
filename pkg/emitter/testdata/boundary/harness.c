@@ -223,8 +223,8 @@ static void test_fiber(void) {
   expect("thread 2 argOnReturn", *gmem64(ARGRET2), 0x88);
   static const char *fp_names[] = {"thread 1 after Run(A)", "A after Switch(B)", "A resumed on thread 2",
                                    "B resumed on thread 2", "thread 2 after Run(A)"};
-  static const uint64_t fp_fpcr[] = {FPCR_RZ, FPCR_RM | FPCR_FZ, FPCR_RM | FPCR_FZ, FPCR_RP, 0};
-  static const uint64_t fp_mxcsr[] = {0x7f80, 0xbf80, 0xbf80, 0x5f80, 0x1f80};
+  static const uint64_t fp_fpcr[] = {FPCR_RZ, FPCR_FZ, FPCR_FZ, FPCR_RP, 0};
+  static const uint64_t fp_mxcsr[] = {0x7f80, 0x9f80, 0x9f80, 0x5f80, 0x1f80};
   for (int i = 0; i < 5; i++) {
     char what[96];
     const uint64_t *fp = gmem64(RES_FP_ADDR + (uint64_t)i * 16);
