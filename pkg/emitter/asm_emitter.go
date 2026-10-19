@@ -78,6 +78,11 @@ type AsmEmitter struct {
 	// unresolved describes every import slot (PLT stub and GOT slot address) that no host
 	// shim and no loaded module satisfies. Each one is bound to shim_unresolved_stub.
 	unresolved map[uint64]unresolvedImport
+	// UnresolvedFuncImports and UnresolvedDataImports count the unresolved import relocations:
+	// JUMP_SLOT ones are calls, GLOB_DAT/R_X86_64_64 ones are address loads (a data import is
+	// bound to the same stub, so reading it as data yields the stub's address).
+	UnresolvedFuncImports int
+	UnresolvedDataImports int
 }
 
 // unresolvedImport is what shim_unresolved_stub reports when the guest calls a missing import.
@@ -95,8 +100,8 @@ const unresolvedStubShim = "shim_unresolved_stub"
 // (or at itself when there is no PLT) when neither a module export nor the canary applies, and
 // the emitter binds a host shim to the slots it can serve. What is left would jump to itself
 // forever, so it is routed to shim_unresolved_stub with its name instead.
-func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]string) map[uint64]unresolvedImport {
-	out := make(map[uint64]unresolvedImport)
+func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]string) (out map[uint64]unresolvedImport, funcs, data int) {
+	out = make(map[uint64]unresolvedImport)
 	for _, rel := range loaded.Relocations {
 		switch rel.Type {
 		case elfloader.R_X86_64_JUMP_SLOT, elfloader.R_X86_64_GLOB_DAT, elfloader.R_X86_64_64:
@@ -112,6 +117,11 @@ func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]st
 		slot := binary.LittleEndian.Uint64(loaded.MemoryImage[rel.Offset : rel.Offset+8])
 		if slot != rel.Offset && (rel.PltAddr == 0 || slot != rel.PltAddr) {
 			continue
+		}
+		if rel.Type == elfloader.R_X86_64_JUMP_SLOT {
+			funcs++
+		} else {
+			data++
 		}
 		imp := unresolvedImport{nid: elfloader.NIDPrefix(rel.SymName), lib: loaded.LibraryForNID(rel.SymName)}
 		if canon, ok := elfloader.ResolveNID(rel.SymName); ok {
@@ -129,7 +139,7 @@ func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]st
 			}
 		}
 	}
-	return out
+	return out, funcs, data
 }
 
 // NewAsmEmitter creates a new ARM64 assembly emitter.
@@ -176,7 +186,7 @@ func NewAsmEmitter(loaded *elfloader.LoadedELF, d *disasm.Disassembler, l *lifte
 		bindAddr(sym.Name, sym.Address)
 	}
 
-	unresolved := collectUnresolvedImports(loaded, shimMap)
+	unresolved, unresFuncs, unresData := collectUnresolvedImports(loaded, shimMap)
 	for addr := range unresolved {
 		shimMap[addr] = unresolvedStubShim
 	}
@@ -187,6 +197,9 @@ func NewAsmEmitter(loaded *elfloader.LoadedELF, d *disasm.Disassembler, l *lifte
 		lifter:     l,
 		shimMap:    shimMap,
 		unresolved: unresolved,
+
+		UnresolvedFuncImports: unresFuncs,
+		UnresolvedDataImports: unresData,
 	}
 }
 
