@@ -586,7 +586,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "shld eax, ebx, 4",
 			bytes:    []byte{0x0f, 0xa4, 0xd8, 0x04}, // shld eax, ebx, 4
 			pc:       0x1000,
-			expected: []string{"extr w16, w16, w17, #28"},
+			expected: []string{"orr x4, x0, x3, lsl #32", "lsl x5, x4, x1", "lsr x5, x5, #32", "mov w19, w5"},
 		},
 		{
 			name:     "vpslld xmm0, xmm1, xmm2",
@@ -826,7 +826,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "rcl rdi, 1",
 			bytes:    []byte{0x48, 0xd1, 0xd7},
 			pc:       0x1000,
-			expected: []string{"mrs  x18, nzcv", "ubfx w19, w18, #29, #1", "lsr  x20, x16, #63", "bfi  x18, x19, #29, #1", "msr  nzcv, x18"},
+			expected: []string{"cset w2, cc", "lsl x5, x3, x1", "rmif x4, #0, #3", "mov x24, x5"},
 		},
 		{
 			name:     "fcos",
@@ -849,7 +849,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "sar al, 7",
 			bytes:    []byte{0xc0, 0xf8, 0x07}, // sar al, 7
 			pc:       0x1000,
-			expected: []string{"sxtb w16, w16", "asr w16, w16, #7"},
+			expected: []string{"sxtb x4, w17", "asr x0, x4, #7", "cmn wzr, w0, lsl #24", "bfi x19, x0, #0, #8"},
 		},
 		{
 			name:     "vpcmpistri x1, x0, 0",
@@ -999,17 +999,17 @@ func TestRolRorVariableAndImmediate(t *testing.T) {
 		{
 			name:     "rol r10d, cl (variable 32-bit)",
 			bytes:    []byte{0x41, 0xd3, 0xc2}, // rol r10d, cl
-			contains: []string{"neg w16, w21", "ror w10, w10, w16"},
+			contains: []string{"neg w5, w21", "ror w10, w10, w5"},
 		},
 		{
 			name:     "rol r9d, cl (variable 32-bit)",
 			bytes:    []byte{0x41, 0xd3, 0xc1}, // rol r9d, cl
-			contains: []string{"neg w16, w21", "ror w9, w9, w16"},
+			contains: []string{"neg w5, w21", "ror w9, w9, w5"},
 		},
 		{
 			name:     "rol rax, cl (variable 64-bit)",
 			bytes:    []byte{0x48, 0xd3, 0xc0}, // rol rax, cl
-			contains: []string{"neg x16, x21", "ror x19, x19, x16"},
+			contains: []string{"neg x5, x21", "ror x19, x19, x5"},
 		},
 		{
 			name:     "ror r10d, cl (variable 32-bit)",
@@ -1029,7 +1029,8 @@ func TestRolRorVariableAndImmediate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("decode failed: %v", err)
 			}
-			dInst := disasm.Instruction{Address: 0x1000, Inst: inst}
+			// CF/OF dead: rotates then only change the value.
+			dInst := disasm.Instruction{Address: 0x1000, Inst: inst, CarryDead: true, OverflowDead: true}
 			lines, err := lifter.LiftInstructionToBuf(dInst, 0x1004, fn, nil)
 			if err != nil {
 				t.Fatalf("lift failed: %v", err)
@@ -1060,7 +1061,8 @@ func TestShiftFlagUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode shr failed: %v", err)
 	}
-	dShr := disasm.Instruction{Address: 0x1000, Inst: shrInst, SkipFlags: false}
+	// ZF is live (JNE), CF/OF are dead: the shift updates SF/ZF with TST.
+	dShr := disasm.Instruction{Address: 0x1000, Inst: shrInst, SkipFlags: false, CarryDead: true, OverflowDead: true}
 	linesShr, err := lifter.LiftInstructionToBuf(dShr, 0x1004, fn, nil)
 	if err != nil {
 		t.Fatalf("lift shr failed: %v", err)

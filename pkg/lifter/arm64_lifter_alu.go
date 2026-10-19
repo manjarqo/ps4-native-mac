@@ -575,324 +575,243 @@ func (l *Arm64Lifter) liftNegNot(inst disasm.Instruction, nextPC uint64, lines [
 	return lines, nil
 }
 
-// liftShift handles SHL, SHR, SAR, ROL, ROR.
+// liftShift handles SHL, SHR, SAR, ROL, ROR with x86 semantics:
+//   - the count is masked to 5 bits (6 for 64-bit operands); a masked count of 0 changes
+//     neither the flags nor the value (a 32-bit register is still zero-extended);
+//   - SHL/SHR/SAR: SF/ZF from the result, CF = last bit shifted out, OF for a count of 1
+//     (SHL: MSB(result) ^ CF, SHR: MSB(source), SAR: 0);
+//   - ROL/ROR change only CF (ROL: LSB(result), ROR: MSB(result)) and OF (ROL: MSB ^ CF,
+//     ROR: the two top bits XORed); SF/ZF are kept.
+// CF and OF are inserted into C and V with RMIF; SF/ZF come from CMN of the top-aligned result.
+// A variable count keeps the current carry sense (the count may be 0); an immediate count
+// leaves carryAdd.
 func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	op := inst.Inst.Op
-	dst := inst.Inst.Args[0]
-	shiftArg := inst.Inst.Args[1]
-
-	armOp := ""
-	switch op {
-	case x86asm.SHL:
-		armOp = "lsl"
-	case x86asm.SHR:
-		armOp = "lsr"
-	case x86asm.SAR:
-		armOp = "asr"
-	case x86asm.ROR:
-		armOp = "ror"
-	case x86asm.ROL:
-		// Rotate left can be implemented as ROR with (size - N)
-		armOp = "ror"
+	load, val, size, store, ok := unaryOperand(inst, nextPC)
+	if !ok {
+		lines = append(lines, l.emitUnsupported(inst, fmt.Sprintf("unsupported %s operand", strings.ToLower(op.String())))...)
+		return lines, nil
 	}
-
-	updateFlags := !inst.SkipFlags && (op == x86asm.SHL || op == x86asm.SHR || op == x86asm.SAR)
-
-	if reg, ok := dst.(x86asm.Reg); ok {
-		if desc, okDesc := arm64RegMap[reg]; okDesc {
-			if imm, okImm := shiftArg.(x86asm.Imm); okImm {
-				shiftVal := int(imm)
-				if desc.Size == 8 {
-					shiftVal &= 63
-					if op == x86asm.ROL {
-						shiftVal = (64 - shiftVal) & 63
-					}
-					if shiftVal > 0 {
-						lines = append(lines, fmt.Sprintf("    %s %s, %s, #%d", armOp, desc.X, desc.X, shiftVal))
-						if updateFlags {
-							lines = append(lines, fmt.Sprintf("    tst %s, %s", desc.X, desc.X))
-						}
-					}
-					return lines, nil
-				} else if desc.Size == 4 {
-					shiftVal &= 31
-					if op == x86asm.ROL {
-						shiftVal = (32 - shiftVal) & 31
-					}
-					if shiftVal > 0 {
-						lines = append(lines, fmt.Sprintf("    %s %s, %s, #%d", armOp, desc.W, desc.W, shiftVal))
-						if updateFlags {
-							lines = append(lines, fmt.Sprintf("    tst %s, %s", desc.W, desc.W))
-						}
-					}
-					return lines, nil
-				} else if desc.Size == 2 && (op == x86asm.ROL || op == x86asm.ROR) {
-					shiftVal &= 15
-					if op == x86asm.ROL {
-						shiftVal = (16 - shiftVal) & 15
-					}
-					if shiftVal > 0 {
-						rc, _ := readRegTo(reg, "x16", "w16")
-						lines = append(lines, rc...)
-						lines = append(lines, "    orr w16, w16, w16, lsl #16")
-						lines = append(lines, fmt.Sprintf("    ror w16, w16, #%d", shiftVal))
-						lines = append(lines, "    uxth w16, w16")
-						wc, _ := writeRegFrom(reg, "x16", "w16")
-						lines = append(lines, wc...)
-					}
-					return lines, nil
-				} else if desc.Size == 1 && (op == x86asm.ROL || op == x86asm.ROR) {
-					shiftVal &= 7
-					if op == x86asm.ROL {
-						shiftVal = (8 - shiftVal) & 7
-					}
-					if shiftVal > 0 {
-						rc, _ := readRegTo(reg, "x16", "w16")
-						lines = append(lines, rc...)
-						lines = append(lines, "    orr w16, w16, w16, lsl #8")
-						lines = append(lines, "    orr w16, w16, w16, lsl #16")
-						lines = append(lines, fmt.Sprintf("    ror w16, w16, #%d", shiftVal))
-						lines = append(lines, "    uxtb w16, w16")
-						wc, _ := writeRegFrom(reg, "x16", "w16")
-						lines = append(lines, wc...)
-					}
-					return lines, nil
-				} else {
-					// 8-bit or 16-bit SHL/SHR/SAR
-					shiftVal &= 31
-					rc, _ := readRegTo(reg, "x16", "w16")
-					lines = append(lines, rc...)
-					if op == x86asm.SAR {
-						if desc.Size == 1 {
-							lines = append(lines, "    sxtb w16, w16")
-						} else if desc.Size == 2 {
-							lines = append(lines, "    sxth w16, w16")
-						}
-					}
-					if shiftVal > 0 {
-						lines = append(lines, fmt.Sprintf("    %s w16, w16, #%d", armOp, shiftVal))
-						if updateFlags {
-							if desc.Size == 1 {
-								lines = append(lines, "    sxtb w17, w16", "    tst w17, w17")
-							} else {
-								lines = append(lines, "    sxth w17, w16", "    tst w17, w17")
-							}
-						}
-					}
-					wc, _ := writeRegFrom(reg, "x16", "w16")
-					lines = append(lines, wc...)
-					return lines, nil
-				}
-			}
-			// Variable shift (CL in x21 / w21)
-			if desc.Size == 8 {
-				if op == x86asm.ROL {
-					lines = append(lines, "    neg x16, x21")
-					lines = append(lines, fmt.Sprintf("    ror %s, %s, x16", desc.X, desc.X))
-				} else {
-					lines = append(lines, fmt.Sprintf("    %s %s, %s, x21", armOp, desc.X, desc.X))
-					if updateFlags {
-						lines = append(lines, fmt.Sprintf("    tst %s, %s", desc.X, desc.X))
-					}
-				}
-			} else if desc.Size == 4 {
-				if op == x86asm.ROL {
-					lines = append(lines, "    neg w16, w21")
-					lines = append(lines, fmt.Sprintf("    ror %s, %s, w16", desc.W, desc.W))
-				} else {
-					lines = append(lines, fmt.Sprintf("    %s %s, %s, w21", armOp, desc.W, desc.W))
-					if updateFlags {
-						lines = append(lines, fmt.Sprintf("    tst %s, %s", desc.W, desc.W))
-					}
-				}
-			} else if desc.Size == 2 && (op == x86asm.ROL || op == x86asm.ROR) {
-				rc, _ := readRegTo(reg, "x16", "w16")
-				lines = append(lines, rc...)
-				if op == x86asm.ROL {
-					lines = append(lines, "    neg w17, w21")
-					lines = append(lines, "    and w17, w17, #15")
-				} else {
-					lines = append(lines, "    and w17, w21, #15")
-				}
-				lines = append(lines, "    orr w16, w16, w16, lsl #16")
-				lines = append(lines, "    ror w16, w16, w17")
-				lines = append(lines, "    uxth w16, w16")
-				wc, _ := writeRegFrom(reg, "x16", "w16")
-				lines = append(lines, wc...)
-			} else if desc.Size == 1 && (op == x86asm.ROL || op == x86asm.ROR) {
-				rc, _ := readRegTo(reg, "x16", "w16")
-				lines = append(lines, rc...)
-				if op == x86asm.ROL {
-					lines = append(lines, "    neg w17, w21")
-					lines = append(lines, "    and w17, w17, #7")
-				} else {
-					lines = append(lines, "    and w17, w21, #7")
-				}
-				lines = append(lines, "    orr w16, w16, w16, lsl #8")
-				lines = append(lines, "    orr w16, w16, w16, lsl #16")
-				lines = append(lines, "    ror w16, w16, w17")
-				lines = append(lines, "    uxtb w16, w16")
-				wc, _ := writeRegFrom(reg, "x16", "w16")
-				lines = append(lines, wc...)
-			} else {
-				rc, _ := readRegTo(reg, "x16", "w16")
-				lines = append(lines, rc...)
-				if op == x86asm.SAR {
-					if desc.Size == 1 {
-						lines = append(lines, "    sxtb w16, w16")
-					} else if desc.Size == 2 {
-						lines = append(lines, "    sxth w16, w16")
-					}
-				}
-				lines = append(lines, fmt.Sprintf("    %s w16, w16, w21", armOp))
-				if updateFlags {
-					if desc.Size == 1 {
-						lines = append(lines, "    sxtb w17, w16", "    tst w17, w17")
-					} else {
-						lines = append(lines, "    sxth w17, w16", "    tst w17, w17")
-					}
-				}
-				wc, _ := writeRegFrom(reg, "x16", "w16")
-				lines = append(lines, wc...)
-			}
+	bits := 8 * size
+	mask := 31
+	if bits == 64 {
+		mask = 63
+	}
+	immCount := -1
+	switch c := inst.Inst.Args[1].(type) {
+	case x86asm.Imm:
+		immCount = int(c) & mask
+	case x86asm.Reg:
+		if c != x86asm.CL {
+			lines = append(lines, l.emitUnsupported(inst, "shift count register")...)
 			return lines, nil
 		}
+	default:
+		lines = append(lines, l.emitUnsupported(inst, "shift count")...)
+		return lines, nil
+	}
+	if immCount == 0 {
+		return lines, nil
+	}
+	rotate := op == x86asm.ROL || op == x86asm.ROR
+	flags := !inst.SkipFlags
+	needCO := !inst.CarryDead || !inst.OverflowDead
+	if rotate && !needCO {
+		flags = false
 	}
 
-	if mem, okMem := dst.(x86asm.Mem); okMem {
-		sz := defMemSz(inst)
-		lines = append(lines, readMemTo(mem, nextPC, sz, "x17", "w17")...)
-		if imm, okImm := shiftArg.(x86asm.Imm); okImm {
-			shiftVal := int(imm)
-			if sz == 8 {
-				shiftVal &= 63
+	if size >= 4 && (!flags || (!needCO && !rotate)) {
+		// Result straight into the operand; at most SF/ZF are needed (TST leaves C = V = 0).
+		cnt := ""
+		if immCount > 0 {
+			r := immCount
+			if rotate {
+				r %= bits
 				if op == x86asm.ROL {
-					shiftVal = (64 - shiftVal) & 63
-				}
-				if shiftVal > 0 {
-					lines = append(lines, fmt.Sprintf("    %s x17, x17, #%d", armOp, shiftVal))
-					if updateFlags {
-						lines = append(lines, "    tst x17, x17")
-					}
-				}
-			} else if sz == 4 {
-				shiftVal &= 31
-				if op == x86asm.ROL {
-					shiftVal = (32 - shiftVal) & 31
-				}
-				if shiftVal > 0 {
-					lines = append(lines, fmt.Sprintf("    %s w17, w17, #%d", armOp, shiftVal))
-					if updateFlags {
-						lines = append(lines, "    tst w17, w17")
-					}
-				}
-			} else if sz == 2 && (op == x86asm.ROL || op == x86asm.ROR) {
-				shiftVal &= 15
-				if op == x86asm.ROL {
-					shiftVal = (16 - shiftVal) & 15
-				}
-				if shiftVal > 0 {
-					lines = append(lines, "    orr w17, w17, w17, lsl #16")
-					lines = append(lines, fmt.Sprintf("    ror w17, w17, #%d", shiftVal))
-					lines = append(lines, "    uxth w17, w17")
-				}
-			} else if sz == 1 && (op == x86asm.ROL || op == x86asm.ROR) {
-				shiftVal &= 7
-				if op == x86asm.ROL {
-					shiftVal = (8 - shiftVal) & 7
-				}
-				if shiftVal > 0 {
-					lines = append(lines, "    orr w17, w17, w17, lsl #8")
-					lines = append(lines, "    orr w17, w17, w17, lsl #16")
-					lines = append(lines, fmt.Sprintf("    ror w17, w17, #%d", shiftVal))
-					lines = append(lines, "    uxtb w17, w17")
-				}
-			} else {
-				shiftVal &= 31
-				if op == x86asm.SAR {
-					if sz == 1 {
-						lines = append(lines, "    sxtb w17, w17")
-					} else if sz == 2 {
-						lines = append(lines, "    sxth w17, w17")
-					}
-				}
-				if shiftVal > 0 {
-					lines = append(lines, fmt.Sprintf("    %s w17, w17, #%d", armOp, shiftVal))
-					if updateFlags {
-						if sz == 1 {
-							lines = append(lines, "    sxtb w0, w17", "    tst w0, w0")
-						} else {
-							lines = append(lines, "    sxth w0, w17", "    tst w0, w0")
-						}
-					}
+					r = (bits - r) % bits
 				}
 			}
+			cnt = fmt.Sprintf("#%d", r)
 		} else {
-			// Variable shift (CL in x21 / w21)
-			if sz == 8 {
-				if op == x86asm.ROL {
-					lines = append(lines, "    neg x16, x21")
-					lines = append(lines, "    ror x17, x17, x16")
-				} else {
-					lines = append(lines, fmt.Sprintf("    %s x17, x17, x21", armOp))
-					if updateFlags {
-						lines = append(lines, "    tst x17, x17")
-					}
-				}
-			} else if sz == 4 {
-				if op == x86asm.ROL {
-					lines = append(lines, "    neg w16, w21")
-					lines = append(lines, "    ror w17, w17, w16")
-				} else {
-					lines = append(lines, fmt.Sprintf("    %s w17, w17, w21", armOp))
-					if updateFlags {
-						lines = append(lines, "    tst w17, w17")
-					}
-				}
-			} else if sz == 2 && (op == x86asm.ROL || op == x86asm.ROR) {
-				if op == x86asm.ROL {
-					lines = append(lines, "    neg w16, w21")
-					lines = append(lines, "    and w16, w16, #15")
-				} else {
-					lines = append(lines, "    and w16, w21, #15")
-				}
-				lines = append(lines, "    orr w17, w17, w17, lsl #16")
-				lines = append(lines, "    ror w17, w17, w16")
-				lines = append(lines, "    uxth w17, w17")
-			} else if sz == 1 && (op == x86asm.ROL || op == x86asm.ROR) {
-				if op == x86asm.ROL {
-					lines = append(lines, "    neg w16, w21")
-					lines = append(lines, "    and w16, w16, #7")
-				} else {
-					lines = append(lines, "    and w16, w21, #7")
-				}
-				lines = append(lines, "    orr w17, w17, w17, lsl #8")
-				lines = append(lines, "    orr w17, w17, w17, lsl #16")
-				lines = append(lines, "    ror w17, w17, w16")
-				lines = append(lines, "    uxtb w17, w17")
-			} else {
-				if op == x86asm.SAR {
-					if sz == 1 {
-						lines = append(lines, "    sxtb w17, w17")
-					} else if sz == 2 {
-						lines = append(lines, "    sxth w17, w17")
-					}
-				}
-				lines = append(lines, fmt.Sprintf("    %s w17, w17, w21", armOp))
-				if updateFlags {
-					if sz == 1 {
-						lines = append(lines, "    sxtb w0, w17", "    tst w0, w0")
-					} else {
-						lines = append(lines, "    sxth w0, w17", "    tst w0, w0")
-					}
-				}
+			// ARM masks register counts to 5/6 bits like x86 does for 32/64-bit operands.
+			cnt = val[:1] + "21"
+		}
+		lines = append(lines, load...)
+		arm := map[x86asm.Op]string{x86asm.SHL: "lsl", x86asm.SHR: "lsr", x86asm.SAR: "asr", x86asm.ROL: "ror", x86asm.ROR: "ror"}[op]
+		if immCount < 0 {
+			lines = append(lines, fmt.Sprintf("    and w1, w21, #%d", mask)) // the flags test needs it
+			if op == x86asm.ROL {
+				lines = append(lines, fmt.Sprintf("    neg %s5, %s21", val[:1], val[:1]))
+				cnt = val[:1] + "5"
 			}
 		}
-		lines = append(lines, writeMemFrom(mem, nextPC, sz, "x17", "w17")...)
+		if !(rotate && immCount > 0 && cnt == "#0") {
+			lines = append(lines, fmt.Sprintf("    %s %s, %s, %s", arm, val, val, cnt))
+		}
+		if flags {
+			skip := ""
+			if immCount < 0 {
+				skip = fmt.Sprintf("L_shift_0x%x_%d", inst.Address, l.labelCounter)
+				l.labelCounter++
+				lines = append(lines, fmt.Sprintf("    cbz w1, %s", skip))
+			}
+			lines = append(lines, fmt.Sprintf("    tst %s, %s", val, val))
+			if skip != "" {
+				lines = append(lines, skip+":")
+			}
+			l.cpol = carryClear // CF is dead
+		}
+		lines = append(lines, store(val)...)
 		return lines, nil
 	}
 
-	lines = append(lines, l.emitUnsupported(inst, fmt.Sprintf("unsupported %s", strings.ToLower(op.String())))...)
+	if immCount < 0 {
+		lines = append(lines, fmt.Sprintf("    and w1, w21, #%d", mask)) // before CL can be written
+	}
+	lines = append(lines, load...)
+
+	// xv: the source as a 64-bit value (zero-extended; sign-extended for SAR).
+	xv := "x" + val[1:]
+	switch {
+	case op == x86asm.SAR && bits < 64:
+		ext := map[int]string{8: "sxtb", 16: "sxth", 32: "sxtw"}[bits]
+		lines = append(lines, fmt.Sprintf("    %s x4, %s", ext, val))
+		xv = "x4"
+	case bits == 32 && val != "w17":
+		lines = append(lines, fmt.Sprintf("    mov w4, %s", val)) // pinned register: drop the upper half
+		xv = "x4"
+	}
+	amt := func(n int) string { return fmt.Sprintf("#%d", n) }
+
+	// Result into x0 (w0).
+	switch op {
+	case x86asm.SHL, x86asm.SHR, x86asm.SAR:
+		arm := map[x86asm.Op]string{x86asm.SHL: "lsl", x86asm.SHR: "lsr", x86asm.SAR: "asr"}[op]
+		if immCount > 0 {
+			lines = append(lines, fmt.Sprintf("    %s x0, %s, %s", arm, xv, amt(immCount)))
+		} else {
+			lines = append(lines, fmt.Sprintf("    %s x0, %s, x1", arm, xv))
+		}
+	default: // ROL/ROR
+		src := xv
+		if bits < 32 {
+			// Replicate the value over 32 bits; a 32-bit rotate then rotates the low bits.
+			lines = append(lines, fmt.Sprintf("    orr w4, %s, %s, lsl #%d", val, val, bits))
+			if bits == 8 {
+				lines = append(lines, "    orr w4, w4, w4, lsl #16")
+			}
+			src = "x4"
+		}
+		rw := "w"
+		if bits == 64 {
+			rw = "x"
+		}
+		width := bits
+		if bits < 32 {
+			width = 32
+		}
+		if immCount > 0 {
+			r := immCount % bits
+			if op == x86asm.ROL {
+				r = (bits - r) % bits
+			}
+			lines = append(lines, fmt.Sprintf("    ror %s0, %s%s, #%d", rw, rw, src[1:], r%width))
+		} else {
+			cnt := "1"
+			if op == x86asm.ROL {
+				lines = append(lines, fmt.Sprintf("    neg %s5, %s1", rw, rw))
+				cnt = "5"
+			}
+			if bits < 32 {
+				lines = append(lines, fmt.Sprintf("    and w5, w%s, #%d", cnt, bits-1))
+				cnt = "5"
+			}
+			lines = append(lines, fmt.Sprintf("    ror %s0, %s%s, %s%s", rw, rw, src[1:], rw, cnt))
+		}
+	}
+
+	if flags {
+		skip := ""
+		if immCount < 0 {
+			skip = fmt.Sprintf("L_shift_0x%x_%d", inst.Address, l.labelCounter)
+			l.labelCounter++
+			lines = append(lines, fmt.Sprintf("    cbz w1, %s", skip))
+		}
+		setNZ := ""
+		if !rotate {
+			if bits == 64 {
+				setNZ = "    cmn xzr, x0"
+			} else {
+				setNZ = fmt.Sprintf("    cmn wzr, w0, lsl #%d", 32-bits)
+			}
+		}
+		if !needCO {
+			// CF and OF are dead: only SF/ZF matter (CMN leaves C = V = 0).
+			lines = append(lines, setNZ)
+			l.cpol = carryClear
+		} else {
+			// x2 = CF, x3 = OF
+			switch op {
+			case x86asm.SHL:
+				if bits < 64 {
+					lines = append(lines,
+						fmt.Sprintf("    ubfx x2, x0, #%d, #1", bits),
+						"    eor x3, x0, x0, lsr #1",
+						fmt.Sprintf("    ubfx x3, x3, #%d, #1", bits-1))
+				} else {
+					if immCount > 0 {
+						lines = append(lines, fmt.Sprintf("    ubfx x2, %s, #%d, #1", xv, 64-immCount))
+					} else {
+						lines = append(lines, "    neg x5, x1", fmt.Sprintf("    lsr x2, %s, x5", xv), "    and x2, x2, #1")
+					}
+					lines = append(lines, "    eor x3, x2, x0, lsr #63")
+				}
+			case x86asm.SHR, x86asm.SAR:
+				if immCount > 0 {
+					lines = append(lines, fmt.Sprintf("    ubfx x2, %s, #%d, #1", xv, immCount-1))
+				} else {
+					arm := "lsr"
+					if op == x86asm.SAR {
+						arm = "asr"
+					}
+					lines = append(lines, "    sub x5, x1, #1", fmt.Sprintf("    %s x2, %s, x5", arm, xv), "    and x2, x2, #1")
+				}
+				if op == x86asm.SHR {
+					lines = append(lines, fmt.Sprintf("    ubfx x3, %s, #%d, #1", xv, bits-1))
+				} else {
+					lines = append(lines, "    mov x3, #0")
+				}
+			case x86asm.ROL:
+				lines = append(lines, "    and x2, x0, #1",
+					fmt.Sprintf("    ubfx x3, x0, #%d, #1", bits-1), "    eor x3, x3, x2")
+			case x86asm.ROR:
+				lines = append(lines, fmt.Sprintf("    ubfx x2, x0, #%d, #1", bits-1),
+					fmt.Sprintf("    ubfx x3, x0, #%d, #1", bits-2), "    eor x3, x3, x2")
+			}
+			outPol := carryAdd
+			if immCount < 0 && l.cpol == carrySub {
+				outPol = carrySub // the skipped path keeps C = !CF
+			}
+			if outPol == carrySub {
+				lines = append(lines, "    eor x2, x2, #1")
+			}
+			lines = append(lines, "    orr x2, x3, x2, lsl #1")
+			if setNZ != "" {
+				lines = append(lines, setNZ)
+			}
+			lines = append(lines, "    rmif x2, #0, #3") // C = bit 1, V = bit 0
+			l.cpol = outPol
+		}
+		if skip != "" {
+			lines = append(lines, skip+":")
+		}
+	}
+
+	res := "w0"
+	if bits == 64 {
+		res = "x0"
+	}
+	lines = append(lines, store(res)...)
 	return lines, nil
 }
 
@@ -2263,146 +2182,100 @@ func (l *Arm64Lifter) liftLeave(lines []string) []string {
 	return lines
 }
 
-// liftShldShrd handles SHLD and SHRD double shifts.
+// liftShldShrd handles SHLD and SHRD (16/32/64-bit) with x86 flags: CF = last bit shifted out of
+// the destination, OF (count 1) = sign change, SF/ZF from the result. A masked count of 0
+// changes nothing. 16/32-bit operands are shifted as one 2*size-bit value in a 64-bit register.
 func (l *Arm64Lifter) liftShldShrd(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	op := inst.Inst.Op
-	dst := inst.Inst.Args[0]
-	src := inst.Inst.Args[1]
-	cnt := inst.Inst.Args[2]
-
-	dstReg, okDstReg := dst.(x86asm.Reg)
-	srcReg, okSrcReg := src.(x86asm.Reg)
-	if !okSrcReg {
-		lines = append(lines, l.emitUnsupported(inst, "shld/shrd src must be reg")...)
+	srcReg, okSrcReg := inst.Inst.Args[1].(x86asm.Reg)
+	if _, ok := arm64RegMap[srcReg]; !okSrcReg || !ok {
+		lines = append(lines, l.emitUnsupported(inst, "shld/shrd src must be a register")...)
 		return lines, nil
 	}
-	descSrc, okSrcD := arm64RegMap[srcReg]
-	if !okSrcD {
-		lines = append(lines, l.emitUnsupported(inst, "unmapped shld/shrd src reg")...)
-		return lines, nil
+	mask := 31
+	if arm64RegMap[srcReg].Size == 8 {
+		mask = 63
 	}
-
-	sz := descSrc.Size
-	if sz != 4 && sz != 8 {
-		sz = 4
-	}
-
-	var cntRegStr string
-	var immShift int
-	isImm := false
-
-	if imm, okImm := cnt.(x86asm.Imm); okImm {
-		isImm = true
-		mask := 31
-		if sz == 8 {
-			mask = 63
-		}
-		immShift = int(imm) & mask
-	} else if cReg, okCReg := cnt.(x86asm.Reg); okCReg {
-		descCnt, okCntD := arm64RegMap[cReg]
-		if !okCntD {
-			lines = append(lines, l.emitUnsupported(inst, "unmapped shld/shrd cnt reg")...)
+	immCount := -1
+	switch c := inst.Inst.Args[2].(type) {
+	case x86asm.Imm:
+		immCount = int(c) & mask
+		if immCount == 0 {
 			return lines, nil
 		}
-		if sz == 8 {
-			lines = append(lines, fmt.Sprintf("    and x18, %s, #63", descCnt.X))
-			cntRegStr = "x18"
-		} else {
-			lines = append(lines, fmt.Sprintf("    and w18, %s, #31", descCnt.W))
-			cntRegStr = "w18"
+		lines = append(lines, fmt.Sprintf("    mov w1, #%d", immCount))
+	case x86asm.Reg:
+		if c != x86asm.CL {
+			lines = append(lines, l.emitUnsupported(inst, "shld/shrd count register")...)
+			return lines, nil
 		}
+		lines = append(lines, fmt.Sprintf("    and w1, w21, #%d", mask)) // before CL can be written
+	default:
+		lines = append(lines, l.emitUnsupported(inst, "shld/shrd count")...)
+		return lines, nil
 	}
-
-	// Load dst into x16 / w16
-	if okDstReg {
-		loadDst, _ := readRegTo(dstReg, "x16", "w16")
-		lines = append(lines, loadDst...)
-	} else if mem, okMem := dst.(x86asm.Mem); okMem {
-		lines = append(lines, readMemTo(mem, nextPC, sz, "x16", "w16")...)
-	} else {
+	load, val, size, store, ok := unaryOperand(inst, nextPC)
+	if !ok {
 		lines = append(lines, l.emitUnsupported(inst, "unsupported shld/shrd dst")...)
 		return lines, nil
 	}
-
-	loadSrc, _ := readRegTo(srcReg, "x17", "w17")
-	lines = append(lines, loadSrc...)
-
-	if isImm {
-		if immShift > 0 {
-			if op == x86asm.SHLD {
-				// SHLD dst, src, imm: result = (dst << imm) | (src >> (sz*8 - imm))
-				if sz == 8 {
-					lines = append(lines, fmt.Sprintf("    extr x16, x16, x17, #%d", 64-immShift))
-				} else {
-					lines = append(lines, fmt.Sprintf("    extr w16, w16, w17, #%d", 32-immShift))
-				}
-			} else {
-				// SHRD dst, src, imm: result = (dst >> imm) | (src << (sz*8 - imm))
-				if sz == 8 {
-					lines = append(lines, fmt.Sprintf("    extr x16, x17, x16, #%d", immShift))
-				} else {
-					lines = append(lines, fmt.Sprintf("    extr w16, w17, w16, #%d", immShift))
-				}
-			}
+	bits := 8 * size
+	lines = append(lines, load...)
+	rs, _ := readRegTo(srcReg, "x0", "w0")
+	lines = append(lines, rs...)
+	skip := ""
+	if immCount < 0 {
+		skip = fmt.Sprintf("L_shxd_0x%x_%d", inst.Address, l.labelCounter)
+		l.labelCounter++
+		lines = append(lines, fmt.Sprintf("    cbz w1, %s", skip))
+	}
+	// x3 = destination value (zero-extended), x5 = result, x2 = CF.
+	if bits == 64 {
+		lines = append(lines, fmt.Sprintf("    mov x3, %s", val), "    neg x6, x1")
+		if op == x86asm.SHLD {
+			lines = append(lines, "    lsl x5, x3, x1", "    lsr x7, x0, x6", "    orr x5, x5, x7", "    lsr x2, x3, x6")
+		} else {
+			lines = append(lines, "    lsr x5, x3, x1", "    lsl x7, x0, x6", "    orr x5, x5, x7", "    sub x6, x1, #1", "    lsr x2, x3, x6")
 		}
 	} else {
-		// Variable count in x18 / w18
-		l.labelCounter++
-		skipLabel := fmt.Sprintf("L_shld_skip_%d", l.labelCounter)
-		if sz == 8 {
-			lines = append(lines,
-				fmt.Sprintf("    cbz %s, %s", cntRegStr, skipLabel),
-				"    sub x0, xzr, x18", // x0 = -count
-			)
-			if op == x86asm.SHLD {
-				lines = append(lines,
-					"    lsl x16, x16, x18",
-					"    neg x1, x18",
-					"    add x1, x1, #64",
-					"    lsr x17, x17, x1",
-					"    orr x16, x16, x17",
-				)
-			} else {
-				lines = append(lines,
-					"    lsr x16, x16, x18",
-					"    neg x1, x18",
-					"    add x1, x1, #64",
-					"    lsl x17, x17, x1",
-					"    orr x16, x16, x17",
-				)
-			}
-			lines = append(lines, fmt.Sprintf("%s:", skipLabel))
+		lines = append(lines, fmt.Sprintf("    mov w3, %s", val))
+		if bits == 16 {
+			lines = append(lines, "    and w3, w3, #0xffff")
+		}
+		if op == x86asm.SHLD {
+			lines = append(lines, fmt.Sprintf("    orr x4, x0, x3, lsl #%d", bits), "    lsl x5, x4, x1",
+				fmt.Sprintf("    lsr x5, x5, #%d", bits), fmt.Sprintf("    mov w6, #%d", 2*bits), "    sub w6, w6, w1", "    lsr x2, x4, x6")
 		} else {
-			lines = append(lines,
-				fmt.Sprintf("    cbz %s, %s", cntRegStr, skipLabel),
-			)
-			if op == x86asm.SHLD {
-				lines = append(lines,
-					"    lsl w16, w16, w18",
-					"    neg w1, w18",
-					"    add w1, w1, #32",
-					"    lsr w17, w17, w1",
-					"    orr w16, w16, w17",
-				)
-			} else {
-				lines = append(lines,
-					"    lsr w16, w16, w18",
-					"    neg w1, w18",
-					"    add w1, w1, #32",
-					"    lsl w17, w17, w1",
-					"    orr w16, w16, w17",
-				)
-			}
-			lines = append(lines, fmt.Sprintf("%s:", skipLabel))
+			lines = append(lines, fmt.Sprintf("    orr x4, x3, x0, lsl #%d", bits), "    lsr x5, x4, x1",
+				"    sub w6, w1, #1", "    lsr x2, x4, x6")
 		}
 	}
-
-	// Write back result
-	if okDstReg {
-		storeDst, _ := writeRegFrom(dstReg, "x16", "w16")
-		lines = append(lines, storeDst...)
-	} else if mem, okMem := dst.(x86asm.Mem); okMem {
-		lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
+	if !inst.SkipFlags {
+		lines = append(lines, "    and x2, x2, #1",
+			"    eor x7, x5, x3", fmt.Sprintf("    ubfx x7, x7, #%d, #1", bits-1)) // OF = sign change
+		outPol := carryAdd
+		if immCount < 0 && l.cpol == carrySub {
+			outPol = carrySub
+		}
+		if outPol == carrySub {
+			lines = append(lines, "    eor x2, x2, #1")
+		}
+		lines = append(lines, "    orr x2, x7, x2, lsl #1")
+		if bits == 64 {
+			lines = append(lines, "    cmn xzr, x5")
+		} else {
+			lines = append(lines, fmt.Sprintf("    cmn wzr, w5, lsl #%d", 32-bits))
+		}
+		lines = append(lines, "    rmif x2, #0, #3")
+		l.cpol = outPol
+	}
+	res := "w5"
+	if bits == 64 {
+		res = "x5"
+	}
+	lines = append(lines, store(res)...)
+	if skip != "" {
+		lines = append(lines, skip+":")
 	}
 	return lines, nil
 }
@@ -2454,110 +2327,100 @@ func (l *Arm64Lifter) liftEnter(inst disasm.Instruction, lines []string) []strin
 	return lines
 }
 
-// liftRclRcr handles RCL and RCR (rotate through carry).
+// liftRclRcr handles RCL and RCR: a rotate of the (size+1)-bit value CF:dst. The count is masked
+// to 5 bits (6 for 64-bit) and taken modulo size+1; a zero count changes nothing. Only CF and OF
+// change (RCL: OF = MSB(result) ^ CF after; RCR: OF = MSB(dst) ^ CF before), inserted with RMIF.
 func (l *Arm64Lifter) liftRclRcr(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	op := inst.Inst.Op
-	dst := inst.Inst.Args[0]
-	shiftArg := inst.Inst.Args[1]
-
-	dstReg, okDstReg := dst.(x86asm.Reg)
-	sz := 4
-	if okDstReg {
-		if dDesc, okDesc := arm64RegMap[dstReg]; okDesc {
-			sz = dDesc.Size
-		}
-	} else {
-		sz = defMemSz(inst)
+	load, val, size, store, ok := unaryOperand(inst, nextPC)
+	if !ok {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported rcl/rcr operand")...)
+		return lines, nil
 	}
-	bitSz := sz * 8
-
-	// Load destination operand into x16
-	if okDstReg {
-		loadDst, _ := readRegTo(dstReg, "x16", "w16")
-		lines = append(lines, loadDst...)
-	} else if mem, okMem := dst.(x86asm.Mem); okMem {
-		lines = append(lines, readMemTo(mem, nextPC, sz, "x16", "w16")...)
+	bits := 8 * size
+	mask := 31
+	if bits == 64 {
+		mask = 63
 	}
-
-	// Read current carry flag into w19 (0 or 1)
-	lines = append(lines,
-		"    mrs  x18, nzcv",
-		"    ubfx w19, w18, #29, #1", // w19 = old CF
-	)
-
-	// Determine shift count
-	if imm, okImm := shiftArg.(x86asm.Imm); okImm {
-		count := int(imm) % (bitSz + 1)
-		if count > 0 {
-			for i := 0; i < count; i++ {
-				if op == x86asm.RCL {
-					lines = append(lines,
-						fmt.Sprintf("    lsr  x20, x16, #%d", bitSz-1), // new CF = MSB
-						"    and  x20, x20, #1",
-						"    lsl  x16, x16, #1",
-						"    orr  x16, x16, x19",                      // insert old CF
-						"    mov  w19, w20",                            // old CF = new CF
-					)
-					if bitSz < 64 {
-						lines = append(lines, fmt.Sprintf("    and  x16, x16, #0x%x", (uint64(1)<<bitSz)-1))
-					}
-				} else {
-					lines = append(lines,
-						"    and  x20, x16, #1",                        // new CF = LSB
-						"    lsr  x16, x16, #1",
-						fmt.Sprintf("    orr  x16, x16, x19, lsl #%d", bitSz-1), // insert old CF at MSB
-						"    mov  w19, w20",
-					)
-				}
-			}
+	immCount := -1
+	switch c := inst.Inst.Args[1].(type) {
+	case x86asm.Imm:
+		immCount = int(c) & mask
+		if bits < 32 {
+			immCount %= bits + 1
 		}
-	} else {
-		// Variable count from CL (w21)
-		loopLabel := fmt.Sprintf("L_rcl_rcr_loop_0x%x", inst.Address)
-		endLabel := fmt.Sprintf("L_rcl_rcr_end_0x%x", inst.Address)
-		lines = append(lines,
-			fmt.Sprintf("    and  w17, w21, #0x%x", bitSz-1),
-			fmt.Sprintf("    cbz  w17, %s", endLabel),
-			fmt.Sprintf("%s:", loopLabel),
-		)
+		if immCount == 0 {
+			return lines, nil
+		}
+		lines = append(lines, fmt.Sprintf("    mov w1, #%d", immCount))
+	case x86asm.Reg:
+		if c != x86asm.CL {
+			lines = append(lines, l.emitUnsupported(inst, "rcl/rcr count register")...)
+			return lines, nil
+		}
+		lines = append(lines, fmt.Sprintf("    and w1, w21, #%d", mask))
+		if bits < 32 {
+			lines = append(lines, fmt.Sprintf("    mov w5, #%d", bits+1), "    udiv w6, w1, w5", "    msub w1, w6, w5, w1")
+		}
+	default:
+		lines = append(lines, l.emitUnsupported(inst, "rcl/rcr count")...)
+		return lines, nil
+	}
+	lines = append(lines, fmt.Sprintf("    cset w2, %s", l.carryCond(true))) // CF in, before NZCV changes
+	lines = append(lines, load...)
+	skip := ""
+	if immCount < 0 {
+		skip = fmt.Sprintf("L_rcx_0x%x_%d", inst.Address, l.labelCounter)
+		l.labelCounter++
+		lines = append(lines, fmt.Sprintf("    cbz w1, %s", skip))
+	}
+	// x3 = value (zero-extended); x5 = result; x4 = CF out; x7 = OF.
+	if bits == 64 {
+		lines = append(lines, fmt.Sprintf("    mov x3, %s", val), "    neg x6, x1") // x6 = 64 - c
 		if op == x86asm.RCL {
-			lines = append(lines,
-				fmt.Sprintf("    lsr  x20, x16, #%d", bitSz-1),
-				"    and  x20, x20, #1",
-				"    lsl  x16, x16, #1",
-				"    orr  x16, x16, x19",
-				"    mov  w19, w20",
-			)
-			if bitSz < 64 {
-				lines = append(lines, fmt.Sprintf("    and  x16, x16, #0x%x", (uint64(1)<<bitSz)-1))
-			}
+			lines = append(lines, "    lsl x5, x3, x1", "    sub x7, x1, #1", "    lsl x7, x2, x7", "    orr x5, x5, x7",
+				"    lsr x7, x3, #1", "    lsr x7, x7, x6", "    orr x5, x5, x7", "    lsr x4, x3, x6")
 		} else {
-			lines = append(lines,
-				"    and  x20, x16, #1",
-				"    lsr  x16, x16, #1",
-				fmt.Sprintf("    orr  x16, x16, x19, lsl #%d", bitSz-1),
-				"    mov  w19, w20",
-			)
+			lines = append(lines, "    lsr x5, x3, x1", "    lsl x7, x2, x6", "    orr x5, x5, x7",
+				"    lsl x7, x3, #1", "    lsl x7, x7, x6", "    orr x5, x5, x7", "    sub x7, x1, #1", "    lsr x4, x3, x7")
 		}
-		lines = append(lines,
-			"    subs w17, w17, #1",
-			fmt.Sprintf("    b.ne %s", loopLabel),
-			fmt.Sprintf("%s:", endLabel),
-		)
+		lines = append(lines, "    and x4, x4, #1")
+	} else {
+		lines = append(lines, fmt.Sprintf("    mov w3, %s", val))
+		if bits < 32 {
+			lines = append(lines, fmt.Sprintf("    and w3, w3, #0x%x", (1<<bits)-1))
+		}
+		lines = append(lines, fmt.Sprintf("    orr x4, x3, x2, lsl #%d", bits), fmt.Sprintf("    mov w6, #%d", bits+1), "    sub w6, w6, w1")
+		if op == x86asm.RCL {
+			lines = append(lines, "    lsl x5, x4, x1", "    lsr x7, x4, x6", "    orr x5, x5, x7")
+		} else {
+			lines = append(lines, "    lsr x5, x4, x1", "    lsl x7, x4, x6", "    orr x5, x5, x7")
+		}
+		lines = append(lines, fmt.Sprintf("    ubfx x4, x5, #%d, #1", bits))
 	}
-
-	// Update carry flag in NZCV
-	lines = append(lines,
-		"    bfi  x18, x19, #29, #1",
-		"    msr  nzcv, x18",
-	)
-
-	// Write back result
-	if okDstReg {
-		storeDst, _ := writeRegFrom(dstReg, "x16", "w16")
-		lines = append(lines, storeDst...)
-	} else if mem, okMem := dst.(x86asm.Mem); okMem {
-		lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
+	if !inst.CarryDead || !inst.OverflowDead {
+		if op == x86asm.RCL {
+			lines = append(lines, fmt.Sprintf("    ubfx x7, x5, #%d, #1", bits-1), "    eor x7, x7, x4")
+		} else {
+			lines = append(lines, fmt.Sprintf("    ubfx x7, x3, #%d, #1", bits-1), "    eor x7, x7, x2")
+		}
+		outPol := carryAdd
+		if immCount < 0 && l.cpol == carrySub {
+			outPol = carrySub
+		}
+		if outPol == carrySub {
+			lines = append(lines, "    eor x4, x4, #1")
+		}
+		lines = append(lines, "    orr x4, x7, x4, lsl #1", "    rmif x4, #0, #3")
+		l.cpol = outPol
+	}
+	res := "w5"
+	if bits == 64 {
+		res = "x5"
+	}
+	lines = append(lines, store(res)...)
+	if skip != "" {
+		lines = append(lines, skip+":")
 	}
 	return lines, nil
 }

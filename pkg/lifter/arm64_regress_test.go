@@ -116,3 +116,23 @@ func TestRegressCarrySense(t *testing.T) {
 	l = liftBlock(t, "4183d400")
 	requireInOrder(t, "adc", l[0], "cfinv", "adcs w12, w12, wzr")
 }
+
+// Shifts and rotates: a count of 0 leaves the flags unchanged, CF is the last bit shifted out,
+// OF is defined for counts of 1, and rotates set CF/OF. The lifter set only SF/ZF (TST).
+func TestRegressShiftFlags(t *testing.T) {
+	// cmp rax, rbx; shl eax, cl: flags only change for a non-zero count.
+	l := liftBlock(t, "4839d8", "d3e0")
+	requireInOrder(t, "shl eax, cl", l[1], "and w1, w21, #31", "cbz w1, ...", "rmif x2, #0, #3", "L_shift_...", "mov w19, w0")
+
+	// rol eax, 1: CF = bit 0 of the result, OF = CF ^ MSB.
+	l = liftBlock(t, "d1c0")
+	requireInOrder(t, "rol eax, 1", l[0], "ror w0, w4, #31", "and x2, x0, #1", "rmif x2, #0, #3")
+
+	// shr rdx, 0x20: CF = bit 31, OF = the original MSB.
+	l = liftBlock(t, "48c1ea20")
+	requireInOrder(t, "shr rdx, 0x20", l[0], "ubfx x2, x22, #31, #1", "ubfx x3, x22, #63, #1", "rmif x2, #0, #3")
+
+	// rcl eax, 1 at a block start: CF is read in the block-boundary sense (CF = !C).
+	l = liftBlock(t, "d1d0")
+	requireInOrder(t, "rcl eax, 1", l[0], "cset w2, cc", "rmif x4, #0, #3")
+}
