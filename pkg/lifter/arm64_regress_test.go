@@ -573,3 +573,10 @@ func TestRegressJumpDispatchKeepsFlags(t *testing.T) {
 	// jmp 0x6000 (not a known function): CF into the block-boundary sense first.
 	requireInOrder(t, "add; jmp 0x6000", lift("4801d8", "e9f84f0000"), "adds x19, x19, x20", "cfinv", "b _recomp_indirect_jump")
 }
+
+// STD was lifted as a NOP, so a following string instruction ran forward instead of backward.
+// DF is not modelled (0 sites in TLOU and U4): STD traps, CLD stays a NOP.
+func TestRegressStdTraps(t *testing.T) {
+	requireInOrder(t, "std", liftBlock(t, "fd")[0], "b _recomp_unsupported_instruction")
+	forbid(t, "cld", liftBlock(t, "fc")[0], "b _recomp_unsupported_instruction")
+}
