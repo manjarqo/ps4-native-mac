@@ -481,3 +481,12 @@ func TestRegressAbsoluteAddress(t *testing.T) {
 	l = liftBlock(t, "c5fa100510000000")[0]
 	requireInOrder(t, "vmovss xmm0, [rip+0x10]", l, "movz x16, #0x1018...")
 }
+
+// INT 0x41 (the Orbis debugger break after Naughty Dog's HALT messages) trapped with BRK and
+// killed TLOU after "A frame did not complete in 2.00 seconds"; the console, without a debugger,
+// continues. Other interrupts still trap.
+func TestRegressInt41Continues(t *testing.T) {
+	forbid(t, "int 0x41", liftBlock(t, "cd41")[0], "brk ...")
+	requireInOrder(t, "int3", liftBlock(t, "cc")[0], "brk #0")
+	requireInOrder(t, "int 0x80", liftBlock(t, "cd80")[0], "brk #0")
+}

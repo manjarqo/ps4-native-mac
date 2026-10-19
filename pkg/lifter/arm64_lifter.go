@@ -1636,6 +1636,13 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		return l.liftFpu(inst, nextPC, lines)
 
 	case x86asm.HLT, x86asm.INT, x86asm.INTO, x86asm.ICEBP:
+		// INT 0x41 is the Orbis debugger break that Naughty Dog's HALT/ASSERT macros issue after
+		// printing the message; without a debugger the process continues (the C backend's no-op,
+		// and how TLOU recovers from "A frame did not complete in 2.00 seconds").
+		if imm, ok := inst.Inst.Args[0].(x86asm.Imm); ok && inst.Inst.Op == x86asm.INT && imm == 0x41 {
+			lines = append(lines, "    // int 0x41: debugger break, no debugger attached")
+			return lines, nil
+		}
 		lines = append(lines, "    brk #0")
 		return lines, nil
 
