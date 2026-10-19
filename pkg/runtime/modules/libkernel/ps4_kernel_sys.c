@@ -757,11 +757,15 @@ static int fill_module_info_ex(GuestContext *ctx, uint64_t addr, uint64_t info_a
         info->eh_frame_size = (uint32_t)mod->eh_frame_size;
     }
     populate_segments(mod, info->segments, &info->segment_count);
-    fprintf(stderr, "[ps4-kernel] GetModuleInfoFromAddr: addr=0x%llx -> mod=%s, num_segments=%u\n",
-            (unsigned long long)addr, info->name, info->segment_count);
-    for (uint32_t i = 0; i < info->segment_count; i++) {
-        fprintf(stderr, "    seg[%u]: addr=0x%llx, size=0x%x, prot=%d\n",
-                i, (unsigned long long)info->segments[i].address, info->segments[i].size, info->segments[i].prot);
+    // Logged on the first call only (unwinding can call this for every frame).
+    static int s_logged;
+    if (!__atomic_exchange_n(&s_logged, 1, __ATOMIC_RELAXED)) {
+        fprintf(stderr, "[ps4-kernel] GetModuleInfoFromAddr: addr=0x%llx -> mod=%s, num_segments=%u (first call)\n",
+                (unsigned long long)addr, info->name, info->segment_count);
+        for (uint32_t i = 0; i < info->segment_count; i++) {
+            fprintf(stderr, "    seg[%u]: addr=0x%llx, size=0x%x, prot=%d\n",
+                    i, (unsigned long long)info->segments[i].address, info->segments[i].size, info->segments[i].prot);
+        }
     }
     return 0;
 }

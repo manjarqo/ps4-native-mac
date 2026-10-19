@@ -401,8 +401,11 @@ int32_t sceVideoOutGetFlipStatus(int32_t handle, OrbisVideoOutFlipStatus *status
 
     pthread_mutex_lock(&vh->mutex);
     *status = vh->flipStatus;
-    fprintf(stderr, "[videoout] sceVideoOutGetFlipStatus: handle=%d num=%llu currentBuf=%d\n",
-            handle, (unsigned long long)vh->flipStatus.num, vh->flipStatus.currentBuffer);
+    // Polled every frame: logged on the first call only.
+    static int s_logged;
+    if (!__atomic_exchange_n(&s_logged, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[videoout] sceVideoOutGetFlipStatus: handle=%d num=%llu currentBuf=%d (first call)\n",
+                handle, (unsigned long long)vh->flipStatus.num, vh->flipStatus.currentBuffer);
     pthread_mutex_unlock(&vh->mutex);
 
     pthread_mutex_unlock(&g_video_table_mutex);

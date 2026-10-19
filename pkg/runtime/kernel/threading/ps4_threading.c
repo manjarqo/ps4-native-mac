@@ -937,8 +937,12 @@ void shim_scePthreadAttrGet(GuestContext *ctx) {
     pattr->stacksize_attr = 2 * 1024 * 1024;
   }
 
-  fprintf(stderr, "[ps4-thread] scePthreadAttrGet: thread=0x%llx -> stackaddr=0x%llx, stacksize=%llu\n",
-          (unsigned long long)thread_handle, (unsigned long long)pattr->stackaddr_attr, (unsigned long long)pattr->stacksize_attr);
+  // Logged on the first call only.
+  static int s_logged;
+  if (!__atomic_exchange_n(&s_logged, 1, __ATOMIC_RELAXED))
+    fprintf(stderr, "[ps4-thread] scePthreadAttrGet: thread=0x%llx -> stackaddr=0x%llx, stacksize=%llu (first call)\n",
+            (unsigned long long)thread_handle, (unsigned long long)pattr->stackaddr_attr,
+            (unsigned long long)pattr->stacksize_attr);
 
   ctx->rax = 0;
   SHIM_RETURN();
