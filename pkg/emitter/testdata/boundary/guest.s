@@ -33,6 +33,7 @@
 .set RES_EXC_HANDLER, RES + 0xd00
 .set RES_GPRS_PRE, RES + 0xe00
 .set RES_GPRS, RES + 0xf00
+.set RES_XMM, RES + 0x1000
 
 .macro LI reg, val
     movz \reg, #((\val) & 0xffff)
@@ -175,4 +176,30 @@ GUEST_FN _guest_gprs
     STORE_REGS RES_GPRS_PRE
     GUEST_CALL _stub_test_set_gprs
     STORE_REGS RES_GPRS
+    GUEST_RET
+
+// ---- Vector arguments and results: xmm0-7 hold distinct bytes; the shim reads them, calls a
+// guest callback with a float argument and returns a double.
+
+GUEST_FN _guest_xmm
+    movi v0.16b, #0x01
+    movi v1.16b, #0x12
+    movi v2.16b, #0x23
+    movi v3.16b, #0x34
+    movi v4.16b, #0x45
+    movi v5.16b, #0x56
+    movi v6.16b, #0x67
+    movi v7.16b, #0x78
+    GUEST_CALL _stub_test_xmm
+    LI   x16, RES_XMM
+    add  x16, x28, x16
+    stp  q0, q1, [x16, #0]
+    stp  q2, q3, [x16, #32]
+    stp  q4, q5, [x16, #64]
+    stp  q6, q7, [x16, #96]
+    GUEST_RET
+
+// float callback(float x) { return x + x; }
+GUEST_FN _guest_xmm_callback
+    fadd s0, s0, s0
     GUEST_RET

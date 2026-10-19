@@ -19,6 +19,20 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
     stp  x14, x15, [\c, #0x70]
 .endm
 
+// xmm0-7 (the System V vector argument and return registers) to and from ctx->xmm[0-7].
+.macro SAVE_XMM0_7 c
+    stp  q0, q1, [\c, #0xa0]
+    stp  q2, q3, [\c, #0xc0]
+    stp  q4, q5, [\c, #0xe0]
+    stp  q6, q7, [\c, #0x100]
+.endm
+.macro LOAD_XMM0_7 c
+    ldp  q0, q1, [\c, #0xa0]
+    ldp  q2, q3, [\c, #0xc0]
+    ldp  q4, q5, [\c, #0xe0]
+    ldp  q6, q7, [\c, #0x100]
+.endm
+
 // Loads the 16 guest GPRs from the GuestContext at \c.
 .macro LOAD_GPRS c
     ldp  x19, x21, [\c, #0x00]
@@ -50,14 +64,17 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 // GuestContext, or the fiber's while a fiber runs (ps4_fiber.c).
 //
 // Host -> guest, recomp_enter_guest(ctx, fn): saves the host callee-saved x19-x30, loads the
-// 16 GPRs, FS base and memory base from ctx, calls fn, and on return stores the 16 GPRs back
-// to ctx.
+// 16 GPRs, FS base, memory base and xmm0-7 from ctx, calls fn, and on return stores the 16
+// GPRs and xmm0-7 back to ctx (a callback's vector arguments and result).
 //
 // Guest -> host, _recomp_call_shim (x0 = shim; the shim stub branches here in place of a
-// guest function): ctx = the TCB slot. Stores the 16 GPRs to ctx, calls shim(ctx), then
-// reloads from that same ctx (kept in the bridge frame, not looked up again) all 16 GPRs,
-// the FS base and the memory base. A shim returns values through ctx and may set any GPR
-// (rsp included), e.g. to resume at a longjmp target.
+// guest function): ctx = the TCB slot. Stores the 16 GPRs and xmm0-7 to ctx, calls
+// shim(ctx), then reloads from that same ctx (kept in the bridge frame, not looked up again)
+// all 16 GPRs, xmm0-7, the FS base and the memory base. A shim reads its arguments and
+// returns its results through ctx (rax/rdx, xmm0/xmm1) and may set any GPR (rsp included),
+// e.g. to resume at a longjmp target. xmm8-15, the ymm upper halves (ctx->ymmh is never
+// written) and the flags are not synced: System V makes them caller-saved, so guest code
+// does not expect them to survive a call, and no shim reads them.
 //
 // A shim that switches context (sceFiberRun/Switch/ReturnToThread) switches host stacks
 // inside the shim. The bridge frame of a call lives on the host stack of the context that
@@ -82,6 +99,7 @@ _recomp_enter_guest:
     str  x0,       [sp, #96]
 
     LOAD_GPRS x0
+    LOAD_XMM0_7 x0
     ldr  x27, [x0, #0x88]        // fs_base
     ldr  x28, [x0, #0x330]       // mem_base
 
@@ -89,6 +107,7 @@ _recomp_enter_guest:
 
     ldr  x0, [sp, #96]
     SAVE_GPRS x0
+    SAVE_XMM0_7 x0
 
     ldp  x19, x20, [sp, #16]
     ldp  x21, x22, [sp, #32]
@@ -99,19 +118,16 @@ _recomp_enter_guest:
     ret
 
 // _recomp_call_shim: calls a host C shim from guest code (see the contract above).
-// x0 = shim. Frame: [sp] x29, x30; [sp+16] shim, ctx; [sp+32] q0-q7.
+// x0 = shim. Frame: [sp] x29, x30; [sp+16] shim, ctx.
 .globl _recomp_call_shim
 _recomp_call_shim:
-    stp  x29, x30, [sp, #-160]!
+    stp  x29, x30, [sp, #-32]!
     mov  x29, sp
     add  x1, x27, #0x70
     ldr  x1, [x28, x1]           // ctx: the TCB slot
     stp  x0, x1, [sp, #16]
-    stp  q0, q1, [sp, #32]
-    stp  q2, q3, [sp, #64]
-    stp  q4, q5, [sp, #96]
-    stp  q6, q7, [sp, #128]
     SAVE_GPRS x1
+    SAVE_XMM0_7 x1
 
     mov  x0, x1
     ldr  x2, [sp, #16]
@@ -121,14 +137,10 @@ _recomp_call_shim:
     // TCB slot, and x27 may name another guest thread's TCB by now.
     ldr  x1, [sp, #24]
     LOAD_GPRS x1
+    LOAD_XMM0_7 x1
     ldr  x27, [x1, #0x88]        // fs_base
     ldr  x28, [x1, #0x330]       // mem_base
-
-    ldp  q0, q1, [sp, #32]
-    ldp  q2, q3, [sp, #64]
-    ldp  q4, q5, [sp, #96]
-    ldp  q6, q7, [sp, #128]
-    ldp  x29, x30, [sp], #160
+    ldp  x29, x30, [sp], #32
     ret
 
 // Slow path of _recomp_indirect_call/_recomp_indirect_jump: the target is not in the

@@ -19,6 +19,7 @@ var boundaryStubs = [][2]string{
 	{"_stub_test_noop", "shim_test_noop"},
 	{"_stub_test_wait_signal", "shim_test_wait_signal"},
 	{"_stub_test_set_gprs", "shim_test_set_gprs"},
+	{"_stub_test_xmm", "shim_test_xmm"},
 }
 
 // boundaryRuntimeSources are the runtime files the boundary tests run against.
@@ -93,6 +94,7 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"fiber/threads", "fiber", []string{"PS4_FIBER_THREADS=1"}},
 		{"exception-handler-in-shim", "exception", nil},
 		{"shim-sets-gprs", "gprs", nil},
+		{"xmm-arguments-and-results", "xmm", nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

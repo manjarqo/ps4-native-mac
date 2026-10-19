@@ -40,6 +40,9 @@ enum { W_RAX, W_RBX, W_RCX, W_RDX, W_RSI, W_RDI, W_RBP, W_RSP, W_R8, W_R15 = W_R
 #define ADDR_EXC_MAIN 0x400400ULL
 #define ADDR_EXC_HANDLER 0x400500ULL
 #define ADDR_GPRS 0x400600ULL
+#define ADDR_XMM 0x400700ULL
+#define ADDR_XMM_CALLBACK 0x400800ULL
+#define RES_XMM_ADDR (D + 0x1000 + 0x1000)
 
 void guest_fiber_main1(void);
 void guest_fiber_main2(void);
@@ -48,6 +51,8 @@ void guest_fiber_b(void);
 void guest_exc_main(void);
 void guest_exc_handler(void);
 void guest_gprs(void);
+void guest_xmm(void);
+void guest_xmm_callback(void);
 
 static GuestContext *g_proc;
 static int g_failures;
@@ -234,6 +239,45 @@ static void test_gprs(void) {
   expect("FS base after the shim", res(RES_GPRS)[W_FS], g_proc->fs_base);
 }
 
+static xmm_reg_t g_shim_saw_xmm[8];
+static float g_callback_result;
+
+// Records xmm0-7 as the shim sees them, calls a guest callback(float) through ctx->xmm[0] and
+// returns the double 2.5 in xmm0.
+void shim_test_xmm(GuestContext *ctx) {
+  memcpy(g_shim_saw_xmm, ctx->xmm, sizeof g_shim_saw_xmm);
+  ctx->xmm[0].f32[0] = 3.0f;
+  recomp_call_guest(ctx, ADDR_XMM_CALLBACK);
+  g_callback_result = ctx->xmm[0].f32[0];
+  memset(&ctx->xmm[0], 0, sizeof ctx->xmm[0]);
+  ctx->xmm[0].f64[0] = 2.5;
+  SHIM_RETURN();
+}
+
+static const uint8_t kXmmByte[8] = {0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78};
+
+static void expect_xmm(const char *what, int i, const xmm_reg_t *got, uint8_t byte) {
+  for (int b = 0; b < 16; b++) {
+    if (got->u8[b] != byte) {
+      fail("%s xmm%d byte %d = 0x%02x, want 0x%02x", what, i, b, got->u8[b], byte);
+      return;
+    }
+  }
+}
+
+// A shim sees the guest's xmm0-7, a callback gets its float argument and returns its float
+// result through ctx, and the guest gets the shim's xmm0 result and its other xmm1-7 back.
+static void test_xmm(void) {
+  recomp_call_guest(g_proc, ADDR_XMM);
+  for (int i = 0; i < 8; i++) expect_xmm("shim argument", i, &g_shim_saw_xmm[i], kXmmByte[i]);
+  if (g_callback_result != 6.0f) fail("callback(3.0f) result in ctx->xmm[0] = %g, want 6", g_callback_result);
+  const xmm_reg_t *after = (const xmm_reg_t *)(g_proc->mem_base + RES_XMM_ADDR);
+  if (after[0].f64[0] != 2.5 || after[0].u64[1] != 0)
+    fail("xmm0 after the shim = %g (0x%016llx 0x%016llx), want 2.5", after[0].f64[0],
+         (unsigned long long)after[0].u64[0], (unsigned long long)after[0].u64[1]);
+  for (int i = 1; i < 8; i++) expect_xmm("after the shim", i, &after[i], kXmmByte[i]);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -250,6 +294,8 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_EXC_MAIN, (recomp_fn_t)guest_exc_main);
   recomp_register_fn(ADDR_EXC_HANDLER, (recomp_fn_t)guest_exc_handler);
   recomp_register_fn(ADDR_GPRS, (recomp_fn_t)guest_gprs);
+  recomp_register_fn(ADDR_XMM, (recomp_fn_t)guest_xmm);
+  recomp_register_fn(ADDR_XMM_CALLBACK, (recomp_fn_t)guest_xmm_callback);
 
   const char *c = argv[1];
   if (strcmp(c, "fiber") == 0) {
@@ -258,6 +304,8 @@ int main(int argc, char **argv) {
     test_exception();
   } else if (strcmp(c, "gprs") == 0) {
     test_gprs();
+  } else if (strcmp(c, "xmm") == 0) {
+    test_xmm();
   } else {
     fprintf(stderr, "unknown case %s\n", c);
     return 2;
