@@ -68,6 +68,8 @@ func TestLockFullBarrier(t *testing.T) {
 		{"lock xadd byte [rdi],ah", []byte{0xf0, 0x0f, 0xc0, 0x27}},
 		{"lock cmpxchg byte [rdi],dl", []byte{0xf0, 0x0f, 0xb0, 0x17}},
 		{"xchg qword [rdi],rsi", []byte{0x48, 0x87, 0x37}},
+		{"lock cmpxchg16b [rdi]", []byte{0xf0, 0x48, 0x0f, 0xc7, 0x0f}},
+		{"lock cmpxchg8b [rdi]", []byte{0xf0, 0x0f, 0xc7, 0x0f}},
 	}
 	l := NewArm64Lifter(map[uint64]bool{0x1000: true})
 	for _, c := range cases {
@@ -89,4 +91,23 @@ func TestLockFullBarrier(t *testing.T) {
 	if got := liftOne(t, l, []byte{0xc5, 0xf0, 0x57, 0xc9}); lseAtomicRe.MatchString(got) || strings.Contains(got, "ldaxr") {
 		t.Errorf("vxorps xmm1,xmm1,xmm1 lifted as an atomic:\n%s", got)
 	}
+}
+
+// CMPXCHG8B/CMPXCHG16B change only ZF. CMPXCHG16B set the whole NZCV (CMP XZR, XZR) and so lost
+// CF/SF/OF and the tracked carry sense; CMPXCHG8B was not lowered at all.
+func TestCmpxchgWideOnlyZF(t *testing.T) {
+	for _, c := range []struct{ name, hex string }{
+		{"lock cmpxchg16b [rdi]", "f0480fc70f"},
+		{"lock cmpxchg8b [rdi]", "f00fc70f"},
+	} {
+		// add rax, rbx first: CF is held in the carryAdd sense and must survive.
+		l := liftBlock(t, "4801d8", c.hex)
+		requireInOrder(t, c.name, l[1], "mrs x5, nzcv", "cset x6, eq", "bfi x5, x6, #30, #1", "msr nzcv, x5")
+		forbid(t, c.name, l[1], "cmp xzr, xzr", "cmp x2, #0")
+		if got := strings.Join(l[1], "\n"); strings.Contains(got, "UNSUPPORTED") {
+			t.Errorf("%s: not lowered:\n%s", c.name, got)
+		}
+	}
+	l := liftBlock(t, "4801d8", "f0480fc70f", "0f92c0") // ...; setb al reads CF of the ADD
+	requireInOrder(t, "setb after cmpxchg16b", l[2], "cset w16, cs")
 }

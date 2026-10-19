@@ -1979,51 +1979,6 @@ func (l *Arm64Lifter) liftAndn(inst disasm.Instruction, nextPC uint64, lines []s
 	return lines, nil
 }
 
-// liftCmpxchg16b handles CMPXCHG16B m128.
-// Compares RDX:RAX with m128. If equal, loads RCX:RBX into m128 and sets ZF.
-// If unequal, loads m128 into RDX:RAX and clears ZF.
-func (l *Arm64Lifter) liftCmpxchg16b(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
-	mem, okMem := inst.Inst.Args[0].(x86asm.Mem)
-	if !okMem {
-		lines = append(lines, l.emitUnsupported(inst, "cmpxchg16b operand must be memory")...)
-		return lines, nil
-	}
-
-	l.labelCounter++
-	loopLabel := fmt.Sprintf("L_cas16b_loop_%d", l.labelCounter)
-	failLabel := fmt.Sprintf("L_cas16b_fail_%d", l.labelCounter)
-	doneLabel := fmt.Sprintf("L_cas16b_done_%d", l.labelCounter)
-
-	lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-	lines = append(lines, "    add x16, x28, x16") // absolute host pointer in x16
-
-	// Desired value is in RCX:RBX (x21:x20)
-	// RAX is in x19, RDX is in x22
-	// RBX is in x20, RCX is in x21
-	lines = append(lines,
-		fmt.Sprintf("%s:", loopLabel),
-		"    ldaxp x0, x1, [x16]", // x0 = mem_lo, x1 = mem_hi
-		"    cmp x0, x19",         // compare mem_lo with RAX
-		fmt.Sprintf("    b.ne %s", failLabel),
-		"    cmp x1, x22",         // compare mem_hi with RDX
-		fmt.Sprintf("    b.ne %s", failLabel),
-		// Equal: attempt atomic store of RCX:RBX (x21:x20)
-		"    stlxp w2, x20, x21, [x16]",
-		fmt.Sprintf("    cbnz w2, %s", loopLabel), // retry if exclusive store failed
-		// Success: ZF = 1
-		"    cmp xzr, xzr", // sets ZF=1
-		fmt.Sprintf("    b %s", doneLabel),
-		fmt.Sprintf("%s:", failLabel),
-		"    clrex",
-		"    mov x19, x0", // RAX = mem_lo
-		"    mov x22, x1", // RDX = mem_hi
-		"    mov x2, #1",
-		"    cmp x2, #0", // sets ZF=0
-		fmt.Sprintf("%s:", doneLabel),
-	)
-	return lines, nil
-}
-
 // liftFlagsOp handles CLC, STC, CMC, LAHF, SAHF in terms of the tracked carry sense.
 // LAHF stores AF = PF = 0 (not modeled); SAHF keeps OF (V), as x86 does.
 func (l *Arm64Lifter) liftFlagsOp(inst disasm.Instruction, lines []string) ([]string, error) {

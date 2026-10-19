@@ -562,7 +562,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "cmpxchg16b [rax]",
 			bytes:    []byte{0x48, 0x0f, 0xc7, 0x08}, // cmpxchg16b [rax]
 			pc:       0x1000,
-			expected: []string{"ldaxp x0, x1, [x16]", "stlxp w2, x20, x21, [x16]"},
+			expected: []string{"caspal x0, x1, x2, x3, [x16]", "msr nzcv, x5"},
 		},
 		{
 			name:     "clc",

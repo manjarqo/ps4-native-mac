@@ -942,6 +942,9 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 	case x86asm.CMPXCHG16B:
 		return l.liftCmpxchg16b(inst, nextPC, lines)
 
+	case x86asm.CMPXCHG8B:
+		return l.liftCmpxchg8b(inst, nextPC, lines)
+
 	case x86asm.XCHG:
 		return l.liftXchg(inst, nextPC, lines)
 

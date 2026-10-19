@@ -17,7 +17,7 @@ import (
 // DMB ISH where it does not (NEG, ADC, SBB). An AL atomic that writes memory is ordered after
 // every earlier and before every later access of the thread, so it needs no extra barrier. A
 // compare-and-swap that fails does not write and has only acquire semantics; the failure path
-// of CMPXCHG therefore runs a DMB ISH.
+// of CMPXCHG/CMPXCHG8B/CMPXCHG16B therefore runs a DMB ISH.
 //
 // The destination register of an LSE atomic is never WZR/XZR: with a zero destination the
 // instruction loses its acquire semantics (LDADDAL WZR is not an acquire). The flags are
@@ -165,8 +165,8 @@ func (l *Arm64Lifter) failBarrier() []string {
 }
 
 // liftLocked lowers a LOCK-prefixed ADD/SUB/AND/OR/XOR/INC/DEC/NEG/NOT/ADC/SBB/BTS/BTR/BTC on
-// memory. ok is false for the instructions it does not handle (XADD, CMPXCHG and XCHG are atomic
-// in their own lowerings; LOCK on a register operand is #UD).
+// memory. ok is false for the instructions it does not handle (XADD, CMPXCHG, CMPXCHG8B/16B and
+// XCHG are atomic in their own lowerings; LOCK on a register operand is #UD).
 func (l *Arm64Lifter) liftLocked(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, bool) {
 	op := inst.Inst.Op
 	mem, isMem := inst.Inst.Args[0].(x86asm.Mem)
@@ -464,4 +464,66 @@ func (l *Arm64Lifter) liftAtomicCmpxchg(mem x86asm.Mem, srcReg x86asm.Reg, nextP
 	}
 	l.cpol = carrySub
 	return append(lines, l.failBarrier()...)
+}
+
+// setZeroFlagFromEq copies the Z result of the compare just made into the guest flags saved in
+// x5 (MRS NZCV before the compare) and restores them: CMPXCHG8B/16B change only ZF. The
+// compare's Z is kept for the following B.EQ.
+func setZeroFlagFromEq() []string {
+	return []string{"    cset x6, eq", "    bfi x5, x6, #30, #1", "    msr nzcv, x5"}
+}
+
+// liftCmpxchg8b lowers CMPXCHG8B m64 with CASAL: EDX:EAX is compared with m64; on success
+// ECX:EBX is stored, on failure m64 is loaded into EDX:EAX (both zero-extended). Only ZF changes.
+func (l *Arm64Lifter) liftCmpxchg8b(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
+	mem, ok := inst.Inst.Args[0].(x86asm.Mem)
+	if !ok {
+		return append(lines, l.emitUnsupported(inst, "cmpxchg8b operand must be memory")...), nil
+	}
+	lines = append(lines,
+		"    mov w0, w19", "    bfi x0, x22, #32, #32", // expected EDX:EAX
+		"    mov x4, x0",
+		"    mov w2, w20", "    bfi x2, x21, #32, #32", // new ECX:EBX
+	)
+	lines = append(lines, lockAddr(mem, nextPC)...)
+	lines = append(lines, "    casal x0, x2, [x16]")
+	flags := !inst.SkipFlags
+	if flags {
+		lines = append(lines, "    mrs x5, nzcv")
+	}
+	lines = append(lines, "    cmp x0, x4",
+		"    mov w6, w0", "    lsr x7, x0, #32",
+		"    csel x19, x19, x6, eq", "    csel x22, x22, x7, eq")
+	if flags {
+		lines = append(lines, setZeroFlagFromEq()...)
+	} else {
+		l.cpol = carrySub
+	}
+	return append(lines, l.failBarrier()...), nil
+}
+
+// liftCmpxchg16b lowers CMPXCHG16B m128 with CASPAL: RDX:RAX is compared with m128; on success
+// RCX:RBX is stored, on failure m128 is loaded into RDX:RAX. Only ZF changes.
+func (l *Arm64Lifter) liftCmpxchg16b(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
+	mem, okMem := inst.Inst.Args[0].(x86asm.Mem)
+	if !okMem {
+		lines = append(lines, l.emitUnsupported(inst, "cmpxchg16b operand must be memory")...)
+		return lines, nil
+	}
+	// CASP takes even/odd register pairs: x0:x1 = expected (RAX, RDX), x2:x3 = new (RBX, RCX).
+	lines = append(lines, "    mov x0, x19", "    mov x1, x22", "    mov x2, x20", "    mov x3, x21")
+	lines = append(lines, lockAddr(mem, nextPC)...)
+	lines = append(lines, "    caspal x0, x1, x2, x3, [x16]")
+	flags := !inst.SkipFlags
+	if flags {
+		lines = append(lines, "    mrs x5, nzcv")
+	}
+	lines = append(lines, "    cmp x0, x19", "    ccmp x1, x22, #0, eq",
+		"    mov x19, x0", "    mov x22, x1") // equal to RAX/RDX on success
+	if flags {
+		lines = append(lines, setZeroFlagFromEq()...)
+	} else {
+		l.cpol = carrySub
+	}
+	return append(lines, l.failBarrier()...), nil
 }
