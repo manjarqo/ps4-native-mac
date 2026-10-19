@@ -15,19 +15,38 @@ func (l *Arm64Lifter) liftMxcsr(inst disasm.Instruction, nextPC uint64, lines []
 		lines = append(lines, l.emitUnsupported(inst, "mxcsr arg not memory")...)
 		return lines, nil
 	}
+	// GuestContext.mxcsr is at 0x2e8 (checked by the lifter-difftest-asm harness).
 	isStore := (inst.Inst.Op == x86asm.STMXCSR || inst.Inst.Op == x86asm.VSTMXCSR)
 	if isStore {
 		lines = append(lines, l.emitLoadCtxPtr("x17")...)
-		lines = append(lines, "    ldr w18, [x17, #0x2ec]")
+		lines = append(lines, "    ldr w0, [x17, #0x2e8]")
 		lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-		lines = append(lines, "    str w18, [x28, x16]")
+		lines = append(lines, "    str w0, [x28, x16]")
 	} else {
 		lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-		lines = append(lines, "    ldr w18, [x28, x16]")
+		lines = append(lines, "    ldr w0, [x28, x16]")
 		lines = append(lines, l.emitLoadCtxPtr("x17")...)
-		lines = append(lines, "    str w18, [x17, #0x2ec]")
+		lines = append(lines, "    str w0, [x17, #0x2e8]")
+		lines = append(lines, mxcsrToFpcr("w0")...)
 	}
 	return lines, nil
+}
+
+// mxcsrToFpcr applies the MXCSR value in register w (rounding mode and flush-to-zero) to FPCR.
+// x86 RC (bits 14:13: 00 nearest, 01 down, 10 up, 11 zero) is ARM RMode (bits 23:22: 00 RN,
+// 01 RP, 10 RM, 11 RZ) with the two bits swapped; MXCSR.FZ (bit 15) is FPCR.FZ (bit 24).
+// Scratch: x1, x2.
+func mxcsrToFpcr(w string) []string {
+	return []string{
+		"    mrs x1, fpcr",
+		fmt.Sprintf("    ubfx w2, %s, #14, #1", w),
+		"    bfi x1, x2, #22, #1",
+		fmt.Sprintf("    ubfx w2, %s, #13, #1", w),
+		"    bfi x1, x2, #23, #1",
+		fmt.Sprintf("    ubfx w2, %s, #15, #1", w),
+		"    bfi x1, x2, #24, #1",
+		"    msr fpcr, x1",
+	}
 }
 
 // liftMaskmov handles VMASKMOVPS and VMASKMOVPD.
@@ -642,16 +661,16 @@ func (l *Arm64Lifter) liftFxsave(inst disasm.Instruction, nextPC uint64, lines [
 	lines = append(lines, "    add x16, x28, x16")
 	lines = append(lines, l.emitLoadCtxPtr("x17")...)
 	lines = append(lines,
-		"    ldrh w18, [x17, #0x2e4]",
-		"    strh w18, [x16, #0]",
-		"    ldrh w18, [x17, #0x2e6]",
-		"    strh w18, [x16, #2]",
-		"    mov  w18, #0xff",
-		"    strb w18, [x16, #4]",
-		"    ldr  w18, [x17, #0x2ec]",
-		"    str  w18, [x16, #24]",
-		"    movz w18, #0xffff",
-		"    str  w18, [x16, #28]",
+		"    ldrh w5, [x17, #0x2e4]",
+		"    strh w5, [x16, #0]",
+		"    ldrh w5, [x17, #0x2e6]",
+		"    strh w5, [x16, #2]",
+		"    mov  w5, #0xff",
+		"    strb w5, [x16, #4]",
+		"    ldr  w5, [x17, #0x2e8]", // mxcsr
+		"    str  w5, [x16, #24]",
+		"    movz w5, #0xffff",
+		"    str  w5, [x16, #28]",
 		"    stp  q0, q1, [x16, #160]",
 		"    stp  q2, q3, [x16, #192]",
 		"    stp  q4, q5, [x16, #224]",
@@ -675,12 +694,12 @@ func (l *Arm64Lifter) liftFxrstor(inst disasm.Instruction, nextPC uint64, lines 
 	lines = append(lines, "    add x16, x28, x16")
 	lines = append(lines, l.emitLoadCtxPtr("x17")...)
 	lines = append(lines,
-		"    ldrh w18, [x16, #0]",
-		"    strh w18, [x17, #0x2e4]",
-		"    ldrh w18, [x16, #2]",
-		"    strh w18, [x17, #0x2e6]",
-		"    ldr  w18, [x16, #24]",
-		"    str  w18, [x17, #0x2ec]",
+		"    ldrh w5, [x16, #0]",
+		"    strh w5, [x17, #0x2e4]",
+		"    ldrh w5, [x16, #2]",
+		"    strh w5, [x17, #0x2e6]",
+		"    ldr  w5, [x16, #24]",
+		"    str  w5, [x17, #0x2e8]", // mxcsr
 		"    ldp  q0, q1, [x16, #160]",
 		"    ldp  q2, q3, [x16, #192]",
 		"    ldp  q4, q5, [x16, #224]",
@@ -690,6 +709,8 @@ func (l *Arm64Lifter) liftFxrstor(inst disasm.Instruction, nextPC uint64, lines 
 		"    ldp  q12, q13, [x16, #352]",
 		"    ldp  q14, q15, [x16, #384]",
 	)
+	lines = append(lines, "    ldr w0, [x17, #0x2e8]")
+	lines = append(lines, mxcsrToFpcr("w0")...)
 	return lines, nil
 }
 

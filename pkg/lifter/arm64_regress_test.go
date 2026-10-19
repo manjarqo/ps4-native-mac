@@ -267,3 +267,16 @@ func TestRegressVectorSemantics(t *testing.T) {
 	l = liftBlock(t, "f30f5ac1") // cvtss2sd xmm0, xmm1
 	requireInOrder(t, "cvtss2sd", l[0], "fcvt d30, s1", "mov v0.d[0], v30.d[0]")
 }
+
+// MXCSR lives at GuestContext offset 0x2e8 (0x2ec, which the lifter used, is padding before
+// mmx[]), and LDMXCSR/FXRSTOR set the FPCR rounding mode and flush-to-zero bits from it.
+func TestRegressMxcsr(t *testing.T) {
+	l := liftBlock(t, "0fae55f4") // ldmxcsr [rbp-0xc]
+	requireInOrder(t, "ldmxcsr", l[0], "ldr w0, [x28, x16]", "str w0, [x17, #0x2e8]", "mrs x1, fpcr", "ubfx w2, w0, #14, #1", "bfi x1, x2, #22, #1", "msr fpcr, x1")
+
+	l = liftBlock(t, "0fae5df4") // stmxcsr [rbp-0xc]
+	requireInOrder(t, "stmxcsr", l[0], "ldr w0, [x17, #0x2e8]", "str w0, [x28, x16]")
+
+	l = liftBlock(t, "0fae08") // fxrstor [rax]
+	requireInOrder(t, "fxrstor", l[0], "str w5, [x17, #0x2e8]", "msr fpcr, x1")
+}

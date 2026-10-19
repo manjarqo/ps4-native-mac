@@ -730,13 +730,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "ldmxcsr [rcx]",
 			bytes:    []byte{0x0f, 0xae, 0x11},
 			pc:       0x1000,
-			expected: []string{"ldr w18, [x28, x16]", "str w18, [x17, #0x2ec]"},
+			expected: []string{"ldr w0, [x28, x16]", "str w0, [x17, #0x2e8]", "msr fpcr, x1"},
 		},
 		{
 			name:     "stmxcsr [rdx]",
 			bytes:    []byte{0x0f, 0xae, 0x1a},
 			pc:       0x1000,
-			expected: []string{"ldr w18, [x17, #0x2ec]", "str w18, [x28, x16]"},
+			expected: []string{"ldr w0, [x17, #0x2e8]", "str w0, [x28, x16]"},
 		},
 		{
 			name:     "pmaddubsw x0, x5",
