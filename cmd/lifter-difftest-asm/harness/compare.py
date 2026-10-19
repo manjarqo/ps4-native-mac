@@ -6,7 +6,8 @@ Usage: compare.py native.bin asm.bin tests.txt [--low] [--strict-nan] [--summary
 tests.txt columns: index, guest address, signature, instruction text, flag rule, vector regs,
 destination vector register.
 Flag rule: letters of the flags compared (C Z S O P), "-" for none, or shift:OP:SIZE:COUNT,
-resolved per trial from the masked shift count (the input CL is stored in DtState.pad).
+resolved per trial from the masked shift count (the input CL is stored in DtState.pad); a
+"deadco:" prefix drops CF and OF (the instruction was lifted with CF/OF dead).
 Vector registers are compared over all 256 bits; differences in a register the instruction does
 not write (column 7: destination vector register) are reported as "clobber" (scratch-register
 aliasing, mostly YMM upper halves in v16-v31) rather than as a semantic difference of the
@@ -39,6 +40,9 @@ def parse(buf, off):
 
 def flags_for(rule, cl):
     """Return (flags to compare, whether register/memory results are defined) for one trial."""
+    if rule.startswith("deadco:"):  # CF and OF dead after the instruction: not compared
+        fl, defined = flags_for(rule[len("deadco:"):], cl)
+        return fl.replace("C", "").replace("O", ""), defined
     if not rule.startswith("shift:"):
         return ("" if rule == "-" else rule), True
     _, op, size, count = rule.split(":")

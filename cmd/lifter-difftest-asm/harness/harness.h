@@ -72,6 +72,7 @@ static inline void dt_make_state(DtState *st, uint8_t *scratch, unsigned test, u
         static const uint64_t fc[4] = {0x000, 0x001, 0x040, 0x045};
         st->flags = 0x202 | fc[(r >> 20) & 3];
     }
+    if (regset[0] >> 62 & 1) st->flags &= ~0x801ULL; /* after a logical op: CF = OF = 0 */
     st->mxcsr = 0x1F80;
     for (int i = 0; i < 16; i++)
         for (int k = 0; k < 8; k++) {
@@ -81,5 +82,11 @@ static inline void dt_make_state(DtState *st, uint8_t *scratch, unsigned test, u
     for (uint64_t off = 0; off < 0x400; off += 4) {
         uint32_t u = dt_lane(&s, special);
         memcpy(scratch + (DT_MEM_TARGET - DT_SCRATCH_BASE) - 0x200 + off, &u, 4);
+    }
+    if (regset[0] >> 61 & 1) { /* a valid MXCSR value for (V)LDMXCSR */
+        uint64_t m = dt_rng(&s);
+        uint32_t v = 0x1f80 | (uint32_t)(m & 0x3f) | (uint32_t)(m & 0x40) | (uint32_t)(m & 0x6000) |
+                     (uint32_t)(m & 0x8000);
+        memcpy(scratch + (DT_MEM_TARGET - DT_SCRATCH_BASE), &v, 4);
     }
 }

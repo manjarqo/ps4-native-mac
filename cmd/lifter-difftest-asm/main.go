@@ -101,12 +101,20 @@ func regClass(r x86asm.Reg) string {
 type entryMode int
 
 const (
-	// modeBlockStart: lastFlagOp reset (start of a basic block); NZCV holds C = !CF.
+	// modeBlockStart: start of a basic block; the lifter tracks C = !CF (carrySub) and NZCV
+	// holds the input flags that way.
 	modeBlockStart entryMode = iota
-	// modeAfterAdd: lifted right after an ADD, so lastFlagOp = ADD and NZCV holds C = CF.
+	// modeAfterAdd: lifted right after an ADD, so the lifter tracks C = CF (carryAdd) and NZCV
+	// holds C = CF.
 	modeAfterAdd
+	// modeAfterLogic: lifted right after a TEST, so the lifter tracks C = 0 = CF (carryClear);
+	// the input flags have CF = OF = 0 and NZCV holds C = V = 0.
+	modeAfterLogic
 	// modeNoFlags: the instruction's flags are dead (disasm sets SkipFlags); flags not compared.
 	modeNoFlags
+	// modeDeadCO: CF and OF are dead after the instruction (disasm sets CarryDead and
+	// OverflowDead); CF and OF are not compared.
+	modeDeadCO
 	// modeFpCmp: the input flags are those of an FP compare (ZF/PF/CF in {000, 001, 100, 111},
 	// OF = SF = AF = 0) and NZCV holds them the way the lifter's COMIS lowering leaves them
 	// (Z = ZF, C = !CF, V = PF, N = 0). The lifter models PF only there, so the PF readers
@@ -114,9 +122,16 @@ const (
 	modeFpCmp
 )
 
-// regsetFpCmp is the bit of a test's regset mask (word 0 of nt_regsets/lt_regsets) that tells
-// dt_make_state to generate FP-compare input flags (modeFpCmp).
-const regsetFpCmp = 1 << 63
+// Bits of a test's regset mask (word 0 of nt_regsets/lt_regsets) that constrain the input
+// flags dt_make_state generates: FP-compare results (modeFpCmp), CF = OF = 0 (modeAfterLogic).
+const (
+	regsetFpCmp = 1 << 63
+	regsetLogic = 1 << 62
+	// regsetMxcsr: the memory operand holds a valid MXCSR value (default exception masks,
+	// random rounding mode, FZ, DAZ and exception flags). A random value would have reserved
+	// bits set, which x86 rejects with #GP and Rosetta 2 silently masks.
+	regsetMxcsr = 1 << 61
+)
 
 // readsPF reports whether the instruction's result depends on PF.
 func readsPF(op x86asm.Op) bool {
@@ -139,7 +154,6 @@ type test struct {
 	flags   string // flag rule passed to compare.py
 	vregs   string // vector registers named by the instruction (comma-separated indexes)
 	vdest   string // vector register the instruction writes ("-" if none)
-	fpcmp   bool   // input flags are an FP-compare result (modeFpCmp)
 }
 
 func skipOp(op x86asm.Op) bool {
@@ -167,13 +181,22 @@ func skipOp(op x86asm.Op) bool {
 }
 
 // readsFlags reports whether the x86 instruction consumes or preserves CF in a way that depends
-// on the lifter's CF polarity. Such instructions are also tested in modeAfterAdd, where the
-// lifter tracks CF with the opposite polarity.
-func readsFlags(op x86asm.Op) bool {
+// on the lifter's carry sense. Such instructions are also tested after an ADD and after a TEST,
+// where the lifter tracks CF in the other two senses.
+func readsFlags(inst x86asm.Inst) bool {
+	op := inst.Op
 	switch op {
 	case x86asm.ADC, x86asm.SBB, x86asm.RCL, x86asm.RCR, x86asm.CMC, x86asm.LAHF, x86asm.PUSHFQ,
-		x86asm.INC, x86asm.DEC:
+		x86asm.INC, x86asm.DEC, x86asm.SAHF:
 		return true
+	case x86asm.SHL, x86asm.SHR, x86asm.SAR, x86asm.ROL, x86asm.ROR, x86asm.SHLD, x86asm.SHRD:
+		// A count of 0 keeps the flags.
+		for _, a := range inst.Args[1:] {
+			if a == x86asm.CL {
+				return true
+			}
+		}
+		return false
 	}
 	s := op.String()
 	return strings.HasPrefix(s, "SET") || strings.HasPrefix(s, "CMOV")
@@ -193,6 +216,10 @@ func flagRule(inst x86asm.Inst) string {
 		// OF (= 0) is not compared: after an FP compare the lifter keeps PF in ARM V, the
 		// register that holds OF everywhere else, so JO/SETO there read PF (model limit).
 		return "CZSP"
+	case x86asm.PTEST, x86asm.VPTEST, x86asm.VTESTPS, x86asm.VTESTPD:
+		// x86 clears OF/SF/AF/PF; Rosetta 2 leaves them unchanged (checked with a native test),
+		// so the reference is only valid for CF and ZF.
+		return "CZ"
 	case x86asm.BSF, x86asm.BSR:
 		return "Z" // CF/OF/SF undefined
 	case x86asm.TZCNT, x86asm.LZCNT:
@@ -371,18 +398,26 @@ func main() {
 	defer f.Close()
 
 	l := lifter.NewArm64Lifter(nil)
-	fn := &disasm.Function{EntryAddr: 0x1000, Blocks: make(map[uint64]*disasm.BasicBlock)}
+	// UsesYmm: lift in the mode that keeps every YMM upper half intact (the strict superset).
+	fn := &disasm.Function{EntryAddr: 0x1000, Blocks: make(map[uint64]*disasm.BasicBlock), UsesYmm: true}
 	lift := func(inst x86asm.Inst, addr uint64, mode entryMode) ([]string, []string, error) {
 		l.ResetFlags()
-		if mode == modeAfterAdd {
-			// Lift (and discard) an ADD so the lifter tracks CF in ADD polarity.
-			add := x86asm.Inst{Op: x86asm.ADD, Args: x86asm.Args{x86asm.RAX, x86asm.RBX}, Len: 3, DataSize: 64}
-			if _, err := l.LiftInstructionToBuf(disasm.Instruction{Address: addr, Inst: add}, addr+3, fn, nil); err != nil {
+		var pre x86asm.Inst
+		switch mode {
+		case modeAfterAdd:
+			pre = x86asm.Inst{Op: x86asm.ADD, Args: x86asm.Args{x86asm.RAX, x86asm.RBX}, Len: 3, DataSize: 64}
+		case modeAfterLogic:
+			pre = x86asm.Inst{Op: x86asm.TEST, Args: x86asm.Args{x86asm.RAX, x86asm.RBX}, Len: 3, DataSize: 64}
+		}
+		if pre.Op != 0 {
+			// Lift (and discard) it so the lifter tracks the carry sense it leaves.
+			if _, err := l.LiftInstructionToBuf(disasm.Instruction{Address: addr, Inst: pre}, addr+3, fn, nil); err != nil {
 				return nil, nil, err
 			}
 		}
-		lines, err := l.LiftInstructionToBuf(disasm.Instruction{Address: addr, Inst: inst, SkipFlags: mode == modeNoFlags},
-			addr+uint64(inst.Len), fn, nil)
+		dead := mode == modeDeadCO
+		lines, err := l.LiftInstructionToBuf(disasm.Instruction{Address: addr, Inst: inst, SkipFlags: mode == modeNoFlags,
+			CarryDead: dead, OverflowDead: dead}, addr+uint64(inst.Len), fn, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -426,29 +461,38 @@ func main() {
 		t.lifted, t.readout, t.mode = ln, ro, modeBlockStart
 		if readsPF(in.Op) {
 			// OF = 0 in an FP-compare state while ARM V holds PF: OF is not compared.
-			t.mode, t.flags, t.fpcmp = modeFpCmp, "CZSP", true
+			t.mode, t.flags = modeFpCmp, "CZSP"
 			t.sig += " [fpcmp]"
 		}
 		tests = append(tests, &t)
-		if readsFlags(in.Op) && !readsPF(in.Op) {
-			if ln2, ro2, err := lift(in, addr, modeAfterAdd); err == nil {
-				if ok, _ := selfContained(ln2); ok {
-					t2 := base
-					t2.sig += " [after-add]"
-					t2.lifted, t2.readout, t2.mode = ln2, ro2, modeAfterAdd
-					tests = append(tests, &t2)
-				}
+		variant := func(mode entryMode, tag, rule string, needDiff bool) {
+			lnV, roV, err := lift(in, addr, mode)
+			if err != nil {
+				return
 			}
-		}
-		if ln3, _, err := lift(in, addr, modeNoFlags); err == nil && strings.Join(ln3[1:], "\n") != strings.Join(ln[1:], "\n") {
-			if ok, _ := selfContained(ln3); ok {
-				t3 := base
-				t3.sig += " [noflags]"
-				t3.flags = "-"
-				t3.lifted, t3.readout, t3.mode = ln3, nil, modeNoFlags
-				tests = append(tests, &t3)
+			if ok, _ := selfContained(lnV); !ok {
+				return
 			}
+			if needDiff && strings.Join(lnV[1:], "\n") == strings.Join(ln[1:], "\n") {
+				return // same code as the block-start test
+			}
+			tv := base
+			tv.sig += " [" + tag + "]"
+			tv.lifted, tv.readout, tv.mode = lnV, roV, mode
+			if rule != "" {
+				tv.flags = rule
+			}
+			if mode == modeNoFlags {
+				tv.readout = nil
+			}
+			tests = append(tests, &tv)
 		}
+		if readsFlags(in) && !readsPF(in.Op) {
+			variant(modeAfterAdd, "after-add", "", false)
+			variant(modeAfterLogic, "after-logic", "", false)
+		}
+		variant(modeNoFlags, "noflags", "-", true)
+		variant(modeDeadCO, "dead-cf-of", "deadco:"+base.flags, true)
 	}
 
 	sc := bufio.NewScanner(f)
@@ -550,7 +594,8 @@ func main() {
 			if scale == 0 {
 				scale = 1
 			}
-			disp := uint64(mem.Disp)
+			// x86asm keeps a disp32 zero-extended; the CPU sign-extends it.
+			disp := uint64(int64(int32(mem.Disp)))
 			if hasB && hasI && bi == ii {
 				v := (memTarget - disp) / (1 + scale)
 				v &^= 63
@@ -585,6 +630,9 @@ func main() {
 			vi, err := x86asm.Decode(v, 64)
 			if err != nil || vi.Op != inst.Op || vi.Len != len(v) || !regArgsOK(vi) {
 				continue
+			}
+			if safeText(vi, addr) == safeText(inst, addr) {
+				continue // VEX.vvvv set on an instruction without that operand: #UD, nothing new
 			}
 			vk := "VAR " + safeText(vi, addr)
 			if seen[vk] {
@@ -708,8 +756,14 @@ func writeRegsets(b *strings.Builder, tests []*test) {
 			mask |= 1 << uint(r)
 			vals[r] = v
 		}
-		if t.fpcmp {
+		switch t.mode {
+		case modeFpCmp:
 			mask |= regsetFpCmp
+		case modeAfterLogic:
+			mask |= regsetLogic
+		}
+		if strings.HasPrefix(t.sig, "LDMXCSR ") || strings.HasPrefix(t.sig, "VLDMXCSR ") {
+			mask |= regsetMxcsr
 		}
 		fmt.Fprintf(b, "  .quad 0x%x", mask)
 		for _, v := range vals {
@@ -734,6 +788,7 @@ const (
 	frameRax   = 168 // guest RAX while the SETcc readout uses AL
 	frameFlags = 176 // 16 bytes: SETcc readout, x86 cc order
 	frameX18   = 192 // host x18 (platform register), restored before returning
+	frameFpcr  = 200 // host FPCR (LDMXCSR changes the rounding mode), restored before returning
 )
 
 // writeAsm emits the arm64 test functions: void lt_N(DtState *st, uint64_t fs_base).
@@ -753,6 +808,7 @@ func writeAsm(path string, tests []*test) {
 			fmt.Fprintf(&b, "    stp d%d, d%d, [sp, #%d]\n", 8+2*k, 9+2*k, 96+16*k)
 		}
 		fmt.Fprintf(&b, "    str x0, [sp, #%d]\n    str x18, [sp, #%d]\n", frameState, frameX18)
+		fmt.Fprintf(&b, "    mrs x2, fpcr\n    str x2, [sp, #%d]\n", frameFpcr)
 		// 2. Load the guest state: vectors, NZCV, pinned GPRs, FS, mem_base.
 		for r := 0; r < 16; r++ {
 			fmt.Fprintf(&b, "    ldr q%d, [x0, #%d]\n    ldr q%d, [x0, #%d]\n", r, offYmm+32*r, r+16, offYmm+32*r+16)
@@ -761,8 +817,8 @@ func writeAsm(path string, tests []*test) {
 		b.WriteString("    ubfx x3, x2, #7, #1\n    lsl x4, x3, #31\n")         // SF -> N
 		b.WriteString("    ubfx x3, x2, #6, #1\n    orr x4, x4, x3, lsl #30\n") // ZF -> Z
 		b.WriteString("    ubfx x3, x2, #0, #1\n")
-		if t.mode != modeAfterAdd {
-			b.WriteString("    eor x3, x3, #1\n") // C = !CF (subtract polarity, lastFlagOp reset)
+		if t.mode != modeAfterAdd && t.mode != modeAfterLogic {
+			b.WriteString("    eor x3, x3, #1\n") // C = !CF (carrySub)
 		}
 		b.WriteString("    orr x4, x4, x3, lsl #29\n")
 		if t.mode == modeFpCmp {
@@ -813,6 +869,7 @@ func writeAsm(path string, tests []*test) {
 		fmt.Fprintf(&b, "    str x5, [x16, #%d]\n", offFlags)
 		// 5. Restore host registers.
 		fmt.Fprintf(&b, "    ldr x18, [sp, #%d]\n", frameX18)
+		fmt.Fprintf(&b, "    ldr x2, [sp, #%d]\n    msr fpcr, x2\n", frameFpcr)
 		for k, r := range pairs {
 			fmt.Fprintf(&b, "    ldp %s, %s, [sp, #%d]\n", r[0], r[1], 16+16*k)
 		}
