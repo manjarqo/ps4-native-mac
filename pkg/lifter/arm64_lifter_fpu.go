@@ -39,8 +39,8 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			"    sub  w17, w17, #1",           // w17 = top - 1
 			"    and  w17, w17, #7",           // w17 = (top - 1) & 7
 			"    str  w17, [x16, #0x2e0]",     // update fpu_top
-			"    add  x18, x16, #0x2a0",       // x18 = &fpu_stack[0]
-			"    str  d0, [x18, w17, uxtw #3]", // fpu_stack[top] = d0
+			"    add  x5, x16, #0x2a0",       // x5 = &fpu_stack[0]
+			"    str  d0, [x5, w17, uxtw #3]", // fpu_stack[top] = d0
 		)
 		return code
 	}
@@ -53,8 +53,8 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		code = append(code, loadCtxPtr("x16")...)
 		code = append(code,
 			"    ldr  w17, [x16, #0x2e0]",     // w17 = fpu_top
-			"    add  x18, x16, #0x2a0",       // x18 = &fpu_stack[0]
-			"    ldr  d0, [x18, w17, uxtw #3]", // d0 = fpu_stack[top]
+			"    add  x5, x16, #0x2a0",       // x5 = &fpu_stack[0]
+			"    ldr  d0, [x5, w17, uxtw #3]", // d0 = fpu_stack[top]
 			"    add  w17, w17, #1",           // w17 = top + 1
 			"    and  w17, w17, #7",           // w17 = (top + 1) & 7
 			"    str  w17, [x16, #0x2e0]",     // update fpu_top
@@ -70,8 +70,8 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			"    ldr  w17, [x16, #0x2e0]",             // w17 = fpu_top
 			fmt.Sprintf("    add  w17, w17, #%d", idx), // w17 = top + idx
 			"    and  w17, w17, #7",                   // w17 = (top + idx) & 7
-			"    add  x18, x16, #0x2a0",               // x18 = &fpu_stack[0]
-			fmt.Sprintf("    ldr  %s, [x18, w17, uxtw #3]", targetD),
+			"    add  x5, x16, #0x2a0",               // x5 = &fpu_stack[0]
+			fmt.Sprintf("    ldr  %s, [x5, w17, uxtw #3]", targetD),
 		)
 		return code
 	}
@@ -84,8 +84,8 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			"    ldr  w17, [x16, #0x2e0]",             // w17 = fpu_top
 			fmt.Sprintf("    add  w17, w17, #%d", idx), // w17 = top + idx
 			"    and  w17, w17, #7",                   // w17 = (top + idx) & 7
-			"    add  x18, x16, #0x2a0",               // x18 = &fpu_stack[0]
-			fmt.Sprintf("    str  %s, [x18, w17, uxtw #3]", srcD),
+			"    add  x5, x16, #0x2a0",               // x5 = &fpu_stack[0]
+			fmt.Sprintf("    str  %s, [x5, w17, uxtw #3]", srcD),
 		)
 		return code
 	}
@@ -450,18 +450,18 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		lines = append(lines, loadCtxPtr("x16")...)
 		lines = append(lines,
 			"    ldrh w17, [x16, #0x2e6]",     // w17 = fpu_sw
-			"    ldr  w18, [x16, #0x2e0]",     // w18 = fpu_top
-			"    and  w18, w18, #7",
+			"    ldr  w5, [x16, #0x2e0]",     // w5 = fpu_top
+			"    and  w5, w5, #7",
 			"    bic  w17, w17, #(7 << 11)",   // clear TOP bits
-			"    orr  w17, w17, w18, lsl #11", // insert TOP bits
+			"    orr  w17, w17, w5, lsl #11", // insert TOP bits
 		)
 		if reg, ok := args[0].(x86asm.Reg); ok && reg == x86asm.AX {
 			lines = append(lines, "    bfi x19, x17, #0, #16") // AX is in x19
 			return lines, nil
 		}
 		if mem, ok := args[0].(x86asm.Mem); ok {
-			lines = append(lines, computeEffAddr(mem, nextPC, "x18")...)
-			lines = append(lines, "    strh w17, [x28, x18]")
+			lines = append(lines, computeEffAddr(mem, nextPC, "x5")...)
+			lines = append(lines, "    strh w17, [x28, x5]")
 			return lines, nil
 		}
 
@@ -469,17 +469,17 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		if mem, ok := args[0].(x86asm.Mem); ok {
 			lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 			lines = append(lines, "    ldrh w17, [x28, x16]")
-			lines = append(lines, loadCtxPtr("x18")...)
-			lines = append(lines, "    strh w17, [x18, #0x2e4]")
+			lines = append(lines, loadCtxPtr("x5")...)
+			lines = append(lines, "    strh w17, [x5, #0x2e4]")
 			return lines, nil
 		}
 
 	case x86asm.FNSTCW:
 		if mem, ok := args[0].(x86asm.Mem); ok {
 			lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-			lines = append(lines, loadCtxPtr("x18")...)
+			lines = append(lines, loadCtxPtr("x5")...)
 			lines = append(lines,
-				"    ldrh w17, [x18, #0x2e4]",
+				"    ldrh w17, [x5, #0x2e4]",
 				"    strh w17, [x28, x16]",
 			)
 			return lines, nil
@@ -529,11 +529,11 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		if mem, ok := args[0].(x86asm.Mem); ok {
 			lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 			lines = append(lines, "    add  x16, x28, x16")
-			lines = append(lines, loadCtxPtr("x18")...)
+			lines = append(lines, loadCtxPtr("x5")...)
 			lines = append(lines,
-				"    ldrh w17, [x18, #0x2e4]",
+				"    ldrh w17, [x5, #0x2e4]",
 				"    str  w17, [x16, #0]",
-				"    ldrh w17, [x18, #0x2e6]",
+				"    ldrh w17, [x5, #0x2e6]",
 				"    str  w17, [x16, #4]",
 				"    mov  w17, #0xffff",
 				"    str  w17, [x16, #8]",
@@ -545,12 +545,12 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		if mem, ok := args[0].(x86asm.Mem); ok {
 			lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 			lines = append(lines, "    add  x16, x28, x16")
-			lines = append(lines, loadCtxPtr("x18")...)
+			lines = append(lines, loadCtxPtr("x5")...)
 			lines = append(lines,
 				"    ldrh w17, [x16, #0]",
-				"    strh w17, [x18, #0x2e4]",
+				"    strh w17, [x5, #0x2e4]",
 				"    ldrh w17, [x16, #4]",
-				"    strh w17, [x18, #0x2e6]",
+				"    strh w17, [x5, #0x2e6]",
 			)
 			return lines, nil
 		}
@@ -601,8 +601,8 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			"    ubfx x17, x16, #52, #11",
 			"    sub  x17, x17, #1023",
 			"    scvtf d2, x17",
-			"    movz x18, #1023",
-			"    bfi  x16, x18, #52, #11",
+			"    movz x5, #1023",
+			"    bfi  x16, x5, #52, #11",
 			"    fmov d0, x16",
 		)
 		lines = append(lines, storeFpuSt("d0", 0)...)
@@ -650,22 +650,22 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		lines = append(lines,
 			"    fcmp d0, d1",
 			"    ldrh w17, [x16, #0x2e6]",
-			"    movz w18, #0x4500",
-			"    bic  w17, w17, w18",
+			"    movz w5, #0x4500",
+			"    bic  w17, w17, w5",
 			"    b.vs 1f",
 			"    b.eq 2f",
 			"    b.mi 3f",
 			"    b    4f",
 			"1:",
-			"    orr  w17, w17, w18",
+			"    orr  w17, w17, w5",
 			"    b    4f",
 			"2:",
-			"    movz w18, #0x4000",
-			"    orr  w17, w17, w18",
+			"    movz w5, #0x4000",
+			"    orr  w17, w17, w5",
 			"    b    4f",
 			"3:",
-			"    movz w18, #0x0100",
-			"    orr  w17, w17, w18",
+			"    movz w5, #0x0100",
+			"    orr  w17, w17, w5",
 			"4:",
 			"    strh w17, [x16, #0x2e6]",
 		)

@@ -84,14 +84,14 @@ func (l *Arm64Lifter) liftMaskmov(inst disasm.Instruction, nextPC uint64, lines 
 			numLanes := 4
 			laneSize := 4
 			elemStr := "s"
-			regStr := "w18"
+			regStr := "w5"
 			bit := 31
 			movOp := "smov"
 			if isDouble {
 				numLanes = 2
 				laneSize = 8
 				elemStr = "d"
-				regStr = "x18"
+				regStr = "x5"
 				bit = 63
 				movOp = "mov"
 			}
@@ -120,7 +120,7 @@ func (l *Arm64Lifter) liftMaskmov(inst disasm.Instruction, nextPC uint64, lines 
 			numLanes := 4
 			laneSize := 4
 			elemStr := "s"
-			regStr := "w18"
+			regStr := "w5"
 			zeroStr := "wzr"
 			bit := 31
 			movOp := "smov"
@@ -128,7 +128,7 @@ func (l *Arm64Lifter) liftMaskmov(inst disasm.Instruction, nextPC uint64, lines 
 				numLanes = 2
 				laneSize = 8
 				elemStr = "d"
-				regStr = "x18"
+				regStr = "x5"
 				zeroStr = "xzr"
 				bit = 63
 				movOp = "mov"
@@ -885,13 +885,13 @@ func (l *Arm64Lifter) liftPcmpistri(inst disasm.Instruction, nextPC uint64, line
 	lines = append(lines,
 		"    ldr  x21, [x17, #8]",
 		"    ldrb w16, [x17, #0x9a]", // sf -> N (bit 31)
-		"    ldrb w18, [x17, #0x99]", // zf -> Z (bit 30)
-		"    orr  w16, w18, w16, lsl #1",
-		"    ldrb w18, [x17, #0x98]", // cf
-		"    eor  w18, w18, #1",      // ARM64 C = NOT x86 CF (C=1 means no carry / above or equal)
-		"    orr  w16, w18, w16, lsl #1",
-		"    ldrb w18, [x17, #0x9b]", // of -> V (bit 28)
-		"    orr  w16, w18, w16, lsl #1",
+		"    ldrb w5, [x17, #0x99]",  // zf -> Z (bit 30)
+		"    orr  w16, w5, w16, lsl #1",
+		"    ldrb w5, [x17, #0x98]", // cf
+		"    eor  w5, w5, #1",       // ARM64 C = NOT x86 CF (C=1 means no carry / above or equal)
+		"    orr  w16, w5, w16, lsl #1",
+		"    ldrb w5, [x17, #0x9b]", // of -> V (bit 28)
+		"    orr  w16, w5, w16, lsl #1",
 		"    lsl  w16, w16, #28",
 		"    msr  nzcv, x16",
 		"    ldp  x29, x30, [sp, #112]",
@@ -963,13 +963,13 @@ func (l *Arm64Lifter) liftPcmpestri(inst disasm.Instruction, nextPC uint64, line
 	lines = append(lines,
 		"    ldr  x21, [x17, #8]",
 		"    ldrb w16, [x17, #0x9a]", // sf -> N (bit 31)
-		"    ldrb w18, [x17, #0x99]", // zf -> Z (bit 30)
-		"    orr  w16, w18, w16, lsl #1",
-		"    ldrb w18, [x17, #0x98]", // cf
-		"    eor  w18, w18, #1",      // ARM64 C = NOT x86 CF (C=1 means no carry / above or equal)
-		"    orr  w16, w18, w16, lsl #1",
-		"    ldrb w18, [x17, #0x9b]", // of -> V (bit 28)
-		"    orr  w16, w18, w16, lsl #1",
+		"    ldrb w5, [x17, #0x99]",  // zf -> Z (bit 30)
+		"    orr  w16, w5, w16, lsl #1",
+		"    ldrb w5, [x17, #0x98]", // cf
+		"    eor  w5, w5, #1",       // ARM64 C = NOT x86 CF (C=1 means no carry / above or equal)
+		"    orr  w16, w5, w16, lsl #1",
+		"    ldrb w5, [x17, #0x9b]", // of -> V (bit 28)
+		"    orr  w16, w5, w16, lsl #1",
 		"    lsl  w16, w16, #28",
 		"    msr  nzcv, x16",
 		"    ldp  x29, x30, [sp, #112]",

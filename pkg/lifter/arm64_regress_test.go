@@ -299,3 +299,29 @@ func TestRegressSsse3Ops(t *testing.T) {
 		requireInOrder(t, tc.name, l[0], tc.want...)
 	}
 }
+
+// x18 is the platform register on Darwin (the kernel may change it at any time); lowerings
+// used it as a scratch register.
+func TestRegressNoPlatformRegister(t *testing.T) {
+	for _, h := range []string{
+		"0ffdc1",       // paddw mm0, mm1
+		"d900",         // fld dword [rax]
+		"dfe0",         // fnstsw ax
+		"c4e27917c1",   // vptest xmm0, xmm1
+		"c4e2712c00",   // vmaskmovps xmm0, xmm1, [rax]
+		"c4e2712e00",   // vmaskmovps [rax], xmm1, xmm0
+		"660f3a63c100", // pcmpistri xmm0, xmm1, 0
+		"0fae00",       // fxsave [rax]
+	} {
+		l := liftBlock(t, h)
+	scan:
+		for _, ln := range l[0] {
+			for _, f := range strings.FieldsFunc(code(ln), func(r rune) bool { return strings.ContainsRune(" ,[]!#", r) }) {
+				if f == "x18" || f == "w18" {
+					t.Errorf("%s uses %s:\n%s", h, f, strings.Join(l[0], "\n"))
+					break scan
+				}
+			}
+		}
+	}
+}

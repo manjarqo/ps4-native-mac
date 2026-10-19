@@ -1886,21 +1886,21 @@ func (l *Arm64Lifter) liftPtestVtest(inst disasm.Instruction, nextPC uint64, lin
 	isTestPD := (op == x86asm.VTESTPD)
 
 	if isTestPS {
-		lines = append(lines, loadImm64("x18", 0x8000000080000000)...)
+		lines = append(lines, loadImm64("x5", 0x8000000080000000)...)
 		lines = append(lines,
-			"    mov x16, v16.d[0]", "    mov x0, v16.d[1]", "    orr x16, x16, x0", "    and x16, x16, x18",
-			"    mov x17, v17.d[0]", "    mov x0, v17.d[1]", "    orr x17, x17, x0", "    and x17, x17, x18",
+			"    mov x16, v16.d[0]", "    mov x0, v16.d[1]", "    orr x16, x16, x0", "    and x16, x16, x5",
+			"    mov x17, v17.d[0]", "    mov x0, v17.d[1]", "    orr x17, x17, x0", "    and x17, x17, x5",
 		)
 	} else if isTestPD {
-		lines = append(lines, loadImm64("x18", 0x8000000000000000)...)
+		lines = append(lines, loadImm64("x5", 0x8000000000000000)...)
 		lines = append(lines,
-			"    mov x16, v16.d[0]", "    mov x0, v16.d[1]", "    orr x16, x16, x0", "    and x16, x16, x18",
-			"    mov x17, v17.d[0]", "    mov x0, v17.d[1]", "    orr x17, x17, x0", "    and x17, x17, x18",
+			"    mov x16, v16.d[0]", "    mov x0, v16.d[1]", "    orr x16, x16, x0", "    and x16, x16, x5",
+			"    mov x17, v17.d[0]", "    mov x0, v17.d[1]", "    orr x17, x17, x0", "    and x17, x17, x5",
 		)
 	} else {
 		lines = append(lines,
-			"    mov x16, v16.d[0]", "    mov x18, v16.d[1]", "    orr x16, x16, x18",
-			"    mov x17, v17.d[0]", "    mov x18, v17.d[1]", "    orr x17, x17, x18",
+			"    mov x16, v16.d[0]", "    mov x5, v16.d[1]", "    orr x16, x16, x5",
+			"    mov x17, v17.d[0]", "    mov x5, v17.d[1]", "    orr x17, x17, x5",
 		)
 	}
 
