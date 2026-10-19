@@ -341,6 +341,14 @@ GUEST_FN _guest_crash
     ldr  x0, [x28, x16]
     GUEST_RET
 
+// ---- longjmp(env, 1) from guest code.
+
+GUEST_FN _guest_longjmp
+    LI   x24, D + 0x700
+    movz x23, #1
+    GUEST_CALL _stub_longjmp
+    GUEST_RET
+
 // ---- A shim sees the guest address of its stub in ctx->rip.
 
 GUEST_FN _guest_rip

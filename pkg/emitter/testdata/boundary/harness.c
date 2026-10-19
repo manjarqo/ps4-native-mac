@@ -75,6 +75,8 @@ void guest_spin(void);
 #define SPIN_FLAG (D + 0x600)
 #define SPIN_HANDLE (D + 0x608)
 void guest_crash(void);
+void guest_longjmp(void);
+#define ADDR_LONGJMP 0x400f00ULL
 #define ADDR_CRASH 0x400e00ULL
 void guest_rip(void);
 #define ADDR_RIP 0x400c00ULL
@@ -510,6 +512,7 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_RIP, (recomp_fn_t)guest_rip);
   recomp_register_fn(ADDR_SPIN, (recomp_fn_t)guest_spin);
   recomp_register_fn(ADDR_CRASH, (recomp_fn_t)guest_crash);
+  recomp_register_fn(ADDR_LONGJMP, (recomp_fn_t)guest_longjmp);
   recomp_register_fn(ADDR_THREAD_MAIN, (recomp_fn_t)guest_thread_main);
   recomp_register_fn(ADDR_THREAD_ENTRY, (recomp_fn_t)guest_thread_entry);
   recomp_register_fn(ADDR_LIFTED_VPCMPISTRI, (recomp_fn_t)guest_lifted_vpcmpistri);
@@ -536,6 +539,10 @@ int main(int argc, char **argv) {
     test_rip();
   } else if (strcmp(c, "profile") == 0) {
     test_profile();
+  } else if (strcmp(c, "longjmp") == 0) {
+    // shim_guest_nonlocal_jump reports and aborts; boundary_test.go checks the report.
+    recomp_call_guest(g_proc, ADDR_LONGJMP);
+    fail("longjmp returned");
   } else if (strcmp(c, "crash") == 0) {
     // The crash handler reports and exits 1; boundary_test.go checks its report.
     recomp_call_guest(g_proc, ADDR_CRASH);

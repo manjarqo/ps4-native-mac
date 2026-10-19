@@ -852,6 +852,44 @@ void recomp_free_runtime(GuestContext *ctx) {
   free(ctx);
 }
 
+// Guest non-local control transfers (longjmp, C++ exception unwinding: libunwind's jumpto)
+// restore the target frame's registers and RET to an address that is not the caller's. The
+// ARM64 assembly backend returns through the host return address of each guest call (contract
+// at recomp_enter_guest), so such a RET would continue after the call that started the
+// transfer. Neither TLOU nor Uncharted 4 imports longjmp, setjmp, __cxa_throw or _Unwind_*;
+// libc.prx reaches them only on error paths. These shims stop there with a report.
+static uint64_t guest_return_address(GuestContext *ctx) {
+  return ctx->rsp + 8 <= ctx->mem_size ? *(uint64_t *)(ctx->mem_base + ctx->rsp) : 0;
+}
+
+void shim_guest_nonlocal_jump(GuestContext *ctx) {
+  fprintf(stderr,
+          "\nFATAL: guest longjmp(env=0x%llx, val=%d) called from 0x%llx: non-local jumps are not "
+          "supported by the ARM64 assembly backend\n",
+          (unsigned long long)ctx->rdi, (int)ctx->rsi, (unsigned long long)guest_return_address(ctx));
+  recomp_dump_guest_context(ctx);
+  fflush(stderr);
+  abort();
+}
+
+// __cxa_throw(void *object, std::type_info *type, void (*dtor)(void *)); __cxa_rethrow(void).
+void shim_guest_cxa_throw(GuestContext *ctx) {
+  const char *type = "?";
+  const uint64_t ti = ctx->rdi && ctx->rsi ? ctx->rsi : 0; // __cxa_rethrow has no type argument
+  if (ti && ti + 16 <= ctx->mem_size) {
+    const uint64_t name = *(uint64_t *)(ctx->mem_base + ti + 8); // Itanium type_info::__name
+    if (name && name < ctx->mem_size) type = (const char *)(ctx->mem_base + name);
+  }
+  fprintf(stderr,
+          "\nFATAL: guest C++ exception (type %.80s) thrown from 0x%llx: exception unwinding is not "
+          "supported by the ARM64 assembly backend\n",
+          type, (unsigned long long)guest_return_address(ctx));
+  recomp_dump_guest_context(ctx);
+  fflush(stderr);
+  abort();
+}
+
+// C backend only: recompiled C functions push UnwindFrames; assembly code never does.
 void recomp_unwind_to(GuestContext *ctx, uint64_t target_ip) {
   ctx->rip = target_ip;
   UnwindFrame *f = ctx->unwind_frame;

@@ -31,13 +31,15 @@ var boundaryStubs = [][2]string{
 	{"_stub___tls_get_addr", "shim___tls_get_addr"},
 	{"_stub_test_record_ctx", "shim_test_record_ctx"},
 	{"_stub_test_rip", "shim_test_rip"},
+	{"_stub_longjmp", "shim_guest_nonlocal_jump"},
 }
 
 // boundaryOutputChecks are further strings a case's output must contain exactly once.
 var boundaryOutputChecks = map[string][]string{
 	"profile": {"[stall-profile] samples in recompiled guest code: PC only (no frame chain)\n",
 		"[stall-profile]   unnamed: busy 100%", ": guest_spin 100%\n"},
-	"crash": {"In recompiled guest code (guest_crash+0x", "RBX=0xd001 RCX=", " R12=0xd00c R13=0xd00d R14=0xd00e R15=0xd00f "},
+	"longjmp": {"FATAL: guest longjmp(env=0x1000700, val=1) called from 0x0: non-local jumps are not supported"},
+	"crash":   {"In recompiled guest code (guest_crash+0x", "RBX=0xd001 RCX=", " R12=0xd00c R13=0xd00d R14=0xd00e R15=0xd00f "},
 }
 
 // boundaryStubAddr is the guest address of boundaryStubs[i] (harness.c: STUB_ADDR).
@@ -165,7 +167,7 @@ func TestGuestStateBoundary(t *testing.T) {
 	cases := []struct {
 		name, arg string
 		env       []string
-		crash     bool // the case ends in the crash handler (exit status 1, no PASS line)
+		crash     bool // the case ends in a fatal report (non-zero exit, no PASS line)
 	}{
 		{"fiber/coroutines", "fiber", nil, false},
 		{"fiber/threads", "fiber", []string{"PS4_FIBER_THREADS=1"}, false},
@@ -179,6 +181,7 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"shim-sets-ctx-rip", "rip", nil, false},
 		{"stall-profile-in-guest-code", "profile", []string{"PS4_STALL_PROFILE=20"}, false},
 		{"crash-in-guest-code", "crash", nil, true},
+		{"guest-longjmp-stops", "longjmp", nil, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -186,8 +189,8 @@ func TestGuestStateBoundary(t *testing.T) {
 			cmd.Env = append(os.Environ(), c.env...)
 			out, err := cmd.CombinedOutput()
 			if c.crash {
-				if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
-					t.Fatalf("%s: %v, want the crash handler's exit status 1\n%s", c.arg, err, out)
+				if _, ok := err.(*exec.ExitError); !ok {
+					t.Fatalf("%s: %v, want it to stop with a report\n%s", c.arg, err, out)
 				}
 			} else if err != nil || !strings.Contains(string(out), "PASS "+c.arg) {
 				t.Fatalf("%s: %v\n%s", c.arg, err, out)

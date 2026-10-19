@@ -30,6 +30,13 @@ var shimAliases = map[string]string{
 	"3GPpjQdAMTw":         "shim_cxa_guard_acquire",
 	"9rAeANT2tyE":         "shim_cxa_guard_release",
 	"2emaaluWzUw":         "shim_cxa_guard_abort",
+	// Non-local control transfers end with an x86 RET to another frame, which recompiled code
+	// cannot follow (see the guest-state contract at recomp_enter_guest): stop with a report.
+	"longjmp":       "shim_guest_nonlocal_jump",
+	"_longjmp":      "shim_guest_nonlocal_jump",
+	"siglongjmp":    "shim_guest_nonlocal_jump",
+	"__cxa_throw":   "shim_guest_cxa_throw",
+	"__cxa_rethrow": "shim_guest_cxa_throw",
 	// Direct Memory & VMM
 	"sceKernelMapDirectMemory2":       "shim_sceKernelMapDirectMemory",
 	"sceKernelMapNamedDirectMemory":   "shim_sceKernelMapDirectMemory",
