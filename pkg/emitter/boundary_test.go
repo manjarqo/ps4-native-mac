@@ -209,6 +209,8 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"crash-in-guest-code", "crash", nil, true},
 		{"guest-longjmp-stops", "longjmp", nil, true},
 		{"exception-in-helper", "signal-in-helper", nil, false},
+		{"exception-in-fiber/coroutines", "exception-fiber", nil, false},
+		{"exception-in-fiber/threads", "exception-fiber", []string{"PS4_FIBER_THREADS=1"}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

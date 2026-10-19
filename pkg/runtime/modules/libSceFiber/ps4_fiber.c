@@ -96,6 +96,7 @@ typedef struct FiberWorker {
   // a fiber runs, and the fiber to mark IDLE once we are back on it.
   void *sp;
   _Atomic uint32_t *release;
+  pthread_t host; // the guest thread's host thread
 } FiberWorker;
 
 typedef struct FiberHost {
@@ -222,11 +223,40 @@ void ps4_fiber_print_stats(int frames) {
           (unsigned long long)atomic_load(&g_fstat_creates));
 }
 
+// Every worker, for ps4_fiber_endpoint_host_thread: append-only, read without locks (also
+// from signal handlers); a destroyed worker's entry is cleared before it is freed.
+#define MAX_WORKERS 1024
+static FiberWorker *_Atomic g_workers[MAX_WORKERS];
+static _Atomic int g_nworkers;
+
 static void worker_destroy(void *p) {
   FiberWorker *w = (FiberWorker *)p;
   if (!w) return;
+  const int n = atomic_load(&g_nworkers);
+  for (int i = 0; i < n && i < MAX_WORKERS; i++)
+    if (atomic_load(&g_workers[i]) == w) atomic_store(&g_workers[i], NULL);
   baton_destroy(&w->baton);
   free(w);
+}
+
+bool ps4_fiber_threads_mode(void) { return g_fiber_threads; }
+
+bool ps4_fiber_endpoint_host_thread(const GuestContext *ctx, pthread_t *out) {
+  const int n = atomic_load(&g_nworkers);
+  for (int i = 0; i < n && i < MAX_WORKERS; i++) {
+    FiberWorker *w = atomic_load(&g_workers[i]);
+    if (!w) continue;
+    FiberHost *h = w->current;
+    if (w->ctx == ctx) {
+      *out = g_fiber_threads && h && h->host_started ? h->host_thread : w->host;
+      return true;
+    }
+    if (h && h->fctx == ctx) {
+      *out = g_fiber_threads && h->host_started ? h->host_thread : w->host;
+      return true;
+    }
+  }
+  return false;
 }
 
 static void worker_key_init(void) {
@@ -240,9 +270,12 @@ static FiberWorker *get_worker(GuestContext *ctx) {
   if (!w) return NULL;
   w->ctx = ctx;
   w->thread = recomp_get_current_thread();
+  w->host = pthread_self();
   baton_init(&w->baton);
   pthread_setspecific(g_worker_key, w);
   tl_worker = w;
+  const int i = atomic_fetch_add(&g_nworkers, 1);
+  if (i < MAX_WORKERS) atomic_store(&g_workers[i], w);
   return w;
 }
 

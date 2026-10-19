@@ -50,6 +50,13 @@ void shim_sceFiberStopContextSizeCheck(GuestContext *ctx);
 void shim_sceFiberAttachContextAndRun(GuestContext *ctx);
 void shim_sceFiberAttachContextAndSwitch(GuestContext *ctx);
 
+// The host thread that runs what a guest thread executes now, given the guest thread's own
+// GuestContext or that of a fiber it runs: the fiber's host thread in thread mode, else the
+// guest thread's. False when no thread that ran fibers has this context. Async-signal-safe.
+bool ps4_fiber_endpoint_host_thread(const GuestContext *ctx, pthread_t *out);
+// PS4_FIBER_THREADS=1: fibers run on their own host threads.
+bool ps4_fiber_threads_mode(void);
+
 // Prints fiber transfer statistics accumulated over the last `frames` frames.
 void ps4_fiber_print_stats(int frames);
 

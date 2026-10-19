@@ -1,6 +1,7 @@
 #include "recomp_runtime.h"
 #include "ps4_kernel_sys.h"
 #include "ps4_sysmodule.h"
+#include "ps4_fiber.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -450,7 +451,22 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     if (!handler) return;
 
     GuestContext *ctx = g_current_ctx;
-    if (!ctx || !ctx->mem_base) return;
+    if (!ctx || !ctx->mem_base || !ctx->fs_base) return;
+
+    // Guest code finds its GuestContext through the TCB slot (contract at recomp_enter_guest).
+    // When the slot names another endpoint of this guest thread, that endpoint is what the
+    // guest thread executes: in fiber thread mode it runs on its own host thread, so pass the
+    // exception on; in coroutine mode this host thread is between endpoints (a hand-over in
+    // progress) and the handler runs on ctx with the slot pointed at it.
+    uint64_t *slot = (uint64_t *)(ctx->mem_base + ctx->fs_base + 0x70ULL);
+    const uint64_t saved_slot = *slot;
+    if (saved_slot != (uint64_t)(uintptr_t)ctx && ps4_fiber_threads_mode()) {
+        pthread_t target;
+        if (ps4_fiber_endpoint_host_thread((GuestContext *)(uintptr_t)saved_slot, &target) &&
+            !pthread_equal(target, pthread_self()))
+            pthread_kill(target, SIGUSR1);
+        return;
+    }
 
     // Save full guest state to restore after exception handler returns
     GuestContext saved_ctx = *ctx;
@@ -528,7 +544,9 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     ctx->rip = handler;
 
     // Execute the guest exception handler (which signals SuspendSemaphore and waits on event flag)
+    *slot = (uint64_t)(uintptr_t)ctx;
     recomp_dispatch(ctx, handler);
+    *slot = saved_slot;
 
     // Restore guest registers exactly as before signal interruption
     *ctx = saved_ctx;
@@ -588,11 +606,16 @@ int32_t sceKernelRaiseException(uint64_t thread, int32_t signum) {
     if (t->finished || !t->host_thread) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    if (pthread_equal(t->host_thread, pthread_self())) {
+    // The host thread that executes the guest thread now (a fiber's own host thread in fiber
+    // thread mode).
+    pthread_t target = t->host_thread;
+    pthread_t fiber_host;
+    if (t->ctx && ps4_fiber_endpoint_host_thread(t->ctx, &fiber_host)) target = fiber_host;
+    if (pthread_equal(target, pthread_self())) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    int rc = pthread_kill(t->host_thread, SIGUSR1);
+    int rc = pthread_kill(target, SIGUSR1);
     if (rc != 0) {
         if (rc == ESRCH) return ORBIS_KERNEL_ERROR_ESRCH;
         if (rc == EINVAL) return ORBIS_KERNEL_ERROR_EINVAL;
