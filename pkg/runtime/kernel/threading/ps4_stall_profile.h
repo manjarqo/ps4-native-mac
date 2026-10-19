@@ -40,8 +40,11 @@ void stall_profile_cpu_begin(StallProfile *p);
 void stall_profile_cpu_end(StallProfile *p);
 // Prints "[stall-profile]" lines: the stall, then every thread that was busy for at least 5 %
 // of its samples (and "Frame Submission" always) with its `top` most frequent functions.
-// A thread with CPU readings gets ", cpu <ms> ms" after its busy share; the header gets
-// ", process cpu <ms> ms, other processes <ms> ms (top <name> <ms> ms)" when it was set.
+// A thread with at least two CPU readings gets ", cpu <ms> ms" after its busy share; it covers
+// the sampled window of that thread (first to last sample), not the whole stall. The process
+// figure covers the time between stall_profile_cpu_begin and _end. "other processes" is a
+// lower bound: proc_pidinfo only answers for processes of the same user, others count as 0.
+// The header gets ", process cpu <ms> ms, other processes <ms> ms (top <name> <ms> ms)" when it was set.
 // Symbolizes the stored samples on the calling thread.
 void stall_profile_report(const StallProfile *p, FILE *out, double stall_ms, int top);
 // Same, with " (watchdog max gap G ms)" appended to the header when max_gap_ms >= 0.

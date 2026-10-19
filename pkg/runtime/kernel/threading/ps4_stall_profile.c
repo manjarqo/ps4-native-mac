@@ -23,7 +23,7 @@ typedef struct {
 typedef struct {
   char name[32];
   uint32_t samples; // all samples of the thread, stored or not
-  int has_cpu;
+  int cpu_readings;
   uint64_t cpu_first_us, cpu_last_us; // first and last cumulative CPU reading
 } StallThread;
 
@@ -92,10 +92,8 @@ void stall_profile_add(StallProfile *p, int slot, const char *thread_name, const
 void stall_profile_thread_cpu(StallProfile *p, int slot, uint64_t cpu_us) {
   if (!p || slot < 0 || slot >= STALL_PROFILE_MAX_THREADS || !cpu_us) return; // 0: unreadable
   StallThread *t = &p->threads[slot];
-  if (!t->has_cpu) {
-    t->has_cpu = 1;
-    t->cpu_first_us = cpu_us;
-  }
+  if (!t->cpu_readings) t->cpu_first_us = cpu_us;
+  t->cpu_readings++;
   t->cpu_last_us = cpu_us;
 }
 
@@ -268,7 +266,7 @@ void stall_profile_report_gap(const StallProfile *p, FILE *out, double stall_ms,
       order[j] = v;
     }
     fprintf(out, "[stall-profile]   %s: busy %u%%", t->name, busy);
-    if (t->has_cpu) fprintf(out, ", cpu %.1f ms", (double)(t->cpu_last_us - t->cpu_first_us) / 1000.0);
+    if (t->cpu_readings >= 2) fprintf(out, ", cpu %.1f ms", (double)(t->cpu_last_us - t->cpu_first_us) / 1000.0);
     fprintf(out, ":");
     for (uint32_t i = 0; i < nfuncs && (int)i < top; i++) {
       const StallFunc *f = &funcs[order[i]];

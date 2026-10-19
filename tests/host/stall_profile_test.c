@@ -56,7 +56,7 @@ static double field_after(const char *text, const char *line_key, const char *ke
 // Samples a spinning and a sleeping thread for ~250 ms, plus a child process that spins, and
 // checks that the reported CPU brackets the truth: the spinner got about the whole window, the
 // sleeper about nothing, the process total about one core, other processes about one core.
-static int cpu_test(void) {
+static int cpu_test(int final_attempt) {
   StallProfile *p = stall_profile_create(fake_symbolize);
   g_stop = 0;
   pthread_t spin, slp;
@@ -102,8 +102,9 @@ static int cpu_test(void) {
   if (!(spin_cpu > 0.7 * window && spin_cpu < 1.3 * window)) ok = 0;
   if (!(slp_cpu >= 0 && slp_cpu < 0.1 * window)) ok = 0;
   if (!(proc_cpu > 0.7 * window && proc_cpu < 1.3 * window + 30)) ok = 0;
-  if (!(others > 0.7 * window && others < 1.3 * window + 30)) ok = 0;
-  if (!ok) printf("cpu_test window %.0f ms: spinner %.1f, sleeper %.1f, process %.1f, others %.1f\n%s", window, spin_cpu,
+  // The upper bound of other processes is machine wide (anything else running adds to it).
+  if (!(others > 0.7 * window && others < 50 * window)) ok = 0;
+  if (!ok && final_attempt) printf("cpu_test window %.0f ms: spinner %.1f, sleeper %.1f, process %.1f, others %.1f\n%s", window, spin_cpu,
                   slp_cpu, proc_cpu, others, buf);
   free(buf);
 
@@ -113,6 +114,8 @@ static int cpu_test(void) {
     stall_profile_add(p, 2, "NdJobWorkerThread 1", pcs, 2);
     stall_profile_thread_cpu(p, 2, 1000 + (uint64_t)i * 4000); // 12000 us over the stall
   }
+  stall_profile_add(p, 3, "SceFiosIO", pcs, 2);
+  stall_profile_thread_cpu(p, 3, 5000); // one reading only: no cpu field
   stall_profile_thread_cpu(p, 2, 0); // an unreadable thread must not reset the readings
   buf = NULL;
   out = open_memstream(&buf, &len);
@@ -120,6 +123,10 @@ static int cpu_test(void) {
   fclose(out);
   if (!strstr(buf, "[stall-profile]   NdJobWorkerThread 1: busy 100%, cpu 12.0 ms: fn_0x1000 100%\n")) {
     printf("format check got:\n%s", buf);
+    ok = 0;
+  }
+  if (strstr(buf, "SceFiosIO: busy 100%, cpu")) {
+    printf("a single cpu reading was reported:\n%s", buf);
     ok = 0;
   }
   free(buf);
@@ -162,7 +169,10 @@ int main(void) {
   }
   free(buf);
   stall_profile_destroy(p);
-  if (!cpu_test()) ok = 0;
+  // A loaded machine can starve the spinner; retry the timing measurement before failing.
+  int cpu_ok = 0;
+  for (int attempt = 1; attempt <= 3 && !cpu_ok; attempt++) cpu_ok = cpu_test(attempt == 3);
+  if (!cpu_ok) ok = 0;
   printf("stall_profile_test: %s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
