@@ -384,3 +384,23 @@ func TestRegressFcmov(t *testing.T) {
 	l = liftBlock(t, "4801d8", "dac1")[1] // add rax, rbx; fcmovb st0, st1: CF = 1 is C = 1 after ADD
 	requireInOrder(t, "fcmovb after add", l, "add w17, w17, #1", "fcsel d0, d1, d0, cs")
 }
+
+// LOOP/LOOPE/LOOPNE decremented RCX with SUBS, which overwrote the guest flags, LOOPE/LOOPNE
+// then tested the Z of that SUBS instead of the guest ZF, and nothing brought C into the
+// block-boundary sense before the branch.
+func TestRegressLoop(t *testing.T) {
+	for _, tc := range []struct {
+		name, hex string
+		want      []string
+	}{
+		{"loop", "e20e", []string{"sub x21, x21, #1", "cbz x21, L_loop_skip_...", "b _recomp_indirect_jump"}},
+		{"loope", "e10e", []string{"sub x21, x21, #1", "cbz x21, L_loope_skip_...", "b.ne L_loope_skip_..."}},
+		{"loopne", "e00e", []string{"sub x21, x21, #1", "cbz x21, L_loopne_skip_...", "b.eq L_loopne_skip_..."}},
+	} {
+		l := liftBlock(t, "4839d8", tc.hex)[1] // cmp rax, rbx; loop*
+		requireInOrder(t, tc.name, l, tc.want...)
+		forbid(t, tc.name, l, "subs ...", "cfinv")
+		// After an ADD (C = CF) the branch targets need C = !CF.
+		requireInOrder(t, tc.name+" after add", liftBlock(t, "4801d8", tc.hex)[1], "cfinv", "sub x21, x21, #1")
+	}
+}

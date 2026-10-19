@@ -575,7 +575,9 @@ func (l *Arm64Lifter) liftXlatb(lines []string) ([]string, error) {
 	return lines, nil
 }
 
-// liftLoop handles LOOP, LOOPE, LOOPNE, and JRCXZ.
+// liftLoop handles LOOP, LOOPE, LOOPNE, and JRCXZ. LOOP/LOOPE/LOOPNE decrement RCX without
+// changing the flags (SUB, not SUBS); LOOPE/LOOPNE also test the guest ZF (Z of NZCV). The
+// targets start in the block-boundary carry sense, so C is normalized first when CF is live.
 func (l *Arm64Lifter) liftLoop(inst disasm.Instruction, nextPC uint64, fn *disasm.Function, lines []string) ([]string, error) {
 	op := inst.Inst.Op
 	rel, okRel := inst.Inst.Args[0].(x86asm.Rel)
@@ -584,69 +586,52 @@ func (l *Arm64Lifter) liftLoop(inst disasm.Instruction, nextPC uint64, fn *disas
 		return lines, nil
 	}
 	target := uint64(int64(nextPC) + int64(rel))
+	if !inst.CarryDead {
+		lines = append(lines, l.normalizeCarry()...)
+	}
+	local := fn != nil && fn.Blocks[target] != nil
+	localLbl := ""
+	if local {
+		localLbl = fmt.Sprintf("L_fn_0x%x_loc_0x%x", fn.EntryAddr, target)
+	}
+	skip := fmt.Sprintf("L_%s_skip_%x", strings.ToLower(op.String()), inst.Address)
+	far := func() {
+		lines = append(lines, loadImm64("x0", target)...)
+		lines = append(lines, "    ldr  x30, [sp], #16", "    b    _recomp_indirect_jump")
+	}
 
 	switch op {
 	case x86asm.LOOP:
-		lines = append(lines, "    subs x21, x21, #1")
-		if fn != nil && fn.Blocks[target] != nil {
-			lines = append(lines, fmt.Sprintf("    b.ne L_fn_0x%x_loc_0x%x", fn.EntryAddr, target))
-		} else {
-			skip := fmt.Sprintf("L_loop_skip_%x", inst.Address)
-			lines = append(lines, fmt.Sprintf("    b.eq %s", skip))
-			lines = append(lines, loadImm64("x0", target)...)
-			lines = append(lines,
-				"    ldr  x30, [sp], #16",
-				"    b    _recomp_indirect_jump",
-				fmt.Sprintf("%s:", skip),
-			)
+		lines = append(lines, "    sub x21, x21, #1")
+		if local {
+			lines = append(lines, fmt.Sprintf("    cbnz x21, %s", localLbl))
+			return lines, nil
 		}
+		lines = append(lines, fmt.Sprintf("    cbz x21, %s", skip))
+		far()
 
-	case x86asm.LOOPE:
-		lines = append(lines, "    subs x21, x21, #1")
-		skip := fmt.Sprintf("L_loope_skip_%x", inst.Address)
-		lines = append(lines, fmt.Sprintf("    b.eq %s", skip))
-		if fn != nil && fn.Blocks[target] != nil {
-			lines = append(lines, fmt.Sprintf("    b.eq L_fn_0x%x_loc_0x%x", fn.EntryAddr, target))
-		} else {
-			lines = append(lines, fmt.Sprintf("    b.ne %s", skip))
-			lines = append(lines, loadImm64("x0", target)...)
-			lines = append(lines,
-				"    ldr  x30, [sp], #16",
-				"    b    _recomp_indirect_jump",
-			)
+	case x86asm.LOOPE, x86asm.LOOPNE:
+		taken, notTaken := "eq", "ne" // LOOPE: ZF = 1
+		if op == x86asm.LOOPNE {
+			taken, notTaken = "ne", "eq"
 		}
-		lines = append(lines, fmt.Sprintf("%s:", skip))
-
-	case x86asm.LOOPNE:
-		lines = append(lines, "    subs x21, x21, #1")
-		skip := fmt.Sprintf("L_loopne_skip_%x", inst.Address)
-		lines = append(lines, fmt.Sprintf("    b.eq %s", skip))
-		if fn != nil && fn.Blocks[target] != nil {
-			lines = append(lines, fmt.Sprintf("    b.ne L_fn_0x%x_loc_0x%x", fn.EntryAddr, target))
+		lines = append(lines, "    sub x21, x21, #1", fmt.Sprintf("    cbz x21, %s", skip))
+		if local {
+			lines = append(lines, fmt.Sprintf("    b.%s %s", taken, localLbl))
 		} else {
-			lines = append(lines, fmt.Sprintf("    b.eq %s", skip))
-			lines = append(lines, loadImm64("x0", target)...)
-			lines = append(lines,
-				"    ldr  x30, [sp], #16",
-				"    b    _recomp_indirect_jump",
-			)
+			lines = append(lines, fmt.Sprintf("    b.%s %s", notTaken, skip))
+			far()
 		}
-		lines = append(lines, fmt.Sprintf("%s:", skip))
 
 	case x86asm.JRCXZ:
-		if fn != nil && fn.Blocks[target] != nil {
-			lines = append(lines, fmt.Sprintf("    cbz x21, L_fn_0x%x_loc_0x%x", fn.EntryAddr, target))
-		} else {
-			skip := fmt.Sprintf("L_jrcxz_skip_%x", inst.Address)
-			lines = append(lines, fmt.Sprintf("    cbnz x21, %s", skip))
-			lines = append(lines, loadImm64("x0", target)...)
-			lines = append(lines,
-				"    ldr  x30, [sp], #16",
-				"    b    _recomp_indirect_jump",
-				fmt.Sprintf("%s:", skip),
-			)
+		if local {
+			lines = append(lines, fmt.Sprintf("    cbz x21, %s", localLbl))
+			return lines, nil
 		}
+		lines = append(lines, fmt.Sprintf("    cbnz x21, %s", skip))
+		far()
 	}
+	lines = append(lines, fmt.Sprintf("%s:", skip))
 	return lines, nil
 }
 
