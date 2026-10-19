@@ -70,6 +70,17 @@ void guest_xmm(void);
 void guest_xmm_callback(void);
 void guest_clobber_fp(void);
 void guest_fpcr(void);
+void guest_thread_main(void);
+void guest_thread_entry(void);
+#define ADDR_THREAD_MAIN 0x400b00ULL
+#define ADDR_THREAD_ENTRY 0x400a00ULL
+#define THREAD_RET (D + 0x408)
+#define TLS_INDEX (D + 0x500)
+#define TLS_TEMPLATE 0x1004000ULL
+#define RES_THR_PRE 0x1300
+#define RES_THR_MAIN 0x1400
+#define RES_THR_MAIN_FP 0x1500
+#define RES_THR_CHILD 0x1600
 void guest_lifted_vpcmpistri(void);
 void guest_lifted_vaeskeygenassist(void);
 #define ADDR_LIFTED_VPCMPISTRI 0x500000ULL
@@ -389,6 +400,56 @@ static void test_helpers(void) {
   check_lifted("vaeskeygenassist", RES_LIFTED_VAESKEYGENASSIST, 4, &want, 20, 0, 0x60000000ULL);
 }
 
+static struct {
+  GuestContext *ctx, *current_ctx;
+  uint64_t fs_base;
+} g_child_seen;
+
+void shim_test_record_ctx(GuestContext *ctx) {
+  g_child_seen.ctx = ctx;
+  g_child_seen.current_ctx = g_current_ctx;
+  g_child_seen.fs_base = ctx->fs_base;
+  SHIM_RETURN();
+}
+
+static uint64_t res_word(uint64_t off, int i) { return gmem64(D + 0x1000 + off)[i]; }
+
+// A guest thread created with pthread_create starts with a fresh context: its own TCB at its
+// FS base, the TCB slot naming its GuestContext, the default MXCSR, and its static TLS laid out
+// as the eboot's PT_TLS expects (variant II: the block ends at FS), which FS-relative accesses
+// and __tls_get_addr agree on. The creating thread is unaffected.
+static void test_thread(void) {
+  memcpy(g_proc->mem_base + TLS_TEMPLATE, "TLS-TEMPLATE-OK!", 16);
+  recomp_init_tls(g_proc, TLS_TEMPLATE, 16, 32, 16);
+  gmem64(TLS_INDEX)[0] = 1;
+  gmem64(TLS_INDEX)[1] = 8;
+  uint64_t tdata0, tdata1;
+  memcpy(&tdata0, "TLS-TEMP", 8);
+  memcpy(&tdata1, "LATE-OK!", 8);
+  const uint64_t fs1 = g_proc->fs_base;
+
+  recomp_call_guest(g_proc, ADDR_THREAD_MAIN);
+
+  const uint64_t fs2 = res_word(RES_THR_CHILD, 0);
+  if (fs2 == fs1 || fs2 == 0) fail("new thread FS base 0x%llx (creator 0x%llx)", (unsigned long long)fs2, (unsigned long long)fs1);
+  expect("new thread fs:[0] (TCB self pointer)", res_word(RES_THR_CHILD, 1), fs2);
+  expect("new thread TCB slot = the ctx its shims get", res_word(RES_THR_CHILD, 2), (uint64_t)(uintptr_t)g_child_seen.ctx);
+  expect("new thread g_current_ctx = its ctx", (uint64_t)(uintptr_t)g_child_seen.current_ctx,
+         (uint64_t)(uintptr_t)g_child_seen.ctx);
+  expect("new thread ctx->fs_base", g_child_seen.fs_base, fs2);
+  expect("new thread FPCR (default MXCSR)", res_word(RES_THR_CHILD, 3), 0);
+  expect("new thread .tdata word at FS - 32", res_word(RES_THR_CHILD, 4), tdata0);
+  expect("new thread .tbss word at FS - 16", res_word(RES_THR_CHILD, 5), 0);
+  expect("new thread argument", res_word(RES_THR_CHILD, 6), 0x1234);
+  expect("__tls_get_addr({1, 8})", res_word(RES_THR_CHILD, 8), fs2 - 32 + 8);
+  expect("__tls_get_addr word", res_word(RES_THR_CHILD, 9), tdata1);
+  expect("join return value", *gmem64(THREAD_RET), 0x1235);
+  check_pattern("creator after pthread_create + join", (int)(RES_THR_MAIN / 0x100), 0x7000, res_word(RES_THR_PRE, W_RSP), fs1);
+  expect("creator FPCR after pthread_create + join", res_word(RES_THR_MAIN_FP, 0), FPCR_RM);
+  expect("creator .tdata word", *gmem64(fs1 - 32), tdata0);
+  expect("creator .tbss word (the new thread wrote its own)", *gmem64(fs1 - 16), 0);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -408,6 +469,8 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_XMM, (recomp_fn_t)guest_xmm);
   recomp_register_fn(ADDR_XMM_CALLBACK, (recomp_fn_t)guest_xmm_callback);
   recomp_register_fn(ADDR_FPCR, (recomp_fn_t)guest_fpcr);
+  recomp_register_fn(ADDR_THREAD_MAIN, (recomp_fn_t)guest_thread_main);
+  recomp_register_fn(ADDR_THREAD_ENTRY, (recomp_fn_t)guest_thread_entry);
   recomp_register_fn(ADDR_LIFTED_VPCMPISTRI, (recomp_fn_t)guest_lifted_vpcmpistri);
   recomp_register_fn(ADDR_LIFTED_VAESKEYGENASSIST, (recomp_fn_t)guest_lifted_vaeskeygenassist);
 
@@ -426,6 +489,8 @@ int main(int argc, char **argv) {
     test_fpcr();
   } else if (strcmp(c, "helpers") == 0) {
     test_helpers();
+  } else if (strcmp(c, "thread") == 0) {
+    test_thread();
   } else {
     fprintf(stderr, "unknown case %s\n", c);
     return 2;

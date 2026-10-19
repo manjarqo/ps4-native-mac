@@ -40,6 +40,14 @@
 .set RES_FP_A2, RES + 0x1220
 .set RES_FP_B1, RES + 0x1230
 .set RES_FP_M2, RES + 0x1240
+.set THREAD_HANDLE, D + 0x400
+.set THREAD_RET, D + 0x408
+.set TLS_INDEX, D + 0x500        // tls_index {module 1, offset 8}
+.set ADDR_THREAD_ENTRY, 0x400a00
+.set RES_THR_PRE, RES + 0x1300
+.set RES_THR_MAIN, RES + 0x1400
+.set RES_THR_MAIN_FP, RES + 0x1500
+.set RES_THR_CHILD, RES + 0x1600
 
 .macro LI reg, val
     movz \reg, #((\val) & 0xffff)
@@ -259,6 +267,61 @@ GUEST_FN _guest_fpcr
     add  x16, x28, x16
     mrs  x0, fpcr
     str  x0, [x16, #8]              // after the shim
+    GUEST_RET
+
+// ---- Thread start: pthread_create from guest code, the new thread's FS base, TCB, TCB slot,
+// FPCR and static TLS (PT_TLS template, variant II, read FS-relative and via __tls_get_addr).
+
+GUEST_FN _guest_thread_main
+    SET_PATTERN 0x7000
+    SET_MXCSR 0x3f80                // round down: a new thread starts with the default
+    STORE_REGS RES_THR_PRE
+    LI   x24, THREAD_HANDLE
+    movz x23, #0
+    LI   x22, ADDR_THREAD_ENTRY
+    movz x21, #0x1234
+    GUEST_CALL _stub_pthread_create
+    LI   x16, THREAD_HANDLE
+    add  x16, x28, x16
+    ldr  x24, [x16]
+    LI   x23, THREAD_RET
+    GUEST_CALL _stub_pthread_join
+    STORE_REGS RES_THR_MAIN
+    STORE_FP RES_THR_MAIN_FP
+    SET_MXCSR 0x1f80
+    GUEST_RET
+
+// void *entry(void *arg): records its thread state, returns arg + 1.
+// Child block: [0] FS base, [1] fs:[0], [2] TCB slot, [3] FPCR, [4] .tdata word 0 at
+// FS - 32, [5] .tbss word at FS - 16, [6] arg, [8] __tls_get_addr({1, 8}), [9] its word.
+GUEST_FN _guest_thread_entry
+    LI   x16, RES_THR_CHILD
+    add  x16, x28, x16
+    mrs  x0, fpcr
+    ldr  x1, [x28, x27]
+    add  x2, x27, #0x70
+    ldr  x2, [x28, x2]
+    stp  x27, x1, [x16, #0]
+    stp  x2, x0, [x16, #16]
+    sub  x3, x27, #32               // recomp_tls_block_offset: memsz 32, align 16
+    ldr  x4, [x28, x3]
+    add  x3, x3, #16
+    ldr  x5, [x28, x3]
+    stp  x4, x5, [x16, #32]
+    movz x6, #0x7777
+    str  x6, [x28, x3]              // this thread's .tbss word only
+    stp  x24, xzr, [x16, #48]
+    LI   x24, TLS_INDEX
+    GUEST_CALL _stub___tls_get_addr
+    LI   x16, RES_THR_CHILD
+    add  x16, x28, x16
+    ldr  x4, [x28, x19]
+    stp  x19, x4, [x16, #64]
+    GUEST_CALL _stub_test_record_ctx
+    LI   x16, RES_THR_CHILD
+    add  x16, x28, x16
+    ldr  x19, [x16, #48]
+    add  x19, x19, #1
     GUEST_RET
 
 // ---- recomp_enter_guest is called from C: it must keep the AAPCS64 callee-saved d8-d15,
