@@ -648,7 +648,9 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			lines = append(lines, loadFpuSt("d29", 1)...)
 		}
 		lines = append(lines, loadCtxPtr("x16")...)
+		// FCOM sets C0/C2/C3 in the status word only; EFLAGS (NZCV) is kept.
 		lines = append(lines,
+			"    mrs  x6, nzcv",
 			"    fcmp d28, d29",
 			"    ldrh w17, [x16, #0x2e6]",
 			"    movz w5, #0x4500",
@@ -669,6 +671,7 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			"    orr  w17, w17, w5",
 			"4:",
 			"    strh w17, [x16, #0x2e6]",
+			"    msr  nzcv, x6",
 		)
 		if op == x86asm.FCOMP || op == x86asm.FICOMP {
 			lines = append(lines, emitFpuDiscard()...)

@@ -278,3 +278,33 @@ func TestExecX87Rounding(t *testing.T) {
 	}
 	runExecCases(t, cases)
 }
+
+// FCOM/FCOMP/FCOMPP/FICOM set C0/C2/C3 in the status word and leave EFLAGS alone.
+func TestExecX87ComparesKeepFlags(t *testing.T) {
+	var cases []execCase
+	for _, c := range []struct {
+		name string
+		code []string
+	}{
+		{"fcom m64", []string{"dd07", "dc5708", "dd7f30", "ddd8"}},
+		{"fcomp m64", []string{"dd07", "dc5f08", "dd7f30"}},
+		{"fcompp", []string{"dd4708", "dd07", "ded9", "dd7f30"}},
+		{"fcom st1", []string{"dd4708", "dd07", "d8d1", "dd7f30", "ddd8", "ddd8"}},
+		{"ficom m32", []string{"dd07", "da5710", "dd7f30", "ddd8"}},
+	} {
+		for _, p := range [][2]float64{{1, 2}, {2, 1}, {2, 2}} {
+			for _, rr := range [][2]uint64{{1, 2}, {2, 1}, {5, 5}, {0x8000000000000000, 1}} {
+				ints := make([]byte, 4)
+				binary.LittleEndian.PutUint32(ints, uint32(int32(p[1])))
+				cases = append(cases, execCase{
+					name: fmt.Sprintf("cmp %d,%d; %s %g,%g", rr[0], rr[1], c.name, p[0], p[1]),
+					code: append([]string{"4839d8"}, c.code...), // cmp rax, rbx
+					regs: map[x86asm.Reg]uint64{x86asm.RAX: rr[0], x86asm.RBX: rr[1], x86asm.RDI: execMemBase + 0x100},
+					mem: map[int][]byte{0x100: le64(math.Float64bits(p[0])), 0x108: le64(math.Float64bits(p[1])),
+						0x110: ints},
+				})
+			}
+		}
+	}
+	runExecCases(t, cases)
+}
