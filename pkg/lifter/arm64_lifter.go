@@ -25,6 +25,18 @@ type XmmDesc struct {
 	V string // Vector register (e.g. "v0")
 }
 
+func isSegmentReg(reg x86asm.Reg) bool {
+	return reg == x86asm.CS || reg == x86asm.DS || reg == x86asm.ES || reg == x86asm.SS || reg == x86asm.FS || reg == x86asm.GS
+}
+
+func isMmx(reg x86asm.Reg) bool {
+	return reg >= x86asm.M0 && reg <= x86asm.M7
+}
+
+func mmxIdx(reg x86asm.Reg) int {
+	return int(reg - x86asm.M0)
+}
+
 // Register map:
 // x86 GPRs map directly to dedicated ARM64 registers.
 // X19-X25: callee-saved registers in Apple Darwin ABI (preserved across C calls)
@@ -837,7 +849,8 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		return lines, nil
 
 	case x86asm.CWD:
-		lines = append(lines,
+		lines = append(
+			lines,
 			"    sxth w16, w19",
 			"    asr  w16, w16, #16",
 			"    bfi  x22, x16, #0, #16",
@@ -1821,4 +1834,3 @@ func isStringCmpsd(inst disasm.Instruction) bool {
 	}
 	return false
 }
-

@@ -38,7 +38,6 @@ type Config struct {
 	AppDir        string
 	CopyResources bool
 	Asan          bool
-	Backend       string
 }
 
 const banner = `
@@ -52,16 +51,15 @@ Usage:
   ps4-recomp analyze <eboot.bin | input.elf | module.prx>
 
 Options:
-  -b, -backend <mode>     Target emission backend: asm (ARM64 assembly) or c (C source) (default: "asm")
-  -o, -out <dir>          Output directory for generated C code and binaries (default: "build")
+  -o, -out <dir>          Output directory for generated code and binaries (default: "build")
   -e, -elf <file>         Path to input PS4 ELF binary
-  -c, -compile            Compile generated C code to native ARM64 binary with clang (default: true)
+  -c, -compile            Compile generated code to native ARM64 binary with clang (default: true)
   -j, -jobs <num>         Number of parallel clang workers (default: NumCPU)
   -O, -opt <level>        Clang optimization level (0, 1, 2, 3, s, z) (default: "2")
   -r, -run                Run the compiled binary after successful recompilation (default: false)
   -t, -timeout <sec>      Watchdog timeout in seconds when running binary (0 = no timeout) (default: 0)
   -a, -all-symbols        Recompile all symbols in symbol table even if unreachable (default: false)
-  -k, -chunk-size <num>   Number of functions per emitted C chunk file (default: 250)
+  -k, -chunk-size <num>   Number of functions per emitted assembly chunk file (default: 250)
   -v, -verbose            Enable verbose output and detailed timing breakdown (default: false)
       -app-dir <dir>      Host directory mapping to /app0 for game assets (auto-detected if omitted)
       -copy-resources     Copy all game assets/resources into macOS .app bundle Resources/ (default: false)
@@ -73,7 +71,6 @@ func normalizeArgs(args []string) ([]string, []string) {
 	var flags []string
 	var positional []string
 	valueFlags := map[string]bool{
-		"-b": true, "-backend": true, "--backend": true,
 		"-o": true, "-out": true, "--out": true,
 		"-e": true, "-elf": true, "--elf": true,
 		"-t": true, "-timeout": true, "--timeout": true,
@@ -112,19 +109,16 @@ func ParseArgs(args []string) (*Config, error) {
 		Jobs:      runtime.NumCPU(),
 		OptLevel:  "2",
 		ChunkSize: 250,
-		Backend:   "asm",
 	}
 
 	var help bool
 
-	fs.StringVar(&cfg.Backend, "backend", cfg.Backend, "Target emission backend: asm (ARM64 assembly) or c (C source)")
-	fs.StringVar(&cfg.Backend, "b", cfg.Backend, "Target emission backend (short)")
 	fs.StringVar(&cfg.ElfPath, "elf", "", "Path to input PS4 ELF binary")
 	fs.StringVar(&cfg.ElfPath, "e", "", "Path to input PS4 ELF binary (short)")
-	fs.StringVar(&cfg.OutDir, "out", cfg.OutDir, "Output directory for recompiled C code and binaries")
+	fs.StringVar(&cfg.OutDir, "out", cfg.OutDir, "Output directory for recompiled assembly code and binaries")
 	fs.StringVar(&cfg.OutDir, "o", cfg.OutDir, "Output directory (short)")
-	fs.BoolVar(&cfg.Compile, "compile", cfg.Compile, "Compile generated C code to native ARM64 binary with clang")
-	fs.BoolVar(&cfg.Compile, "c", cfg.Compile, "Compile generated C code (short)")
+	fs.BoolVar(&cfg.Compile, "compile", cfg.Compile, "Compile generated assembly code to native ARM64 binary with clang")
+	fs.BoolVar(&cfg.Compile, "c", cfg.Compile, "Compile generated code (short)")
 	fs.BoolVar(&cfg.Run, "run", cfg.Run, "Run the compiled binary after successful compilation")
 	fs.BoolVar(&cfg.Run, "r", cfg.Run, "Run binary (short)")
 	fs.IntVar(&cfg.TimeoutSec, "timeout", cfg.TimeoutSec, "Execution timeout in seconds")
@@ -375,33 +369,16 @@ func Execute(args []string) error {
 		knownFuncs[f.Addr] = true
 	}
 
-	var cFiles []string
-	if cfg.Backend == "asm" {
-		l := lifter.NewArm64Lifter(knownFuncs)
-		em := emitter.NewAsmEmitter(loaded, d, l)
-		em.AppDir = cfg.AppDir
-		em.Modules = moduleInfos
-		em.ChunkSize = cfg.ChunkSize
-		em.Funcs = funcs
-		em.HLE = hle
-		var err error
-		cFiles, err = em.EmitAll(cfg.OutDir)
-		if err != nil {
-			return fmt.Errorf("failed to emit ARM64 assembly: %w", err)
-		}
-	} else {
-		l := lifter.NewLifter(knownFuncs)
-		em := emitter.NewCEmitter(loaded, d, l)
-		em.AppDir = cfg.AppDir
-		em.Modules = moduleInfos
-		em.ChunkSize = cfg.ChunkSize
-		em.Funcs = funcs
-		em.HLE = hle
-		var err error
-		cFiles, err = em.EmitAll(cfg.OutDir)
-		if err != nil {
-			return fmt.Errorf("failed to emit C code: %w", err)
-		}
+	l := lifter.NewArm64Lifter(knownFuncs)
+	em := emitter.NewAsmEmitter(loaded, d, l)
+	em.AppDir = cfg.AppDir
+	em.Modules = moduleInfos
+	em.ChunkSize = cfg.ChunkSize
+	em.Funcs = funcs
+	em.HLE = hle
+	cFiles, err := em.EmitAll(cfg.OutDir)
+	if err != nil {
+		return fmt.Errorf("failed to emit ARM64 assembly: %w", err)
 	}
 	hlePath := filepath.Join(cfg.OutDir, "hle_report.txt")
 	if err := hle.WriteFile(hlePath); err != nil {

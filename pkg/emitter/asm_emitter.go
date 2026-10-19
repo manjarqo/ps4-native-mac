@@ -15,6 +15,52 @@ import (
 	"ps4-recomp/pkg/lifter"
 )
 
+type GuestModule struct {
+	FileName       string
+	Aliases        []string
+	Exports        []elfloader.Symbol
+	Init           []uint64
+	StartAddr      uint64
+	EndAddr        uint64
+	Seg0Addr       uint64
+	Seg0Size       uint64
+	EHFrameHdrAddr uint64
+	EHFrameHdrSize uint64
+	EHFrameAddr    uint64
+	EHFrameSize    uint64
+	Segments       []*elfloader.Segment
+}
+
+func writeFileIfChanged(path string, data []byte) error {
+	existing, err := os.ReadFile(path)
+	if err == nil && bytes.Equal(existing, data) {
+		return nil
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func uniqueModuleNames(fileName string, aliases []string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		key := strings.ToLower(filepath.Base(s))
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, filepath.Base(s))
+	}
+	add(fileName)
+	for _, a := range aliases {
+		add(a)
+	}
+	return out
+}
+
 // AsmEmitter emits Apple Silicon ARM64 assembly (.s) files from disassembled functions.
 type AsmEmitter struct {
 	elf          *elfloader.LoadedELF

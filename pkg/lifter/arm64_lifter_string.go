@@ -7,6 +7,27 @@ import (
 	"ps4-recomp/pkg/disasm"
 )
 
+func instHasRep(inst x86asm.Inst) bool {
+	return instRepPrefix(inst) == 0xF3
+}
+
+func instHasRepn(inst x86asm.Inst) bool {
+	return instRepPrefix(inst) == 0xF2
+}
+
+func instRepPrefix(inst x86asm.Inst) byte {
+	for _, p := range inst.Prefix {
+		if p == 0 {
+			continue
+		}
+		switch p & 0xFF {
+		case 0xF3, 0xF2:
+			return byte(p & 0xFF)
+		}
+	}
+	return 0
+}
+
 // liftStringOp handles string instructions: MOVS*, STOS*, LODS*, SCAS*, CMPS*.
 func (l *Arm64Lifter) liftStringOp(inst disasm.Instruction, width int, lines []string) ([]string, error) {
 	op := inst.Inst.Op
