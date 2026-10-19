@@ -113,6 +113,13 @@ typedef struct GuestContext {
 
   // Active exception unwinding frame stack
   UnwindFrame *unwind_frame;
+
+  // ELF PT_TLS and Static TLS Layout
+  uint64_t tls_vaddr;
+  uint64_t tls_filesz;
+  uint64_t tls_memsz;
+  uint64_t tls_align;
+  uint64_t static_tls_size;
 } GuestContext;
 
 #define SHIM_RETURN()                                                          \
@@ -392,7 +399,12 @@ static inline void recomp_dispatch(GuestContext *ctx, uint64_t target) {
       if (__builtin_expect(l3 != NULL, 1)) {
         recomp_fn_t fn = l3[target & DISPATCH_LEVEL_MASK];
         if (__builtin_expect(fn != NULL, 1)) {
+#if defined(RECOMP_ARM64_ASM)
+          extern void recomp_enter_guest(GuestContext *ctx, uint64_t target_fn);
+          recomp_enter_guest(ctx, (uint64_t)fn);
+#else
           fn(ctx);
+#endif
           return;
         }
       }

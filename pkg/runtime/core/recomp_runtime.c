@@ -16,6 +16,14 @@ recomp_fn_t **g_dispatch_l1[DISPATCH_LEVEL_SIZE] = {0};
 _Thread_local GuestContext *g_current_ctx = NULL;
 pthread_mutex_t g_heap_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+GuestContext *recomp_get_current_ctx(void) {
+  return g_current_ctx;
+}
+
+void recomp_set_current_ctx(GuestContext *ctx) {
+  g_current_ctx = ctx;
+}
+
 static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
   if (g_current_ctx) {
     fprintf(stderr,
@@ -52,8 +60,16 @@ static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
       }
     }
 #if defined(__APPLE__) && defined(__arm64__)
-    uint64_t host_pc = ((ucontext_t *)ucontext)->uc_mcontext->__ss.__pc;
-    fprintf(stderr, "Host PC: 0x%llx\n", (unsigned long long)host_pc);
+    arm_thread_state64_t *state = (arm_thread_state64_t *)&(((ucontext_t *)ucontext)->uc_mcontext->__ss);
+    fprintf(stderr, "Host PC: 0x%llx (ARM64)\n", (unsigned long long)state->__pc);
+    for (int i = 0; i < 29; i++) {
+      fprintf(stderr, "x%d=0x%llx ", i, (unsigned long long)state->__x[i]);
+      if ((i + 1) % 4 == 0) fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "\nfp=0x%llx lr=0x%llx sp=0x%llx\n",
+            (unsigned long long)state->__fp,
+            (unsigned long long)state->__lr,
+            (unsigned long long)state->__sp);
 #endif
     void *callstack[64];
     int frames = backtrace(callstack, 64);
@@ -224,6 +240,8 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
   sa.sa_sigaction = crash_handler;
   sigaction(SIGSEGV, &sa, NULL);
   sigaction(SIGBUS, &sa, NULL);
+  sigaction(SIGTRAP, &sa, NULL);
+  sigaction(SIGILL, &sa, NULL);
 
   // Dynamic memory size calculation without hardcoded limits
   if (guest_mem_sz == 0) {
@@ -273,11 +291,13 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
     image_end = 0x10000ULL;
   }
 
-  // Set up FS segment (Thread Control Block for TLS) right above image
-  uint64_t tcb_addr = image_end;
+  // Reserve 64KB for Static TLS block immediately before TCB
+  uint64_t tls_area = image_end;
+  uint64_t tcb_addr = tls_area + 0x10000ULL;
   ctx->fs_base = tcb_addr;
   MEM_U64(tcb_addr) = tcb_addr;
   MEM_U64(tcb_addr + 0x28ULL) = 0x595e9fbd94fda766ULL;
+  MEM_U64(tcb_addr + 0x70ULL) = (uint64_t)ctx;
   ctx->mxcsr = 0x1f80;
   ctx->fpu_cw = 0x037f;
 
@@ -353,8 +373,29 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
   }
 
   // Set up guest stack at top of low memory region (growing downwards)
+  ctx->stack_base = stack_floor;
+  ctx->stack_alloc_size = low_mem_limit - stack_floor;
   ctx->rsp = (low_mem_limit - 0x1000ULL) & ~0xFFULL;
   ctx->rbp = ctx->rsp;
+
+  // Register main thread stack extent in VM extents
+  GuestVMExtent *stack_extent = (GuestVMExtent *)calloc(1, sizeof(GuestVMExtent));
+  if (stack_extent) {
+    stack_extent->addr = stack_floor;
+    stack_extent->size = low_mem_limit - stack_floor;
+    stack_extent->is_free = false;
+    stack_extent->prot = PROT_READ | PROT_WRITE;
+    strncpy(stack_extent->name, "main_stack", sizeof(stack_extent->name) - 1);
+    GuestVMExtent *tail = ctx->vm_extents;
+    while (tail && tail->next)
+      tail = tail->next;
+    if (tail) {
+      tail->next = stack_extent;
+      stack_extent->prev = tail;
+    } else {
+      ctx->vm_extents = stack_extent;
+    }
+  }
 
   ctx->thread_id = 1000;
   recomp_init_main_thread(ctx);
@@ -441,6 +482,10 @@ GuestContext *recomp_init_runtime_file(const char *image_filename,
     }
   }
   fclose(fp);
+
+  // Guard guest NULL page (0x0 .. 0x10000) against invalid reads/writes
+  mprotect(ctx->mem_base, 0x10000, PROT_NONE);
+
   return ctx;
 }
 
@@ -515,6 +560,41 @@ void recomp_init_process_param(GuestContext *ctx, uint64_t proc_param_addr) {
   }
 }
 
+void recomp_init_tls(GuestContext *ctx, uint64_t tls_vaddr, uint64_t tls_filesz, uint64_t tls_memsz, uint64_t tls_align) {
+  if (!ctx) return;
+  uint64_t align = tls_align ? tls_align : 16;
+  if (align < 16) align = 16;
+  uint64_t static_tls_size = (tls_memsz + (align - 1)) & ~(align - 1);
+  if (static_tls_size < 0x100ULL) {
+    static_tls_size = 0x100ULL;
+  }
+  ctx->tls_vaddr = tls_vaddr;
+  ctx->tls_filesz = tls_filesz;
+  ctx->tls_memsz = tls_memsz;
+  ctx->tls_align = tls_align;
+  ctx->static_tls_size = static_tls_size;
+  if (ctx->process_ctx) {
+    ctx->process_ctx->tls_vaddr = tls_vaddr;
+    ctx->process_ctx->tls_filesz = tls_filesz;
+    ctx->process_ctx->tls_memsz = tls_memsz;
+    ctx->process_ctx->tls_align = tls_align;
+    ctx->process_ctx->static_tls_size = static_tls_size;
+  }
+
+  // Populate main thread static TLS block [ctx->fs_base - static_tls_size, ctx->fs_base)
+  if (ctx->mem_base && ctx->fs_base >= static_tls_size) {
+    uint8_t *dest = ctx->mem_base + ctx->fs_base - static_tls_size;
+    memset(dest, 0, static_tls_size);
+    if (tls_filesz > 0 && tls_vaddr > 0 && tls_vaddr + tls_filesz <= ctx->mem_size) {
+      memcpy(dest, ctx->mem_base + tls_vaddr, tls_filesz);
+    }
+    printf("[ps4-recomp] TLS initialized: vaddr=0x%llx filesz=0x%llx memsz=0x%llx align=%llu static_tls_size=0x%llx (fs_base=0x%llx)\n",
+           (unsigned long long)tls_vaddr, (unsigned long long)tls_filesz,
+           (unsigned long long)tls_memsz, (unsigned long long)tls_align,
+           (unsigned long long)static_tls_size, (unsigned long long)ctx->fs_base);
+  }
+}
+
 void recomp_setup_entry_args(GuestContext *ctx, int argc, char **argv, uint64_t entry_addr) {
   if (!ctx || !ctx->mem_base) return;
 
@@ -582,6 +662,10 @@ void shim_sceKernelGetProcParam(GuestContext *ctx) {
   GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
   ctx->rax = proc->proc_param_addr;
   SHIM_RETURN();
+}
+
+void recomp_dispatch_external(GuestContext *ctx, uint64_t target) {
+  recomp_dispatch(ctx, target);
 }
 
 void recomp_free_runtime(GuestContext *ctx) {
@@ -998,15 +1082,25 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
     stack_size = 2 * 1024 * 1024; // 2MB default stack
   GuestContext *proc = parent->process_ctx ? parent->process_ctx : parent;
 
-  // Allocate stack and TCB (64KB) via VM extent allocator
-  size_t alloc_total = stack_size + 0x10000ULL;
+  uint64_t tls_size = proc->static_tls_size ? proc->static_tls_size : 0x1000ULL;
+  tls_size = (tls_size + 0xFFFULL) & ~0xFFFULL;
+
+  // Allocate stack, TLS area and TCB (64KB) via VM extent allocator
+  size_t alloc_total = stack_size + tls_size + 0x10000ULL;
   uint64_t stack_base = recomp_vm_alloc(proc, alloc_total);
   if (stack_base == (uint64_t)-1) {
     fprintf(stderr,
             "[ps4-recomp] FATAL: out of guest memory for new thread stack\n");
     return NULL;
   }
-  uint64_t tcb_base = stack_base + stack_size;
+  uint64_t tcb_base = stack_base + stack_size + tls_size;
+
+  // Initialize Static TLS block for new thread [tcb_base - tls_size, tcb_base)
+  uint8_t *dest = parent->mem_base + tcb_base - tls_size;
+  memset(dest, 0, tls_size);
+  if (proc->tls_filesz > 0 && proc->tls_vaddr > 0 && proc->tls_vaddr + proc->tls_filesz <= parent->mem_size) {
+    memcpy(dest, parent->mem_base + proc->tls_vaddr, proc->tls_filesz);
+  }
 
   // Initialize FS TCB base and stack canary
   *(uint64_t *)(parent->mem_base + tcb_base) = tcb_base;
@@ -1015,6 +1109,8 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   GuestContext *t_ctx = (GuestContext *)calloc(1, sizeof(GuestContext));
   if (!t_ctx)
     return NULL;
+
+  *(uint64_t *)(parent->mem_base + tcb_base + 0x70ULL) = (uint64_t)t_ctx;
 
   t_ctx->mem_base = parent->mem_base;
   t_ctx->mem_size = parent->mem_size;
@@ -1026,6 +1122,11 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   t_ctx->rsp = (stack_base + stack_size - 0x100ULL) & ~0xFFULL;
   t_ctx->rbp = t_ctx->rsp;
   t_ctx->fpu_cw = 0x037F;
+  t_ctx->tls_vaddr = proc->tls_vaddr;
+  t_ctx->tls_filesz = proc->tls_filesz;
+  t_ctx->tls_memsz = proc->tls_memsz;
+  t_ctx->tls_align = proc->tls_align;
+  t_ctx->static_tls_size = proc->static_tls_size;
 
   return t_ctx;
 }
@@ -1034,7 +1135,7 @@ void recomp_free_thread_context(GuestContext *ctx) {
   if (!ctx)
     return;
   GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
-  if (ctx->stack_base && ctx->stack_alloc_size > 0) {
+  if (ctx->stack_base && ctx->stack_alloc_size > 0 && ctx != proc) {
     recomp_vm_free(proc, ctx->stack_base, ctx->stack_alloc_size);
   }
   free(ctx);
@@ -1659,4 +1760,21 @@ xmm_reg_t recomp_vaeskeygenassist(xmm_reg_t s, uint8_t rcon) {
   res.u32[2] = sw3;
   res.u32[3] = aes_rotword(sw3) ^ (uint32_t)rcon;
   return res;
+}
+
+void recomp_unsupported_instruction(uint64_t rip, uint64_t fn_entry, const char *inst_str) {
+  fprintf(stderr, "\n=======================================================\n");
+  fprintf(stderr, "FATAL: Unsupported guest instruction executed!\n");
+  fprintf(stderr, "  Guest RIP:   0x%llx\n", (unsigned long long)rip);
+  if (fn_entry != 0) {
+    fprintf(stderr, "  Function:    fn_0x%llx (offset +0x%llx)\n",
+            (unsigned long long)fn_entry,
+            (unsigned long long)(rip >= fn_entry ? rip - fn_entry : 0));
+  }
+  if (inst_str && (uintptr_t)inst_str > 0x1000 && inst_str[0]) {
+    fprintf(stderr, "  Instruction: %s\n", inst_str);
+  }
+  fprintf(stderr, "=======================================================\n\n");
+  fflush(stderr);
+  abort();
 }

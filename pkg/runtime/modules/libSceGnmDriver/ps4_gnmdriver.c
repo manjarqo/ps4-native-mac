@@ -881,15 +881,27 @@ int32_t sceGnmSubmitAndFlipCommandBuffersForWorkload(GuestContext *ctx, uint32_t
 int32_t sceGnmSubmitDone(void) {
     pthread_mutex_lock(&g_gnm_mutex);
     g_submitted_frames++;
+    uint64_t cur = g_submitted_frames;
     pthread_mutex_unlock(&g_gnm_mutex);
+    fprintf(stderr, "[gnm] sceGnmSubmitDone called (total=%llu)\n", (unsigned long long)cur);
     return ORBIS_GNM_OK;
 }
 
-int32_t sceGnmRequestFlipAndSubmitDone(void) {
-    return ORBIS_GNM_OK;
+int32_t sceGnmRequestFlipAndSubmitDone(GuestContext *ctx, uint64_t gpu_addr, uint32_t gpu_addr_size_in_bytes, uint32_t vo_handle, uint32_t buf_idx, uint32_t flip_mode, int64_t flip_arg) {
+    return sceGnmRequestFlipAndSubmitDoneForWorkload(ctx, gpu_addr, gpu_addr, gpu_addr_size_in_bytes, vo_handle, buf_idx, flip_mode, flip_arg);
 }
 
-int32_t sceGnmRequestFlipAndSubmitDoneForWorkload(void) {
+int32_t sceGnmRequestFlipAndSubmitDoneForWorkload(GuestContext *ctx, uint64_t workload, uint64_t gpu_addr, uint32_t gpu_addr_size_in_bytes, uint32_t vo_handle, uint32_t buf_idx, uint32_t flip_mode, int64_t flip_arg) {
+    (void)workload;
+    (void)gpu_addr;
+    (void)gpu_addr_size_in_bytes;
+
+    sceGnmSubmitDone();
+
+    int32_t flip_res = sceVideoOutSubmitFlip(ctx, (int32_t)vo_handle, (int32_t)buf_idx, flip_mode, flip_arg);
+    if (flip_res != 0) {
+        return (flip_res == -ENOSPC) ? (int32_t)0x80d11081 : flip_res;
+    }
     return ORBIS_GNM_OK;
 }
 
@@ -2129,13 +2141,27 @@ void shim_sceGnmSubmitDone(GuestContext *ctx) {
 }
 
 void shim_sceGnmRequestFlipAndSubmitDone(GuestContext *ctx) {
-    (void)ctx;
-    ctx->rax = (uint64_t)(int64_t)sceGnmRequestFlipAndSubmitDone();
+    uint64_t gpu_addr = ctx->rdi;
+    uint32_t gpu_addr_size_in_bytes = (uint32_t)ctx->rsi;
+    uint32_t vo_handle = (uint32_t)ctx->rdx;
+    uint32_t buf_idx = (uint32_t)ctx->rcx;
+    uint32_t flip_mode = (uint32_t)ctx->r8;
+    int64_t flip_arg = (int64_t)ctx->r9;
+    ctx->rax = (uint64_t)(int64_t)sceGnmRequestFlipAndSubmitDone(ctx, gpu_addr, gpu_addr_size_in_bytes, vo_handle, buf_idx, flip_mode, flip_arg);
     SHIM_RETURN();
 }
 
 void shim_sceGnmRequestFlipAndSubmitDoneForWorkload(GuestContext *ctx) {
-    (void)ctx;
-    ctx->rax = (uint64_t)(int64_t)sceGnmRequestFlipAndSubmitDoneForWorkload();
+    uint64_t workload = ctx->rdi;
+    uint64_t gpu_addr = ctx->rsi;
+    uint32_t gpu_addr_size_in_bytes = (uint32_t)ctx->rdx;
+    uint32_t vo_handle = (uint32_t)ctx->rcx;
+    uint32_t buf_idx = (uint32_t)ctx->r8;
+    uint32_t flip_mode = (uint32_t)ctx->r9;
+    int64_t flip_arg = 0;
+    if (ctx->rsp && ctx->mem_base) {
+        flip_arg = *(int64_t *)recomp_guest_to_host(ctx, ctx->rsp + 8);
+    }
+    ctx->rax = (uint64_t)(int64_t)sceGnmRequestFlipAndSubmitDoneForWorkload(ctx, workload, gpu_addr, gpu_addr_size_in_bytes, vo_handle, buf_idx, flip_mode, flip_arg);
     SHIM_RETURN();
 }

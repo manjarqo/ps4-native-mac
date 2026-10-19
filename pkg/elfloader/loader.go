@@ -107,6 +107,12 @@ type LoadedELF struct {
 	// CanaryAddr tracks the guest virtual address allocated for the stack canary value.
 	CanaryAddr uint64
 
+	// TLSVaddr, TLSFilesz, TLSMemsz, and TLSAlign store PT_TLS template metadata.
+	TLSVaddr  uint64
+	TLSFilesz uint64
+	TLSMemsz  uint64
+	TLSAlign  uint64
+
 	// MemoryImage holds the pre-mapped guest memory image with relative relocs applied.
 	MemoryImage []byte
 
@@ -207,6 +213,12 @@ func LoadELFBytes(data []byte) (*LoadedELF, error) {
 		if prog.Type == PT_SCE_PROCPARAM {
 			loaded.ProcParamAddr = prog.Vaddr
 			loaded.ProcParamSize = prog.Memsz
+		}
+		if prog.Type == elf.PT_TLS {
+			loaded.TLSVaddr = prog.Vaddr
+			loaded.TLSFilesz = prog.Filesz
+			loaded.TLSMemsz = prog.Memsz
+			loaded.TLSAlign = prog.Align
 		}
 		if !isMappedProg(prog.Type) || prog.Memsz == 0 {
 			continue
