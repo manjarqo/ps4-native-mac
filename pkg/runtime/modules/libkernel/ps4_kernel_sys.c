@@ -438,6 +438,37 @@ void shim_sceKernelIsAddressSanitizerEnabled(GuestContext *ctx) {
 #define ORBIS_KERNEL_ERROR_EAGAIN 0x80020023
 #define ORBIS_KERNEL_ERROR_EFAULT 0x8002000e
 
+// The guest general-purpose registers and rip, laid out as at the start of GuestContext.
+typedef struct GuestGprs {
+    uint64_t rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15, rip;
+} GuestGprs;
+_Static_assert(offsetof(GuestContext, rax) == 0 && offsetof(GuestContext, r15) == offsetof(GuestGprs, r15) &&
+               offsetof(GuestContext, fs_base) == sizeof(GuestGprs), "GuestGprs is the start of GuestContext");
+
+// What running guest code changes in its GuestContext: the GPRs and rip, the flags, the vector,
+// x87, MXCSR and MMX state (cf up to mmx). fs_base and gs_base in between and everything after
+// mmx (memory, heap, TLS keys and destructors, unwind frames, the VM mutex) are thread state,
+// which a guest exception handler may change for good.
+#define GUEST_CPU_REST_BEGIN offsetof(GuestContext, cf)
+#define GUEST_CPU_REST_END offsetof(GuestContext, mem_base)
+_Static_assert(offsetof(GuestContext, cf) == offsetof(GuestContext, gs_base) + 8 &&
+                   offsetof(GuestContext, mem_base) == offsetof(GuestContext, mmx) + sizeof(((GuestContext *)0)->mmx),
+               "the guest CPU state is rax..rip and cf..mmx of GuestContext");
+typedef struct GuestCpuState {
+    GuestGprs gprs;
+    uint8_t rest[GUEST_CPU_REST_END - GUEST_CPU_REST_BEGIN];
+} GuestCpuState;
+
+static void guest_cpu_state_save(GuestCpuState *s, const GuestContext *ctx) {
+    memcpy(&s->gprs, ctx, sizeof s->gprs);
+    memcpy(s->rest, (const uint8_t *)ctx + GUEST_CPU_REST_BEGIN, sizeof s->rest);
+}
+
+static void guest_cpu_state_restore(GuestContext *ctx, const GuestCpuState *s) {
+    memcpy(ctx, &s->gprs, sizeof s->gprs);
+    memcpy((uint8_t *)ctx + GUEST_CPU_REST_BEGIN, s->rest, sizeof s->rest);
+}
+
 static uint64_t g_exception_handlers[64] = {0};
 static pthread_mutex_t g_exception_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_sigusr1_installed = false;
@@ -468,72 +499,73 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
         // No other host thread runs the endpoint (it is changing hands): handle it here.
     }
 
-    // Save full guest state to restore after exception handler returns
-    // ctx as it was when the signal arrived, restored afterwards. saved_ctx is the interrupted
-    // state the guest handler gets in its ucontext: in guest code the live registers.
-    const GuestContext orig_ctx = *ctx;
-    GuestContext saved_ctx = *ctx;
+    // The guest CPU state in ctx when the signal arrived: the handler runs guest code on ctx, and
+    // this comes back afterwards (only the CPU state: what the handler did to the thread's TLS,
+    // heap or unwind state stays). `interrupted` holds the registers the handler gets in its
+    // ucontext: in guest code the live registers, else the ones in ctx.
+    GuestCpuState orig_cpu;
+    guest_cpu_state_save(&orig_cpu, ctx);
+    GuestGprs interrupted = orig_cpu.gprs;
 
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
     // Interrupted in recompiled guest code: the guest registers are the pinned host registers.
     // Anywhere else (a shim, the bridge, a helper) the host registers hold host values and ctx
-    // holds the guest registers the bridge stored; ctx is restored from saved_ctx below, so
-    // taking host registers there would hand them to the guest when the shim returns.
+    // holds the guest registers the bridge stored, which the ucontext must show.
     if (ucontext_raw) {
         arm_thread_state64_t *state = (arm_thread_state64_t *)&(((ucontext_t *)ucontext_raw)->uc_mcontext->__ss);
         uint64_t host_x26 = state->__x[26];
         if (recomp_pc_in_guest_code((uint64_t)state->__pc) &&
             state->__x[28] == (uint64_t)ctx->mem_base &&
             host_x26 >= 0x10000ULL && host_x26 < ctx->mem_size) {
-            saved_ctx.rax = state->__x[19];
-            saved_ctx.rbx = state->__x[20];
-            saved_ctx.rcx = state->__x[21];
-            saved_ctx.rdx = state->__x[22];
-            saved_ctx.rsi = state->__x[23];
-            saved_ctx.rdi = state->__x[24];
-            saved_ctx.rbp = state->__x[25];
-            saved_ctx.rsp = host_x26;
-            saved_ctx.r8  = state->__x[8];
-            saved_ctx.r9  = state->__x[9];
-            saved_ctx.r10 = state->__x[10];
-            saved_ctx.r11 = state->__x[11];
-            saved_ctx.r12 = state->__x[12];
-            saved_ctx.r13 = state->__x[13];
-            saved_ctx.r14 = state->__x[14];
-            saved_ctx.r15 = state->__x[15];
+            interrupted.rax = state->__x[19];
+            interrupted.rbx = state->__x[20];
+            interrupted.rcx = state->__x[21];
+            interrupted.rdx = state->__x[22];
+            interrupted.rsi = state->__x[23];
+            interrupted.rdi = state->__x[24];
+            interrupted.rbp = state->__x[25];
+            interrupted.rsp = host_x26;
+            interrupted.r8  = state->__x[8];
+            interrupted.r9  = state->__x[9];
+            interrupted.r10 = state->__x[10];
+            interrupted.r11 = state->__x[11];
+            interrupted.r12 = state->__x[12];
+            interrupted.r13 = state->__x[13];
+            interrupted.r14 = state->__x[14];
+            interrupted.r15 = state->__x[15];
         }
     }
 #endif
 
-    if (saved_ctx.rsp < 0x10000ULL || saved_ctx.rsp > ctx->mem_size) {
+    if (interrupted.rsp < 0x10000ULL || interrupted.rsp > ctx->mem_size) {
         return;
     }
 
     // Allocate Orbis ucontext structure on the guest stack, below the 128-byte red zone
-    uint64_t ucontext_guest_addr = (saved_ctx.rsp - 128ULL - 0x200ULL) & ~0xfULL;
+    uint64_t ucontext_guest_addr = (interrupted.rsp - 128ULL - 0x200ULL) & ~0xfULL;
     if (ucontext_guest_addr + 0x200ULL <= ctx->mem_size) {
         memset(ctx->mem_base + ucontext_guest_addr, 0, 0x200);
         // In FreeBSD/Orbis x86_64 ucontext_t:
         // mc_rdi=0x48, mc_rsi=0x50, mc_rdx=0x58, mc_rcx=0x60, mc_r8=0x68, mc_r9=0x70
         // mc_rax=0x78, mc_rbx=0x80, mc_rbp=0x88, mc_r10=0x90, mc_r11=0x98, mc_r12=0xa0
         // mc_r13=0xa8, mc_r14=0xb0, mc_r15=0xb8, mc_rip=0xe0, mc_rsp=0xf8
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x48ULL) = saved_ctx.rdi;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x50ULL) = saved_ctx.rsi;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x58ULL) = saved_ctx.rdx;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x60ULL) = saved_ctx.rcx;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x68ULL) = saved_ctx.r8;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x70ULL) = saved_ctx.r9;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x78ULL) = saved_ctx.rax;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x80ULL) = saved_ctx.rbx;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x88ULL) = saved_ctx.rbp;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x90ULL) = saved_ctx.r10;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x98ULL) = saved_ctx.r11;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xa0ULL) = saved_ctx.r12;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xa8ULL) = saved_ctx.r13;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xb0ULL) = saved_ctx.r14;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xb8ULL) = saved_ctx.r15;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xe0ULL) = saved_ctx.rip;
-        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xf8ULL) = saved_ctx.rsp;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x48ULL) = interrupted.rdi;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x50ULL) = interrupted.rsi;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x58ULL) = interrupted.rdx;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x60ULL) = interrupted.rcx;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x68ULL) = interrupted.r8;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x70ULL) = interrupted.r9;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x78ULL) = interrupted.rax;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x80ULL) = interrupted.rbx;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x88ULL) = interrupted.rbp;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x90ULL) = interrupted.r10;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0x98ULL) = interrupted.r11;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xa0ULL) = interrupted.r12;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xa8ULL) = interrupted.r13;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xb0ULL) = interrupted.r14;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xb8ULL) = interrupted.r15;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xe0ULL) = interrupted.rip;
+        *(uint64_t *)(ctx->mem_base + ucontext_guest_addr + 0xf8ULL) = interrupted.rsp;
     }
 
     // Set arguments for Orbis exception handler:
@@ -551,11 +583,11 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     recomp_dispatch(ctx, handler);
     *slot = saved_slot;
 
-    // Restore ctx exactly as before the signal. Not saved_ctx: in guest code its GPRs are the
+    // The CPU state in ctx as before the signal. Not `interrupted`: in guest code its GPRs are the
     // live registers, which may not hold what the code wrote to ctx just before (a helper's
     // rcx result the lifted code has not loaded yet); the live registers come back by
     // sigreturn anyway.
-    *ctx = orig_ctx;
+    guest_cpu_state_restore(ctx, &orig_cpu);
 }
 
 int32_t sceKernelInstallExceptionHandler(int32_t signum, uint64_t handler) {

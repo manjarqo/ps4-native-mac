@@ -214,6 +214,25 @@ GUEST_FN _guest_exc_handler
     STORE_REGS RES_EXC_HANDLER
     GUEST_RET
 
+// ---- Guest exception handler that changes thread state: TLS key 5 = 0x7777
+// (pthread_setspecific), a new key with destructor 0x7abc (pthread_key_create, key number to
+// EXC_KEY_OUT) and the heap pointer (shim_test_heap_bump). harness.c test_exception_state
+// checks that all of it survives the return from the handler.
+
+.set EXC_KEY_OUT, D + 0x6f0
+
+GUEST_FN _guest_exc_state_handler
+    movz x24, #5
+    movz x23, #0x7777
+    GUEST_CALL _stub_pthread_setspecific
+    LI   x24, EXC_KEY_OUT
+    movz x23, #0x7abc
+    GUEST_CALL _stub_pthread_key_create
+    GUEST_CALL _stub_test_heap_bump
+    movz x24, #30                   // the signal number raise_exception_in_wait waits for
+    STORE_REGS RES_EXC_HANDLER
+    GUEST_RET
+
 // ---- A shim that sets every GPR (as a longjmp-style shim does).
 
 GUEST_FN _guest_gprs

@@ -88,6 +88,9 @@ void guest_exc_fiber_a(void);
 #define ADDR_UC_CHECK 0x401000ULL
 #define ADDR_EXC_FIBER_MAIN 0x401100ULL
 #define ADDR_EXC_FIBER_A 0x401200ULL
+void guest_exc_state_handler(void);
+#define ADDR_EXC_STATE_HANDLER 0x401400ULL
+#define EXC_KEY_OUT (D + 0x6f0)
 #define HELPER_LOOP_FLAG 0x1000800ULL
 void guest_longjmp(void);
 #define ADDR_LONGJMP 0x400f00ULL
@@ -288,6 +291,35 @@ static void test_exception(void) {
   expect("ucontext r12", *gmem64(uc + 0xa0), 0xe00c);
   expect("ucontext rbx", *gmem64(uc + 0x80), 0xe001);
   expect("ucontext rbp", *gmem64(uc + 0x88), 0xe002);
+  check_pattern("after the shim the handler interrupted", RES_EXC, 0xe000, res(RES_EXC_PRE)[W_RSP], t->fs_base);
+}
+
+void shim_test_heap_bump(GuestContext *ctx) {
+  ctx->heap_ptr += 0x10000;
+  SHIM_RETURN();
+}
+
+// A guest exception handler that changes the thread's state: a TLS value, a new key's
+// destructor (in the process context) and the heap pointer. All of it stays after the handler,
+// and the guest registers the interrupted shim returns with are unchanged.
+static void test_exception_state(void) {
+  GuestContext *t = g_proc;
+  GuestContext *proc = t->process_ctx ? t->process_ctx : t;
+  t->tls_keys[5] = 0x1111;
+  const uint64_t heap = t->heap_ptr;
+  expect("sceKernelInstallExceptionHandler",
+         (uint64_t)(int64_t)sceKernelInstallExceptionHandler(30, ADDR_EXC_STATE_HANDLER), 0);
+  pthread_t th;
+  pthread_create(&th, NULL, raise_exception_in_wait, NULL);
+  recomp_call_guest(t, ADDR_EXC_MAIN);
+  pthread_join(th, NULL);
+  expect("TLS key 5 (set by the handler)", t->tls_keys[5], 0x7777);
+  const uint32_t key = *(uint32_t *)(g_proc->mem_base + EXC_KEY_OUT);
+  if (key == 0 || key >= 128)
+    fail("pthread_key_create in the handler returned key %u", key);
+  else
+    expect("destructor of the key the handler created", proc->tls_destructors[key], 0x7abc);
+  expect("heap pointer (moved by the handler)", t->heap_ptr, heap + 0x10000);
   check_pattern("after the shim the handler interrupted", RES_EXC, 0xe000, res(RES_EXC_PRE)[W_RSP], t->fs_base);
 }
 
@@ -615,6 +647,7 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_UC_CHECK, (recomp_fn_t)guest_uc_check);
   recomp_register_fn(ADDR_EXC_FIBER_MAIN, (recomp_fn_t)guest_exc_fiber_main);
   recomp_register_fn(ADDR_EXC_FIBER_A, (recomp_fn_t)guest_exc_fiber_a);
+  recomp_register_fn(ADDR_EXC_STATE_HANDLER, (recomp_fn_t)guest_exc_state_handler);
   recomp_register_fn(ADDR_LONGJMP, (recomp_fn_t)guest_longjmp);
   recomp_register_fn(ADDR_THREAD_MAIN, (recomp_fn_t)guest_thread_main);
   recomp_register_fn(ADDR_THREAD_ENTRY, (recomp_fn_t)guest_thread_entry);
@@ -626,6 +659,8 @@ int main(int argc, char **argv) {
     test_fiber();
   } else if (strcmp(c, "exception") == 0) {
     test_exception();
+  } else if (strcmp(c, "exception-state") == 0) {
+    test_exception_state();
   } else if (strcmp(c, "gprs") == 0) {
     test_gprs();
   } else if (strcmp(c, "xmm") == 0) {

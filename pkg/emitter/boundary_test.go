@@ -33,6 +33,9 @@ var boundaryStubs = [][2]string{
 	{"_stub_test_rip", "shim_test_rip"},
 	{"_stub_longjmp", "shim_guest_nonlocal_jump"},
 	{"_stub_test_check_uc", "shim_test_check_uc"},
+	{"_stub_pthread_setspecific", "shim_pthread_setspecific"},
+	{"_stub_pthread_key_create", "shim_pthread_key_create"},
+	{"_stub_test_heap_bump", "shim_test_heap_bump"},
 }
 
 // boundaryOutputChecks are further strings a case's output must contain exactly once.
@@ -238,6 +241,7 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"fiber/coroutines", "fiber", nil, false},
 		{"fiber/threads", "fiber", []string{"PS4_FIBER_THREADS=1"}, false},
 		{"exception-handler-in-shim", "exception", nil, false},
+		{"exception-handler-keeps-thread-state", "exception-state", nil, false},
 		{"shim-sets-gprs", "gprs", nil, false},
 		{"xmm-arguments-and-results", "xmm", nil, false},
 		{"enter-guest-keeps-d8-d15", "callee-saved-fp", nil, false},
