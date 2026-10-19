@@ -2447,3 +2447,41 @@ ls -la "$D/all-fixes.patch"; grep -c "^diff --git" "$D/all-fixes.patch"
 ```
 
 Expected: ≥ 1.1 MB, ≥ 88 entries (the new files add entries). The diff base is the upstream commit `63510f6`: since Task 0 the work is committed, so a plain `git diff` would be nearly empty. Update the memory note `~/.claude/projects/-Volumes-ssd-The-Last-of-Us-Remastered-Repack/memory/patch-export-under-bash.md` with this command (diff against `63510f6` plus untracked files). Append a Russian section to `$D/progress.md` with the before/after numbers of Steps 1–2.
+
+---
+
+## Addendum tasks (approved by the owner on 2026-10-19)
+
+The spec addendum ("Addendum: cause of hitches without renderer work") was approved in full: fixes 1, 2, 3 and 5 are implemented, fixes 4 and 6 are experiments decided by measurement. These tasks run before Task 13; Task 13's final measurement then includes them.
+
+### Task 14: NP stub logging, CP thread QoS, latency activity
+
+**Files:**
+- Modify: `pkg/runtime/modules/libSceNp/ps4_np.c` (`NP_LOG`)
+- Modify: other shims that print on every call from guest threads (find them, see Step 2)
+- Modify: `pkg/runtime/modules/libSceGnmDriver/` — the entry of `sceGnmSubmitCommandBuffers` / `sceGnmSubmitAndFlipCommandBuffers` (find the shim definitions)
+- Modify: `pkg/runtime/modules/libSceVideoOut/ps4_metal_screen.m` (start-up)
+
+- [ ] **Step 1: NP logging.** `NP_LOG` keeps a per-call-site counter (`static _Atomic unsigned` inside the macro expansion via a statement expression): the first call of each site prints as today; later calls only count. The periodic `[perf]` output (or, if that is awkward from C, an `atexit`-free approach: print `[libSceNp] <name>: N calls` every 1000th call of a site) reports the counts. `PS4_NP_LOG_ALL=1` (read once) restores printing every call.
+- [ ] **Step 2: Other per-call prints.** Run a walk (`tools/walk_bench.sh spores <bin> t14log`) and list the log lines that repeat more than 100 times per minute from guest threads (`sort | uniq -c` on the line prefix with numbers stripped). Give each source the same first-call-only treatment with the same switch name pattern (`PS4_<MODULE>_LOG_ALL=1`) or, if a print is already behind a debug env var, leave it. List them in the report.
+- [ ] **Step 3: CP thread QoS.** At the first call of the submit shims on a given thread (thread-local flag), call `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)` unless `PS4_GNM_CP_QOS=0`. Log once `[gnm] submit thread '<name>' raised to USER_INTERACTIVE`.
+- [ ] **Step 4: Latency activity.** At start-up in `ps4_metal_screen.m` (where the NSApplication is created), unless `PS4_NO_LATENCY_ACTIVITY=1`: `id act = [[NSProcessInfo processInfo] beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical) reason:@"game"];` and keep `act` in a static (never ended).
+- [ ] **Step 5: Build, exit_test (terminate), one spores walk.** Expected: fatal 0; no `__write_nocancel` stall; the QoS log line appears once; avg fps within the noise of t11f1 (91.9) / t11 (99.5).
+- [ ] **Step 6: Commit** ("Log NP stubs once, raise the CP thread, opt out of App Nap").
+
+### Task 15: Profiler CPU time per thread
+
+**Files:** `pkg/runtime/kernel/threading/ps4_threading.c`, `ps4_stall_profile.{h,c}`, `tests/host/stall_profile_test.c`.
+
+- [ ] **Step 1:** At the start and the end of a sampled stall, read each sampled thread's CPU time (`thread_info(THREAD_BASIC_INFO)` user+system, as in `~/ps4recomp-work/walk_bench/t12-diag/diag6.patch`) and the process's total CPU (`task_info` or `getrusage`). Print per thread `cpu <ms>` next to the busy share, and in the stall header `process cpu <ms>` and the summed CPU of other processes if diag6 had a cheap way (proc_pid_rusage over `proc_listpids`); otherwise only the process total.
+- [ ] **Step 2:** Extend the host test with a thread that spins (cpu ≈ window) and one that is runnable-starved or sleeping (cpu ≈ 0), asserting the reported cpu values bracket the truth (±30 %).
+- [ ] **Step 3:** Add `~/ps4recomp-work/tools/stall_groups.py` (from `walk_bench/t12-diag/classify.py`) that classifies every stall ≥ 100 ms without renderer work into groups 1–4 of the addendum using the new cpu fields; `walk_bench.sh` prints the group counts after its report line.
+- [ ] **Step 4:** Commit ("Stall profiler: CPU time per thread and process").
+
+### Task 16: Experiments — worker QoS (fix 4) and memory (fix 6)
+
+- [ ] **Step 1: Switch.** `PS4_GUEST_WORKER_QOS=<default|utility|initiated|interactive>` applied at guest thread start for threads whose name starts with `NdJobWorkerThread` (kernel/threading). Default `default` (unchanged).
+- [ ] **Step 2: Controlled load A/B.** Fixes 1–3 on. With 8 × `yes > /dev/null` running next to the game (started by the experiment script, killed after): spores, 2 pairs alternating `PS4_GUEST_WORKER_QOS=initiated` vs default; also `PS4_GNM_CP_QOS=0` vs default once each to confirm fix 2 under load. Report >33/>100 ms, max, groups (Task 15 script), fps.
+- [ ] **Step 3: Decide.** If `initiated` gives fewer group-3 stalls and fps not lower beyond noise, make it the default (keep the switch); otherwise keep `default`. Record the ruling.
+- [ ] **Step 4: Memory (group 4).** Measure peak wired/resident memory of the game (`footprint` or `vmmap --summary` once at 4 min) and `S.guest_bufs` total window size (one log line at exit of the walk). If guest windows exceed ~1.5 GB, propose (in the report, no code) a bound. The owner's VM is not stopped by us.
+- [ ] **Step 5:** Commit the switch (and the default change if ruled).
