@@ -411,8 +411,14 @@ func Execute(args []string) error {
 	if !cfg.TSO {
 		tso = "off"
 	}
-	fmt.Printf("             Emitted %d C source files | TSO: %s | Time: %v\n",
-		len(cFiles), tso, time.Since(stepStart).Round(time.Millisecond))
+	nAsm := 0
+	for _, f := range cFiles {
+		if strings.HasSuffix(f, ".s") {
+			nAsm++
+		}
+	}
+	fmt.Printf("             Emitted %d source files (%d assembly, %d C) | TSO: %s | Time: %v\n",
+		len(cFiles), nAsm, len(cFiles)-nAsm, tso, time.Since(stepStart).Round(time.Millisecond))
 
 	// Step 4: Compile with Clang
 	targetBin := filepath.Join(cfg.OutDir, "ps4_app")
