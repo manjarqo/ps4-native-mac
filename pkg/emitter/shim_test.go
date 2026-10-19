@@ -388,7 +388,6 @@ func TestVideoOutAndEqueueShims(t *testing.T) {
 	}
 }
 
-
 // Guest longjmp and C++ throws cannot work with the assembly backend's structured returns;
 // libc's exports bind to the shims that report them (by name and by NID).
 func TestNonLocalTransfersAreShimmed(t *testing.T) {

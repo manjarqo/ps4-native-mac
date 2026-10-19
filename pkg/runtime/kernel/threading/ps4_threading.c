@@ -1304,8 +1304,15 @@ static void stall_dump_threads(double stalled_ms) {
       Dl_info di;
       if (dladdr((void *)pc, &di) && di.dli_sname) sym = di.dli_sname;
     }
-    fprintf(stderr, "[stall]   %-28s guest rip 0x%llx  host %s\n", t->name[0] ? t->name : "unnamed",
-            (unsigned long long)t->ctx->rip, sym);
+    // The GuestContext of what the thread runs (a fiber's while it runs one): its rip is the
+    // guest address of the last shim it called (guest code itself never writes rip).
+    const GuestContext *run = t->ctx;
+    if (t->ctx->mem_base && t->ctx->fs_base) {
+      const uint64_t slot = *(const uint64_t *)(t->ctx->mem_base + t->ctx->fs_base + 0x70ULL);
+      if (slot) run = (const GuestContext *)(uintptr_t)slot;
+    }
+    fprintf(stderr, "[stall]   %-28s last shim 0x%llx  mxcsr 0x%x%s  host %s\n", t->name[0] ? t->name : "unnamed",
+            (unsigned long long)run->rip, run->mxcsr, run != t->ctx ? " (fiber)" : "", sym);
   }
   pthread_mutex_unlock(&g_threads_mutex);
 }

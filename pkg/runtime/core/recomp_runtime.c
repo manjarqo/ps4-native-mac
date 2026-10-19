@@ -73,7 +73,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
       for (int i = 0; i < 512 && shown < 24; i++) {
         if ((uint64_t)(g_current_ctx->rsp + i * 8 + 8) > g_current_ctx->mem_size) break;
         uint64_t v = sp[i];
-        if (v >= 0x10000 && v < 0x1474000) {
+        if (recomp_module_text_contains(v)) {
           // Return addresses point into the middle of a function.
           fprintf(stderr, " %llx", (unsigned long long)v);
           shown++;
@@ -109,7 +109,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
         fprintf(stderr, "Guest code addresses on the live stack:");
         const uint64_t *sp = (const uint64_t *)(g_current_ctx->mem_base + x[26]);
         for (int i = 0, shown = 0; i < 512 && shown < 24 && x[26] + (uint64_t)i * 8 + 8 <= g_current_ctx->mem_size; i++) {
-          if (sp[i] >= 0x10000 && sp[i] < 0x1474000) {
+          if (recomp_module_text_contains(sp[i])) {
             fprintf(stderr, " %llx", (unsigned long long)sp[i]);
             shown++;
           }

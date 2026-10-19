@@ -51,6 +51,9 @@ void recomp_module_register_init(const char *filename, const uint64_t *inits,
                                  size_t count);
 void recomp_module_register_unwind_info(const RecompModuleUnwindInfo *info);
 const RecompModuleUnwindInfo *recomp_module_find_by_addr(uint64_t addr);
+// True when addr is in an executable segment of a registered guest module. Takes no lock
+// (modules register before guest code runs), for crash reports and other signal context.
+bool recomp_module_text_contains(uint64_t addr);
 const RecompModuleUnwindInfo *recomp_module_find_by_handle(int32_t handle);
 void recomp_register_guest_modules(void);
 void recomp_module_start(GuestContext *ctx, int32_t handle);

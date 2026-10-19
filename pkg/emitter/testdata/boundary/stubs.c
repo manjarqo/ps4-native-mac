@@ -40,3 +40,4 @@ const RecompModuleUnwindInfo *recomp_module_find_by_handle(int32_t handle) {
   return NULL;
 }
 void shim_clock_gettime(GuestContext *ctx) { SHIM_RETURN(); }
+bool recomp_module_text_contains(uint64_t addr) { return addr >= 0x400000 && addr < 0x600000; }
