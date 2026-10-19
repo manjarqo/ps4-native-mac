@@ -534,13 +534,22 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 			lines = append(lines, "    add  x16, x28, x16")
 			lines = append(lines, loadCtxPtr("x5")...)
+			// The 28-byte protected-mode environment: FCW, FSW with TOP, the tag word (not
+			// modelled: all empty), and the last instruction and operand pointers (0). Then all
+			// exceptions are masked, as FNSTENV does.
 			lines = append(lines,
 				"    ldrh w17, [x5, #0x2e4]",
 				"    str  w17, [x16, #0]",
+				"    orr  w17, w17, #0x3f",
+				"    strh w17, [x5, #0x2e4]",
 				"    ldrh w17, [x5, #0x2e6]",
+				"    ldr  w6, [x5, #0x2e0]",
+				"    bfi  w17, w6, #11, #3",
 				"    str  w17, [x16, #4]",
 				"    mov  w17, #0xffff",
 				"    str  w17, [x16, #8]",
+				"    stur xzr, [x16, #12]",
+				"    stur xzr, [x16, #20]",
 			)
 			return lines, nil
 		}
@@ -555,6 +564,8 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 				"    strh w17, [x5, #0x2e4]",
 				"    ldrh w17, [x16, #4]",
 				"    strh w17, [x5, #0x2e6]",
+				"    ubfx w17, w17, #11, #3", // TOP
+				"    str  w17, [x5, #0x2e0]",
 			)
 			return lines, nil
 		}

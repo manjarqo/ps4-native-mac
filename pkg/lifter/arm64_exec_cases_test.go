@@ -279,6 +279,51 @@ func TestExecX87Rounding(t *testing.T) {
 	runExecCases(t, cases)
 }
 
+// FNSTENV stores FCW, FSW with TOP and the tag word; FLDENV loads FCW and FSW, TOP included.
+// The instruction and operand pointers (not modelled) are cleared in memory before the
+// comparison, and so is the tag word after pushes (tags are not modelled; with an empty stack,
+// the state at every call, it is compared).
+//
+// FNSTENV then masks all exceptions (SDM; libc's fegetenv reloads the control word for that
+// reason). Rosetta 2 leaves the control word unchanged, so that part is checked on the lowering.
+func TestExecX87Environment(t *testing.T) {
+	const (
+		fldcwRsi   = "d92e"             // fldcw [rsi]
+		fnstenv    = "d97740"           // fnstenv [rdi+0x40]
+		clearPtrs1 = "48c7474c00000000" // mov qword [rdi+0x4c], 0
+		clearPtrs2 = "48c7475400000000" // mov qword [rdi+0x54], 0
+		clearTags  = "c74748ffff0000"   // mov dword [rdi+0x48], 0xffff
+		fnstcw60   = "d97f60"           // fnstcw [rdi+0x60]
+		fld1       = "d9e8"
+		fldenv     = "d96770" // fldenv [rdi+0x70]
+		fnstswAx   = "dfe0"   // fnstsw ax
+		fldRdi     = "dd07"   // fld qword [rdi]
+		fistp64    = "db5f64" // fistp dword [rdi+0x64]
+	)
+	env := make([]byte, 28)
+	binary.LittleEndian.PutUint32(env[0:], 0x0f7f)             // RC toward zero
+	binary.LittleEndian.PutUint32(env[4:], 0x4000|5<<11|0x100) // C3, C0, TOP = 5
+	binary.LittleEndian.PutUint32(env[8:], 0xffff)
+	var cases []execCase
+	for _, cw := range []uint16{0x037f, 0x0360, 0x0b72} {
+		ctl := make([]byte, 2)
+		binary.LittleEndian.PutUint16(ctl, cw)
+		mem := map[int][]byte{0x80: ctl, 0x100: le64(math.Float64bits(2.75)), 0x170: env}
+		regs := map[x86asm.Reg]uint64{x86asm.RSI: execMemBase + 0x80, x86asm.RDI: execMemBase + 0x100}
+		cases = append(cases,
+			execCase{name: fmt.Sprintf("fnstenv empty cw=%#x", cw), code: []string{fldcwRsi, fnstenv, clearPtrs1, clearPtrs2},
+				regs: regs, mem: mem},
+			execCase{name: fmt.Sprintf("fnstenv two pushes cw=%#x", cw),
+				code: []string{fldcwRsi, fld1, fld1, fnstenv, clearPtrs1, clearPtrs2, clearTags}, regs: regs, mem: mem},
+			execCase{name: fmt.Sprintf("fldenv cw=%#x", cw), code: []string{fldcwRsi, fldenv, fnstswAx, fnstcw60, fldRdi, fistp64},
+				regs: regs, mem: mem},
+		)
+	}
+	runExecCases(t, cases)
+	requireInOrder(t, "fnstenv", liftBlock(t, "d930")[0], "ldrh w17, [x5, #0x2e4]", "str w17, [x16, #0]",
+		"orr w17, w17, #0x3f", "strh w17, [x5, #0x2e4]")
+}
+
 // FCOM/FCOMP/FCOMPP/FICOM set C0/C2/C3 in the status word and leave EFLAGS alone.
 func TestExecX87ComparesKeepFlags(t *testing.T) {
 	var cases []execCase
