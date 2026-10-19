@@ -106,7 +106,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "imul eax, ebx",
 			bytes:    []byte{0x0f, 0xaf, 0xc3}, // imul eax, ebx
 			pc:       0x1000,
-			expected: []string{"mul w19, w19, w20"},
+			expected: []string{"smull x0, w19, w20", "cmp x0, w0, sxtw", "mov w19, w0", "rmif x2, #0, #3"},
 		},
 		{
 			name:     "bswap rax",
@@ -424,13 +424,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "mul qword [rcx]",
 			bytes:    []byte{0x48, 0xf7, 0x21}, // mul qword [rcx]
 			pc:       0x1000,
-			expected: []string{"ldr x17, [x28, x16]", "mul x16, x19, x17", "umulh x22, x19, x17", "mov x19, x16"},
+			expected: []string{"ldr x1, [x28, x16]", "mul x0, x19, x1", "umulh x22, x19, x1", "mov x19, x0"},
 		},
 		{
 			name:     "mul r8b",
 			bytes:    []byte{0x41, 0xf6, 0xe0}, // mul r8b
 			pc:       0x1000,
-			expected: []string{"and w17, w19, #0xff", "mul w16, w17, w16", "bfi x19, x16, #0, #16"},
+			expected: []string{"and w1, w8, #0xff", "and w0, w19, #0xff", "mul w0, w0, w1", "bfi x19, x0, #0, #16"},
 		},
 		{
 			name:     "not qword [rdx]",

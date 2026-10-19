@@ -815,184 +815,212 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 	return lines, nil
 }
 
-// liftImul handles IMUL.
-func (l *Arm64Lifter) liftImul(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
-	args := inst.Inst.Args
-	// 2-operand form: IMUL dst, src
-	if args[0] != nil && args[1] != nil && args[2] == nil {
-		dstReg, okDst := args[0].(x86asm.Reg)
-		descDst, okDescDst := arm64RegMap[dstReg]
-		if okDst && okDescDst {
-			if srcReg, okSrc := args[1].(x86asm.Reg); okSrc {
-				if descSrc, okDescSrc := arm64RegMap[srcReg]; okDescSrc {
-					if descDst.Size == 4 {
-						lines = append(lines, fmt.Sprintf("    mul %s, %s, %s", descDst.W, descDst.W, descSrc.W))
-					} else {
-						lines = append(lines, fmt.Sprintf("    mul %s, %s, %s", descDst.X, descDst.X, descSrc.X))
-					}
-					return lines, nil
-				}
-			}
-			if mem, okMem := args[1].(x86asm.Mem); okMem {
-				lines = append(lines, readMemTo(mem, nextPC, descDst.Size, "x16", "w16")...)
-				if descDst.Size == 4 {
-					lines = append(lines, fmt.Sprintf("    mul %s, %s, w16", descDst.W, descDst.W))
-				} else {
-					lines = append(lines, fmt.Sprintf("    mul %s, %s, x16", descDst.X, descDst.X))
-				}
-				return lines, nil
-			}
-		}
-	}
-	// 3-operand form: IMUL dst, src, imm
-	if args[0] != nil && args[1] != nil && args[2] != nil {
-		dstReg, okDst := args[0].(x86asm.Reg)
-		imm, okImm := args[2].(x86asm.Imm)
-		descDst, okDescDst := arm64RegMap[dstReg]
-		if okDst && okImm && okDescDst {
-			if srcReg, okSrc := args[1].(x86asm.Reg); okSrc {
-				if descSrc, okDescSrc := arm64RegMap[srcReg]; okDescSrc {
-					lines = append(lines, loadImm32("w16", uint32(imm))...)
-					if descDst.Size == 4 {
-						lines = append(lines, fmt.Sprintf("    mul %s, %s, w16", descDst.W, descSrc.W))
-					} else {
-						lines = append(lines, fmt.Sprintf("    mul %s, %s, x16", descDst.X, descSrc.X))
-					}
-					return lines, nil
-				}
-			} else if mem, okMem := args[1].(x86asm.Mem); okMem {
-				lines = append(lines, readMemTo(mem, nextPC, descDst.Size, "x17", "w17")...)
-				lines = append(lines, loadImm32("w16", uint32(imm))...)
-				if descDst.Size == 4 {
-					lines = append(lines, fmt.Sprintf("    mul %s, w17, w16", descDst.W))
-				} else {
-					lines = append(lines, fmt.Sprintf("    mul %s, x17, x16", descDst.X))
-				}
-				return lines, nil
-			}
-		}
-	}
-	// 1-operand form: IMUL src (RAX * src -> RDX:RAX)
-	if args[0] != nil && args[1] == nil {
-		if reg, ok := args[0].(x86asm.Reg); ok {
-			if desc, okDesc := arm64RegMap[reg]; okDesc {
-				switch desc.Size {
-				case 1:
-					rc, _ := readRegTo(reg, "x16", "w16")
-					lines = append(lines, rc...)
-					lines = append(lines, "    sxtb w16, w16")
-					lines = append(lines, "    sxtb w17, w19")
-					lines = append(lines, "    mul w16, w17, w16")
-					lines = append(lines, "    bfi x19, x16, #0, #16")
-				case 2:
-					rc, _ := readRegTo(reg, "x16", "w16")
-					lines = append(lines, rc...)
-					lines = append(lines, "    sxth w16, w16")
-					lines = append(lines, "    sxth w17, w19")
-					lines = append(lines, "    mul w16, w17, w16")
-					lines = append(lines, "    bfi x19, x16, #0, #16")
-					lines = append(lines, "    lsr w17, w16, #16")
-					lines = append(lines, "    bfi x22, x17, #0, #16")
-				case 4:
-					lines = append(lines, fmt.Sprintf("    smull x16, w19, %s", desc.W))
-					lines = append(lines, "    mov w19, w16")
-					lines = append(lines, "    lsr x22, x16, #32")
-				default: // 8
-					lines = append(lines, fmt.Sprintf("    mul x16, x19, %s", desc.X))
-					lines = append(lines, fmt.Sprintf("    smulh x22, x19, %s", desc.X))
-					lines = append(lines, "    mov x19, x16")
-				}
-				return lines, nil
-			}
-		} else if mem, ok := args[0].(x86asm.Mem); ok {
-			sz := defMemSz(inst)
-			lines = append(lines, readMemTo(mem, nextPC, sz, "x17", "w17")...)
-			switch sz {
-			case 1:
-				lines = append(lines, "    sxtb w17, w17")
-				lines = append(lines, "    sxtb w16, w19")
-				lines = append(lines, "    mul w16, w16, w17")
-				lines = append(lines, "    bfi x19, x16, #0, #16")
-			case 2:
-				lines = append(lines, "    sxth w17, w17")
-				lines = append(lines, "    sxth w16, w19")
-				lines = append(lines, "    mul w16, w16, w17")
-				lines = append(lines, "    bfi x19, x16, #0, #16")
-				lines = append(lines, "    lsr w17, w16, #16")
-				lines = append(lines, "    bfi x22, x17, #0, #16")
-			case 4:
-				lines = append(lines, "    smull x16, w19, w17")
-				lines = append(lines, "    mov w19, w16")
-				lines = append(lines, "    lsr x22, x16, #32")
-			default: // 8
-				lines = append(lines, "    mul x16, x19, x17")
-				lines = append(lines, "    smulh x22, x19, x17")
-				lines = append(lines, "    mov x19, x16")
-			}
-			return lines, nil
-		}
-	}
-
-	lines = append(lines, "    brk #0 // unsupported imul")
-	return lines, nil
+// mulOverflowFlags sets x86 CF = OF = (bit 0 of w2) in C and V; SF/ZF are undefined after
+// MUL/IMUL and are left as they are. The carry sense afterwards is carryAdd (C = CF).
+func (l *Arm64Lifter) mulOverflowFlags(lines []string) []string {
+	l.cpol = carryAdd
+	return append(lines, "    orr w2, w2, w2, lsl #1", "    rmif x2, #0, #3")
 }
 
-// liftMul handles unsigned MUL.
-func (l *Arm64Lifter) liftMul(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
-	if reg, ok := inst.Inst.Args[0].(x86asm.Reg); ok {
-		if desc, okDesc := arm64RegMap[reg]; okDesc {
-			switch desc.Size {
-			case 1:
-				rc, _ := readRegTo(reg, "x16", "w16")
-				lines = append(lines, rc...)
-				lines = append(lines, "    and w17, w19, #0xff")
-				lines = append(lines, "    mul w16, w17, w16")
-				lines = append(lines, "    bfi x19, x16, #0, #16")
-			case 2:
-				rc, _ := readRegTo(reg, "x16", "w16")
-				lines = append(lines, rc...)
-				lines = append(lines, "    and w17, w19, #0xffff")
-				lines = append(lines, "    mul w16, w17, w16")
-				lines = append(lines, "    bfi x19, x16, #0, #16")
-				lines = append(lines, "    lsr w17, w16, #16")
-				lines = append(lines, "    bfi x22, x17, #0, #16")
-			case 4:
-				lines = append(lines, fmt.Sprintf("    umull x16, w19, %s", desc.W))
-				lines = append(lines, "    mov w19, w16")
-				lines = append(lines, "    lsr x22, x16, #32")
-			default: // 8
-				lines = append(lines, fmt.Sprintf("    mul x16, x19, %s", desc.X))
-				lines = append(lines, fmt.Sprintf("    umulh x22, x19, %s", desc.X))
-				lines = append(lines, "    mov x19, x16")
+// mulSource puts a multiplier operand in x1/w1 (a pinned register is returned as is).
+func mulSource(arg x86asm.Arg, size int, nextPC uint64) ([]string, string, bool) {
+	switch v := arg.(type) {
+	case x86asm.Reg:
+		d, ok := arm64RegMap[v]
+		if !ok {
+			return nil, "", false
+		}
+		switch size {
+		case 8:
+			return nil, d.X, true
+		case 4:
+			return nil, d.W, true
+		}
+		rc, _ := readRegTo(v, "x1", "w1")
+		return rc, "w1", true
+	case x86asm.Mem:
+		if size == 8 {
+			return readMemTo(v, nextPC, 8, "x1", "w1"), "x1", true
+		}
+		return readMemTo(v, nextPC, size, "x1", "w1"), "w1", true
+	}
+	return nil, "", false
+}
+
+// liftImul handles IMUL (one, two and three operands). CF = OF = 1 when the signed product does
+// not fit the destination; they are computed only when one of them is live.
+func (l *Arm64Lifter) liftImul(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
+	args := inst.Inst.Args
+	flags := !inst.CarryDead || !inst.OverflowDead
+	if args[1] == nil {
+		// One operand: RDX:RAX (AX for 8-bit) = RAX * src, signed.
+		size := defMemSz(inst)
+		if r, ok := args[0].(x86asm.Reg); ok {
+			d, okD := arm64RegMap[r]
+			if !okD {
+				lines = append(lines, l.emitUnsupported(inst, "unmapped imul src")...)
+				return lines, nil
 			}
+			size = d.Size
+		}
+		ld, src, ok := mulSource(args[0], size, nextPC)
+		if !ok {
+			lines = append(lines, l.emitUnsupported(inst, "unsupported imul operand")...)
 			return lines, nil
 		}
-	} else if mem, ok := inst.Inst.Args[0].(x86asm.Mem); ok {
-		sz := defMemSz(inst)
-		lines = append(lines, readMemTo(mem, nextPC, sz, "x17", "w17")...)
-		switch sz {
-		case 1:
-			lines = append(lines, "    and w16, w19, #0xff")
-			lines = append(lines, "    mul w16, w16, w17")
-			lines = append(lines, "    bfi x19, x16, #0, #16")
-		case 2:
-			lines = append(lines, "    and w16, w19, #0xffff")
-			lines = append(lines, "    mul w16, w16, w17")
-			lines = append(lines, "    bfi x19, x16, #0, #16")
-			lines = append(lines, "    lsr w17, w16, #16")
-			lines = append(lines, "    bfi x22, x17, #0, #16")
+		lines = append(lines, ld...)
+		switch size {
+		case 1, 2:
+			ext := "sxtb"
+			if size == 2 {
+				ext = "sxth"
+			}
+			lines = append(lines, fmt.Sprintf("    %s w1, %s", ext, src), fmt.Sprintf("    %s w0, w19", ext),
+				"    mul w0, w0, w1")
+			if size == 1 {
+				lines = append(lines, "    bfi x19, x0, #0, #16") // AX
+			} else {
+				lines = append(lines, "    bfi x19, x0, #0, #16", "    lsr w1, w0, #16", "    bfi x22, x1, #0, #16")
+			}
+			if flags {
+				lines = append(lines, fmt.Sprintf("    cmp w0, w0, %s", ext), "    cset w2, ne")
+				lines = l.mulOverflowFlags(lines)
+			}
 		case 4:
-			lines = append(lines, "    umull x16, w19, w17")
-			lines = append(lines, "    mov w19, w16")
-			lines = append(lines, "    lsr x22, x16, #32")
-		default: // 8
-			lines = append(lines, "    mul x16, x19, x17")
-			lines = append(lines, "    umulh x22, x19, x17")
-			lines = append(lines, "    mov x19, x16")
+			lines = append(lines, fmt.Sprintf("    smull x0, w19, %s", src), "    mov w19, w0", "    lsr x22, x0, #32")
+			if flags {
+				lines = append(lines, "    cmp x0, w0, sxtw", "    cset w2, ne")
+				lines = l.mulOverflowFlags(lines)
+			}
+		default:
+			lines = append(lines, fmt.Sprintf("    mul x0, x19, %s", src), fmt.Sprintf("    smulh x22, x19, %s", src),
+				"    mov x19, x0")
+			if flags {
+				lines = append(lines, "    cmp x22, x0, asr #63", "    cset w2, ne")
+				lines = l.mulOverflowFlags(lines)
+			}
 		}
 		return lines, nil
 	}
-	lines = append(lines, "    brk #0 // unsupported mul")
+
+	dstReg, okDst := args[0].(x86asm.Reg)
+	d, okD := arm64RegMap[dstReg]
+	if !okDst || !okD {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported imul dst")...)
+		return lines, nil
+	}
+	size := d.Size
+	// Two operands: dst = dst * src. Three operands: dst = src * imm.
+	var a, b string
+	if args[2] == nil {
+		ld, src, ok := mulSource(args[1], size, nextPC)
+		if !ok {
+			lines = append(lines, l.emitUnsupported(inst, "unsupported imul src")...)
+			return lines, nil
+		}
+		lines = append(lines, ld...)
+		b = src
+		switch size {
+		case 8:
+			a = d.X
+		case 4:
+			a = d.W
+		default:
+			rc, _ := readRegTo(dstReg, "x0", "w0")
+			lines = append(lines, rc...)
+			a = "w0"
+		}
+	} else {
+		imm, okImm := args[2].(x86asm.Imm)
+		ld, src, ok := mulSource(args[1], size, nextPC)
+		if !okImm || !ok {
+			lines = append(lines, l.emitUnsupported(inst, "unsupported imul operands")...)
+			return lines, nil
+		}
+		lines = append(lines, ld...)
+		a = src
+		// The immediate is sign-extended to the operand size.
+		if size == 8 {
+			lines = append(lines, loadImm64("x3", uint64(int64(imm)))...)
+			b = "x3"
+		} else {
+			lines = append(lines, loadImm32("w3", uint32(int64(imm)))...)
+			b = "w3"
+		}
+	}
+	switch {
+	case !flags && size >= 4:
+		// The low half of the product does not depend on the signedness.
+		if size == 8 {
+			lines = append(lines, fmt.Sprintf("    mul %s, %s, %s", d.X, a, b))
+		} else {
+			lines = append(lines, fmt.Sprintf("    mul %s, %s, %s", d.W, a, b))
+		}
+	case size == 8:
+		lines = append(lines, fmt.Sprintf("    mul x0, %s, %s", a, b))
+		lines = append(lines, fmt.Sprintf("    smulh x2, %s, %s", a, b), "    cmp x2, x0, asr #63", "    cset w2, ne")
+		lines = append(lines, fmt.Sprintf("    mov %s, x0", d.X))
+	case size == 4:
+		lines = append(lines, fmt.Sprintf("    smull x0, %s, %s", a, b))
+		lines = append(lines, "    cmp x0, w0, sxtw", "    cset w2, ne")
+		lines = append(lines, fmt.Sprintf("    mov %s, w0", d.W))
+	default: // 16-bit
+		lines = append(lines, fmt.Sprintf("    sxth w4, %s", a), fmt.Sprintf("    sxth w5, %s", b), "    mul w0, w4, w5")
+		if flags {
+			lines = append(lines, "    cmp w0, w0, sxth", "    cset w2, ne")
+		}
+		wc, _ := writeRegFrom(dstReg, "x0", "w0")
+		lines = append(lines, wc...)
+	}
+	if flags {
+		lines = l.mulOverflowFlags(lines)
+	}
+	return lines, nil
+}
+
+// liftMul handles unsigned MUL: RDX:RAX (AX for 8-bit) = RAX * src; CF = OF = (high half != 0).
+func (l *Arm64Lifter) liftMul(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
+	flags := !inst.CarryDead || !inst.OverflowDead
+	size := defMemSz(inst)
+	if r, ok := inst.Inst.Args[0].(x86asm.Reg); ok {
+		d, okD := arm64RegMap[r]
+		if !okD {
+			lines = append(lines, l.emitUnsupported(inst, "unmapped mul src")...)
+			return lines, nil
+		}
+		size = d.Size
+	}
+	ld, src, ok := mulSource(inst.Inst.Args[0], size, nextPC)
+	if !ok {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported mul operand")...)
+		return lines, nil
+	}
+	lines = append(lines, ld...)
+	switch size {
+	case 1:
+		lines = append(lines, "    and w0, w19, #0xff", fmt.Sprintf("    mul w0, w0, %s", src), "    bfi x19, x0, #0, #16")
+		if flags {
+			lines = append(lines, "    ubfx w2, w0, #8, #8")
+		}
+	case 2:
+		lines = append(lines, "    and w0, w19, #0xffff", fmt.Sprintf("    mul w0, w0, %s", src),
+			"    bfi x19, x0, #0, #16", "    lsr w2, w0, #16", "    bfi x22, x2, #0, #16")
+	case 4:
+		lines = append(lines, fmt.Sprintf("    umull x0, w19, %s", src), "    mov w19, w0", "    lsr x22, x0, #32")
+		if flags {
+			lines = append(lines, "    mov x2, x22")
+		}
+	default:
+		lines = append(lines, fmt.Sprintf("    mul x0, x19, %s", src), fmt.Sprintf("    umulh x22, x19, %s", src),
+			"    mov x19, x0")
+		if flags {
+			lines = append(lines, "    mov x2, x22")
+		}
+	}
+	if flags {
+		lines = append(lines, "    cmp x2, #0", "    cset w2, ne")
+		lines = l.mulOverflowFlags(lines)
+	}
 	return lines, nil
 }
 

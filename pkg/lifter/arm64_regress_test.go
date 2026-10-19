@@ -136,3 +136,12 @@ func TestRegressShiftFlags(t *testing.T) {
 	l = liftBlock(t, "d1d0")
 	requireInOrder(t, "rcl eax, 1", l[0], "cset w2, cc", "rmif x4, #0, #3")
 }
+
+// MUL/IMUL set CF = OF = (the result does not fit the destination); the lifter left them.
+func TestRegressMulFlags(t *testing.T) {
+	l := liftBlock(t, "410fafc6") // imul eax, r14d
+	requireInOrder(t, "imul eax, r14d", l[0], "smull x0, w19, w14", "cmp x0, w0, sxtw", "cset w2, ne", "mov w19, w0", "rmif x2, #0, #3")
+
+	l = liftBlock(t, "48f7e1") // mul rcx
+	requireInOrder(t, "mul rcx", l[0], "umulh x22, x19, x21", "cmp x2, #0", "rmif x2, #0, #3")
+}
