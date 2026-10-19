@@ -31,6 +31,8 @@
 .set RES_EXC_PRE, RES + 0xb00
 .set RES_EXC, RES + 0xc00
 .set RES_EXC_HANDLER, RES + 0xd00
+.set RES_GPRS_PRE, RES + 0xe00
+.set RES_GPRS, RES + 0xf00
 
 .macro LI reg, val
     movz \reg, #((\val) & 0xffff)
@@ -159,4 +161,18 @@ GUEST_FN _guest_exc_main
 // void handler(int signum, void *ucontext)
 GUEST_FN _guest_exc_handler
     STORE_REGS RES_EXC_HANDLER
+    GUEST_RET
+
+// ---- A shim that sets every GPR (as a longjmp-style shim does).
+
+GUEST_FN _guest_gprs
+    SET_PATTERN 0xc000
+    movz x19, #0xc019
+    movz x21, #0xc021
+    movz x22, #0xc022
+    movz x23, #0xc023
+    movz x24, #0xc024
+    STORE_REGS RES_GPRS_PRE
+    GUEST_CALL _stub_test_set_gprs
+    STORE_REGS RES_GPRS
     GUEST_RET

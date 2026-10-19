@@ -55,8 +55,9 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 //
 // Guest -> host, _recomp_call_shim (x0 = shim; the shim stub branches here in place of a
 // guest function): ctx = the TCB slot. Stores the 16 GPRs to ctx, calls shim(ctx), then
-// reloads from that same ctx (kept in the bridge frame, not looked up again):
-// rax, rdx, rsp, r8-r15, FS base and memory base. A shim returns values through ctx.
+// reloads from that same ctx (kept in the bridge frame, not looked up again) all 16 GPRs,
+// the FS base and the memory base. A shim returns values through ctx and may set any GPR
+// (rsp included), e.g. to resume at a longjmp target.
 //
 // A shim that switches context (sceFiberRun/Switch/ReturnToThread) switches host stacks
 // inside the shim. The bridge frame of a call lives on the host stack of the context that
@@ -119,13 +120,7 @@ _recomp_call_shim:
     // The ctx this call stored into. A context switch inside the shim may have changed the
     // TCB slot, and x27 may name another guest thread's TCB by now.
     ldr  x1, [sp, #24]
-    ldr  x19, [x1, #0x00]        // rax
-    ldr  x22, [x1, #0x10]        // rdx
-    ldr  x26, [x1, #0x20]        // rsp
-    ldp  x8,  x9,  [x1, #0x40]
-    ldp  x10, x11, [x1, #0x50]
-    ldp  x12, x13, [x1, #0x60]
-    ldp  x14, x15, [x1, #0x70]
+    LOAD_GPRS x1
     ldr  x27, [x1, #0x88]        // fs_base
     ldr  x28, [x1, #0x330]       // mem_base
 

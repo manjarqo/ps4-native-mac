@@ -27,7 +27,7 @@
 
 enum {
   RES_M1, RES_A1, RES_A2, RES_B1, RES_M2, RES_A_ARGS, RES_B_ARGS, RES_A_PRE, RES_B_PRE, RES_M1_PRE, RES_M2_PRE,
-  RES_EXC_PRE, RES_EXC, RES_EXC_HANDLER,
+  RES_EXC_PRE, RES_EXC, RES_EXC_HANDLER, RES_GPRS_PRE, RES_GPRS,
 };
 // Result block words (guest.s STORE_REGS).
 enum { W_RAX, W_RBX, W_RCX, W_RDX, W_RSI, W_RDI, W_RBP, W_RSP, W_R8, W_R15 = W_R8 + 7, W_FS, W_MEM };
@@ -39,6 +39,7 @@ enum { W_RAX, W_RBX, W_RCX, W_RDX, W_RSI, W_RDI, W_RBP, W_RSP, W_R8, W_R15 = W_R
 #define ADDR_FIBER_B 0x400300ULL
 #define ADDR_EXC_MAIN 0x400400ULL
 #define ADDR_EXC_HANDLER 0x400500ULL
+#define ADDR_GPRS 0x400600ULL
 
 void guest_fiber_main1(void);
 void guest_fiber_main2(void);
@@ -46,6 +47,7 @@ void guest_fiber_a(void);
 void guest_fiber_b(void);
 void guest_exc_main(void);
 void guest_exc_handler(void);
+void guest_gprs(void);
 
 static GuestContext *g_proc;
 static int g_failures;
@@ -210,6 +212,28 @@ static void test_exception(void) {
   check_pattern("after the shim the handler interrupted", RES_EXC, 0xe000, res(RES_EXC_PRE)[W_RSP], t->fs_base);
 }
 
+// Sets every GPR but rsp to 0x5100 + its result-block index; rsp gets the usual return.
+void shim_test_set_gprs(GuestContext *ctx) {
+  uint64_t *gpr[] = {&ctx->rax, &ctx->rbx, &ctx->rcx, &ctx->rdx, &ctx->rsi, &ctx->rdi, &ctx->rbp, NULL,
+                     &ctx->r8,  &ctx->r9,  &ctx->r10, &ctx->r11, &ctx->r12, &ctx->r13, &ctx->r14, &ctx->r15};
+  for (int i = 0; i < 16; i++)
+    if (gpr[i]) *gpr[i] = 0x5100 + (uint64_t)i;
+  SHIM_RETURN();
+}
+
+// Guest code continues with every GPR a shim wrote to ctx.
+static void test_gprs(void) {
+  static const char *names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                                "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+  recomp_call_guest(g_proc, ADDR_GPRS);
+  for (int i = 0; i < 16; i++) {
+    char what[32];
+    snprintf(what, sizeof what, "%s after the shim", names[i]);
+    expect(what, res(RES_GPRS)[i], i == W_RSP ? res(RES_GPRS_PRE)[W_RSP] : 0x5100 + (uint64_t)i);
+  }
+  expect("FS base after the shim", res(RES_GPRS)[W_FS], g_proc->fs_base);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -225,12 +249,15 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_FIBER_B, (recomp_fn_t)guest_fiber_b);
   recomp_register_fn(ADDR_EXC_MAIN, (recomp_fn_t)guest_exc_main);
   recomp_register_fn(ADDR_EXC_HANDLER, (recomp_fn_t)guest_exc_handler);
+  recomp_register_fn(ADDR_GPRS, (recomp_fn_t)guest_gprs);
 
   const char *c = argv[1];
   if (strcmp(c, "fiber") == 0) {
     test_fiber();
   } else if (strcmp(c, "exception") == 0) {
     test_exception();
+  } else if (strcmp(c, "gprs") == 0) {
+    test_gprs();
   } else {
     fprintf(stderr, "unknown case %s\n", c);
     return 2;
