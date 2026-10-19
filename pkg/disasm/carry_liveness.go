@@ -73,12 +73,17 @@ func knownCarryOverflowEffect(inst x86asm.Inst) (reads, kills uint8, known bool)
 		x86asm.PTEST, x86asm.VPTEST, x86asm.VTESTPS, x86asm.VTESTPD,
 		x86asm.BT, x86asm.BTS, x86asm.BTR, x86asm.BTC,
 		x86asm.POPF, x86asm.POPFD, x86asm.POPFQ, x86asm.CMPXCHG, x86asm.XADD,
-		x86asm.CMPSB, x86asm.CMPSW, x86asm.CMPSD, x86asm.CMPSQ, x86asm.SCASB, x86asm.SCASW, x86asm.SCASD, x86asm.SCASQ,
 		x86asm.FCOMI, x86asm.FCOMIP, x86asm.FUCOMI, x86asm.FUCOMIP,
 		x86asm.PCMPISTRI, x86asm.PCMPESTRI, x86asm.PCMPISTRM, x86asm.PCMPESTRM,
 		x86asm.VPCMPISTRI, x86asm.VPCMPESTRI, x86asm.VPCMPISTRM, x86asm.VPCMPESTRM,
 		// Flags are not preserved across calls (System V ABI).
 		x86asm.CALL:
+		return 0, both, true
+	case x86asm.CMPSB, x86asm.CMPSW, x86asm.CMPSD, x86asm.CMPSQ, x86asm.SCASB, x86asm.SCASW, x86asm.SCASD, x86asm.SCASQ:
+		// With REPE/REPNE and RCX = 0 nothing is compared and the flags pass through.
+		if hasRepPrefix(inst) {
+			return 0, 0, true
+		}
 		return 0, both, true
 	case x86asm.SHL, x86asm.SHR, x86asm.SAR, x86asm.ROL, x86asm.ROR, x86asm.SHLD, x86asm.SHRD:
 		// A count of 0 leaves the flags unchanged, so only a non-zero immediate count defines them.
@@ -150,6 +155,19 @@ func readsAnyFlag(inst x86asm.Inst) bool {
 	}
 	_, _, known := knownCarryOverflowEffect(inst)
 	return !known
+}
+
+// hasRepPrefix reports a REP/REPE (F3) or REPNE (F2) prefix.
+func hasRepPrefix(inst x86asm.Inst) bool {
+	for _, p := range inst.Prefix {
+		if p == 0 {
+			break
+		}
+		if b := p & 0xff; b == 0xf3 || b == 0xf2 {
+			return true
+		}
+	}
+	return false
 }
 
 // shiftImmCount returns the masked immediate count of a shift or rotate.

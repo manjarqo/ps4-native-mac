@@ -111,25 +111,27 @@ type want struct {
 
 func TestCarryOverflowLiveness(t *testing.T) {
 	const (
-		clc      = "f8"
-		adcMem   = "481306"   // adc rax, [rsi]
-		adcRR    = "4811d8"   // adc rax, rbx
-		adcImm   = "4883d100" // adc rcx, 0
-		leaRsi   = "488d7608" // lea rsi, [rsi+8]
-		decRcx   = "48ffc9"   // dec rcx
-		cmpRR    = "4839d8"   // cmp rax, rbx
-		addRR    = "4801d8"   // add rax, rbx
-		xorEax   = "31c0"     // xor eax, eax
-		ret      = "c3"
-		jmpRax   = "ffe0"     // jmp rax
-		shlCl    = "48d3e2"   // shl rdx, cl
-		shlImm   = "48c1e203" // shl rdx, 3
-		shl1     = "48d1e0"   // shl rax, 1
-		rcl1     = "48d1d2"   // rcl rdx, 1
-		syscall  = "0f05"     // not classified: treated as reading CF/OF
-		fcmovb   = "dac1"     // fcmovb st0, st1: reads CF
-		addEcx1  = "83c101"   // add ecx, 1
-		movRaxRb = "4889d8"   // mov rax, rbx
+		clc       = "f8"
+		adcMem    = "481306"   // adc rax, [rsi]
+		adcRR     = "4811d8"   // adc rax, rbx
+		adcImm    = "4883d100" // adc rcx, 0
+		leaRsi    = "488d7608" // lea rsi, [rsi+8]
+		decRcx    = "48ffc9"   // dec rcx
+		cmpRR     = "4839d8"   // cmp rax, rbx
+		addRR     = "4801d8"   // add rax, rbx
+		xorEax    = "31c0"     // xor eax, eax
+		ret       = "c3"
+		jmpRax    = "ffe0"     // jmp rax
+		shlCl     = "48d3e2"   // shl rdx, cl
+		shlImm    = "48c1e203" // shl rdx, 3
+		shl1      = "48d1e0"   // shl rax, 1
+		rcl1      = "48d1d2"   // rcl rdx, 1
+		syscall   = "0f05"     // not classified: treated as reading CF/OF
+		fcmovb    = "dac1"     // fcmovb st0, st1: reads CF
+		addEcx1   = "83c101"   // add ecx, 1
+		movRaxRb  = "4889d8"   // mov rax, rbx
+		repeCmpsb = "f3a6"     // repe cmpsb
+		cmpsb     = "a6"       // cmpsb
 	)
 	for _, tc := range []struct {
 		name   string
@@ -204,6 +206,12 @@ func TestCarryOverflowLiveness(t *testing.T) {
 		{"FCMOVB reads CF", []testBlock{
 			{"entry", []string{addRR, fcmovb, xorEax, ret}},
 		}, nil, []want{{label: "entry", idx: 0, carryDead: false}}},
+		{"REPE CMPSB passes CF through (RCX = 0)", []testBlock{
+			{"entry", []string{addRR, repeCmpsb, adcImm, ret}},
+		}, nil, []want{{label: "entry", idx: 0, carryDead: false}}},
+		{"CMPSB without REP defines CF", []testBlock{
+			{"entry", []string{addRR, cmpsb, adcImm, ret}},
+		}, nil, []want{{label: "entry", idx: 0, carryDead: true}}},
 		{"LOOP is a conditional branch", []testBlock{
 			{"entry", []string{clc}},
 			{"loop", []string{adcRR, "jcc:LOOP:loop"}},
