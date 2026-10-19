@@ -1152,4 +1152,46 @@ func TestTzcntLzcntBsfBsrFlags(t *testing.T) {
 	}
 }
 
+func TestVectorShiftPreservesFlags(t *testing.T) {
+	lifter := NewArm64Lifter(map[uint64]bool{0x1000: true})
+	fn := &disasm.Function{
+		EntryAddr: 0x1000,
+		EndAddr:   0x2000,
+		Blocks: map[uint64]*disasm.BasicBlock{
+			0x1000: {StartAddr: 0x1000},
+		},
+	}
+
+	// VPSRLQ X0, X1, X2: c5 f1 d3 c2
+	vpsrlqInst, err := x86asm.Decode([]byte{0xc5, 0xf1, 0xd3, 0xc2}, 64)
+	if err != nil {
+		t.Fatalf("decode vpsrlq failed: %v", err)
+	}
+	dVpsrlq := disasm.Instruction{Address: 0x1000, Inst: vpsrlqInst}
+	lines, err := lifter.LiftInstructionToBuf(dVpsrlq, 0x1004, fn, nil)
+	if err != nil {
+		t.Fatalf("lift vpsrlq failed: %v", err)
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "mrs x17, nzcv") || !strings.Contains(joined, "msr nzcv, x17") {
+		t.Errorf("expected VPSRLQ to preserve NZCV, got:\n%s", joined)
+	}
+
+	// PSRLQ X0, X1: 66 0f d3 c1
+	psrlqInst, err := x86asm.Decode([]byte{0x66, 0x0f, 0xd3, 0xc1}, 64)
+	if err != nil {
+		t.Fatalf("decode psrlq failed: %v", err)
+	}
+	dPsrlq := disasm.Instruction{Address: 0x1004, Inst: psrlqInst}
+	linesPsrlq, err := lifter.LiftInstructionToBuf(dPsrlq, 0x1008, fn, nil)
+	if err != nil {
+		t.Fatalf("lift psrlq failed: %v", err)
+	}
+	joinedPsrlq := strings.Join(linesPsrlq, "\n")
+	if !strings.Contains(joinedPsrlq, "mrs x17, nzcv") || !strings.Contains(joinedPsrlq, "msr nzcv, x17") {
+		t.Errorf("expected PSRLQ to preserve NZCV, got:\n%s", joinedPsrlq)
+	}
+}
+
+
 

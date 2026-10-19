@@ -362,6 +362,10 @@ func (l *Arm64Lifter) liftMmxShift(inst disasm.Instruction, nextPC uint64, lines
 			lines = append(lines, "    ldr x16, [x28, x17]")
 		}
 		// Clamp and shift
+		lines = append(lines,
+			"    mrs x17, nzcv",
+			"    str x17, [sp, #-16]!",
+		)
 		switch inst.Inst.Op {
 		case x86asm.PSLLW:
 			lines = append(lines,
@@ -433,6 +437,10 @@ func (l *Arm64Lifter) liftMmxShift(inst disasm.Instruction, nextPC uint64, lines
 				"    sshl v16.2s, v16.2s, v17.2s",
 			)
 		}
+		lines = append(lines,
+			"    ldr x17, [sp], #16",
+			"    msr nzcv, x17",
+		)
 	}
 
 	lines = append(lines, fmt.Sprintf("    str d16, [x18, #%d]", mmxOffset(mmxIdx(dstReg))))

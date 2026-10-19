@@ -893,8 +893,15 @@ int32_t sceGnmRequestFlipAndSubmitDone(GuestContext *ctx, uint64_t gpu_addr, uin
 
 int32_t sceGnmRequestFlipAndSubmitDoneForWorkload(GuestContext *ctx, uint64_t workload, uint64_t gpu_addr, uint32_t gpu_addr_size_in_bytes, uint32_t vo_handle, uint32_t buf_idx, uint32_t flip_mode, int64_t flip_arg) {
     (void)workload;
-    (void)gpu_addr;
-    (void)gpu_addr_size_in_bytes;
+
+    if (gpu_addr != 0 && gpu_addr_size_in_bytes > 0) {
+        pthread_mutex_lock(&g_gnm_mutex);
+        if (!g_gnm_initialized) {
+            ps4_gnmdriver_init(ctx);
+        }
+        ps4_gnm_process_command_buffers(ctx, 1, &gpu_addr, &gpu_addr_size_in_bytes, NULL, NULL);
+        pthread_mutex_unlock(&g_gnm_mutex);
+    }
 
     sceGnmSubmitDone();
 

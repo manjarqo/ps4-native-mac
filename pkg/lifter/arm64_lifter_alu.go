@@ -2303,6 +2303,8 @@ func (l *Arm64Lifter) liftCpuid(lines []string) []string {
 
 	lines = append(lines,
 		"    // cpuid",
+		"    mrs x16, nzcv",
+		"    str x16, [sp, #-16]!",
 		"    mov w16, w19 // save input leaf (eax)",
 		"    mov w17, w21 // save input subleaf (ecx)",
 		"    mov w19, #0  // eax = 0",
@@ -2314,11 +2316,11 @@ func (l *Arm64Lifter) liftCpuid(lines []string) []string {
 		fmt.Sprintf("    b.eq %s", lblLeaf1),
 		"    cmp w16, #7",
 		fmt.Sprintf("    b.eq %s", lblLeaf7),
-		"    mov w18, #0x80000000",
-		"    cmp w16, w18",
+		"    mov w20, #0x80000000",
+		"    cmp w16, w20",
 		fmt.Sprintf("    b.eq %s", lblLeaf80),
-		"    add w18, w18, #1",
-		"    cmp w16, w18",
+		"    add w20, w20, #1",
+		"    cmp w16, w20",
 		fmt.Sprintf("    b.eq %s", lblLeaf81),
 		fmt.Sprintf("    b %s", lblEnd),
 		fmt.Sprintf("%s:", lblLeaf0),
@@ -2359,6 +2361,8 @@ func (l *Arm64Lifter) liftCpuid(lines []string) []string {
 	lines = append(lines, loadImm32("w22", 0x2c100800)...)
 	lines = append(lines,
 		fmt.Sprintf("%s:", lblEnd),
+		"    ldr x16, [sp], #16",
+		"    msr nzcv, x16",
 	)
 	return lines
 }

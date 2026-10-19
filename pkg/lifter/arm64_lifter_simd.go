@@ -858,6 +858,11 @@ func (l *Arm64Lifter) liftVectorShift(inst disasm.Instruction, nextPC uint64, li
 	}
 
 	// x16 holds 64-bit shift count
+	lines = append(lines,
+		"    mrs x17, nzcv",
+		"    str x17, [sp, #-16]!",
+	)
+
 	l.labelCounter++
 	skipLabel := fmt.Sprintf("L_vec_shift_skip_%d", l.labelCounter)
 	zeroLabel := fmt.Sprintf("L_vec_shift_zero_%d", l.labelCounter)
@@ -941,6 +946,11 @@ func (l *Arm64Lifter) liftVectorShift(inst disasm.Instruction, nextPC uint64, li
 			fmt.Sprintf("%s:", skipLabel),
 		)
 	}
+
+	lines = append(lines,
+		"    ldr x17, [sp], #16",
+		"    msr nzcv, x17",
+	)
 
 	return lines, nil
 }
@@ -2234,6 +2244,11 @@ func (l *Arm64Lifter) liftAvxShift(inst disasm.Instruction, nextPC uint64, lines
 		return lines, nil
 	}
 
+	lines = append(lines,
+		"    mrs x17, nzcv",
+		"    str x17, [sp, #-16]!",
+	)
+
 	l.labelCounter++
 	skipLabel := fmt.Sprintf("L_vshift_skip_%d", l.labelCounter)
 	zeroLabel := fmt.Sprintf("L_vshift_zero_%d", l.labelCounter)
@@ -2347,6 +2362,10 @@ func (l *Arm64Lifter) liftAvxShift(inst disasm.Instruction, nextPC uint64, lines
 	if !isYmm {
 		lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", dHighV))
 	}
+	lines = append(lines,
+		"    ldr x17, [sp], #16",
+		"    msr nzcv, x17",
+	)
 	return lines, nil
 }
 

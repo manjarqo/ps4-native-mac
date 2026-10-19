@@ -361,27 +361,35 @@ func (l *Arm64Lifter) liftVphminposuw(inst disasm.Instruction, nextPC uint64, li
 		lines = append(lines, "    ldr q30, [x28, x16]")
 	}
 
+	l.labelCounter++
 	lines = append(lines,
+		"    mrs x16, nzcv",
+		"    str x16, [sp, #-16]!",
 		// Find min unsigned 16-bit word
 		fmt.Sprintf("    uminv h20, %s.8h", sLow),
 		fmt.Sprintf("    mov   %s.h[0], v20.h[0]", dLowV),
 		// Search for index
-		"    umov  w18, v20.h[0]",
-		"    mov   w19, wzr",
+		"    umov  w17, v20.h[0]",
+		"    mov   v20.h[1], wzr",
 	)
 	for i := 7; i >= 0; i-- {
+		skipMatch := fmt.Sprintf("L_phminposuw_skip_%d_%d", l.labelCounter, i)
 		lines = append(lines,
 			fmt.Sprintf("    umov  w16, %s.h[%d]", sLow, i),
-			"    cmp   w16, w18",
-			fmt.Sprintf("    mov   w17, #%d", i),
-			"    csel  w19, w17, w19, eq",
+			"    cmp   w16, w17",
+			fmt.Sprintf("    b.ne  %s", skipMatch),
+			fmt.Sprintf("    mov   w16, #%d", i),
+			"    mov   v20.h[1], w16",
+			fmt.Sprintf("%s:", skipMatch),
 		)
 	}
 	lines = append(lines,
-		fmt.Sprintf("    mov   %s.h[1], w19", dLowV),
+		fmt.Sprintf("    mov   %s.h[1], v20.h[1]", dLowV),
 		fmt.Sprintf("    mov   %s.s[1], wzr", dLowV),
 		fmt.Sprintf("    mov   %s.d[1], xzr", dLowV),
 		fmt.Sprintf("    movi  %s.16b, #0", dHighV),
+		"    ldr x16, [sp], #16",
+		"    msr nzcv, x16",
 	)
 	return lines, nil
 }
