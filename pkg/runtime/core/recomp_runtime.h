@@ -74,8 +74,7 @@ void ps4_aio_destroy(void);
 void ps4_gnmdriver_destroy(void);
 void ps4_ajm_destroy(void);
 
-// SIMD String helpers
-void recomp_vpcmpistri(GuestContext *ctx, const void *src2_ptr, const void *src1_ptr, uint8_t imm8);
+// SIMD String helpers: see recomp_context.h
 
 // AES-NI and PCLMULQDQ helpers
 xmm_reg_t recomp_pclmulqdq(uint64_t a, uint64_t b);
@@ -84,7 +83,6 @@ xmm_reg_t recomp_vaesenclast(xmm_reg_t s1, xmm_reg_t s2);
 xmm_reg_t recomp_vaesdec(xmm_reg_t s1, xmm_reg_t s2);
 xmm_reg_t recomp_vaesdeclast(xmm_reg_t s1, xmm_reg_t s2);
 xmm_reg_t recomp_vaesimc(xmm_reg_t s);
-xmm_reg_t recomp_vaeskeygenassist(xmm_reg_t s, uint8_t rcon);
 
 #ifdef __cplusplus
 }

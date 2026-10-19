@@ -1264,7 +1264,7 @@ void recomp_free_thread_context(GuestContext *ctx) {
   free(ctx);
 }
 
-void recomp_vpcmpistri(GuestContext *ctx, const void *src2_ptr,
+void recomp_vpcmpistri_impl(GuestContext *ctx, const void *src2_ptr,
                        const void *src1_ptr, uint8_t imm8) {
   const uint8_t *s2_bytes = (const uint8_t *)src2_ptr;
   const uint8_t *s1_bytes = (const uint8_t *)src1_ptr;
@@ -1462,7 +1462,7 @@ void recomp_vpcmpistri(GuestContext *ctx, const void *src2_ptr,
   ctx->pf = 0;
 }
 
-void recomp_vpcmpe_stri(GuestContext *ctx, const void *src2_ptr,
+void recomp_vpcmpe_stri_impl(GuestContext *ctx, const void *src2_ptr,
                         const void *src1_ptr, uint8_t imm8) {
   int is_word = (imm8 & 1);
   int is_signed = ((imm8 >> 1) & 1);
@@ -1872,7 +1872,7 @@ static inline uint32_t aes_rotword(uint32_t w) {
   return (w >> 8) | ((w & 0xFF) << 24);
 }
 
-xmm_reg_t recomp_vaeskeygenassist(xmm_reg_t s, uint8_t rcon) {
+xmm_reg_t recomp_vaeskeygenassist_impl(xmm_reg_t s, uint8_t rcon) {
   xmm_reg_t res = {0};
   uint32_t x1 = s.u32[1];
   uint32_t x3 = s.u32[3];

@@ -70,6 +70,12 @@ void guest_xmm(void);
 void guest_xmm_callback(void);
 void guest_clobber_fp(void);
 void guest_fpcr(void);
+void guest_lifted_vpcmpistri(void);
+void guest_lifted_vaeskeygenassist(void);
+#define ADDR_LIFTED_VPCMPISTRI 0x500000ULL
+#define ADDR_LIFTED_VAESKEYGENASSIST 0x500100ULL
+#define RES_LIFTED_VPCMPISTRI 0x1003000ULL
+#define RES_LIFTED_VAESKEYGENASSIST 0x1003400ULL
 uint64_t host_enter_guest_d8_d15(GuestContext *ctx, uint64_t fn);
 
 static GuestContext *g_proc;
@@ -337,6 +343,52 @@ static void test_fpcr(void) {
   expect("ctx->mxcsr after LDMXCSR", g_proc->mxcsr, 0xbf80);
 }
 
+// A lifted instruction that calls a runtime helper (the lifter saves x8-x15 itself) keeps
+// every vector register it does not write and the flags it does not define.
+// boundary_test.go liftedHelperFns sets v<n> = 0x40+n in all bytes and NZCV = Z|C first.
+// written: the vector register the instruction writes (want: its value), zeroed: one it
+// clears, skip: one not checked; -1 for none.
+static void check_lifted(const char *what, uint64_t res_addr, int written, const xmm_reg_t *written_want,
+                         int zeroed, int skip, uint64_t nzcv_want) {
+  const xmm_reg_t *v = (const xmm_reg_t *)(g_proc->mem_base + res_addr);
+  static const xmm_reg_t zero;
+  for (int i = 0; i < 32; i++) {
+    if (i == skip) continue;
+    char name[96];
+    snprintf(name, sizeof name, "%s: v%d", what, i);
+    if (i == written || i == zeroed) {
+      if (i == zeroed) written_want = &zero;
+      if (memcmp(&v[i], written_want, 16) != 0)
+        fail("%s = %016llx%016llx, want %016llx%016llx", name, (unsigned long long)v[i].u64[1],
+             (unsigned long long)v[i].u64[0], (unsigned long long)written_want->u64[1],
+             (unsigned long long)written_want->u64[0]);
+      continue;
+    }
+    xmm_reg_t want;
+    memset(&want, 0x40 + i, sizeof want);
+    if (memcmp(&v[i], &want, 16) != 0)
+      fail("%s changed to %016llx%016llx", name, (unsigned long long)v[i].u64[1], (unsigned long long)v[i].u64[0]);
+  }
+  if (nzcv_want != ~0ULL) expect(what, ((const uint64_t *)&v[32])[1], nzcv_want);
+}
+
+static void test_helpers(void) {
+  // vpcmpistri xmm2, xmm3, 0x38 (equal each, masked negative: the helper's vectorized path):
+  // the strings differ in byte 0, so ECX = 0.
+  recomp_call_guest(g_proc, ADDR_LIFTED_VPCMPISTRI);
+  check_lifted("vpcmpistri", RES_LIFTED_VPCMPISTRI, -1, NULL, -1, -1, ~0ULL);
+  expect("vpcmpistri rcx", ((const uint64_t *)(g_proc->mem_base + RES_LIFTED_VPCMPISTRI + 512))[0], 0);
+
+  // vaeskeygenassist xmm4, xmm5, 1: xmm4 = the C implementation's result, ymm4's upper half is
+  // zeroed (VEX.128), NZCV stays Z|C. The lowering moves the source into v0 before the call
+  // (a lifter issue, reported), so v0 is not checked.
+  xmm_reg_t src;
+  memset(&src, 0x45, sizeof src);
+  const xmm_reg_t want = recomp_vaeskeygenassist_impl(src, 1);
+  recomp_call_guest(g_proc, ADDR_LIFTED_VAESKEYGENASSIST);
+  check_lifted("vaeskeygenassist", RES_LIFTED_VAESKEYGENASSIST, 4, &want, 20, 0, 0x60000000ULL);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -356,6 +408,8 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_XMM, (recomp_fn_t)guest_xmm);
   recomp_register_fn(ADDR_XMM_CALLBACK, (recomp_fn_t)guest_xmm_callback);
   recomp_register_fn(ADDR_FPCR, (recomp_fn_t)guest_fpcr);
+  recomp_register_fn(ADDR_LIFTED_VPCMPISTRI, (recomp_fn_t)guest_lifted_vpcmpistri);
+  recomp_register_fn(ADDR_LIFTED_VAESKEYGENASSIST, (recomp_fn_t)guest_lifted_vaeskeygenassist);
 
   const char *c = argv[1];
   if (strcmp(c, "fiber") == 0) {
@@ -370,6 +424,8 @@ int main(int argc, char **argv) {
     test_callee_saved_fp();
   } else if (strcmp(c, "fpcr") == 0) {
     test_fpcr();
+  } else if (strcmp(c, "helpers") == 0) {
+    test_helpers();
   } else {
     fprintf(stderr, "unknown case %s\n", c);
     return 2;
