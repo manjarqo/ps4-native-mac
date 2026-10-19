@@ -3,6 +3,7 @@
 // every sample per thread and prints the most frequent ones.
 #pragma once
 #include <stdint.h>
+#include <pthread.h>
 #include <stdio.h>
 
 #ifdef __cplusplus
@@ -26,8 +27,21 @@ void stall_profile_reset(StallProfile *p);
 // first). Only copies the pcs into the pool allocated at create: never symbolizes, never
 // allocates, never takes a lock.
 void stall_profile_add(StallProfile *p, int slot, const char *thread_name, const uint64_t *pcs, int n);
+// Records the cumulative CPU time (user + system, microseconds) of thread `slot`, read at the
+// moment of a sample. The first and the last reading of a stall give the CPU the thread really
+// got while it was sampled; "busy" alone cannot tell a running thread from a runnable one that
+// is starved. Call it together with stall_profile_add.
+void stall_profile_thread_cpu(StallProfile *p, int slot, uint64_t cpu_us);
+// Cumulative CPU time (user + system) of a pthread in microseconds; 0 when it cannot be read.
+uint64_t stall_profile_thread_cpu_us(pthread_t th);
+// Brackets a stall: begin records the CPU of this process and of every other process, end stores
+// what each of them used since, for the report header. Not thread safe; one thread calls both.
+void stall_profile_cpu_begin(StallProfile *p);
+void stall_profile_cpu_end(StallProfile *p);
 // Prints "[stall-profile]" lines: the stall, then every thread that was busy for at least 5 %
 // of its samples (and "Frame Submission" always) with its `top` most frequent functions.
+// A thread with CPU readings gets ", cpu <ms> ms" after its busy share; the header gets
+// ", process cpu <ms> ms, other processes <ms> ms (top <name> <ms> ms)" when it was set.
 // Symbolizes the stored samples on the calling thread.
 void stall_profile_report(const StallProfile *p, FILE *out, double stall_ms, int top);
 // Same, with " (watchdog max gap G ms)" appended to the header when max_gap_ms >= 0.

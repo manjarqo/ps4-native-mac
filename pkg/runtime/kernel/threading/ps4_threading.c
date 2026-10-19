@@ -1059,6 +1059,7 @@ static int g_prof_nslots;
 static void stall_profile_begin(void) {
   stall_profile_reset(g_stall_prof);
   g_prof_nslots = 0;
+  stall_profile_cpu_begin(g_stall_prof);
 }
 
 static int stall_profile_slot(uint64_t thread_id) {
@@ -1135,7 +1136,11 @@ static void stall_profile_sample_all(void) {
       }
     }
     thread_resume(port);
-    if (np) stall_profile_add(g_stall_prof, stall_profile_slot(list[i].id), list[i].name, pcs, np);
+    if (np) {
+      const int slot = stall_profile_slot(list[i].id);
+      stall_profile_add(g_stall_prof, slot, list[i].name, pcs, np);
+      stall_profile_thread_cpu(g_stall_prof, slot, stall_profile_thread_cpu_us(list[i].th));
+    }
   }
 }
 
@@ -1196,6 +1201,7 @@ static void *stall_watchdog_main(void *arg) {
     }
     if (!prof_ns) continue;
     if (g_prof_for && g_prof_for != last) { // a frame ended the stall being profiled
+      stall_profile_cpu_end(g_stall_prof);
       stall_profile_report_gap(g_stall_prof, stderr, (double)(last - g_prof_for) / 1e6, 6, (double)max_gap / 1e6);
       g_prof_for = 0;
       prev_wake = deadline = stall_now_ns(); // the report itself is not a gap of the next stall

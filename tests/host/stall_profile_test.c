@@ -2,7 +2,12 @@
 #include "ps4_stall_profile.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <signal.h>
 #include <string.h>
+#include <time.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 // Fixed address map standing in for dladdr: [start, start + 0x1000) -> name.
 static int fake_symbolize(uint64_t pc, uint64_t *start, const char **name) {
@@ -15,6 +20,111 @@ static int fake_symbolize(uint64_t pc, uint64_t *start, const char **name) {
       return 1;
     }
   return 0;
+}
+
+static double now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
+static volatile int g_stop;
+
+static void *spin_main(void *arg) {
+  (void)arg;
+  volatile uint64_t x = 0;
+  while (!g_stop) x++;
+  return NULL;
+}
+
+static void *sleep_main(void *arg) {
+  (void)arg;
+  while (!g_stop) usleep(2000); // wakes up 500 times a second, does nothing
+  return NULL;
+}
+
+// Extracts the value after `key` in the line that contains `line_key`; -1 when absent.
+static double field_after(const char *text, const char *line_key, const char *key) {
+  const char *l = strstr(text, line_key);
+  if (!l) return -1;
+  const char *eol = strchr(l, '\n');
+  const char *k = strstr(l, key);
+  if (!k || (eol && k > eol)) return -1;
+  return atof(k + strlen(key));
+}
+
+// Samples a spinning and a sleeping thread for ~250 ms, plus a child process that spins, and
+// checks that the reported CPU brackets the truth: the spinner got about the whole window, the
+// sleeper about nothing, the process total about one core, other processes about one core.
+static int cpu_test(void) {
+  StallProfile *p = stall_profile_create(fake_symbolize);
+  g_stop = 0;
+  pthread_t spin, slp;
+  pthread_create(&spin, NULL, spin_main, NULL);
+  pthread_create(&slp, NULL, sleep_main, NULL);
+  const pid_t child = fork();
+  if (child == 0) {
+    volatile uint64_t x = 0;
+    for (;;) x++;
+  }
+  stall_profile_cpu_begin(p);
+  const uint64_t pcs[] = {0x1010, 0x3010};
+  double first = 0, last = 0;
+  for (int i = 0; i < 250; i++) {
+    stall_profile_add(p, 0, "Spinner", pcs, 2);
+    stall_profile_thread_cpu(p, 0, stall_profile_thread_cpu_us(spin));
+    stall_profile_add(p, 1, "Frame Submission", pcs, 2);
+    stall_profile_thread_cpu(p, 1, stall_profile_thread_cpu_us(slp));
+    if (i == 0) first = now_ms();
+    last = now_ms();
+    usleep(1000);
+  }
+  stall_profile_cpu_end(p);
+  const double window = last - first;
+  g_stop = 1;
+  pthread_join(spin, NULL);
+  pthread_join(slp, NULL);
+  kill(child, SIGKILL);
+  waitpid(child, NULL, 0);
+
+  char *buf = NULL;
+  size_t len = 0;
+  FILE *out = open_memstream(&buf, &len);
+  stall_profile_report(p, out, 300.0, 6);
+  fclose(out);
+  const double spin_cpu = field_after(buf, "Spinner:", "cpu ");
+  const double slp_cpu = field_after(buf, "Frame Submission:", "cpu ");
+  const double proc_cpu = field_after(buf, "stall 300 ms", "process cpu ");
+  const double others = field_after(buf, "stall 300 ms", "other processes ");
+  int ok = 1;
+  // The spinner runs on one core for the whole window; the process total also holds the
+  // sampling loop itself (a few ms), the sleeper and the spinner.
+  if (!(spin_cpu > 0.7 * window && spin_cpu < 1.3 * window)) ok = 0;
+  if (!(slp_cpu >= 0 && slp_cpu < 0.1 * window)) ok = 0;
+  if (!(proc_cpu > 0.7 * window && proc_cpu < 1.3 * window + 30)) ok = 0;
+  if (!(others > 0.7 * window && others < 1.3 * window + 30)) ok = 0;
+  if (!ok) printf("cpu_test window %.0f ms: spinner %.1f, sleeper %.1f, process %.1f, others %.1f\n%s", window, spin_cpu,
+                  slp_cpu, proc_cpu, others, buf);
+  free(buf);
+
+  // Deterministic format check: readings given by hand, first reading is the baseline.
+  stall_profile_reset(p);
+  for (int i = 0; i < 4; i++) {
+    stall_profile_add(p, 2, "NdJobWorkerThread 1", pcs, 2);
+    stall_profile_thread_cpu(p, 2, 1000 + (uint64_t)i * 4000); // 12000 us over the stall
+  }
+  stall_profile_thread_cpu(p, 2, 0); // an unreadable thread must not reset the readings
+  buf = NULL;
+  out = open_memstream(&buf, &len);
+  stall_profile_report(p, out, 40.0, 6);
+  fclose(out);
+  if (!strstr(buf, "[stall-profile]   NdJobWorkerThread 1: busy 100%, cpu 12.0 ms: fn_0x1000 100%\n")) {
+    printf("format check got:\n%s", buf);
+    ok = 0;
+  }
+  free(buf);
+  stall_profile_destroy(p);
+  return ok;
 }
 
 int main(void) {
@@ -52,6 +162,7 @@ int main(void) {
   }
   free(buf);
   stall_profile_destroy(p);
+  if (!cpu_test()) ok = 0;
   printf("stall_profile_test: %s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
