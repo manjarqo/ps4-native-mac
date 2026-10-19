@@ -1228,6 +1228,7 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   t_ctx->rsp = (stack_base + stack_size - 0x100ULL) & ~0xFFULL;
   t_ctx->rbp = t_ctx->rsp;
   t_ctx->fpu_cw = 0x037F;
+  t_ctx->mxcsr = 0x1F80; // x86 default: all exceptions masked, round to nearest
   t_ctx->tls_vaddr = proc->tls_vaddr;
   t_ctx->tls_filesz = proc->tls_filesz;
   t_ctx->tls_memsz = proc->tls_memsz;
