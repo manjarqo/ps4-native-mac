@@ -85,6 +85,37 @@
 
   This is the input for Tasks 7–8. No fix in this task.
 
+### Task 2b: Differential test harness for the assembly lifter (inserted 2026-10-19)
+
+Why: the first asm run of TLOU hangs in early init because of a lifter bug. In `ANDN rdx, rax, [mem]` the src1 value in x16 is overwritten by the address computation. Bugs of this kind, where a scratch register is reused while a memory operand is computed, can only be found reliably by comparing against real x86.
+
+**Files:** new `cmd/lifter-difftest-asm/` (port of `~/ps4recomp-work/c_backend_reference/cmd/lifter-difftest/`): `main.go`, `run.sh`, `harness/{native_main.c, asm_main.c, harness.h, compare.py}`.
+
+- [ ] **Step 1: Port the generator.**
+  - Keep the sampling: instruction encodings from the guest image at addresses in a linear disassembly, one representative per (opcode, operand shape, immediate) signature, `-max-per-op`.
+  - Keep the native side: raw bytes in x86-64 stubs, run under Rosetta 2, unchanged.
+  - New lifted side, which emits an arm64 `.s` per test:
+    1. a prologue that saves the host callee-saved registers;
+    2. loads the pinned registers from a `GuestContext`-shaped state block (x19–x25, x8–x15, x26 = RSP, x27 = FS, x28 = mem_base = 0, vector registers, and NZCV from the stored flags);
+    3. the instruction as lifted by `Arm64Lifter`;
+    4. an epilogue that stores the pinned registers, vectors and flags back into the block.
+  - Use the same scratch-memory mapping as the C version (fixed address, memory operands redirected).
+  - Instructions that call runtime helpers or shims are skipped and listed: that includes calls, jumps, syscalls and x87 if it uses helpers.
+- [ ] **Step 2: Compare** GPRs, the low 128 bits of XMM (and YMM if the lifter supports AVX-256), the arithmetic flags (CF, PF, AF, ZF, SF, OF, comparing only flags the instruction defines) and scratch memory. Reuse `compare.py`.
+- [ ] **Step 3: Self-test.** The harness must catch a planted bug: temporarily break one lowering, for example swap the operands of one `sub`, and check that it reports a mismatch. Record the result; do not commit the planted bug.
+- [ ] **Step 4: Run on both eboots.**
+  - TLOU: `guest_image.bin` from `tlou_build_asm`.
+  - Uncharted 4: `/Volumes/ssd/Uncharted 4 v1.32 by MorpheusGames/CUSA04529/eboot.bin`, generated with `ps4-recomp` into `~/ps4recomp-work/u4_build_asm`; generation only, no link needed.
+  - Produce the linear disassemblies the generator needs.
+  - Report the mismatches grouped by opcode, with one example each.
+- [ ] **Step 5: Fix every mismatch** in the assembly lifter.
+  - Write one Go regression test per bug class in `pkg/lifter/arm64_regress_test.go`, asserting the corrected emitted pattern; each must fail before its fix.
+  - Re-run the harness until both eboots show 0 mismatches, or only mismatches in undefined flags.
+  - Fix the `ANDN` bug and the suspicious `BLSI` flags found in the first run.
+  - Add the AVX ops TLOU uses that are unsupported (VPMULHRSW, VPSIGNW, VLDDQU) with harness coverage.
+- [ ] **Step 6:** Commit the harness, then the fixes (one commit per bug class).
+- Order: this task runs before Task 3. Tasks 3, 4 and 6 then extend the harness where it applies: Task 3 checks that ordering does not change results; Task 4 adds LOCK ops; Task 6 overlaps the shift and `rep movs` checks.
+
 ### Task 3: Memory ordering (x86 TSO) in the assembly lifter
 **Files:** `pkg/lifter/arm64_lifter*.go` (the guest memory load/store emission helpers), a new `pkg/lifter/arm64_tso_test.go`, and the `ps4-recomp` flag in `pkg/cli/cli.go`.
 
