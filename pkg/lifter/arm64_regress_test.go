@@ -536,3 +536,40 @@ func TestRegressAddressingForms(t *testing.T) {
 	}
 	forbid(t, "nop [rax+rax]", liftBlock(t, "0f1f440000")[0], "b _recomp_unsupported_instruction")
 }
+
+// The local jump-table dispatch of an indirect JMP compared with CMP/B.EQ and so clobbered the
+// flags on the way into the table target, and did not bring CF into the block-boundary sense.
+// A direct JMP out of the function did not either (CF is live there only when the target is no
+// function entry, disasm TestCarryOverflowLiveness).
+func TestRegressJumpDispatchKeepsFlags(t *testing.T) {
+	lift := func(insts ...string) []string {
+		l := NewArm64Lifter(map[uint64]bool{0x5000: true})
+		fn := &disasm.Function{EntryAddr: 0x1000, EndAddr: 0x1030,
+			Blocks:     map[uint64]*disasm.BasicBlock{0x1000: {StartAddr: 0x1000}, 0x1010: {StartAddr: 0x1010}, 0x1020: {StartAddr: 0x1020}},
+			BlockOrder: []uint64{0x1000, 0x1010, 0x1020}}
+		pc := uint64(0x1000)
+		var out []string
+		for _, h := range insts {
+			b, _ := hex.DecodeString(h)
+			inst, err := x86asm.Decode(b, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err = l.LiftInstructionToBuf(disasm.Instruction{Address: pc, Inst: inst}, pc+uint64(inst.Len), fn, out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pc += uint64(inst.Len)
+		}
+		return out
+	}
+	lines := lift("4801d8", "ffe0") // add rax, rbx; jmp rax
+	requireInOrder(t, "add; jmp rax", lines, "adds x19, x19, x20", "mov x0, x19", "cfinv", "mrs x17, nzcv",
+		"cmp x0, x16", "b.lo L_fn_0x1000_outside_0x1003", "cmp x0, x16", "b.hs L_fn_0x1000_outside_0x1003",
+		"msr nzcv, x17", "eor x16, x16, x0", "cbz x16, L_fn_0x1000_loc_0x1000", "cbz x16, L_fn_0x1000_loc_0x1010",
+		"cbz x16, L_fn_0x1000_loc_0x1020", "b L_fn_0x1000_not_local_0x1003", "L_fn_0x1000_outside_0x1003:",
+		"msr nzcv, x17", "L_fn_0x1000_not_local_0x1003:", "b _recomp_indirect_jump")
+	forbid(t, "jmp rax", lines, "b.eq ...")
+	// jmp 0x6000 (not a known function): CF into the block-boundary sense first.
+	requireInOrder(t, "add; jmp 0x6000", lift("4801d8", "e9f84f0000"), "adds x19, x19, x20", "cfinv", "b _recomp_indirect_jump")
+}

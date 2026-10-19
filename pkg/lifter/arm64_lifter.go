@@ -1057,31 +1057,52 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 					lines = append(lines, l.normalizeCarry()...)
 				}
 				lines = append(lines, fmt.Sprintf("    b L_fn_0x%x_loc_0x%x", fn.EntryAddr, target))
-			} else if l.IsKnownFunc(target) {
-				lines = append(lines, "    ldr x30, [sp], #16")
-				lines = append(lines, fmt.Sprintf("    b _fn_0x%x", target))
 			} else {
-				lines = append(lines, loadImm64("x0", target)...)
-				lines = append(lines, "    ldr x30, [sp], #16")
-				lines = append(lines, "    b _recomp_indirect_jump")
+				// A target outside the function: a tail call to a function (flags dead, so the
+				// liveness pass marks CF dead) or, for a target that is no function entry, an
+				// unknown continuation that starts in the block-boundary sense.
+				if !inst.CarryDead {
+					lines = append(lines, l.normalizeCarry()...)
+				}
+				if l.IsKnownFunc(target) {
+					lines = append(lines, "    ldr x30, [sp], #16")
+					lines = append(lines, fmt.Sprintf("    b _fn_0x%x", target))
+				} else {
+					lines = append(lines, loadImm64("x0", target)...)
+					lines = append(lines, "    ldr x30, [sp], #16")
+					lines = append(lines, "    b _recomp_indirect_jump")
+				}
 			}
 			return lines, nil
 		}
+		// emitLocalJumpTable dispatches an indirect jump to a block of the function. The table
+		// targets start in the block-boundary carry sense, and the flags (which may be live into
+		// them) survive the dispatch: the range check saves and restores NZCV, the block compare
+		// chain uses EOR/CBZ.
 		emitLocalJumpTable := func(targetReg string) {
 			if fn != nil && len(fn.Blocks) > 1 && fn.EndAddr > fn.EntryAddr {
+				if !inst.CarryDead {
+					lines = append(lines, l.normalizeCarry()...)
+				}
+				outside := fmt.Sprintf("L_fn_0x%x_outside_0x%x", fn.EntryAddr, inst.Address)
 				skipLocal := fmt.Sprintf("L_fn_0x%x_not_local_0x%x", fn.EntryAddr, inst.Address)
+				lines = append(lines, "    mrs x17, nzcv")
 				lines = append(lines, loadImm64("x16", fn.EntryAddr)...)
 				lines = append(lines, fmt.Sprintf("    cmp %s, x16", targetReg))
-				lines = append(lines, fmt.Sprintf("    b.lo %s", skipLocal))
+				lines = append(lines, fmt.Sprintf("    b.lo %s", outside))
 				lines = append(lines, loadImm64("x16", fn.EndAddr)...)
 				lines = append(lines, fmt.Sprintf("    cmp %s, x16", targetReg))
-				lines = append(lines, fmt.Sprintf("    b.hs %s", skipLocal))
+				lines = append(lines, fmt.Sprintf("    b.hs %s", outside))
+				lines = append(lines, "    msr nzcv, x17")
 
 				for _, blockAddr := range fn.BlockOrder {
 					lines = append(lines, loadImm64("x16", blockAddr)...)
-					lines = append(lines, fmt.Sprintf("    cmp %s, x16", targetReg))
-					lines = append(lines, fmt.Sprintf("    b.eq L_fn_0x%x_loc_0x%x", fn.EntryAddr, blockAddr))
+					lines = append(lines, fmt.Sprintf("    eor x16, x16, %s", targetReg))
+					lines = append(lines, fmt.Sprintf("    cbz x16, L_fn_0x%x_loc_0x%x", fn.EntryAddr, blockAddr))
 				}
+				lines = append(lines, fmt.Sprintf("    b %s", skipLocal))
+				lines = append(lines, fmt.Sprintf("%s:", outside))
+				lines = append(lines, "    msr nzcv, x17")
 				lines = append(lines, fmt.Sprintf("%s:", skipLocal))
 			}
 		}
