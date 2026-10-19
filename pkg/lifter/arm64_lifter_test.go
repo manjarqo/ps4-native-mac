@@ -839,7 +839,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "frndint",
 			bytes:    []byte{0xd9, 0xfc},
 			pc:       0x1000,
-			expected: []string{"frinti d28, d28"},
+			expected: []string{"msr  fpcr, x7", "frintx d28, d28", "msr  fpcr, x5"},
 		},
 		{
 			name:     "vpclmulqdq x0, x1, x2, 0",

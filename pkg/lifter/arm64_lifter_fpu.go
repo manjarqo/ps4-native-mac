@@ -16,6 +16,16 @@ import (
 // fpu_top is at offset 0x2e0 (int32).
 // fpu_sw is at offset 0x2e6 (uint16).
 // fpu_cw is at offset 0x2e4 (uint16).
+//
+// Rounding: the stack holds doubles, so arithmetic results are rounded to double precision in
+// the FPCR rounding mode (the one LDMXCSR derives from MXCSR). The precision control of the
+// x87 control word is not modelled, and neither is its rounding control for arithmetic. The
+// rounding control is applied where x87 code rounds to an integer or to single precision:
+// FIST/FISTP, FRNDINT and FST/FSTP m32 (x87RoundBegin). libc's fesetround sets both control
+// words alike, so the two modes only differ if guest code changes one of them alone.
+//
+// Tags: the tag word is not modelled. FNSTENV stores 0xffff (all empty), which is the state at
+// every call boundary of the System V ABI; FLDENV ignores the stored tags.
 func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	op := inst.Inst.Op
 	args := inst.Inst.Args
@@ -187,7 +197,9 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 				lines = append(lines, "    str d28, [x28, x16]")
 			} else {
+				lines = append(lines, x87RoundBegin()...)
 				lines = append(lines, "    fcvt s28, d28")
+				lines = append(lines, x87RoundEnd()...)
 				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 				lines = append(lines, "    str s28, [x28, x16]")
 			}
@@ -205,7 +217,15 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			} else {
 				lines = append(lines, emitFpuPopD0()...)
 			}
+			// FIST/FISTP round by the control word (FISTTP truncates): the value is rounded to an
+			// integer in that mode first, so the conversion itself is exact.
 			trunc := op == x86asm.FISTTP
+			if !trunc {
+				lines = append(lines, x87RoundBegin()...)
+				lines = append(lines, "    frintx d28, d28")
+				lines = append(lines, x87RoundEnd()...)
+				trunc = true
+			}
 			switch defMemSz {
 			case 8:
 				lines = append(lines, fpToIntX86("x17", "d28", trunc)...)
@@ -577,7 +597,9 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 
 	case x86asm.FRNDINT:
 		lines = append(lines, loadFpuSt("d28", 0)...)
-		lines = append(lines, "    frinti d28, d28")
+		lines = append(lines, x87RoundBegin()...)
+		lines = append(lines, "    frintx d28, d28")
+		lines = append(lines, x87RoundEnd()...)
 		lines = append(lines, storeFpuSt("d28", 0)...)
 		return lines, nil
 
@@ -661,6 +683,31 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 	return lines, nil
 }
 
+// x87RoundBegin sets FPCR.RMode to the rounding control of the x87 control word (FCW bits
+// 11:10: nearest, down, up, toward zero; FPCR RMode: nearest, up, down, toward zero) and keeps
+// the previous FPCR in x5 for x87RoundEnd. NZCV is not touched. Scratch: x5-x7.
+func x87RoundBegin() []string {
+	return []string{
+		"    add  x5, x27, #0x70",
+		"    ldr  x5, [x28, x5]",
+		"    ldrh w6, [x5, #0x2e4]",
+		"    ubfx w6, w6, #10, #2",
+		"    eor  w7, w6, w6, lsr #1",
+		"    and  w7, w7, #1",        // 1 for down and up, whose encodings swap
+		"    orr  w7, w7, w7, lsl #1",
+		"    eor  w6, w6, w7",
+		"    mrs  x5, fpcr",
+		"    mov  x7, x5",
+		"    bfi  x7, x6, #22, #2",
+		"    msr  fpcr, x7",
+	}
+}
+
+// x87RoundEnd restores the FPCR that x87RoundBegin saved in x5.
+func x87RoundEnd() []string {
+	return []string{"    msr  fpcr, x5"}
+}
+
 // isX87M80 reports FLD m80 (DB /5) and FSTP m80 (DB /7). x86asm decodes them as FLD/FSTP with
 // a memory operand and MemBytes 0 (the m32/m64 forms report 4 or 8).
 func isX87M80(inst disasm.Instruction) bool {
@@ -674,9 +721,11 @@ func isX87M80(inst disasm.Instruction) bool {
 }
 
 // x87LoadM80 converts the 80-bit extended value at host address x1 to the double in d28 (the
-// x87 stack holds doubles). The 64-bit significand is rounded to 53 bits by UCVTF (the current
-// rounding mode), exponents beyond the double range give +-inf, small ones a denormal (rounded
-// to nearest even) or +-0.
+// x87 stack holds doubles). For a normal double result the 64-bit significand is rounded to 53
+// bits by UCVTF, i.e. in the FPCR mode derived from the guest MXCSR; a denormal result is
+// rounded to nearest even. The x87 control word's rounding control is not applied here (on x86
+// the load is exact and the rounding happens at a later store). Exponents beyond the double
+// range give +-inf, small ones a denormal or +-0.
 // Unsupported encodings (unnormals, pseudo-infinities and pseudo-NaNs: integer bit clear with a
 // nonzero exponent) load the real indefinite, as the invalid-operand response of the x87.
 // NaN payloads keep their top 51 fraction bits and are made quiet. NZCV is preserved. Scratch: x0, x2-x4, x6, x7.

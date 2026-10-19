@@ -91,11 +91,11 @@ func execSkip(t *testing.T) {
 	}
 }
 
-// liftSeq lifts the instructions of one case at pc and returns the lowering, the lifter and the
-// function (the readout continues in both, from the carry sense the sequence left).
-func liftSeq(t *testing.T, c execCase, pc uint64) ([]string, *Arm64Lifter, *disasm.Function) {
+// liftSeq lifts the instructions of one case at pc with l (one lifter for all cases keeps the
+// generated labels unique) and returns the lowering and the function (the readout continues in
+// it, from the carry sense the sequence left).
+func liftSeq(t *testing.T, l *Arm64Lifter, c execCase, pc uint64) ([]string, *disasm.Function) {
 	t.Helper()
-	l := NewArm64Lifter(nil)
 	fn := &disasm.Function{EntryAddr: pc, EndAddr: pc + 0x100,
 		Blocks: map[uint64]*disasm.BasicBlock{pc: {StartAddr: pc}}, BlockOrder: []uint64{pc}}
 	var out []string
@@ -119,7 +119,7 @@ func liftSeq(t *testing.T, c execCase, pc uint64) ([]string, *Arm64Lifter, *disa
 		}
 		pc = next
 	}
-	return out, l, fn
+	return out, fn
 }
 
 func runExecCases(t *testing.T, cases []execCase) {
@@ -135,9 +135,10 @@ func runExecCases(t *testing.T, cases []execCase) {
 	host.WriteString(".text\n")
 	native.WriteString(".intel_syntax noprefix\n.text\n")
 	data.WriteString("#include <stdint.h>\nstruct init { int off, len; const uint8_t *b; };\n")
+	l := NewArm64Lifter(nil)
 	for i, c := range cases {
 		pc := uint64(0x10000 + i*0x1000)
-		lines, l, fn := liftSeq(t, c, pc)
+		lines, fn := liftSeq(t, l, c, pc)
 		for _, ln := range lines {
 			if strings.Contains(ln, "_recomp_unsupported") {
 				t.Fatalf("%s: not lifted:\n%s", c.name, strings.Join(lines, "\n"))

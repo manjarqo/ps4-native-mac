@@ -386,9 +386,10 @@ func TestRegressX87Stores(t *testing.T) {
 				tc.name, w, strings.Join(l, "\n"))
 		}
 	}
-	// FIST/FISTP give the integer indefinite for NaN and out-of-range values.
-	requireInOrder(t, "fistp word", liftBlock(t, "df18")[0], "fcvtzs x17, d31", "and w1, w1, #0x8000")
-	requireInOrder(t, "fistp dword", liftBlock(t, "db18")[0], "fcvtzs x17, d31", "and w1, w1, #0x80000000")
+	// FIST/FISTP give the integer indefinite for NaN and out-of-range values (after rounding in
+	// the control word's mode, TestExecX87Rounding).
+	requireInOrder(t, "fistp word", liftBlock(t, "df18")[0], "frintx d28, d28", "fcvtzs x17, d28", "and w1, w1, #0x8000")
+	requireInOrder(t, "fistp dword", liftBlock(t, "db18")[0], "frintx d28, d28", "fcvtzs x17, d28", "and w1, w1, #0x80000000")
 }
 
 // FCMOVcc ST(0), ST(i) took i from the first operand (always ST(0), a no-op) and used fixed ARM

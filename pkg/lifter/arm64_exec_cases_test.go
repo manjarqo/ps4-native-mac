@@ -1,7 +1,9 @@
 package lifter
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"testing"
 
 	"golang.org/x/arch/x86/x86asm"
@@ -225,6 +227,54 @@ func TestExecStackRsp(t *testing.T) {
 			// pop rsp loads this value: a valid address in the window
 			mem: map[int][]byte{int(top-execMemBase) - 0x20: stack, int(top - execMemBase): le64(execMemBase + 0x1000)},
 		})
+	}
+	runExecCases(t, cases)
+}
+
+// x87 rounding control: FIST/FISTP and FRNDINT round to an integer, FST m32 rounds to single,
+// in the mode of the x87 control word (not MXCSR's). FISTTP truncates in every mode; NaN,
+// infinities and out-of-range values store the integer indefinite.
+func TestExecX87Rounding(t *testing.T) {
+	values := []float64{0, 2.5, -2.5, 3.5, -3.5, 0.5, -0.5, 1.5, 2.4999999999999996, 1e10, -1e10, 4e9,
+		32767.5, -32768.5, 65536.7, 9.3e18, -9.3e18, 1 + 0x1p-24, 1 + 0x1p-23 + 0x1p-24, -(1 + 0x1p-24),
+		3.4028235677973366e38, 1e-46, -1e-46, math.Inf(1), math.Inf(-1), math.NaN(), 7.999999999999999e15}
+	seq := []string{
+		"d92e",   // fldcw [rsi]
+		"dd07",   // fld qword [rdi]
+		"df7f08", // fistp qword [rdi+8]
+		"dd07",   // fld qword [rdi]
+		"d9fc",   // frndint
+		"dd5f10", // fstp qword [rdi+0x10]
+		"dd07",   // fld qword [rdi]
+		"d95718", // fst dword [rdi+0x18]
+		"db5724", // fist dword [rdi+0x24]
+		"db5f1c", // fistp dword [rdi+0x1c]
+		"dd07",   // fld qword [rdi]
+		"df5f20", // fistp word [rdi+0x20]
+		"dd07",   // fld qword [rdi]
+		"db4f28", // fisttp dword [rdi+0x28]
+		"d97f2c", // fnstcw [rdi+0x2c]
+	}
+	var cases []execCase
+	for rc := uint64(0); rc < 4; rc++ {
+		for _, mx := range []uint32{0x1f80, 0x5f80} { // MXCSR nearest / up: must not matter
+			for _, v := range values {
+				code := seq
+				if mx != 0x1f80 {
+					code = append([]string{"0fae5604"}, seq...) // ldmxcsr [rsi+4]
+				}
+				ctl := make([]byte, 8)
+				binary.LittleEndian.PutUint16(ctl, uint16(0x37f|rc<<10))
+				binary.LittleEndian.PutUint32(ctl[4:], mx)
+				cases = append(cases, execCase{
+					name:  fmt.Sprintf("rc=%d mxcsr=%#x v=%g", rc, mx, v),
+					code:  code,
+					regs:  map[x86asm.Reg]uint64{x86asm.RSI: execMemBase + 0x80, x86asm.RDI: execMemBase + 0x100},
+					mem:   map[int][]byte{0x80: ctl, 0x100: le64(math.Float64bits(v))},
+					flags: fCF | fZF,
+				})
+			}
+		}
 	}
 	runExecCases(t, cases)
 }
