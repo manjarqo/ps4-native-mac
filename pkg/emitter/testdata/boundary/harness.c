@@ -93,6 +93,7 @@ void guest_exc_state_handler(void);
 #define EXC_KEY_OUT (D + 0x6f0)
 #define HELPER_LOOP_FLAG 0x1000800ULL
 void guest_longjmp(void);
+void recomp_register_guest_modules(void);  // emitted guest_modules.c
 #define ADDR_LONGJMP 0x400f00ULL
 #define ADDR_CRASH 0x400e00ULL
 void guest_rip(void);
@@ -700,6 +701,13 @@ int main(int argc, char **argv) {
     // shim_guest_nonlocal_jump reports and aborts; boundary_test.go checks the report.
     recomp_call_guest(g_proc, ADDR_LONGJMP);
     fail("longjmp returned");
+  } else if (strcmp(c, "unresolved-plt") == 0 || strcmp(c, "unresolved-got") == 0) {
+    // The generated guest_modules.c binds the unresolved import (unresolvedTestELF in
+    // unresolved_test.go) to shim_unresolved_stub, which reports its NID and library and aborts;
+    // boundary_test.go checks the report.
+    recomp_register_guest_modules();
+    recomp_call_guest(g_proc, strcmp(c, "unresolved-plt") == 0 ? 0x540000ULL : 0x560000ULL);
+    fail("the unresolved import returned");
   } else if (strcmp(c, "crash") == 0) {
     // The crash handler reports and exits 1; boundary_test.go checks its report.
     recomp_call_guest(g_proc, ADDR_CRASH);

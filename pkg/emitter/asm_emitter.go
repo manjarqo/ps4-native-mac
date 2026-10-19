@@ -75,6 +75,61 @@ type AsmEmitter struct {
 	HLE          *HLEReport
 	linesBuf     []string
 	knownFuncSet map[uint64]bool
+	// unresolved describes every import slot (PLT stub and GOT slot address) that no host
+	// shim and no loaded module satisfies. Each one is bound to shim_unresolved_stub.
+	unresolved map[uint64]unresolvedImport
+}
+
+// unresolvedImport is what shim_unresolved_stub reports when the guest calls a missing import.
+type unresolvedImport struct {
+	nid  string // NID portion of the dynsym name
+	name string // plaintext symbol name when the NID database knows it
+	lib  string // importing library as named by DT_SCE_IMPORT_LIB
+}
+
+// unresolvedStubShim is the host function every unresolved import reports through.
+const unresolvedStubShim = "shim_unresolved_stub"
+
+// collectUnresolvedImports finds the import slots that remain self-bound after module
+// relocation: elfloader.ResolveModuleRelocations leaves a slot pointing at its own PLT stub
+// (or at itself when there is no PLT) when neither a module export nor the canary applies, and
+// the emitter binds a host shim to the slots it can serve. What is left would jump to itself
+// forever, so it is routed to shim_unresolved_stub with its name instead.
+func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]string) map[uint64]unresolvedImport {
+	out := make(map[uint64]unresolvedImport)
+	for _, rel := range loaded.Relocations {
+		switch rel.Type {
+		case elfloader.R_X86_64_JUMP_SLOT, elfloader.R_X86_64_GLOB_DAT, elfloader.R_X86_64_64:
+		default:
+			continue
+		}
+		if rel.SymName == "" || rel.Offset+8 > uint64(len(loaded.MemoryImage)) {
+			continue
+		}
+		if _, ok := LookupShim(rel.SymName); ok {
+			continue
+		}
+		slot := binary.LittleEndian.Uint64(loaded.MemoryImage[rel.Offset : rel.Offset+8])
+		if slot != rel.Offset && (rel.PltAddr == 0 || slot != rel.PltAddr) {
+			continue
+		}
+		imp := unresolvedImport{nid: elfloader.NIDPrefix(rel.SymName), lib: loaded.LibraryForNID(rel.SymName)}
+		if canon, ok := elfloader.ResolveNID(rel.SymName); ok {
+			imp.name = canon
+		}
+		for _, addr := range []uint64{rel.PltAddr, rel.Offset} {
+			if addr == 0 {
+				continue
+			}
+			if _, bound := shimMap[addr]; bound {
+				continue
+			}
+			if _, dup := out[addr]; !dup {
+				out[addr] = imp
+			}
+		}
+	}
+	return out
 }
 
 // NewAsmEmitter creates a new ARM64 assembly emitter.
@@ -121,11 +176,17 @@ func NewAsmEmitter(loaded *elfloader.LoadedELF, d *disasm.Disassembler, l *lifte
 		bindAddr(sym.Name, sym.Address)
 	}
 
+	unresolved := collectUnresolvedImports(loaded, shimMap)
+	for addr := range unresolved {
+		shimMap[addr] = unresolvedStubShim
+	}
+
 	return &AsmEmitter{
-		elf:     loaded,
-		disasm:  d,
-		lifter:  l,
-		shimMap: shimMap,
+		elf:        loaded,
+		disasm:     d,
+		lifter:     l,
+		shimMap:    shimMap,
+		unresolved: unresolved,
 	}
 }
 
@@ -600,7 +661,7 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 
 	// Forward declarations and weak fallback implementations for host shims
 	uniqueShims := make(map[string]bool)
-	uniqueShims["shim_unresolved_stub"] = true
+	uniqueShims[unresolvedStubShim] = true
 	for _, target := range CanonicalShims {
 		uniqueShims[target] = true
 	}
@@ -616,7 +677,7 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 	}
 	w.WriteString("\n// Weak fallback implementations\n")
 	for _, s := range sortedShims {
-		if s == "shim_unresolved_stub" {
+		if s == unresolvedStubShim {
 			continue
 		}
 		fmt.Fprintf(w, "__attribute__((weak)) void %s(GuestContext *ctx) { recomp_unimplemented_shim(ctx, %q); }\n", s, s)
@@ -646,6 +707,29 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 	}
 
 	w.WriteString("void recomp_register_guest_modules(void) {\n")
+	unresolvedAddrs := make([]uint64, 0, len(e.unresolved))
+	for addr := range e.unresolved {
+		unresolvedAddrs = append(unresolvedAddrs, addr)
+	}
+	slices.Sort(unresolvedAddrs)
+	for _, addr := range unresolvedAddrs {
+		imp := e.unresolved[addr]
+		fmt.Fprintf(w, "    recomp_register_unresolved(0x%xULL, %q, %q, %q);\n", addr, imp.nid, imp.name, imp.lib)
+	}
+	// Slots that are not discovered functions (GOT entries) still need a registered target;
+	// the discovered ones (PLT stubs) get their stub from the code chunks.
+	isFunc := make(map[uint64]bool)
+	for _, a := range e.functionAddrs() {
+		isFunc[a] = true
+	}
+	var unresolvedSynth []uint64
+	for _, addr := range unresolvedAddrs {
+		if isFunc[addr] {
+			continue
+		}
+		unresolvedSynth = append(unresolvedSynth, addr)
+		fmt.Fprintf(w, "    extern void fn_0x%x(GuestContext *ctx);\n    recomp_register_fn(0x%xULL, fn_0x%x);\n", addr, addr, addr)
+	}
 	for _, line := range synthRegs {
 		w.WriteString(line)
 	}
@@ -766,6 +850,9 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 	sw.WriteString("// Synthetic shims ARM64 bridge\n" + guestTextSection + "\n.p2align 2\n\n")
 	for _, entry := range synthList {
 		writeShimStub(sw, fmt.Sprintf("_fn_0x%x", entry.addr), entry.shim, entry.addr)
+	}
+	for _, addr := range unresolvedSynth {
+		writeShimStub(sw, fmt.Sprintf("_fn_0x%x", addr), unresolvedStubShim, addr)
 	}
 	if err := sw.Flush(); err != nil {
 		return err

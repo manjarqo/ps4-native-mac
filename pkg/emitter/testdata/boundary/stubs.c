@@ -41,3 +41,9 @@ const RecompModuleUnwindInfo *recomp_module_find_by_handle(int32_t handle) {
 }
 void shim_clock_gettime(GuestContext *ctx) { SHIM_RETURN(); }
 bool recomp_module_text_contains(uint64_t addr) { return addr >= 0x400000 && addr < 0x600000; }
+// The module registry is not under test; the emitted recomp_register_guest_modules only feeds it.
+void recomp_module_register(const char *filename, const RecompModuleExport *exports) {
+  (void)filename;
+  (void)exports;
+}
+void recomp_module_register_unwind_info(const RecompModuleUnwindInfo *info) { (void)info; }

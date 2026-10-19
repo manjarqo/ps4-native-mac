@@ -42,8 +42,10 @@ var boundaryStubs = [][2]string{
 var boundaryOutputChecks = map[string][]string{
 	"profile": {"[stall-profile] samples in recompiled guest code: PC only (no frame chain)\n",
 		"[stall-profile]   unnamed: busy 100%", ": guest_spin 100%\n"},
-	"longjmp": {"FATAL: guest longjmp(env=0x1000700, val=1) called from 0x0: non-local jumps are not supported"},
-	"crash":   {"In recompiled guest code (guest_crash+0x", "RBX=0xd001 RCX=", " R12=0xd00c R13=0xd00d R14=0xd00e R15=0xd00f "},
+	"longjmp":        {"FATAL: guest longjmp(env=0x1000700, val=1) called from 0x0: non-local jumps are not supported"},
+	"unresolved-plt": {"Called unimplemented function NID 'AbCdEfGhIjK' (Lib: libSceFoo) at RIP=0x540000 "},
+	"unresolved-got": {"Called unimplemented function NID 'AbCdEfGhIjK' (Lib: libSceFoo) at RIP=0x560000 "},
+	"crash":          {"In recompiled guest code (guest_crash+0x", "RBX=0xd001 RCX=", " R12=0xd00c R13=0xd00d R14=0xd00e R15=0xd00f "},
 }
 
 // boundaryStubAddr is the guest address of boundaryStubs[i] (harness.c: STUB_ADDR).
@@ -216,11 +218,17 @@ func buildBoundaryHarness(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// guest_modules.c and its synthetic stubs as the emitter writes them for the image of
+	// unresolvedTestELF: recomp_register_guest_modules registers its unresolved imports.
+	modPath := filepath.Join(dir, "guest_modules.c")
+	if err := NewAsmEmitter(unresolvedTestELF(), nil, nil).EmitGuestModules(modPath); err != nil {
+		t.Fatal(err)
+	}
 	lifted := filepath.Join(dir, "lifted_gen.s")
 	writeLiftedHelperFns(t, lifted)
 	td, _ := filepath.Abs("testdata/boundary")
 	args = append(args, filepath.Join(td, "harness.c"), filepath.Join(td, "stubs.c"), filepath.Join(td, "guest.s"),
-		tramp, stubPath, lifted, strings.TrimSuffix(lifted, ".s")+"_loop.s")
+		tramp, stubPath, modPath, strings.TrimSuffix(modPath, ".c")+"_synth.s", lifted, strings.TrimSuffix(lifted, ".s")+"_loop.s")
 	for _, s := range boundaryRuntimeSources {
 		args = append(args, filepath.Join(rt, s))
 	}
@@ -255,6 +263,8 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"stall-profile-in-guest-code", "profile", []string{"PS4_STALL_PROFILE=20"}, false},
 		{"crash-in-guest-code", "crash", nil, true},
 		{"guest-longjmp-stops", "longjmp", nil, true},
+		{"unresolved-import-plt-reports", "unresolved-plt", nil, true},
+		{"unresolved-import-got-reports", "unresolved-got", nil, true},
 		{"exception-in-helper", "signal-in-helper", nil, false},
 		{"exception-after-helper", "signal-after-helper", nil, false},
 		{"exception-in-fiber/coroutines", "exception-fiber", nil, false},
