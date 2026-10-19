@@ -852,31 +852,8 @@ void shim_sceKernelInternalMemoryGetModuleSegmentInfo(GuestContext *ctx) {
     SHIM_RETURN();
 }
 
-void shim_sceKernelGetModuleInfo(GuestContext *ctx) {
-    int32_t handle = (int32_t)ctx->rdi;
-    uint64_t info_addr = ctx->rsi;
-    if (!info_addr || !ctx->mem_base) {
-        ctx->rax = (uint64_t)(int64_t)0x8002000e; // ORBIS_KERNEL_ERROR_EFAULT
-        SHIM_RETURN();
-    }
-    const RecompModuleUnwindInfo *mod = recomp_module_find_by_handle(handle);
-    if (!mod) {
-        ctx->rax = (uint64_t)(int64_t)0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
-        SHIM_RETURN();
-    }
-    OrbisKernelModuleInfo *info = (OrbisKernelModuleInfo *)(ctx->mem_base + info_addr);
-    memset(info, 0, sizeof(*info));
-    info->st_size = sizeof(OrbisKernelModuleInfo);
-    if (mod->name) {
-        snprintf(info->name, sizeof(info->name), "%s", mod->name);
-    } else {
-        snprintf(info->name, sizeof(info->name), "eboot.bin");
-    }
-    populate_segments(mod, info->segments, &info->num_segments);
-    ctx->rax = 0;
-    SHIM_RETURN();
-}
-
+// shim_sceKernelGetModuleInfo lives in ps4_kernel_modules.c (it shares the module handles of
+// sceKernelGetModuleList); GetModuleInfo2 is the same call.
 void shim_sceKernelGetModuleInfo2(GuestContext *ctx) {
     shim_sceKernelGetModuleInfo(ctx);
 }

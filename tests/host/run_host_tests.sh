@@ -3,6 +3,7 @@
 set -euo pipefail
 R=$(cd "$(dirname "$0")/../.." && pwd)
 T=$(mktemp -d)
+"$R/tests/host/runtime_link_check.sh"
 clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/kernel/threading" "$R/tests/host/stall_profile_test.c" \
   "$R/pkg/runtime/kernel/threading/ps4_stall_profile.c" -o "$T/stall_profile_test"
 "$T/stall_profile_test"
