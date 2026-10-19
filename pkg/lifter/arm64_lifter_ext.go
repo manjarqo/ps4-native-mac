@@ -978,3 +978,78 @@ func (l *Arm64Lifter) liftPcmpestri(inst disasm.Instruction, nextPC uint64, line
 	l.cpol = carrySub
 	return lines, nil
 }
+
+// ssse3Operands resolves the operands of a 128-bit integer op in its legacy (dst, src) or VEX
+// (dst, src1, src2) form; a memory src2 is loaded into v28.
+func (l *Arm64Lifter) ssse3Operands(inst disasm.Instruction, nextPC uint64, lines []string) (
+	out []string, d, dHigh, a, b string, vex, ok bool) {
+	args := inst.Inst.Args
+	vex = strings.HasPrefix(inst.Inst.Op.String(), "V")
+	dReg, okD := args[0].(x86asm.Reg)
+	src1, src2 := args[0], args[1]
+	if vex {
+		src1, src2 = args[1], args[2]
+	}
+	s1Reg, okS1 := src1.(x86asm.Reg)
+	isY, _, _, dLow, dHi, _, _, okDD := getVectorDesc(dReg)
+	_, _, _, s1Low, _, _, _, okS1D := getVectorDesc(s1Reg)
+	if !okD || !okS1 || !okDD || !okS1D || isY {
+		return lines, "", "", "", "", vex, false
+	}
+	switch v := src2.(type) {
+	case x86asm.Reg:
+		_, _, _, s2Low, _, _, _, okS2 := getVectorDesc(v)
+		if !okS2 {
+			return lines, "", "", "", "", vex, false
+		}
+		b = s2Low
+	case x86asm.Mem:
+		lines = append(lines, computeEffAddr(v, nextPC, "x16")...)
+		lines = append(lines, "    ldr q28, [x28, x16]")
+		b = "v28"
+	default:
+		return lines, "", "", "", "", vex, false
+	}
+	return lines, dLow, dHi, s1Low, b, vex, true
+}
+
+// liftPmulhrsw handles (V)PMULHRSW: per signed word, (a * b + 0x4000) >> 15, truncated to 16
+// bits (so -32768 * -32768 gives -32768; ARM SQRDMULH would saturate to 32767).
+func (l *Arm64Lifter) liftPmulhrsw(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
+	lines, d, dHigh, a, b, vex, ok := l.ssse3Operands(inst, nextPC, lines)
+	if !ok {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported pmulhrsw operands")...)
+		return lines, nil
+	}
+	lines = append(lines,
+		fmt.Sprintf("    smull v29.4s, %s.4h, %s.4h", a, b),
+		fmt.Sprintf("    smull2 v30.4s, %s.8h, %s.8h", a, b),
+		fmt.Sprintf("    rshrn %s.4h, v29.4s, #15", d),
+		fmt.Sprintf("    rshrn2 %s.8h, v30.4s, #15", d))
+	if vex {
+		lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", dHigh))
+	}
+	return lines, nil
+}
+
+// liftPsign handles (V)PSIGNB/W/D: each element of src1 is negated where the src2 element is
+// negative, zeroed where it is zero and kept where it is positive (negation wraps, as on x86).
+func (l *Arm64Lifter) liftPsign(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
+	lines, d, dHigh, a, b, vex, ok := l.ssse3Operands(inst, nextPC, lines)
+	if !ok {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported psign operands")...)
+		return lines, nil
+	}
+	arr := map[x86asm.Op]string{x86asm.PSIGNB: ".16b", x86asm.VPSIGNB: ".16b", x86asm.PSIGNW: ".8h",
+		x86asm.VPSIGNW: ".8h", x86asm.PSIGND: ".4s", x86asm.VPSIGND: ".4s"}[inst.Inst.Op]
+	lines = append(lines,
+		fmt.Sprintf("    cmlt v29%s, %s%s, #0", arr, b, arr), // negative
+		fmt.Sprintf("    cmeq v30%s, %s%s, #0", arr, b, arr), // zero
+		fmt.Sprintf("    neg v31%s, %s%s", arr, a, arr),
+		fmt.Sprintf("    bsl v29.16b, v31.16b, %s.16b", a),
+		fmt.Sprintf("    bic %s.16b, v29.16b, v30.16b", d))
+	if vex {
+		lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", dHigh))
+	}
+	return lines, nil
+}

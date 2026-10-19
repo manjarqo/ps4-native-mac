@@ -280,3 +280,22 @@ func TestRegressMxcsr(t *testing.T) {
 	l = liftBlock(t, "0fae08") // fxrstor [rax]
 	requireInOrder(t, "fxrstor", l[0], "str w5, [x17, #0x2e8]", "msr fpcr, x1")
 }
+
+// PMULHRSW, PSIGNB/W/D and LDDQU (legacy and VEX) were unsupported.
+func TestRegressSsse3Ops(t *testing.T) {
+	for _, tc := range []struct {
+		name, hex string
+		want      []string
+	}{
+		{"vpmulhrsw xmm1, xmm2, xmm3", "c4e2690bcb", []string{"smull v29.4s, v2.4h, v3.4h", "smull2 v30.4s, v2.8h, v3.8h", "rshrn v1.4h, v29.4s, #15", "rshrn2 v1.8h, v30.4s, #15"}},
+		{"pmulhrsw xmm1, xmm2", "660f380bca", []string{"smull v29.4s, v1.4h, v2.4h", "rshrn v1.4h, v29.4s, #15"}},
+		{"vpsignw xmm1, xmm2, xmm3", "c4e26909cb", []string{"cmlt v29.8h, v3.8h, #0", "cmeq v30.8h, v3.8h, #0", "neg v31.8h, v2.8h", "bsl v29.16b, v31.16b, v2.16b", "bic v1.16b, v29.16b, v30.16b"}},
+		{"psignw xmm1, xmm2", "660f3809ca", []string{"cmlt v29.8h, v2.8h, #0", "bic v1.16b, v29.16b, v30.16b"}},
+		{"vlddqu xmm1, [rax]", "c5fbf008", []string{"ldr q1, [x28, x16]"}},
+		{"lddqu xmm1, [rax]", "f20ff008", []string{"ldr q1, [x28, x16]"}},
+	} {
+		l := liftBlock(t, tc.hex)
+		forbid(t, tc.name, l[0], "b _recomp_unsupported_instruction")
+		requireInOrder(t, tc.name, l[0], tc.want...)
+	}
+}

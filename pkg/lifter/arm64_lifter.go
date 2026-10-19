@@ -1132,8 +1132,15 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		return l.liftShldShrd(inst, nextPC, lines)
 
 	// Vector & Floating Point Moves
-	case x86asm.MOVAPS, x86asm.MOVUPS, x86asm.MOVDQA, x86asm.MOVDQU, x86asm.MOVAPD, x86asm.MOVUPD:
+	case x86asm.MOVAPS, x86asm.MOVUPS, x86asm.MOVDQA, x86asm.MOVDQU, x86asm.MOVAPD, x86asm.MOVUPD,
+		x86asm.LDDQU: // LDDQU is an unaligned load (MOVDQU)
 		return l.liftVectorMove128(inst, nextPC, lines)
+
+	case x86asm.PMULHRSW, x86asm.VPMULHRSW:
+		return l.liftPmulhrsw(inst, nextPC, lines)
+
+	case x86asm.PSIGNB, x86asm.PSIGNW, x86asm.PSIGND, x86asm.VPSIGNB, x86asm.VPSIGNW, x86asm.VPSIGND:
+		return l.liftPsign(inst, nextPC, lines)
 
 	case x86asm.MOVSS:
 		return l.liftVectorMove32(inst, nextPC, lines)
@@ -1279,7 +1286,8 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		x86asm.PSRAW, x86asm.PSRAD:
 		return l.liftVectorShift(inst, nextPC, lines)
 
-	case x86asm.VMOVUPS, x86asm.VMOVUPD, x86asm.VMOVAPS, x86asm.VMOVAPD, x86asm.VMOVDQU, x86asm.VMOVDQA:
+	case x86asm.VMOVUPS, x86asm.VMOVUPD, x86asm.VMOVAPS, x86asm.VMOVAPD, x86asm.VMOVDQU, x86asm.VMOVDQA,
+		x86asm.VLDDQU: // VLDDQU is an unaligned load (VMOVDQU)
 		return l.liftAvxMove(inst, nextPC, lines)
 
 	case x86asm.VMOVSS:
