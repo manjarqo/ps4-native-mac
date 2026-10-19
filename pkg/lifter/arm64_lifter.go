@@ -2,6 +2,7 @@ package lifter
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"ps4-recomp/pkg/disasm"
@@ -159,18 +160,22 @@ var arm64XmmMap = map[x86asm.Reg]XmmDesc{
 	x86asm.X15: {Q: "q15", D: "d15", S: "s15", V: "v15"},
 }
 
-// getVectorDesc resolves XMM or YMM registers to ARM64 NEON registers (q0-q31 / v0-v31).
+// getVectorDesc resolves XMM or YMM registers to ARM64 NEON registers: the low 128 bits live in
+// v0-v15, the YMM upper halves in v16-v31. The upper-half names are returned as placeholders
+// ("vU<n>", "qU<n>"): lowerings also use v16-v31 as scratch registers, and LiftInstructionToBuf
+// moves a scratch register that collides with an operand's upper half elsewhere before it
+// replaces the placeholders with the real names (see fixUpperHalves).
 func getVectorDesc(reg x86asm.Reg) (isYmm bool, lowQ, highQ, lowV, highV, lowS, lowD string, ok bool) {
 	if reg >= x86asm.Y0 && reg <= x86asm.Y15 {
 		idx := int(reg - x86asm.Y0)
-		return true, fmt.Sprintf("q%d", idx), fmt.Sprintf("q%d", idx+16),
-			fmt.Sprintf("v%d", idx), fmt.Sprintf("v%d", idx+16),
+		return true, fmt.Sprintf("q%d", idx), fmt.Sprintf("qU%d", idx+16),
+			fmt.Sprintf("v%d", idx), fmt.Sprintf("vU%d", idx+16),
 			fmt.Sprintf("s%d", idx), fmt.Sprintf("d%d", idx), true
 	}
 	if reg >= x86asm.X0 && reg <= x86asm.X15 {
 		idx := int(reg - x86asm.X0)
-		return false, fmt.Sprintf("q%d", idx), fmt.Sprintf("q%d", idx+16),
-			fmt.Sprintf("v%d", idx), fmt.Sprintf("v%d", idx+16),
+		return false, fmt.Sprintf("q%d", idx), fmt.Sprintf("qU%d", idx+16),
+			fmt.Sprintf("v%d", idx), fmt.Sprintf("vU%d", idx+16),
 			fmt.Sprintf("s%d", idx), fmt.Sprintf("d%d", idx), true
 	}
 	return false, "", "", "", "", "", "", false
@@ -649,12 +654,167 @@ func invertArm64Cond(cond string) string {
 
 // LiftInstructionToBuf translates a single x86 instruction into ARM64 assembly instructions.
 func (l *Arm64Lifter) LiftInstructionToBuf(inst disasm.Instruction, nextPC uint64, fn *disasm.Function, dst []string) ([]string, error) {
+	start := len(dst)
 	lines, err := l.liftInstructionInternal(inst, nextPC, fn, dst)
 	if err == nil && inst.Inst.Op == x86asm.CALL {
 		// Flags are dead after a call (System V ABI); any sense is consistent.
 		l.cpol = carrySub
 	}
+	if err == nil {
+		lines = fixUpperHalves(inst.Inst, lines, start, fn != nil && fn.UsesYmm)
+	}
 	return lines, err
+}
+
+var (
+	highVecRe  = regexp.MustCompile(`\b[bhsdqv](1[6-9]|2[0-9]|3[01])\b`)
+	upperTokRe = regexp.MustCompile(`\b([bhsdqv])U(1[6-9]|2[0-9]|3[01])\b`)
+)
+
+// vecArg0IsSource reports VEX instructions whose first operand is a source, not a destination.
+func vecArg0IsSource(op x86asm.Op) bool {
+	switch op {
+	case x86asm.VCOMISS, x86asm.VUCOMISS, x86asm.VCOMISD, x86asm.VUCOMISD,
+		x86asm.VPTEST, x86asm.VTESTPS, x86asm.VTESTPD:
+		return true
+	}
+	return false
+}
+
+// fixUpperHalves post-processes the lowering of one instruction (lines[start:]):
+//  1. A scratch register in v16-v31 that is also an operand's upper half (a "vU<n>"
+//     placeholder from getVectorDesc) is renamed to a free one, then the placeholders become
+//     the real register names.
+//  2. In a function with YMM code (ymmFn), every v16-v31 register the lowering touches other
+//     than the upper halves it legitimately reads or writes is saved and restored around it.
+//     The legitimate ones are those of its YMM operands and, for a VEX instruction, the upper
+//     half of its XMM destination (VEX.128 zeroes it). In functions without YMM instructions no
+//     upper half is live (YMM registers are caller-saved), so the scratch use is harmless.
+//     Restoring also makes legacy SSE instructions keep their destination's upper half.
+func fixUpperHalves(inst x86asm.Inst, lines []string, start int, ymmFn bool) []string {
+	body := lines[start:]
+	var opnd, scratch uint32
+	for _, ln := range body {
+		t := strings.TrimSpace(ln)
+		if t == "" || t[0] == '.' || strings.HasPrefix(t, "//") {
+			continue
+		}
+		for _, m := range upperTokRe.FindAllStringSubmatch(t, -1) {
+			n := 0
+			fmt.Sscanf(m[2], "%d", &n)
+			opnd |= 1 << uint(n)
+		}
+		if i := strings.Index(t, "//"); i >= 0 {
+			t = t[:i]
+		}
+		for _, m := range highVecRe.FindAllStringSubmatch(t, -1) {
+			n := 0
+			fmt.Sscanf(m[1], "%d", &n)
+			scratch |= 1 << uint(n)
+		}
+	}
+	if opnd == 0 && (scratch == 0 || !ymmFn) {
+		return lines
+	}
+	// The upper halves the instruction legitimately reads or writes: those of its YMM operands
+	// and, for a VEX instruction, that of its XMM destination (VEX.128 zeroes it).
+	var legit uint32
+	vex := strings.HasPrefix(inst.Op.String(), "V")
+	for i, a := range inst.Args {
+		if a == nil {
+			break
+		}
+		r, ok := a.(x86asm.Reg)
+		if !ok {
+			continue
+		}
+		if r >= x86asm.Y0 && r <= x86asm.Y15 {
+			legit |= 1 << (16 + uint(r-x86asm.Y0))
+		} else if i == 0 && vex && !vecArg0IsSource(inst.Op) && r >= x86asm.X0 && r <= x86asm.X15 {
+			legit |= 1 << (16 + uint(r-x86asm.X0))
+		}
+	}
+	// 1. Rename scratch registers that collide with an operand's upper half (whether or not
+	// the lowering refers to that upper half), then resolve the placeholders.
+	reserved := opnd | legit
+	rename := map[int]int{}
+	free := ^(reserved | scratch) & 0xffff0000
+	for n := 16; n < 32; n++ {
+		if scratch&reserved&(1<<uint(n)) == 0 {
+			continue
+		}
+		for m := 31; m >= 16; m-- {
+			if free&(1<<uint(m)) != 0 {
+				free &^= 1 << uint(m)
+				rename[n] = m
+				scratch = scratch&^(1<<uint(n)) | 1<<uint(m)
+				break
+			}
+		}
+	}
+	for i := start; i < len(lines); i++ {
+		ln := lines[i]
+		t := strings.TrimSpace(ln)
+		if t == "" || t[0] == '.' || strings.HasPrefix(t, "//") {
+			continue
+		}
+		if len(rename) > 0 {
+			ln = highVecRe.ReplaceAllStringFunc(ln, func(r string) string {
+				n := 0
+				fmt.Sscanf(r[1:], "%d", &n)
+				if m, ok := rename[n]; ok {
+					return fmt.Sprintf("%c%d", r[0], m)
+				}
+				return r
+			})
+		}
+		lines[i] = upperTokRe.ReplaceAllString(ln, "$1$2")
+	}
+	if !ymmFn || inst.Op == x86asm.VZEROUPPER || inst.Op == x86asm.VZEROALL {
+		return lines
+	}
+
+	// 2. Save and restore the upper halves the lowering is not meant to change.
+	for _, ln := range lines[start:] {
+		f := strings.Fields(strings.TrimSpace(ln))
+		if len(f) == 0 || strings.HasPrefix(f[0], "//") {
+			continue
+		}
+		if f[0] == "ret" || f[0] == "br" || ((f[0] == "b" || strings.HasPrefix(f[0], "b.")) && len(f) > 1 && strings.HasPrefix(f[1], "L_fn_")) {
+			return lines // control leaves the instruction: no single restore point
+		}
+	}
+	spill := (scratch | opnd) &^ legit
+	if spill == 0 {
+		return lines
+	}
+	var regs []int
+	for n := 16; n < 32; n++ {
+		if spill&(1<<uint(n)) != 0 {
+			regs = append(regs, n)
+		}
+	}
+	var save, restore []string
+	for i := 0; i < len(regs); i += 2 {
+		if i+1 < len(regs) {
+			save = append(save, fmt.Sprintf("    stp q%d, q%d, [sp, #-32]!", regs[i], regs[i+1]))
+			restore = append([]string{fmt.Sprintf("    ldp q%d, q%d, [sp], #32", regs[i], regs[i+1])}, restore...)
+		} else {
+			save = append(save, fmt.Sprintf("    str q%d, [sp, #-16]!", regs[i]))
+			restore = append([]string{fmt.Sprintf("    ldr q%d, [sp], #16", regs[i])}, restore...)
+		}
+	}
+	// Keep the "// 0x...: inst" comment first.
+	body = append([]string(nil), lines[start:]...)
+	out := lines[:start]
+	if len(body) > 0 && strings.HasPrefix(strings.TrimSpace(body[0]), "//") {
+		out = append(out, body[0])
+		body = body[1:]
+	}
+	out = append(out, save...)
+	out = append(out, body...)
+	out = append(out, restore...)
+	return out
 }
 
 func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC uint64, fn *disasm.Function, dst []string) ([]string, error) {

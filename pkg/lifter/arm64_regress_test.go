@@ -7,6 +7,7 @@ package lifter
 
 import (
 	"encoding/hex"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -88,6 +89,29 @@ func forbid(t *testing.T, what string, lines []string, bad ...string) {
 			}
 		}
 	}
+}
+
+// writesVecReg reports whether a line of lines has vector register n (v/q/d/s/h/b) as its
+// destination, i.e. its first operand; stores and compares have no register destination.
+func writesVecReg(lines []string, n int) bool {
+	for _, ln := range lines {
+		f := strings.Fields(strings.ReplaceAll(code(ln), ",", " "))
+		if len(f) < 2 {
+			continue
+		}
+		switch f[0] {
+		case "str", "stp", "stur", "st1", "cmp", "fcmp", "tst", "cmn":
+			continue
+		}
+		d := f[1]
+		if i := strings.IndexAny(d, ".["); i >= 0 {
+			d = d[:i]
+		}
+		if len(d) > 1 && strings.ContainsRune("vqdshb", rune(d[0])) && d[1:] == strconv.Itoa(n) {
+			return true
+		}
+	}
+	return false
 }
 
 // Carry sense: x86 CF is held in ARM C either inverted (after SUBS/CMP, C = !CF) or directly
@@ -201,4 +225,23 @@ func TestRegressCompareFlags(t *testing.T) {
 	l = liftBlock(t, "4801d8", "c4e27917c1", "720e")
 	requireInOrder(t, "jb after vptest", l[2], "b.cs ...")
 	forbid(t, "jb after vptest", l[2], "cfinv")
+}
+
+// YMM upper halves live in v16-v31, which lowerings also use as scratch registers: a scratch
+// register must not be the upper half of a source operand.
+func TestRegressYmmUpperHalves(t *testing.T) {
+	l := liftBlock(t, "c4e37506c220") // vperm2f128 ymm0, ymm1, ymm2, 0x20
+	for _, n := range []int{17, 18} { // ymm1, ymm2 upper halves
+		if writesVecReg(l[0], n) {
+			t.Errorf("vperm2f128 writes v%d (a source's upper half):\n%s", n, strings.Join(l[0], "\n"))
+		}
+	}
+	requireInOrder(t, "vperm2f128", l[0], "mov v16.16b, v19.16b")
+
+	l = liftBlock(t, "c4e27d17c1") // vptest ymm0, ymm1
+	for _, n := range []int{16, 17} {
+		if writesVecReg(l[0], n) {
+			t.Errorf("vptest ymm writes v%d (a source's upper half):\n%s", n, strings.Join(l[0], "\n"))
+		}
+	}
 }

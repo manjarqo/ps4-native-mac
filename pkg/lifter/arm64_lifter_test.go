@@ -256,7 +256,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "vinsertf128 ymm0, ymm1, xmm2, 1",
 			bytes:    []byte{0xc4, 0xe3, 0x75, 0x18, 0xc2, 0x01},
 			pc:       0x1000,
-			expected: []string{"mov v16.16b, v2.16b", "mov v0.16b, v1.16b", "mov v16.16b, v16.16b"},
+			expected: []string{"mov v31.16b, v2.16b", "mov v0.16b, v1.16b", "mov v16.16b, v31.16b"},
 		},
 		{
 			name:     "vextractps eax, xmm0, 1",
@@ -268,13 +268,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "vinsertps xmm0, xmm1, xmm2, 0x10",
 			bytes:    []byte{0xc4, 0xe3, 0x71, 0x21, 0xc2, 0x10},
 			pc:       0x1000,
-			expected: []string{"mov v16.s[0], v2.s[0]", "mov v0.16b, v1.16b", "mov v0.s[1], v16.s[0]", "movi v16.16b, #0"},
+			expected: []string{"mov v31.s[0], v2.s[0]", "mov v0.s[1], v31.s[0]", "movi v16.16b, #0"},
 		},
 		{
 			name:     "vperm2f128 ymm0, ymm1, ymm2, 0x20",
 			bytes:    []byte{0xc4, 0xe3, 0x75, 0x06, 0xc2, 0x20},
 			pc:       0x1000,
-			expected: []string{"mov v18.16b, v1.16b", "mov v19.16b, v2.16b", "mov v0.16b, v18.16b", "mov v16.16b, v19.16b"},
+			expected: []string{"mov v31.16b, v1.16b", "mov v19.16b, v2.16b", "mov v0.16b, v31.16b", "mov v16.16b, v19.16b"},
 		},
 		{
 			name:     "vpermilps ymm0, ymm1, 0x1b",
@@ -472,7 +472,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "vptest ymm0, ymm1",
 			bytes:    []byte{0xc4, 0xe2, 0x7d, 0x17, 0xc1}, // vptest ymm0, ymm1
 			pc:       0x1000,
-			expected: []string{"and v16.16b, v1.16b, v0.16b", "bic v17.16b, v1.16b, v0.16b", "msr nzcv"},
+			expected: []string{"and v31.16b, v1.16b, v0.16b", "bic v30.16b, v1.16b, v0.16b", "and v18.16b, v17.16b, v16.16b", "msr nzcv"},
 		},
 		{
 			name:     "vpmulld xmm0, xmm1, xmm2",

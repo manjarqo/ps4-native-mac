@@ -39,6 +39,10 @@ type Function struct {
 	Blocks     map[uint64]*BasicBlock
 	BlockOrder []uint64            // Topologically or address-sorted block start addresses
 	JumpTables map[uint64][]uint64 // Map of indirect jump PC -> target addresses
+	// UsesYmm: some instruction names a YMM register. Only then can a YMM upper half be live
+	// inside the function (they are caller-saved), so only then must the lifter keep the upper
+	// halves it uses as scratch registers.
+	UsesYmm bool
 }
 
 // CapHitInfo records diagnostic information about a function decode that hit safety caps.
@@ -617,6 +621,7 @@ func (d *Disassembler) disasmLinearFunction(entryAddr uint64, size uint64) (*Fun
 	}
 	slices.Sort(fn.BlockOrder)
 
+	fn.UsesYmm = usesYmm(fn)
 	d.analyzeBlockFlagLiveness(fn)
 	if !d.SkipFlagLiveness {
 		analyzeCarryOverflowLiveness(fn)
@@ -987,6 +992,7 @@ func (d *Disassembler) disasmBranchFollowing(entryAddr uint64) (*Function, []uin
 	}
 	fn.EndAddr = maxEnd
 
+	fn.UsesYmm = usesYmm(fn)
 	d.analyzeBlockFlagLiveness(fn)
 	if !d.SkipFlagLiveness {
 		analyzeCarryOverflowLiveness(fn)
@@ -1097,4 +1103,21 @@ func isJcc(op x86asm.Op) bool {
 	default:
 		return false
 	}
+}
+
+// usesYmm reports whether an instruction of fn names a YMM register.
+func usesYmm(fn *Function) bool {
+	for _, b := range fn.Blocks {
+		for _, in := range b.Insts {
+			for _, a := range in.Inst.Args {
+				if a == nil {
+					break
+				}
+				if r, ok := a.(x86asm.Reg); ok && r >= x86asm.Y0 && r <= x86asm.Y15 {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
