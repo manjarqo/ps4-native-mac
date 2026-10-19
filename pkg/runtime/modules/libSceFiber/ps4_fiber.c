@@ -96,6 +96,7 @@ typedef struct FiberWorker {
   // a fiber runs, and the fiber to mark IDLE once we are back on it.
   void *sp;
   _Atomic uint32_t *release;
+  pthread_t host; // the guest thread's host thread
 } FiberWorker;
 
 typedef struct FiberHost {
@@ -222,11 +223,40 @@ void ps4_fiber_print_stats(int frames) {
           (unsigned long long)atomic_load(&g_fstat_creates));
 }
 
+// Every worker, for ps4_fiber_endpoint_host_thread: append-only, read without locks (also
+// from signal handlers); a destroyed worker's entry is cleared before it is freed.
+#define MAX_WORKERS 1024
+static FiberWorker *_Atomic g_workers[MAX_WORKERS];
+static _Atomic int g_nworkers;
+
 static void worker_destroy(void *p) {
   FiberWorker *w = (FiberWorker *)p;
   if (!w) return;
+  const int n = atomic_load(&g_nworkers);
+  for (int i = 0; i < n && i < MAX_WORKERS; i++)
+    if (atomic_load(&g_workers[i]) == w) atomic_store(&g_workers[i], NULL);
   baton_destroy(&w->baton);
   free(w);
+}
+
+bool ps4_fiber_threads_mode(void) { return g_fiber_threads; }
+
+bool ps4_fiber_endpoint_host_thread(const GuestContext *ctx, pthread_t *out) {
+  const int n = atomic_load(&g_nworkers);
+  for (int i = 0; i < n && i < MAX_WORKERS; i++) {
+    FiberWorker *w = atomic_load(&g_workers[i]);
+    if (!w) continue;
+    FiberHost *h = w->current;
+    if (w->ctx == ctx) {
+      *out = g_fiber_threads && h && h->host_started ? h->host_thread : w->host;
+      return true;
+    }
+    if (h && h->fctx == ctx) {
+      *out = g_fiber_threads && h->host_started ? h->host_thread : w->host;
+      return true;
+    }
+  }
+  return false;
 }
 
 static void worker_key_init(void) {
@@ -240,9 +270,16 @@ static FiberWorker *get_worker(GuestContext *ctx) {
   if (!w) return NULL;
   w->ctx = ctx;
   w->thread = recomp_get_current_thread();
+  w->host = pthread_self();
   baton_init(&w->baton);
   pthread_setspecific(g_worker_key, w);
   tl_worker = w;
+  const int i = atomic_fetch_add(&g_nworkers, 1);
+  if (i < MAX_WORKERS)
+    atomic_store(&g_workers[i], w);
+  else if (i == MAX_WORKERS)
+    fprintf(stderr, "[ps4-fiber] more than %d guest threads run fibers: guest exceptions for the "
+                    "later ones go to their own host thread, not to the fiber they run\n", MAX_WORKERS);
   return w;
 }
 
@@ -286,6 +323,15 @@ static void fiber_adopt_thread(GuestContext *f, const GuestContext *t) {
 // TLS values written while the fiber ran belong to the guest thread.
 static void fiber_release_thread(const GuestContext *f, GuestContext *t) {
   memcpy(t->tls_keys, f->tls_keys, sizeof(t->tls_keys));
+}
+
+// Guest code and the shim bridge find the GuestContext of what runs on a guest thread
+// through the TCB slot [fs_base + 0x70] (see the contract at recomp_enter_guest): the
+// thread's own context, or the fiber's while a fiber runs. Every hand-over points it at the
+// endpoint that runs next on thread t, before that endpoint runs.
+static void tcb_set_running(const GuestContext *t, GuestContext *running) {
+  if (t->mem_base && t->fs_base)
+    *(uint64_t *)(t->mem_base + t->fs_base + 0x70ULL) = (uint64_t)(uintptr_t)running;
 }
 
 static void fiber_free_host(FiberHost *h) {
@@ -343,6 +389,7 @@ static int fiber_resume(FiberHost *h, FiberWorker *w, uint64_t arg, int kind) {
     h->host_started = true;
     atomic_fetch_add_explicit(&g_fstat_creates, 1, memory_order_relaxed);
   }
+  tcb_set_running(w->ctx, h->fctx);
   baton_post(&h->baton, kind);
   return 0;
 }
@@ -389,6 +436,12 @@ static void *fiber_host_main(void *arg) {
 // restores the same frame from load_sp. A new fiber's stack starts with such
 // a frame that "returns" into ps4_fiber_co_trampoline with x19 = FiberHost
 // and x20 = fiber_co_main.
+// FPCR and MXCSR need no slot in the frame: a switch happens inside a shim, and
+// the shim bridge keeps the switching endpoint's guest FPCR in its frame on that
+// endpoint's host stack and writes it back when the endpoint resumes, whatever
+// FPCR (round to nearest, but the FZ of the last endpoint) the host thread has
+// then. MXCSR is in each endpoint's own GuestContext, the one the TCB slot names
+// while it runs.
 __attribute__((visibility("hidden"))) void ps4_fiber_ctx_switch(void **save_sp, void *load_sp);
 __attribute__((visibility("hidden"))) extern const char ps4_fiber_co_trampoline[];
 
@@ -470,6 +523,7 @@ static void co_enter(FiberHost *h, FiberWorker *w, uint64_t arg, _Atomic uint32_
   w->current = h;
   tl_fiber_self = h;
   g_current_ctx = h->fctx;
+  tcb_set_running(w->ctx, h->fctx);
 }
 
 // ---- Guest API ----
@@ -729,6 +783,7 @@ void shim_sceFiberReturnToThread(GuestContext *ctx) {
   fiber_release_thread(self->fctx, w->ctx);
   w->return_arg = ctx->rdi;
   w->current = NULL;
+  tcb_set_running(w->ctx, w->ctx);
   uint64_t arg;
   if (!g_fiber_threads) {
     fstat_count(FSTAT_RETURN);

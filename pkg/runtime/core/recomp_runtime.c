@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <unistd.h>
 #if defined(__APPLE__)
+#include <dlfcn.h>
 #include <execinfo.h>
 #include <libgen.h>
 #include <mach-o/dyld.h>
@@ -72,7 +73,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
       for (int i = 0; i < 512 && shown < 24; i++) {
         if ((uint64_t)(g_current_ctx->rsp + i * 8 + 8) > g_current_ctx->mem_size) break;
         uint64_t v = sp[i];
-        if (v >= 0x10000 && v < 0x1474000) {
+        if (recomp_module_text_contains(v)) {
           // Return addresses point into the middle of a function.
           fprintf(stderr, " %llx", (unsigned long long)v);
           shown++;
@@ -88,6 +89,34 @@ static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
     }
 #if defined(__APPLE__) && defined(__arm64__)
     arm_thread_state64_t *state = (arm_thread_state64_t *)&(((ucontext_t *)ucontext)->uc_mcontext->__ss);
+    if (recomp_pc_in_guest_code(state->__pc)) {
+      // The registers above are what the last shim call stored; in guest code the pinned host
+      // registers are the live guest registers (contract at recomp_enter_guest).
+      Dl_info di;
+      const int named = dladdr((void *)state->__pc, &di) && di.dli_sname;
+      const uint64_t *x = state->__x;
+      fprintf(stderr,
+              "In recompiled guest code (%s+0x%llx); live guest registers:\n"
+              "RSP=0x%llx RBP=0x%llx RAX=0x%llx RBX=0x%llx RCX=0x%llx RDX=0x%llx RSI=0x%llx RDI=0x%llx\n"
+              "R8=0x%llx R9=0x%llx R10=0x%llx R11=0x%llx R12=0x%llx R13=0x%llx R14=0x%llx R15=0x%llx FS=0x%llx\n",
+              named ? di.dli_sname : "?", named ? (unsigned long long)(state->__pc - (uint64_t)(uintptr_t)di.dli_saddr) : 0ULL,
+              (unsigned long long)x[26], (unsigned long long)x[25], (unsigned long long)x[19], (unsigned long long)x[20],
+              (unsigned long long)x[21], (unsigned long long)x[22], (unsigned long long)x[23], (unsigned long long)x[24],
+              (unsigned long long)x[8], (unsigned long long)x[9], (unsigned long long)x[10], (unsigned long long)x[11],
+              (unsigned long long)x[12], (unsigned long long)x[13], (unsigned long long)x[14], (unsigned long long)x[15],
+              (unsigned long long)x[27]);
+      if (x[28] == (uint64_t)(uintptr_t)g_current_ctx->mem_base && x[26] < g_current_ctx->mem_size) {
+        fprintf(stderr, "Guest code addresses on the live stack:");
+        const uint64_t *sp = (const uint64_t *)(g_current_ctx->mem_base + x[26]);
+        for (int i = 0, shown = 0; i < 512 && shown < 24 && x[26] + (uint64_t)i * 8 + 8 <= g_current_ctx->mem_size; i++) {
+          if (recomp_module_text_contains(sp[i])) {
+            fprintf(stderr, " %llx", (unsigned long long)sp[i]);
+            shown++;
+          }
+        }
+        fprintf(stderr, "\n");
+      }
+    }
     fprintf(stderr, "Host PC: 0x%llx (ARM64)\n", (unsigned long long)state->__pc);
     for (int i = 0; i < 29; i++) {
       fprintf(stderr, "x%d=0x%llx ", i, (unsigned long long)state->__x[i]);
@@ -767,6 +796,22 @@ void recomp_dispatch_external(GuestContext *ctx, uint64_t target) {
   recomp_dispatch(ctx, target);
 }
 
+#if defined(__APPLE__)
+// Bounds of the __TEXT,__recomp_guest section, provided by the linker (empty when there is no
+// guest code, as in host tests).
+extern const char g_recomp_guest_text_start[] __asm("section$start$__TEXT$__recomp_guest");
+extern const char g_recomp_guest_text_end[] __asm("section$end$__TEXT$__recomp_guest");
+
+bool recomp_pc_in_guest_code(uint64_t pc) {
+  return pc >= (uint64_t)(uintptr_t)g_recomp_guest_text_start && pc < (uint64_t)(uintptr_t)g_recomp_guest_text_end;
+}
+#else
+bool recomp_pc_in_guest_code(uint64_t pc) {
+  (void)pc;
+  return false;
+}
+#endif
+
 void recomp_free_runtime(GuestContext *ctx) {
   if (!ctx)
     return;
@@ -807,6 +852,44 @@ void recomp_free_runtime(GuestContext *ctx) {
   free(ctx);
 }
 
+// Guest non-local control transfers (longjmp, C++ exception unwinding: libunwind's jumpto)
+// restore the target frame's registers and RET to an address that is not the caller's. The
+// ARM64 assembly backend returns through the host return address of each guest call (contract
+// at recomp_enter_guest), so such a RET would continue after the call that started the
+// transfer. Neither TLOU nor Uncharted 4 imports longjmp, setjmp, __cxa_throw or _Unwind_*;
+// libc.prx reaches them only on error paths. These shims stop there with a report.
+static uint64_t guest_return_address(GuestContext *ctx) {
+  return ctx->rsp + 8 <= ctx->mem_size ? *(uint64_t *)(ctx->mem_base + ctx->rsp) : 0;
+}
+
+void shim_guest_nonlocal_jump(GuestContext *ctx) {
+  fprintf(stderr,
+          "\nFATAL: guest longjmp(env=0x%llx, val=%d) called from 0x%llx: non-local jumps are not "
+          "supported by the ARM64 assembly backend\n",
+          (unsigned long long)ctx->rdi, (int)ctx->rsi, (unsigned long long)guest_return_address(ctx));
+  recomp_dump_guest_context(ctx);
+  fflush(stderr);
+  abort();
+}
+
+// __cxa_throw(void *object, std::type_info *type, void (*dtor)(void *)); __cxa_rethrow(void).
+void shim_guest_cxa_throw(GuestContext *ctx) {
+  const char *type = "?";
+  const uint64_t ti = ctx->rdi && ctx->rsi ? ctx->rsi : 0; // __cxa_rethrow has no type argument
+  if (ti && ti + 16 <= ctx->mem_size) {
+    const uint64_t name = *(uint64_t *)(ctx->mem_base + ti + 8); // Itanium type_info::__name
+    if (name && name < ctx->mem_size) type = (const char *)(ctx->mem_base + name);
+  }
+  fprintf(stderr,
+          "\nFATAL: guest C++ exception (type %.80s) thrown from 0x%llx: exception unwinding is not "
+          "supported by the ARM64 assembly backend\n",
+          type, (unsigned long long)guest_return_address(ctx));
+  recomp_dump_guest_context(ctx);
+  fflush(stderr);
+  abort();
+}
+
+// C backend only: recompiled C functions push UnwindFrames; assembly code never does.
 void recomp_unwind_to(GuestContext *ctx, uint64_t target_ip) {
   ctx->rip = target_ip;
   UnwindFrame *f = ctx->unwind_frame;
@@ -1248,7 +1331,7 @@ void recomp_free_thread_context(GuestContext *ctx) {
   free(ctx);
 }
 
-void recomp_vpcmpistri(GuestContext *ctx, const void *src2_ptr,
+void recomp_vpcmpistri_impl(GuestContext *ctx, const void *src2_ptr,
                        const void *src1_ptr, uint8_t imm8) {
   const uint8_t *s2_bytes = (const uint8_t *)src2_ptr;
   const uint8_t *s1_bytes = (const uint8_t *)src1_ptr;
@@ -1446,7 +1529,7 @@ void recomp_vpcmpistri(GuestContext *ctx, const void *src2_ptr,
   ctx->pf = 0;
 }
 
-void recomp_vpcmpe_stri(GuestContext *ctx, const void *src2_ptr,
+void recomp_vpcmpe_stri_impl(GuestContext *ctx, const void *src2_ptr,
                         const void *src1_ptr, uint8_t imm8) {
   int is_word = (imm8 & 1);
   int is_signed = ((imm8 >> 1) & 1);
@@ -1856,7 +1939,7 @@ static inline uint32_t aes_rotword(uint32_t w) {
   return (w >> 8) | ((w & 0xFF) << 24);
 }
 
-xmm_reg_t recomp_vaeskeygenassist(xmm_reg_t s, uint8_t rcon) {
+xmm_reg_t recomp_vaeskeygenassist_impl(xmm_reg_t s, uint8_t rcon) {
   xmm_reg_t res = {0};
   uint32_t x1 = s.u32[1];
   uint32_t x3 = s.u32[3];

@@ -1236,8 +1236,13 @@ static int stall_symbolize(uint64_t pc, uint64_t *start, const char **name) {
 // thread is suspended; libpthread never waits for other locks while holding it). A joinable
 // thread can still be joined (its pthread_t freed) during the walk; pthread_mach_thread_np looks
 // the pthread_t up in libpthread's thread list and returns MACH_PORT_NULL for one that is gone.
+// Recompiled guest code builds no frame records (see the contract at recomp_enter_guest):
+// there x29 still names the frame of recomp_enter_guest and LR the return address of the
+// function's own last call, so a sample whose PC is in guest code keeps only the PC.
+static int g_prof_no_chain_noted;
+
 static void stall_profile_sample_all(void) {
-  int n = 0;
+  int n = 0, in_guest_code = 0;
   pthread_mutex_lock(&g_threads_mutex);
   for (RecompThread *t = g_threads; t && n < STALL_PROFILE_MAX_THREADS; t = t->next) {
     if (t->finished || !t->ctx) continue;
@@ -1250,8 +1255,10 @@ static void stall_profile_sample_all(void) {
     mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
       pcs[np++] = (uint64_t)arm_thread_state64_get_pc(st);
-      pcs[np++] = (uint64_t)arm_thread_state64_get_lr(st);
-      uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st);
+      const int guest = recomp_pc_in_guest_code(pcs[0]);
+      in_guest_code |= guest;
+      if (!guest) pcs[np++] = (uint64_t)arm_thread_state64_get_lr(st);
+      uint64_t fp = guest ? 0 : (uint64_t)arm_thread_state64_get_fp(st);
       while (np < STALL_PROFILE_DEPTH && fp && !(fp & 15)) {
         uint64_t frame[2];
         mach_vm_size_t got = 0;
@@ -1271,6 +1278,10 @@ static void stall_profile_sample_all(void) {
     }
   }
   pthread_mutex_unlock(&g_threads_mutex);
+  if (in_guest_code && !g_prof_no_chain_noted) { // no thread is suspended here
+    g_prof_no_chain_noted = 1;
+    fprintf(stderr, "[stall-profile] samples in recompiled guest code: PC only (no frame chain)\n");
+  }
 }
 
 static _Atomic uint64_t g_last_present_ns;
@@ -1293,8 +1304,15 @@ static void stall_dump_threads(double stalled_ms) {
       Dl_info di;
       if (dladdr((void *)pc, &di) && di.dli_sname) sym = di.dli_sname;
     }
-    fprintf(stderr, "[stall]   %-28s guest rip 0x%llx  host %s\n", t->name[0] ? t->name : "unnamed",
-            (unsigned long long)t->ctx->rip, sym);
+    // The GuestContext of what the thread runs (a fiber's while it runs one): its rip is the
+    // guest address of the last shim it called (guest code itself never writes rip).
+    const GuestContext *run = t->ctx;
+    if (t->ctx->mem_base && t->ctx->fs_base) {
+      const uint64_t slot = *(const uint64_t *)(t->ctx->mem_base + t->ctx->fs_base + 0x70ULL);
+      if (slot) run = (const GuestContext *)(uintptr_t)slot;
+    }
+    fprintf(stderr, "[stall]   %-28s last shim 0x%llx  mxcsr 0x%x%s  host %s\n", t->name[0] ? t->name : "unnamed",
+            (unsigned long long)run->rip, run->mxcsr, run != t->ctx ? " (fiber)" : "", sym);
   }
   pthread_mutex_unlock(&g_threads_mutex);
 }

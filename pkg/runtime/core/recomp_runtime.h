@@ -17,6 +17,14 @@ void recomp_init_tls(GuestContext *ctx, uint64_t tls_vaddr, uint64_t tls_filesz,
 uint64_t recomp_tls_block_offset(const GuestContext *ctx);
 void recomp_setup_entry_args(GuestContext *ctx, int argc, char **argv, uint64_t entry_addr);
 void recomp_dispatch_external(GuestContext *ctx, uint64_t target);
+// True when host pc is in recompiled guest code (the __recomp_guest section: recompiled
+// functions, shim stubs, indirect-branch entry points). There the guest registers are live in
+// the pinned host registers; in host code (shims, the bridge, helpers) the GuestContext holds
+// what the last guest -> host transition stored. Async-signal-safe.
+bool recomp_pc_in_guest_code(uint64_t pc);
+// Reports guest longjmp / C++ throw (unsupported by the assembly backend) and aborts.
+void shim_guest_nonlocal_jump(GuestContext *ctx);
+void shim_guest_cxa_throw(GuestContext *ctx);
 void recomp_free_runtime(GuestContext *ctx);
 GuestContext *recomp_create_thread_context(GuestContext *parent, uint64_t stack_size);
 uint64_t recomp_vm_alloc(GuestContext *ctx, size_t size);
@@ -69,8 +77,7 @@ void ps4_aio_destroy(void);
 void ps4_gnmdriver_destroy(void);
 void ps4_ajm_destroy(void);
 
-// SIMD String helpers
-void recomp_vpcmpistri(GuestContext *ctx, const void *src2_ptr, const void *src1_ptr, uint8_t imm8);
+// SIMD String helpers: see recomp_context.h
 
 // AES-NI and PCLMULQDQ helpers
 xmm_reg_t recomp_pclmulqdq(uint64_t a, uint64_t b);
@@ -79,7 +86,6 @@ xmm_reg_t recomp_vaesenclast(xmm_reg_t s1, xmm_reg_t s2);
 xmm_reg_t recomp_vaesdec(xmm_reg_t s1, xmm_reg_t s2);
 xmm_reg_t recomp_vaesdeclast(xmm_reg_t s1, xmm_reg_t s2);
 xmm_reg_t recomp_vaesimc(xmm_reg_t s);
-xmm_reg_t recomp_vaeskeygenassist(xmm_reg_t s, uint8_t rcon);
 
 #ifdef __cplusplus
 }

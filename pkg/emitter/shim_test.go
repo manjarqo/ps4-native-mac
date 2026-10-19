@@ -388,3 +388,47 @@ func TestVideoOutAndEqueueShims(t *testing.T) {
 	}
 }
 
+// Guest longjmp and C++ throws cannot work with the assembly backend's structured returns;
+// libc's exports bind to the shims that report them (by name and by NID).
+func TestNonLocalTransfersAreShimmed(t *testing.T) {
+	for name, want := range map[string]string{
+		"longjmp":       "shim_guest_nonlocal_jump",
+		"_longjmp":      "shim_guest_nonlocal_jump",
+		"siglongjmp":    "shim_guest_nonlocal_jump",
+		"__cxa_throw":   "shim_guest_cxa_throw",
+		"__cxa_rethrow": "shim_guest_cxa_throw",
+	} {
+		for _, sym := range []string{name, elfloader.CalculateNID(name) + "#D#A"} {
+			if got, ok := LookupShim(sym); !ok || got != want {
+				t.Errorf("LookupShim(%q) = %q, %v; want %q", sym, got, ok, want)
+			}
+		}
+	}
+	path := "/Volumes/ssd/The Last of Us Remastered Repack/CUSA00557/sce_module/libc.prx"
+	if _, err := os.Stat(path); err != nil {
+		t.Skip("TLOU libc.prx not present")
+	}
+	loaded, err := elfloader.LoadELF(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := NewAsmEmitter(loaded, nil, nil)
+	found := 0
+	for _, sym := range loaded.DynSymbols {
+		switch elfloader.NIDPrefix(sym.Name) {
+		case elfloader.CalculateNID("longjmp"), elfloader.CalculateNID("_longjmp"):
+			found++
+			if e.shimMap[sym.Address] != "shim_guest_nonlocal_jump" {
+				t.Errorf("libc.prx %s at 0x%x: shim %q", sym.Name, sym.Address, e.shimMap[sym.Address])
+			}
+		case elfloader.CalculateNID("__cxa_throw"):
+			found++
+			if e.shimMap[sym.Address] != "shim_guest_cxa_throw" {
+				t.Errorf("libc.prx __cxa_throw at 0x%x: shim %q", sym.Address, e.shimMap[sym.Address])
+			}
+		}
+	}
+	if found != 3 {
+		t.Errorf("found %d of longjmp, _longjmp, __cxa_throw in libc.prx", found)
+	}
+}

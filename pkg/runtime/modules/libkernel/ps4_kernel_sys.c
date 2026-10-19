@@ -1,6 +1,7 @@
 #include "recomp_runtime.h"
 #include "ps4_kernel_sys.h"
 #include "ps4_sysmodule.h"
+#include "ps4_fiber.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -450,16 +451,39 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     if (!handler) return;
 
     GuestContext *ctx = g_current_ctx;
-    if (!ctx || !ctx->mem_base) return;
+    if (!ctx || !ctx->mem_base || !ctx->fs_base) return;
+
+    // Guest code finds its GuestContext through the TCB slot (contract at recomp_enter_guest).
+    // When the slot names another endpoint of this guest thread, that endpoint is what the
+    // guest thread executes: in fiber thread mode it runs on its own host thread, so pass the
+    // exception on; in coroutine mode this host thread is between endpoints (a hand-over in
+    // progress) and the handler runs on ctx with the slot pointed at it.
+    uint64_t *slot = (uint64_t *)(ctx->mem_base + ctx->fs_base + 0x70ULL);
+    const uint64_t saved_slot = *slot;
+    if (saved_slot != (uint64_t)(uintptr_t)ctx && ps4_fiber_threads_mode()) {
+        pthread_t target;
+        if (ps4_fiber_endpoint_host_thread((GuestContext *)(uintptr_t)saved_slot, &target) &&
+            !pthread_equal(target, pthread_self()) && pthread_kill(target, SIGUSR1) == 0)
+            return;
+        // No other host thread runs the endpoint (it is changing hands): handle it here.
+    }
 
     // Save full guest state to restore after exception handler returns
+    // ctx as it was when the signal arrived, restored afterwards. saved_ctx is the interrupted
+    // state the guest handler gets in its ucontext: in guest code the live registers.
+    const GuestContext orig_ctx = *ctx;
     GuestContext saved_ctx = *ctx;
 
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+    // Interrupted in recompiled guest code: the guest registers are the pinned host registers.
+    // Anywhere else (a shim, the bridge, a helper) the host registers hold host values and ctx
+    // holds the guest registers the bridge stored; ctx is restored from saved_ctx below, so
+    // taking host registers there would hand them to the guest when the shim returns.
     if (ucontext_raw) {
         arm_thread_state64_t *state = (arm_thread_state64_t *)&(((ucontext_t *)ucontext_raw)->uc_mcontext->__ss);
         uint64_t host_x26 = state->__x[26];
-        if (state->__x[28] == (uint64_t)ctx->mem_base &&
+        if (recomp_pc_in_guest_code((uint64_t)state->__pc) &&
+            state->__x[28] == (uint64_t)ctx->mem_base &&
             host_x26 >= 0x10000ULL && host_x26 < ctx->mem_size) {
             saved_ctx.rax = state->__x[19];
             saved_ctx.rbx = state->__x[20];
@@ -485,8 +509,8 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
         return;
     }
 
-    // Allocate Orbis ucontext structure on the guest stack
-    uint64_t ucontext_guest_addr = (saved_ctx.rsp - 0x200ULL) & ~0xfULL;
+    // Allocate Orbis ucontext structure on the guest stack, below the 128-byte red zone
+    uint64_t ucontext_guest_addr = (saved_ctx.rsp - 128ULL - 0x200ULL) & ~0xfULL;
     if (ucontext_guest_addr + 0x200ULL <= ctx->mem_size) {
         memset(ctx->mem_base + ucontext_guest_addr, 0, 0x200);
         // In FreeBSD/Orbis x86_64 ucontext_t:
@@ -523,10 +547,15 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     ctx->rip = handler;
 
     // Execute the guest exception handler (which signals SuspendSemaphore and waits on event flag)
+    *slot = (uint64_t)(uintptr_t)ctx;
     recomp_dispatch(ctx, handler);
+    *slot = saved_slot;
 
-    // Restore guest registers exactly as before signal interruption
-    *ctx = saved_ctx;
+    // Restore ctx exactly as before the signal. Not saved_ctx: in guest code its GPRs are the
+    // live registers, which may not hold what the code wrote to ctx just before (a helper's
+    // rcx result the lifted code has not loaded yet); the live registers come back by
+    // sigreturn anyway.
+    *ctx = orig_ctx;
 }
 
 int32_t sceKernelInstallExceptionHandler(int32_t signum, uint64_t handler) {
@@ -583,11 +612,16 @@ int32_t sceKernelRaiseException(uint64_t thread, int32_t signum) {
     if (t->finished || !t->host_thread) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    if (pthread_equal(t->host_thread, pthread_self())) {
+    // The host thread that executes the guest thread now (a fiber's own host thread in fiber
+    // thread mode).
+    pthread_t target = t->host_thread;
+    pthread_t fiber_host;
+    if (t->ctx && ps4_fiber_endpoint_host_thread(t->ctx, &fiber_host)) target = fiber_host;
+    if (pthread_equal(target, pthread_self())) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    int rc = pthread_kill(t->host_thread, SIGUSR1);
+    int rc = pthread_kill(target, SIGUSR1);
     if (rc != 0) {
         if (rc == ESRCH) return ORBIS_KERNEL_ERROR_ESRCH;
         if (rc == EINVAL) return ORBIS_KERNEL_ERROR_EINVAL;

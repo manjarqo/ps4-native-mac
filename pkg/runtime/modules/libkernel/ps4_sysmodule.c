@@ -208,6 +208,18 @@ void recomp_module_register_unwind_info(const RecompModuleUnwindInfo *info) {
     pthread_mutex_unlock(&g_sysmodule_mutex);
 }
 
+bool recomp_module_text_contains(uint64_t addr) {
+    const int n = __atomic_load_n(&g_unwind_modules_count, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        const RecompModuleUnwindInfo *m = &g_unwind_modules[i];
+        for (uint32_t k = 0; k < m->num_segments && k < 4; k++) {
+            const RecompModuleSegment *seg = &m->segments[k];
+            if ((seg->prot & 1) && addr >= seg->addr && addr - seg->addr < seg->size) return true; // PF_X
+        }
+    }
+    return false;
+}
+
 const RecompModuleUnwindInfo *recomp_module_find_by_addr(uint64_t addr) {
     pthread_mutex_lock(&g_sysmodule_mutex);
     const RecompModuleUnwindInfo *best = NULL;

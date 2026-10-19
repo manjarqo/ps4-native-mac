@@ -617,9 +617,16 @@ static inline void recomp_call_guest(GuestContext *ctx, uint64_t target) {
 #define RECOMP_POP_UNWIND() do { if (__cur_unwind_frame) ctx->unwind_frame = __cur_unwind_frame->prev; } while (0)
 void recomp_unwind_to(GuestContext *ctx, uint64_t target_ip);
 
-// SIMD helpers
+// SIMD helpers. Recompiled code calls recomp_vpcmpistri, recomp_vpcmpe_stri and
+// recomp_vaeskeygenassist in the middle of a guest instruction; those entry points are
+// assembly (trampoline_arm64.s) that keep every vector register and the flags and call the C
+// implementations below. recomp_vpcmpistri/recomp_vpcmpe_stri have the C signature of their
+// implementation; recomp_vaeskeygenassist takes the source in v0 and the round constant in
+// w0 and returns in v0, as the lifter calls it.
 void recomp_vpcmpistri(GuestContext *ctx, const void *src2_ptr, const void *src1_ptr, uint8_t imm8);
 void recomp_vpcmpe_stri(GuestContext *ctx, const void *src2_ptr, const void *src1_ptr, uint8_t imm8);
+void recomp_vpcmpistri_impl(GuestContext *ctx, const void *src2_ptr, const void *src1_ptr, uint8_t imm8);
+void recomp_vpcmpe_stri_impl(GuestContext *ctx, const void *src2_ptr, const void *src1_ptr, uint8_t imm8);
 
 // AES-NI and PCLMULQDQ helpers
 xmm_reg_t recomp_pclmulqdq(uint64_t a, uint64_t b);
@@ -628,7 +635,7 @@ xmm_reg_t recomp_vaesenclast(xmm_reg_t s1, xmm_reg_t s2);
 xmm_reg_t recomp_vaesdec(xmm_reg_t s1, xmm_reg_t s2);
 xmm_reg_t recomp_vaesdeclast(xmm_reg_t s1, xmm_reg_t s2);
 xmm_reg_t recomp_vaesimc(xmm_reg_t s);
-xmm_reg_t recomp_vaeskeygenassist(xmm_reg_t s, uint8_t rcon);
+xmm_reg_t recomp_vaeskeygenassist_impl(xmm_reg_t s, uint8_t rcon);
 
 // CRC32 helpers (Castagnoli 0x1EDC6F41 polynomial)
 static inline uint32_t recomp_crc32_u8(uint32_t crc, uint8_t val) {
