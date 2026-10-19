@@ -32,6 +32,7 @@ var boundaryStubs = [][2]string{
 	{"_stub_test_record_ctx", "shim_test_record_ctx"},
 	{"_stub_test_rip", "shim_test_rip"},
 	{"_stub_longjmp", "shim_guest_nonlocal_jump"},
+	{"_stub_test_check_uc", "shim_test_check_uc"},
 }
 
 // boundaryOutputChecks are further strings a case's output must contain exactly once.
@@ -102,7 +103,32 @@ func writeLiftedHelperFns(t *testing.T, path string) {
 		b.WriteString("    add x16, x16, #512\n    stp x21, x0, [x16]\n")
 		b.WriteString("    ldr x16, [x28, x26]\n    add x26, x26, #8\n    ldr x30, [sp], #16\n    ret\n\n")
 	}
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+	fns := b.String()
+	// _guest_helper_loop: rbx, rbp, r12-r15 = 0xf001, 0xf002, 0xf00c-0xf00f, then the lifted
+	// vpcmpistri xmm2, xmm3, 0x38 in a loop until the guest word at 0x1000800 is set
+	// (harness.c test_signal_in_helper raises exceptions meanwhile).
+	inst, err := x86asm.Decode(liftedHelperFns[0].code, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines, err := lifter.NewArm64Lifter(nil).LiftInstructionToBuf(disasm.Instruction{Address: 0x500200, Inst: inst},
+		0x500206, &disasm.Function{EntryAddr: 0x500200}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Reset()
+	b.WriteString(guestTextSection + "\n.p2align 2\n\n.globl _guest_helper_loop\n_guest_helper_loop:\n    str x30, [sp, #-16]!\n")
+	for r, v := range map[int]int{20: 0xf001, 25: 0xf002, 12: 0xf00c, 13: 0xf00d, 14: 0xf00e, 15: 0xf00f} {
+		fmt.Fprintf(&b, "    movz x%d, #0x%x\n", r, v)
+	}
+	fmt.Fprintf(&b, "Lhelper_loop:\n%s\n", strings.Join(lines, "\n"))
+	li("x16", 0x1000800)
+	b.WriteString("    ldr x0, [x28, x16]\n    cbz x0, Lhelper_loop\n")
+	b.WriteString("    ldr x16, [x28, x26]\n    add x26, x26, #8\n    ldr x30, [sp], #16\n    ret\n")
+	if err := os.WriteFile(strings.TrimSuffix(path, ".s")+"_loop.s", []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(fns), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -148,7 +174,7 @@ func buildBoundaryHarness(t *testing.T) string {
 	writeLiftedHelperFns(t, lifted)
 	td, _ := filepath.Abs("testdata/boundary")
 	args = append(args, filepath.Join(td, "harness.c"), filepath.Join(td, "stubs.c"), filepath.Join(td, "guest.s"),
-		tramp, stubPath, lifted)
+		tramp, stubPath, lifted, strings.TrimSuffix(lifted, ".s")+"_loop.s")
 	for _, s := range boundaryRuntimeSources {
 		args = append(args, filepath.Join(rt, s))
 	}
@@ -182,6 +208,7 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"stall-profile-in-guest-code", "profile", []string{"PS4_STALL_PROFILE=20"}, false},
 		{"crash-in-guest-code", "crash", nil, true},
 		{"guest-longjmp-stops", "longjmp", nil, true},
+		{"exception-in-helper", "signal-in-helper", nil, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

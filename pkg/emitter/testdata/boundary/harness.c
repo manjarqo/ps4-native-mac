@@ -75,6 +75,15 @@ void guest_spin(void);
 #define SPIN_FLAG (D + 0x600)
 #define SPIN_HANDLE (D + 0x608)
 void guest_crash(void);
+void guest_helper_loop(void);
+void guest_uc_check(void);
+void guest_exc_fiber_main(void);
+void guest_exc_fiber_a(void);
+#define ADDR_HELPER_LOOP 0x500200ULL
+#define ADDR_UC_CHECK 0x401000ULL
+#define ADDR_EXC_FIBER_MAIN 0x401100ULL
+#define ADDR_EXC_FIBER_A 0x401200ULL
+#define HELPER_LOOP_FLAG 0x1000800ULL
 void guest_longjmp(void);
 #define ADDR_LONGJMP 0x400f00ULL
 #define ADDR_CRASH 0x400e00ULL
@@ -490,6 +499,77 @@ static void test_profile(void) {
   call_shim(t, shim_pthread_join, *gmem64(SPIN_HANDLE), 0, 0, 0, 0, 0, 0);
 }
 
+// Exceptions raised while guest code runs a helper call (the lifted vpcmpistri loop): every
+// handler invocation must see the live guest registers in its ucontext, with the ucontext
+// below the red zone of the live guest stack.
+static _Atomic int g_uc_seen, g_uc_bad;
+static uint64_t g_uc_rsp;
+
+void shim_test_check_uc(GuestContext *ctx) {
+  const uint64_t uc = ctx->rsi;
+  static const struct {
+    uint32_t off;
+    uint64_t want;
+  } regs[] = {{0x80, 0xf001}, {0x88, 0xf002}, {0xa0, 0xf00c}, {0xa8, 0xf00d}, {0xb0, 0xf00e}, {0xb8, 0xf00f}};
+  int bad = 0;
+  for (unsigned i = 0; i < sizeof regs / sizeof regs[0]; i++)
+    if (*gmem64(uc + regs[i].off) != regs[i].want) bad = 1;
+  if (*gmem64(uc + 0xf8) != g_uc_rsp || uc + 0x200 > g_uc_rsp - 128) bad = 1;
+  if (bad && atomic_load(&g_uc_bad) == 0)
+    printf("first bad ucontext: rbx 0x%llx r12 0x%llx rsp 0x%llx (want 0x%llx) at 0x%llx\n",
+           (unsigned long long)*gmem64(uc + 0x80), (unsigned long long)*gmem64(uc + 0xa0),
+           (unsigned long long)*gmem64(uc + 0xf8), (unsigned long long)g_uc_rsp, (unsigned long long)uc);
+  atomic_fetch_add(&g_uc_bad, bad);
+  atomic_fetch_add(&g_uc_seen, 1);
+  SHIM_RETURN();
+}
+
+static void *raise_during_helper_loop(void *arg) {
+  (void)arg;
+  usleep(20 * 1000);
+  for (int i = 0; i < 300; i++) {
+    const int before = atomic_load(&g_uc_seen);
+    if (sceKernelRaiseException(1000, 30) != 0) break;
+    for (int k = 0; k < 2000 && atomic_load(&g_uc_seen) == before; k++) usleep(50);
+  }
+  *gmem64(HELPER_LOOP_FLAG) = 1;
+  return NULL;
+}
+
+static void test_signal_in_helper(void) {
+  expect("sceKernelInstallExceptionHandler", (uint64_t)(int64_t)sceKernelInstallExceptionHandler(30, ADDR_UC_CHECK), 0);
+  g_uc_rsp = g_proc->rsp - 8; // the return address recomp_call_guest pushes
+  pthread_t th;
+  pthread_create(&th, NULL, raise_during_helper_loop, NULL);
+  recomp_call_guest(g_proc, ADDR_HELPER_LOOP);
+  pthread_join(th, NULL);
+  if (atomic_load(&g_uc_seen) < 100) fail("only %d exceptions handled", atomic_load(&g_uc_seen));
+  if (atomic_load(&g_uc_bad))
+    fail("%d of %d handler invocations saw a stale interrupted state", atomic_load(&g_uc_bad), atomic_load(&g_uc_seen));
+}
+
+// An exception raised on a guest thread while it runs a fiber that waits in a shim: the
+// handler interrupts the fiber (in fiber thread mode on the fiber's own host thread), sees the
+// fiber's registers, and the fiber, the thread and the TCB slot are unchanged afterwards.
+static void test_exception_fiber(void) {
+  GuestContext *t1 = g_proc;
+  strcpy((char *)g_proc->mem_base + NAME_A, "A");
+  expect("init A", call_shim(t1, shim_sceFiberInitializeImpl, FIBER_A, NAME_A, ADDR_EXC_FIBER_A, 0, STACK_A,
+                             FIBER_STACK_SIZE, 0), 0);
+  expect("sceKernelInstallExceptionHandler", (uint64_t)(int64_t)sceKernelInstallExceptionHandler(30, ADDR_EXC_HANDLER), 0);
+  pthread_t th;
+  pthread_create(&th, NULL, raise_exception_in_wait, NULL);
+  recomp_call_guest(t1, ADDR_EXC_FIBER_MAIN);
+  pthread_join(th, NULL);
+  expect("handler signum", res(RES_EXC_HANDLER)[W_RDI], 30);
+  const uint64_t uc = res(RES_EXC_HANDLER)[W_RSI];
+  expect("ucontext r12 (the fiber's)", *gmem64(uc + 0xa0), 0xe50c);
+  expect("ucontext rbx (the fiber's)", *gmem64(uc + 0x80), 0xe501);
+  check_pattern("fiber after the shim the handler interrupted", RES_A1, 0xe500, res(RES_A_PRE)[W_RSP], t1->fs_base);
+  check_pattern("thread after Run", RES_M1, 0x1500, res(RES_M1_PRE)[W_RSP], t1->fs_base);
+  expect("TCB slot", tcb_slot(t1), (uint64_t)(uintptr_t)t1);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -512,6 +592,10 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_RIP, (recomp_fn_t)guest_rip);
   recomp_register_fn(ADDR_SPIN, (recomp_fn_t)guest_spin);
   recomp_register_fn(ADDR_CRASH, (recomp_fn_t)guest_crash);
+  recomp_register_fn(ADDR_HELPER_LOOP, (recomp_fn_t)guest_helper_loop);
+  recomp_register_fn(ADDR_UC_CHECK, (recomp_fn_t)guest_uc_check);
+  recomp_register_fn(ADDR_EXC_FIBER_MAIN, (recomp_fn_t)guest_exc_fiber_main);
+  recomp_register_fn(ADDR_EXC_FIBER_A, (recomp_fn_t)guest_exc_fiber_a);
   recomp_register_fn(ADDR_LONGJMP, (recomp_fn_t)guest_longjmp);
   recomp_register_fn(ADDR_THREAD_MAIN, (recomp_fn_t)guest_thread_main);
   recomp_register_fn(ADDR_THREAD_ENTRY, (recomp_fn_t)guest_thread_entry);
@@ -539,6 +623,10 @@ int main(int argc, char **argv) {
     test_rip();
   } else if (strcmp(c, "profile") == 0) {
     test_profile();
+  } else if (strcmp(c, "signal-in-helper") == 0) {
+    test_signal_in_helper();
+  } else if (strcmp(c, "exception-fiber") == 0) {
+    test_exception_fiber();
   } else if (strcmp(c, "longjmp") == 0) {
     // shim_guest_nonlocal_jump reports and aborts; boundary_test.go checks the report.
     recomp_call_guest(g_proc, ADDR_LONGJMP);

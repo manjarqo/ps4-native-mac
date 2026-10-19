@@ -490,8 +490,8 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
         return;
     }
 
-    // Allocate Orbis ucontext structure on the guest stack
-    uint64_t ucontext_guest_addr = (saved_ctx.rsp - 0x200ULL) & ~0xfULL;
+    // Allocate Orbis ucontext structure on the guest stack, below the 128-byte red zone
+    uint64_t ucontext_guest_addr = (saved_ctx.rsp - 128ULL - 0x200ULL) & ~0xfULL;
     if (ucontext_guest_addr + 0x200ULL <= ctx->mem_size) {
         memset(ctx->mem_base + ucontext_guest_addr, 0, 0x200);
         // In FreeBSD/Orbis x86_64 ucontext_t:

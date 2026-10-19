@@ -33,6 +33,25 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
     ldp  q6, q7, [\c, #0x100]
 .endm
 
+// Code with the guest registers live goes to __recomp_guest, host code to __text: a signal
+// handler tells them apart by PC (recomp_pc_in_guest_code). Every instruction in __recomp_guest
+// runs with the pinned registers holding the guest state; everywhere else ctx holds it (or the
+// live registers equal ctx).
+.macro GUEST_SECTION
+.section __TEXT,__recomp_guest,regular,pure_instructions
+.p2align 2
+.endm
+.macro HOST_SECTION
+.text
+.p2align 2
+.endm
+
+// Points x30 at label \l (in another section than the caller).
+.macro RETURN_TO l
+    adrp x30, \l@PAGE
+    add  x30, x30, \l@PAGEOFF
+.endm
+
 // Loads the 16 guest GPRs from the GuestContext at \c.
 .macro LOAD_GPRS c
     ldp  x19, x21, [\c, #0x00]
@@ -136,11 +155,20 @@ _recomp_enter_guest:
     ldr  x27, [x0, #0x88]        // fs_base
     ldr  x28, [x0, #0x330]       // mem_base
 
-    blr  x1
+    // The guest function returns to Lenter_guest_ret (guest section: its registers are live
+    // there until they are stored).
+    RETURN_TO Lenter_guest_ret
+    br   x1
 
+GUEST_SECTION
+Lenter_guest_ret:
     ldr  x0, [sp, #160]
     SAVE_GPRS x0
     SAVE_XMM0_7 x0
+    b    Lenter_guest_tail
+
+HOST_SECTION
+Lenter_guest_tail:
     ldr  x2, [sp, #168]          // host FPCR
     mrs  x3, fpcr
     cmp  x2, x3
@@ -163,6 +191,8 @@ _recomp_enter_guest:
 // x0 = shim, x1 = guest address of the shimmed function (stored to ctx->rip).
 // Frame: [sp] x29, x30; [sp+16] shim, ctx; [sp+32] guest FPCR. The frame record makes host
 // backtraces from inside a shim reach the guest function that called it (x30).
+// The entry, up to the stores of the guest registers, is in the guest section.
+GUEST_SECTION
 .globl _recomp_call_shim
 _recomp_call_shim:
     stp  x29, x30, [sp, #-48]!
@@ -173,6 +203,10 @@ _recomp_call_shim:
     str  x1, [x2, #0x80]         // rip
     SAVE_GPRS x2
     SAVE_XMM0_7 x2
+    b    Lcall_shim_host
+
+HOST_SECTION
+Lcall_shim_host:
     mrs  x3, fpcr                // host code runs with the default FPCR
     str  x3, [sp, #32]
     cbz  x3, 1f
@@ -187,9 +221,7 @@ _recomp_call_shim:
     // TCB slot, and x27 may name another guest thread's TCB by now.
     ldr  x1, [sp, #24]
     ldr  x2, [sp, #32]           // guest FPCR of this call (the frame is the caller's)
-    mrs  x3, fpcr
-    cmp  x2, x3
-    b.eq 2f
+    cbz  x2, 2f                  // host code leaves FPCR at 0
     msr  fpcr, x2
 2:
     LOAD_GPRS x1
@@ -202,8 +234,26 @@ _recomp_call_shim:
 // ---- Helpers called in the middle of a guest instruction ----------------------------
 // The lifter calls these with bl and keeps x8-x15 itself; every other guest register the
 // instruction does not write must survive, but C code clobbers v0-v7, v16-v31, the upper
-// halves of v8-v15 and NZCV. These entry points keep all 32 vector registers (and NZCV) and
-// call the C implementations.
+// halves of v8-v15 and NZCV. These entry points keep all 32 vector registers (and
+// _recomp_vaeskeygenassist NZCV, which the lifter does not set after it). Their guest-section
+// part stores the GPRs to ctx (the TCB slot), so ctx holds the guest registers while the C
+// implementation runs; the host part reloads r8-r15 before returning, so every GPR is live
+// again when execution is back in guest code.
+
+// ctx (the TCB slot) into x16, then the 16 GPRs to it.
+.macro HELPER_SAVE_GPRS
+    add  x16, x27, #0x70
+    ldr  x16, [x28, x16]
+    SAVE_GPRS x16
+.endm
+.macro HELPER_LOAD_R8_R15
+    add  x16, x27, #0x70
+    ldr  x16, [x28, x16]
+    ldp  x8,  x9,  [x16, #0x40]
+    ldp  x10, x11, [x16, #0x50]
+    ldp  x12, x13, [x16, #0x60]
+    ldp  x14, x15, [x16, #0x70]
+.endm
 
 .macro SAVE_Q0_31
     sub  sp, sp, #512
@@ -246,35 +296,51 @@ _recomp_call_shim:
 
 // (V)PCMPISTRI / (V)PCMPESTRI: C signature (ctx, src2, src1, imm8); results in ctx (rcx,
 // flags), which the lifter reads back.
+GUEST_SECTION
 .globl _recomp_vpcmpistri
 _recomp_vpcmpistri:
     stp  x29, x30, [sp, #-16]!
     mov  x29, sp
-    SAVE_Q0_31
-    bl   _recomp_vpcmpistri_impl
-    LOAD_Q0_31
-    ldp  x29, x30, [sp], #16
-    ret
-
+    HELPER_SAVE_GPRS
+    b    Lvpcmpistri_host
 .globl _recomp_vpcmpe_stri
 _recomp_vpcmpe_stri:
     stp  x29, x30, [sp, #-16]!
     mov  x29, sp
+    HELPER_SAVE_GPRS
+    b    Lvpcmpe_stri_host
+
+HOST_SECTION
+Lvpcmpistri_host:
+    SAVE_Q0_31
+    bl   _recomp_vpcmpistri_impl
+    LOAD_Q0_31
+    HELPER_LOAD_R8_R15
+    ldp  x29, x30, [sp], #16
+    ret
+Lvpcmpe_stri_host:
     SAVE_Q0_31
     bl   _recomp_vpcmpe_stri_impl
     LOAD_Q0_31
+    HELPER_LOAD_R8_R15
     ldp  x29, x30, [sp], #16
     ret
 
 // (V)AESKEYGENASSIST as the lifter calls it: v0 = source, w0 = round constant; result in v0.
 // recomp_vaeskeygenassist_impl(xmm_reg_t s, uint8_t rcon) takes s in x0:x1 and rcon in w2
 // and returns in x0:x1 (AAPCS64, a 16-byte non-HFA union).
+GUEST_SECTION
 .globl _recomp_vaeskeygenassist
 _recomp_vaeskeygenassist:
     stp  x29, x30, [sp, #-32]!
     mov  x29, sp
     mrs  x16, nzcv
     str  x16, [sp, #16]
+    HELPER_SAVE_GPRS
+    b    Lvaeskeygenassist_host
+
+HOST_SECTION
+Lvaeskeygenassist_host:
     SAVE_Q0_31
     and  w2, w0, #0xff
     fmov x0, d0
@@ -283,6 +349,7 @@ _recomp_vaeskeygenassist:
     LOAD_Q0_31
     fmov d0, x0
     mov  v0.d[1], x1
+    HELPER_LOAD_R8_R15
     ldr  x16, [sp, #16]
     msr  nzcv, x16
     ldp  x29, x30, [sp], #32
@@ -332,8 +399,7 @@ _recomp_vaeskeygenassist:
 .endm
 
 // The indirect-branch entry points run with the guest registers live: guest code section.
-.section __TEXT,__recomp_guest,regular,pure_instructions
-.p2align 2
+GUEST_SECTION
 
 // _recomp_indirect_call: calls a guest function via dispatch. x0 = guest target RIP.
 .globl _recomp_indirect_call

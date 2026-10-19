@@ -341,6 +341,35 @@ GUEST_FN _guest_crash
     ldr  x0, [x28, x16]
     GUEST_RET
 
+// ---- Exception handler that checks the interrupted state (shim_test_check_uc).
+
+// void handler(int signum, void *ucontext)
+GUEST_FN _guest_uc_check
+    GUEST_CALL _stub_test_check_uc
+    GUEST_RET
+
+// ---- Exceptions while a fiber runs: thread 1 runs fiber A, which waits in a shim.
+
+GUEST_FN _guest_exc_fiber_main
+    SET_PATTERN 0x1500
+    STORE_REGS RES_M1_PRE
+    LI   x24, FIBER_A
+    movz x23, #0
+    LI   x22, ARGRET1
+    GUEST_CALL _stub_sceFiberRun
+    STORE_REGS RES_M1
+    GUEST_RET
+
+GUEST_FN _guest_exc_fiber_a
+    SET_PATTERN 0xe500
+    STORE_REGS RES_A_PRE
+    GUEST_CALL _stub_test_wait_signal
+    STORE_REGS RES_A1
+    movz x24, #0
+    movz x23, #0
+    GUEST_CALL _stub_sceFiberReturnToThread
+    brk  #3
+
 // ---- longjmp(env, 1) from guest code.
 
 GUEST_FN _guest_longjmp
