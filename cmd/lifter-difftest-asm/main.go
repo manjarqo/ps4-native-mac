@@ -698,7 +698,7 @@ func main() {
 			}
 		}
 		key := inst.Op.String() + " " + strings.Join(sig, ",") + alias
-		if lockPrefixed(inst) {
+		if lifter.HasLockPrefix(inst) {
 			key = "LOCK " + key // sampled apart from the plain form: a different lowering
 		}
 		if force && seen[key] {
@@ -1175,23 +1175,6 @@ func vexAliasVariants(b []byte) [][]byte {
 	w[vb] = (w[vb] &^ 0x78) | byte((^reg&0xf)<<3)
 	out = append(out, w)
 	return out
-}
-
-// lockPrefixed reports an F0 LOCK prefix. x86asm records the second byte of a VEX prefix in the
-// prefix list too, so VEX instructions never count.
-func lockPrefixed(inst x86asm.Inst) bool {
-	for _, p := range inst.Prefix {
-		if p == 0 {
-			break
-		}
-		if p.IsVEX() || p.IsEVEX() {
-			return false
-		}
-		if p&0xFF == x86asm.PrefixLOCK {
-			return true
-		}
-	}
-	return false
 }
 
 // synthLockAddr is the (fake) address of the synthesized LOCK forms, outside any guest image.

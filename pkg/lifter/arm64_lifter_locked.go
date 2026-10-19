@@ -24,9 +24,9 @@ import (
 // recomputed from the old value the atomic returns, with the same rules (operand top-alignment
 // for 8/16-bit, carry sense) as the non-atomic lowerings.
 
-// hasLockPrefix reports whether the instruction carries an F0 LOCK prefix. x86asm records the
+// HasLockPrefix reports whether the instruction carries an F0 LOCK prefix. x86asm records the
 // second byte of a VEX prefix in the prefix list as well, so VEX instructions never count.
-func hasLockPrefix(inst x86asm.Inst) bool {
+func HasLockPrefix(inst x86asm.Inst) bool {
 	for _, p := range inst.Prefix {
 		if p == 0 {
 			break

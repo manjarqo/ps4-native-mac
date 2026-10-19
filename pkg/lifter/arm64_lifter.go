@@ -885,7 +885,7 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		return lines, nil
 	}
 
-	if hasLockPrefix(inst.Inst) {
+	if HasLockPrefix(inst.Inst) {
 		if out, ok := l.liftLocked(inst, nextPC, lines); ok {
 			return out, nil
 		}
