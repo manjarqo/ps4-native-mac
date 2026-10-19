@@ -577,6 +577,34 @@ struct GuestBufMru {
 };
 GuestBufMru g_guest_buf_mru[4];
 
+// PS4_GNM_LOG_GUEST_WINDOWS=1: print the guest-memory windows wrapped in Metal buffers each
+// time their total has changed by 128 MiB since the last line (grown, or shrunk by dropped
+// windows). "sum" counts every buffer's length (buffers spanning several windows overlap),
+// "distinct" the guest memory they cover. Diagnostics for memory pressure: windows are only
+// released when the kernel layer remaps their pages.
+void LogGuestWindows(const char* why) {
+    static const bool on = [] {
+        const char* e = getenv("PS4_GNM_LOG_GUEST_WINDOWS");
+        return e && e[0] == '1';
+    }();
+    if (!on || !S.ctx) return;
+    static uint64_t logged_sum;
+    uint64_t sum = 0;
+    std::vector<bool> covered(S.ctx->mem_size / kWindow + 1);
+    for (auto& kv : S.guest_bufs) {
+        const uint64_t first = (kv.first & ((1ull << 48) - 1)) / kWindow, n = kv.first >> 48;
+        sum += n * kWindow;
+        for (uint64_t w = first; w < first + n && w < covered.size(); w++) covered[w] = true;
+    }
+    uint64_t distinct = 0;
+    for (bool c : covered) distinct += c ? kWindow : 0;
+    const uint64_t step = 128ull << 20;
+    if (sum < logged_sum + step && sum + step > logged_sum) return;
+    logged_sum = sum;
+    printf("[gnm] guest windows (%s): %zu buffers, sum %llu MiB, distinct %llu MiB\n", why,
+           S.guest_bufs.size(), (unsigned long long)(sum >> 20), (unsigned long long)(distinct >> 20));
+}
+
 void DropRemappedWindows() {
     const uint64_t mb_t0 = ps4_hitch_now_ns();
     std::vector<std::pair<uint64_t, uint64_t>> ranges;
@@ -596,6 +624,7 @@ void DropRemappedWindows() {
     }
     for (auto& m : g_guest_buf_mru) m = GuestBufMru{};
     ps4_hitch_add_ns(PS4_HITCH_MTLBUF, ps4_hitch_now_ns() - mb_t0);
+    if (!ranges.empty()) LogGuestWindows("drop");
 }
 
 // `out` is a strong pointer: an (implicitly autoreleasing) plain one would retain and autorelease
@@ -639,6 +668,7 @@ bool GuestBuffer(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint
             return false;
         }
         S.guest_bufs[key] = b;
+        LogGuestWindows("grow");
     }
     mru.key = key;
     mru.buf = b;
