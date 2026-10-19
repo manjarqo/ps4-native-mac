@@ -865,25 +865,27 @@ void shim_sceKernelGetModuleInfoInternal(GuestContext *ctx) {
         ctx->rax = (uint64_t)(int64_t)0x8002000e; // ORBIS_KERNEL_ERROR_EFAULT
         SHIM_RETURN();
     }
-    const RecompModuleUnwindInfo *mod = recomp_module_find_by_handle(handle);
-    if (!mod) {
+    RecompModuleSnapshot snap;
+    if (recomp_module_info_by_handle(handle, &snap) != 0) {
         ctx->rax = (uint64_t)(int64_t)0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
         SHIM_RETURN();
     }
     OrbisKernelModuleInfoEx *info = (OrbisKernelModuleInfoEx *)(ctx->mem_base + info_addr);
     memset(info, 0, sizeof(*info));
     info->st_size = sizeof(OrbisKernelModuleInfoEx);
-    if (mod->name) {
-        snprintf(info->name, sizeof(info->name), "%s", mod->name);
-    } else {
-        snprintf(info->name, sizeof(info->name), "eboot.bin");
-    }
+    snprintf(info->name, sizeof(info->name), "%s", snap.name);
     info->id = handle;
-    info->eh_frame_hdr_addr = mod->eh_frame_hdr_addr;
-    info->eh_frame_hdr_size = (uint32_t)mod->eh_frame_hdr_size;
-    info->eh_frame_addr = mod->eh_frame_addr;
-    info->eh_frame_size = (uint32_t)mod->eh_frame_size;
-    populate_segments(mod, info->segments, &info->segment_count);
+    info->eh_frame_hdr_addr = snap.eh_frame_hdr_addr;
+    info->eh_frame_hdr_size = (uint32_t)snap.eh_frame_hdr_size;
+    info->eh_frame_addr = snap.eh_frame_addr;
+    info->eh_frame_size = (uint32_t)snap.eh_frame_size;
+    RecompModuleSegment segs[4];
+    info->segment_count = recomp_module_snapshot_segments(&snap, segs);
+    for (uint32_t i = 0; i < info->segment_count; i++) {
+        info->segments[i].address = segs[i].addr;
+        info->segments[i].size = (uint32_t)segs[i].size;
+        info->segments[i].prot = segs[i].prot;
+    }
     ctx->rax = 0;
     SHIM_RETURN();
 }
