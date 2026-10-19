@@ -245,3 +245,25 @@ func TestRegressYmmUpperHalves(t *testing.T) {
 		}
 	}
 }
+
+// SSE/AVX semantics: MAX/MIN return the second operand for NaN and signed zeros (ARM FMAX/FMIN
+// do not), float->int conversions return 0x80000000 for NaN and out-of-range values, RCPPS needs
+// a refinement step for x86 precision, and legacy scalar operations keep the rest of the
+// destination register (writing an ARM S/D register clears it).
+func TestRegressVectorSemantics(t *testing.T) {
+	l := liftBlock(t, "c4c1505ff1") // vmaxps xmm6, xmm5, xmm9
+	requireInOrder(t, "vmaxps", l[0], "fcmgt v29.4s, v5.4s, v9.4s", "bsl v29.16b, v5.16b, v9.16b", "mov v6.16b, v29.16b")
+	forbid(t, "vmaxps", l[0], "fmax ...")
+
+	l = liftBlock(t, "c5fa2cd0") // vcvttss2si edx, xmm0
+	requireInOrder(t, "vcvttss2si", l[0], "fcvtzs w22, s0", "fcmeq s30, s0, s0", "and w2, w2, #0x80000000", "orr w22, w22, w2")
+
+	l = liftBlock(t, "c5f8538de0feffff") // vrcpps xmm1, [rbp-0x120]
+	requireInOrder(t, "vrcpps", l[0], "frecpe v27.4s, v24.4s", "frecps v26.4s, v24.4s, v27.4s", "fmul v27.4s, v27.4s, v26.4s")
+
+	l = liftBlock(t, "f30f58c1") // addss xmm0, xmm1
+	requireInOrder(t, "addss", l[0], "fadd s31, s0, s1", "mov v0.s[0], v31.s[0]")
+
+	l = liftBlock(t, "f30f5ac1") // cvtss2sd xmm0, xmm1
+	requireInOrder(t, "cvtss2sd", l[0], "fcvt d30, s1", "mov v0.d[0], v30.d[0]")
+}

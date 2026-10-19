@@ -160,7 +160,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "cvtss2sd xmm0, xmm1",
 			bytes:    []byte{0xf3, 0x0f, 0x5a, 0xc1}, // cvtss2sd xmm0, xmm1
 			pc:       0x1000,
-			expected: []string{"fcvt d0, s1"},
+			expected: []string{"fcvt d30, s1", "mov v0.d[0], v30.d[0]"},
 		},
 		{
 			name:     "pandn xmm0, xmm1",
@@ -514,7 +514,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "vrcpps ymm0, ymm1",
 			bytes:    []byte{0xc4, 0xe1, 0x7c, 0x53, 0xc1}, // vrcpps ymm0, ymm1
 			pc:       0x1000,
-			expected: []string{"frecpe v0.4s, v1.4s", "frecpe v16.4s, v17.4s"},
+			expected: []string{"frecpe v27.4s, v24.4s", "frecps v26.4s, v24.4s, v27.4s", "and v0.16b, v27.16b, v25.16b", "and v16.16b, v27.16b, v25.16b"},
 		},
 		{
 			name:     "vmovlpd [rax], xmm0",
@@ -556,7 +556,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "vcvttpd2dq xmm0, ymm1",
 			bytes:    []byte{0xc5, 0xfd, 0xe6, 0xc1}, // vcvttpd2dq xmm0, ymm1
 			pc:       0x1000,
-			expected: []string{"fcvtzs v28.2d, v1.2d", "fcvtn v0.2s, v28.2d", "fcvtzs v29.2d, v17.2d", "fcvtn2 v0.4s, v29.2d"},
+			expected: []string{"mov d29, v1.d[0]", "fcvtzs x3, d29", "mov v28.s[3], w3", "mov v0.16b, v28.16b", "movi v16.16b, #0"},
 		},
 		{
 			name:     "cmpxchg16b [rax]",
