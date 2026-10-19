@@ -30,6 +30,10 @@ for n in 1 2 3; do
 done
 echo "log_abort_test: PASS"
 G="$R/pkg/runtime/modules/libSceGnmDriver"
+# GPU windows over guest memory work with the guest NULL page guard on.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
+  -framework Foundation -o "$T/guest_window_test"
+"$T/guest_window_test"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"

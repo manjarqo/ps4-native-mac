@@ -3,6 +3,7 @@
 #include "ps4_vfs.h"
 #include "ps4_log.h"
 
+#include <errno.h>
 #include <signal.h>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -554,8 +555,18 @@ GuestContext *recomp_init_runtime_file(const char *image_filename,
   }
   fclose(fp);
 
-  // Guard guest NULL page (0x0 .. 0x10000) against invalid reads/writes
-  mprotect(ctx->mem_base, 0x10000, PROT_NONE);
+  // PS4_NULL_GUARD=1 makes guest [0, 0x10000) inaccessible, so NULL dereferences fault.
+  // Off by default: the C build read zeros there and the acceptance bar is "no worse than
+  // the C build"; the eboot's first segment also starts at guest address 0 in some games.
+  // GPU windows never cover this range (ps4_gnm_guest_window.h), so Metal works either way.
+  const char *null_guard = getenv("PS4_NULL_GUARD");
+  if (null_guard && null_guard[0] == '1') {
+    if (mprotect(ctx->mem_base, 0x10000, PROT_NONE) == 0) {
+      fprintf(stderr, "[ps4-recomp] PS4_NULL_GUARD: guest [0, 0x10000) is PROT_NONE\n");
+    } else {
+      fprintf(stderr, "[ps4-recomp] PS4_NULL_GUARD: mprotect failed: %s\n", strerror(errno));
+    }
+  }
 
   start_watch(ctx);
   return ctx;

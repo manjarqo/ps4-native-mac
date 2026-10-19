@@ -53,6 +53,7 @@ extern "C" const char* ps4_vfs_get_app_root(void);
 
 #include "gcn_recompiler.h"
 #include "ps4_gnm_draw.h"
+#include "ps4_gnm_guest_window.h"
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_shader_cache.h"
 #include "ps4_gnm_pipeline_archive.h"
@@ -559,9 +560,10 @@ bool ReadGuest(void* c, uint64_t addr, void* dst, uint64_t size) {
 // Guest memory as MTLBuffers (UMA, zero copy). Guest memory is one 512 GiB anonymous
 // mapping, far larger than a Metal buffer may be, so it is exposed in 64 MiB aligned windows
 // (created lazily with newBufferWithBytesNoCopy). A range crossing windows gets a buffer
-// spanning all windows it touches.
+// spanning all windows it touches. Window 0 starts at PS4_GNM_WINDOW0_BASE, above the guest
+// NULL page area (ps4_gnm_guest_window.h).
 // =====================================================================================
-const uint64_t kWindow = 64ull << 20;
+const uint64_t kWindow = PS4_GNM_WINDOW_SIZE;
 
 // Guest ranges whose host pages were replaced (direct memory remapped/unmapped by the
 // kernel layer). A no-copy MTLBuffer keeps referencing the pages it was created over,
@@ -615,7 +617,7 @@ void DropRemappedWindows() {
     }
     for (auto it = S.guest_bufs.begin(); it != S.guest_bufs.end();) {
         const uint64_t base = it->first & ((1ull << 48) - 1);
-        const uint64_t end = base + (it->first >> 48) * kWindow;
+        const uint64_t end = (base & ~(kWindow - 1)) + (it->first >> 48) * kWindow;
         bool hit = false;
         for (auto& r : ranges)
             if (r.first < end && r.first + r.second > base) { hit = true; break; }
@@ -632,18 +634,14 @@ void DropRemappedWindows() {
 bool GuestBuffer(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint64_t* offset) {
     GuestContext* ctx = S.ctx;
     if (g_remap_pending.load(std::memory_order_acquire)) DropRemappedWindows();
-    if (!ctx || addr == 0 || size == 0 || addr >= ctx->mem_size || size > ctx->mem_size - addr)
-        return false;
-    const uint64_t base = addr & ~(kWindow - 1);
-    uint64_t end = (addr + size + kWindow - 1) & ~(kWindow - 1);
-    if (end > ctx->mem_size) end = ctx->mem_size & ~16383ull;
-    if (end <= addr) return false;
+    if (!ctx) return false;
+    uint64_t base, end, nwin;
+    if (!ps4_gnm_guest_window_range(addr, size, ctx->mem_size, &base, &end, &nwin)) return false;
     if (end - base > (2ull << 30)) {
         RLog("guestbuf-big", "guest buffer range 0x%llx+0x%llx too large", (unsigned long long)addr,
              (unsigned long long)size);
         return false;
     }
-    const uint64_t nwin = (end - base) / kWindow;
     const uint64_t key = base | (nwin << 48);
     GuestBufMru& mru = g_guest_buf_mru[(base / kWindow + nwin) & 3];
     if (mru.key == key) {
