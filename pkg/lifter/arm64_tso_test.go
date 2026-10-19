@@ -111,3 +111,57 @@ func TestCmpxchgWideOnlyZF(t *testing.T) {
 	l := liftBlock(t, "4801d8", "f0480fc70f", "0f92c0") // ...; setb al reads CF of the ADD
 	requireInOrder(t, "setb after cmpxchg16b", l[2], "cset w16, cs")
 }
+
+// x86 TSO: non-stack guest memory accesses are acquire loads and release stores; stack and
+// frame accesses and vector accesses stay plain.
+func TestTsoOrdering(t *testing.T) {
+	cases := []struct {
+		name    string
+		code    []byte
+		want    []string // substrings that must appear
+		wantNot []string // substrings that must not appear
+	}{
+		{"load [rdi] is acquire", []byte{0x8b, 0x07}, []string{"ldapr w19, ["}, nil},                       // mov eax,[rdi]
+		{"store [rdi] is release", []byte{0x89, 0x07}, []string{"stlr w19, ["}, nil},                       // mov [rdi],eax
+		{"64-bit load [rsi+8] is acquire", []byte{0x48, 0x8b, 0x46, 0x08}, []string{"ldapr x19, ["}, nil},  // mov rax,[rsi+8]
+		{"byte store [rdi] is release", []byte{0x88, 0x07}, []string{"stlrb w"}, nil},                      // mov [rdi],al
+		{"word load [rdi] is acquire", []byte{0x66, 0x8b, 0x07}, []string{"ldaprh w"}, nil},                // mov ax,[rdi]
+		{"rmw add [rdi],eax", []byte{0x01, 0x07}, []string{"ldapr w", "stlr w"}, nil},                      // add [rdi],eax
+		{"stack load [rsp+8] stays plain", []byte{0x8b, 0x44, 0x24, 0x08}, nil, []string{"ldapr", "ldar"}}, // mov eax,[rsp+8]
+		{"frame store [rbp-4] stays plain", []byte{0x89, 0x45, 0xfc}, nil, []string{"stlr"}},               // mov [rbp-4],eax
+		{"movups load stays plain", []byte{0x0f, 0x10, 0x07}, nil, []string{"ldapr", "ldar"}},              // movups xmm0,[rdi]
+	}
+	l := NewArm64Lifter(map[uint64]bool{0x1000: true})
+	for _, c := range cases {
+		got := liftOne(t, l, c.code)
+		for _, w := range c.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: want %q in\n%s", c.name, w, got)
+			}
+		}
+		for _, w := range c.wantNot {
+			if strings.Contains(got, w) {
+				t.Errorf("%s: did not want %q in\n%s", c.name, w, got)
+			}
+		}
+	}
+	l.SetTSO(false)
+	if got := liftOne(t, l, []byte{0x8b, 0x07}); strings.Contains(got, "ldapr") {
+		t.Errorf("TSO off: want plain load, got\n%s", got)
+	}
+}
+
+// LDAPR/STLR fault on an access that crosses a 16-byte boundary (also with FEAT_LSE2): 2-8 byte
+// ordered accesses check bit 4 of the first and last byte's address and take the plain access
+// with a fence instead; byte accesses need no check.
+func TestTsoSplitAccess(t *testing.T) {
+	l := liftBlock(t, "8b07") // mov eax, [rdi]
+	requireInOrder(t, "load", l[0], "add x7, x16, #3", "eor x7, x7, x16", "tbz x7, #4, L_tso_ok_...",
+		"ldr w19, [x28, x16]", "dmb ishld", "b L_tso_done_...", "L_tso_ok_...", "add x7, x28, x16", "ldapr w19, [x7]", "L_tso_done_...")
+	l = liftBlock(t, "48893e") // mov [rsi], rdi
+	requireInOrder(t, "store", l[0], "add x7, x16, #7", "eor x7, x7, x16", "tbz x7, #4, L_tso_ok_...",
+		"dmb ish", "str x24, [x28, x16]", "b L_tso_done_...", "L_tso_ok_...", "add x7, x28, x16", "stlr x24, [x7]")
+	l = liftBlock(t, "8807") // mov [rdi], al
+	forbid(t, "byte store", l[0], "tbz ...", "dmb ish")
+	requireInOrder(t, "byte store", l[0], "add x7, x28, x16", "stlrb w19, [x7]")
+}

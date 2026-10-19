@@ -50,6 +50,11 @@ func (l *Arm64Lifter) liftMov(inst disasm.Instruction, nextPC uint64, lines []st
 		// Reg <- Mem
 		if mem, okMem := src.(x86asm.Mem); okMem {
 			descDst, okDst := arm64RegMap[dstReg]
+			if okDst && descDst.Size >= 4 {
+				// 32/64-bit: load straight into the pinned register (a 32-bit load zero-extends,
+				// as an x86 32-bit write does).
+				return append(lines, readMemTo(mem, nextPC, descDst.Size, descDst.X, descDst.W)...), nil
+			}
 			if okDst {
 				lines = append(lines, readMemTo(mem, nextPC, descDst.Size, "x16", "w16")...)
 				storeCode, _ := writeRegFrom(dstReg, "x16", "w16")
@@ -63,6 +68,10 @@ func (l *Arm64Lifter) liftMov(inst disasm.Instruction, nextPC uint64, lines []st
 	if mem, okMem := dst.(x86asm.Mem); okMem {
 		if srcReg, okSrc := src.(x86asm.Reg); okSrc {
 			descSrc, okDesc := arm64RegMap[srcReg]
+			if okDesc && !descSrc.IsHigh8 {
+				// Store straight from the pinned register (STRB/STRH store its low bits).
+				return append(lines, writeMemFrom(mem, nextPC, descSrc.Size, descSrc.X, descSrc.W)...), nil
+			}
 			if okDesc {
 				loadCode, _ := readRegTo(srcReg, "x17", "w17")
 				lines = append(lines, loadCode...)

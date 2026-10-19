@@ -189,6 +189,8 @@ type Arm64Lifter struct {
 	labelCounter  uint64
 	// cpol is how ARM C holds x86 CF at the current point of the block being lifted.
 	cpol carryPol
+	// noTSO turns off acquire/release for non-stack guest memory (see arm64_lifter_tso.go).
+	noTSO bool
 }
 
 // x86 flags live in NZCV: N = SF, Z = ZF, V = OF (PF after an FP compare, the only place PF
@@ -664,6 +666,9 @@ func (l *Arm64Lifter) LiftInstructionToBuf(inst disasm.Instruction, nextPC uint6
 	}
 	if err == nil {
 		lines = fixUpperHalves(inst.Inst, lines, start, fn != nil && fn.UsesYmm)
+		if !l.noTSO {
+			lines = l.applyTSO(inst, lines, start)
+		}
 	}
 	return lines, err
 }

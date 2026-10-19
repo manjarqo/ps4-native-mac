@@ -194,7 +194,7 @@ func TestRegressBitOps(t *testing.T) {
 	requireInOrder(t, "bextr", l[0], "lsr w0, w0, w1", "cmp w1, #32", "csel w0, wzr, w0, hs")
 
 	l = liftBlock(t, "c4e208f208") // andn ecx, r14d, [rax]
-	requireInOrder(t, "andn", l[0], "ldr w17, [x28, x16]", "bics w21, w17, w14")
+	requireInOrder(t, "andn", l[0], "add x7, x28, x16", "ldapr w17, [x7]", "bics w21, w17, w14")
 
 	l = liftBlock(t, "c4e278f3c9") // blsr eax, ecx: CF = (src == 0)
 	requireInOrder(t, "blsr", l[0], "cmp w0, #0", "cset w2, eq", "tst w1, w1", "rmif x2, #63, #2", "mov w19, w1")
@@ -474,7 +474,7 @@ func TestRegressX87Math(t *testing.T) {
 // after the instruction instead of address 0xc (the NULL page).
 func TestRegressAbsoluteAddress(t *testing.T) {
 	l := liftBlock(t, "8b04250c000000")[0] // mov eax, [0xc]
-	requireInOrder(t, "mov eax, [0xc]", l, "mov x16, #0", "add x16, x16, #12", "ldr w16, [x28, x16]")
+	requireInOrder(t, "mov eax, [0xc]", l, "mov x16, #0", "add x16, x16, #12", "add x7, x28, x16", "ldapr w19, [x7]")
 	// VEX RIP-relative: vmovss xmm0, [rip+0x10] at 0x1000 (next instruction at 0x1008).
 	l = liftBlock(t, "c5fa100510000000")[0]
 	requireInOrder(t, "vmovss xmm0, [rip+0x10]", l, "movz x16, #0x1018...")

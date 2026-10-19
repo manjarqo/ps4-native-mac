@@ -11,6 +11,7 @@ import (
 
 func TestArm64LifterBasic(t *testing.T) {
 	lifter := NewArm64Lifter(map[uint64]bool{0x1000: true, 0x2000: true})
+	lifter.SetTSO(false) // these cases check the plain lowerings; TestTsoOrdering checks the ordering
 
 	tests := []struct {
 		name     string

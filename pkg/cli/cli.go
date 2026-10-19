@@ -38,6 +38,8 @@ type Config struct {
 	AppDir        string
 	CopyResources bool
 	Asan          bool
+	// TSO: acquire loads and release stores for non-stack guest memory (x86 memory ordering).
+	TSO bool
 }
 
 const banner = `
@@ -64,6 +66,7 @@ Options:
       -app-dir <dir>      Host directory mapping to /app0 for game assets (auto-detected if omitted)
       -copy-resources     Copy all game assets/resources into macOS .app bundle Resources/ (default: false)
       -asan               Compile with AddressSanitizer and LeakSanitizer (default: false)
+      -tso                x86 memory ordering: acquire/release for non-stack guest memory (default: true)
   -h, -help               Show this help message
 `
 
@@ -109,6 +112,7 @@ func ParseArgs(args []string) (*Config, error) {
 		Jobs:      runtime.NumCPU(),
 		OptLevel:  "2",
 		ChunkSize: 250,
+		TSO:       true,
 	}
 
 	var help bool
@@ -135,6 +139,7 @@ func ParseArgs(args []string) (*Config, error) {
 	fs.BoolVar(&cfg.CopyResources, "copy-resources", false, "Copy all game assets/resources into macOS .app bundle Resources/")
 	fs.BoolVar(&cfg.CopyResources, "bundle-resources", false, "Copy all game assets/resources into macOS .app bundle Resources/ (alias)")
 	fs.BoolVar(&cfg.Asan, "asan", false, "Compile with AddressSanitizer and LeakSanitizer")
+	fs.BoolVar(&cfg.TSO, "tso", cfg.TSO, "x86 memory ordering: acquire/release for non-stack guest memory")
 	fs.BoolVar(&cfg.Verbose, "verbose", cfg.Verbose, "Verbose logging")
 	fs.BoolVar(&cfg.Verbose, "v", cfg.Verbose, "Verbose logging (short)")
 	fs.BoolVar(&help, "help", false, "Show help message")
@@ -374,6 +379,7 @@ func Execute(args []string) error {
 	}
 
 	l := lifter.NewArm64Lifter(knownFuncs)
+	l.SetTSO(cfg.TSO)
 	em := emitter.NewAsmEmitter(loaded, d, l)
 	em.AppDir = cfg.AppDir
 	em.Modules = moduleInfos
@@ -401,8 +407,12 @@ func Execute(args []string) error {
 	}
 
 	cFiles = append(cFiles, runtimeCFiles...)
-	fmt.Printf("             Emitted %d C source files | Time: %v\n",
-		len(cFiles), time.Since(stepStart).Round(time.Millisecond))
+	tso := "on (acquire/release for non-stack guest memory)"
+	if !cfg.TSO {
+		tso = "off"
+	}
+	fmt.Printf("             Emitted %d C source files | TSO: %s | Time: %v\n",
+		len(cFiles), tso, time.Since(stepStart).Round(time.Millisecond))
 
 	// Step 4: Compile with Clang
 	targetBin := filepath.Join(cfg.OutDir, "ps4_app")
