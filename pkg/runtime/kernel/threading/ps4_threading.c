@@ -1151,8 +1151,11 @@ void shim_scePthreadGetspecific(GuestContext *ctx) {
 void shim___tls_get_addr(GuestContext *ctx) {
   uint64_t ti_addr = ctx->rdi;
   if (ti_addr) {
+    // tls_index {module, offset}. Only the eboot's static TLS block exists; it ends at fs base
+    // (variant II, recomp_tls_block_offset). Without a PT_TLS segment the offset stays fs-relative.
     uint64_t offset = *(uint64_t *)(ctx->mem_base + ti_addr + 8);
-    ctx->rax = ctx->fs_base + offset;
+    GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
+    ctx->rax = ctx->fs_base - recomp_tls_block_offset(proc) + offset;
   } else {
     ctx->rax = ctx->fs_base;
   }

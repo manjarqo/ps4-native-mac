@@ -643,6 +643,15 @@ void recomp_init_process_param(GuestContext *ctx, uint64_t proc_param_addr) {
   }
 }
 
+// x86-64 static TLS is TLS variant II: the main module's block ends at the thread pointer
+// (fs base) and starts at fs - round_up(p_memsz, p_align). The linker resolves the eboot's
+// fs-relative TLS accesses with this offset, so the .tdata template is copied there.
+uint64_t recomp_tls_block_offset(const GuestContext *ctx) {
+  if (!ctx || ctx->tls_memsz == 0) return 0;
+  uint64_t align = ctx->tls_align ? ctx->tls_align : 1;
+  return (ctx->tls_memsz + align - 1) / align * align;
+}
+
 void recomp_init_tls(GuestContext *ctx, uint64_t tls_vaddr, uint64_t tls_filesz, uint64_t tls_memsz, uint64_t tls_align) {
   if (!ctx) return;
   uint64_t align = tls_align ? tls_align : 16;
@@ -664,12 +673,19 @@ void recomp_init_tls(GuestContext *ctx, uint64_t tls_vaddr, uint64_t tls_filesz,
     ctx->process_ctx->static_tls_size = static_tls_size;
   }
 
-  // Populate main thread static TLS block [ctx->fs_base - static_tls_size, ctx->fs_base)
+  // Main thread static TLS area [fs_base - static_tls_size, fs_base): zeroed, with the .tdata
+  // template at fs_base - recomp_tls_block_offset() (variant II). recomp_init_runtime
+  // reserves 64 KB below the TCB for it.
+  if (static_tls_size > 0x10000ULL) {
+    fprintf(stderr, "[ps4-recomp] FATAL: static TLS 0x%llx exceeds the 64 KB main thread TLS area\n",
+            (unsigned long long)static_tls_size);
+    abort();
+  }
   if (ctx->mem_base && ctx->fs_base >= static_tls_size) {
-    uint8_t *dest = ctx->mem_base + ctx->fs_base - static_tls_size;
-    memset(dest, 0, static_tls_size);
-    if (tls_filesz > 0 && tls_vaddr > 0 && tls_vaddr + tls_filesz <= ctx->mem_size) {
-      memcpy(dest, ctx->mem_base + tls_vaddr, tls_filesz);
+    memset(ctx->mem_base + ctx->fs_base - static_tls_size, 0, static_tls_size);
+    uint64_t block = ctx->fs_base - recomp_tls_block_offset(ctx);
+    if (tls_filesz > 0 && tls_filesz <= tls_memsz && tls_vaddr > 0 && tls_vaddr + tls_filesz <= ctx->mem_size) {
+      memcpy(ctx->mem_base + block, ctx->mem_base + tls_vaddr, tls_filesz);
     }
     printf("[ps4-recomp] TLS initialized: vaddr=0x%llx filesz=0x%llx memsz=0x%llx align=%llu static_tls_size=0x%llx (fs_base=0x%llx)\n",
            (unsigned long long)tls_vaddr, (unsigned long long)tls_filesz,
@@ -1183,11 +1199,13 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   }
   uint64_t tcb_base = stack_base + stack_size + tls_size;
 
-  // Initialize Static TLS block for new thread [tcb_base - tls_size, tcb_base)
-  uint8_t *dest = parent->mem_base + tcb_base - tls_size;
-  memset(dest, 0, tls_size);
-  if (proc->tls_filesz > 0 && proc->tls_vaddr > 0 && proc->tls_vaddr + proc->tls_filesz <= parent->mem_size) {
-    memcpy(dest, parent->mem_base + proc->tls_vaddr, proc->tls_filesz);
+  // Static TLS area for the new thread [tcb_base - tls_size, tcb_base): zeroed, with the
+  // .tdata template at tcb_base - recomp_tls_block_offset() (variant II, see recomp_init_tls).
+  memset(parent->mem_base + tcb_base - tls_size, 0, tls_size);
+  if (proc->tls_filesz > 0 && proc->tls_filesz <= proc->tls_memsz && proc->tls_vaddr > 0 &&
+      proc->tls_vaddr + proc->tls_filesz <= parent->mem_size) {
+    memcpy(parent->mem_base + tcb_base - recomp_tls_block_offset(proc), parent->mem_base + proc->tls_vaddr,
+           proc->tls_filesz);
   }
 
   // Initialize FS TCB base and stack canary
