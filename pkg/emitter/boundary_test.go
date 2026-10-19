@@ -33,6 +33,9 @@ var boundaryStubs = [][2]string{
 	{"_stub_test_rip", "shim_test_rip"},
 	{"_stub_longjmp", "shim_guest_nonlocal_jump"},
 	{"_stub_test_check_uc", "shim_test_check_uc"},
+	{"_stub_pthread_setspecific", "shim_pthread_setspecific"},
+	{"_stub_pthread_key_create", "shim_pthread_key_create"},
+	{"_stub_test_heap_bump", "shim_test_heap_bump"},
 }
 
 // boundaryOutputChecks are further strings a case's output must contain exactly once.
@@ -152,14 +155,17 @@ func writeLiftedHelperFns(t *testing.T, path string) {
 	b.WriteString("    ldr x0, [x28, x16]\n    add x0, x0, #1\n    str x0, [x28, x16]\nLhelper_window_ok:\n")
 	b.WriteString("    subs x9, x9, #1\n    b.ne Lhelper_window\n")
 	b.WriteString("    ldr x16, [x28, x26]\n    add x26, x26, #8\n    ldr x30, [sp], #16\n    ret\n\n")
-	// kill(getpid(), SIGUSR1); the signal is delivered on the return from the syscall.
+	// pthread_kill(pthread_self(), SIGUSR1) as the __pthread_kill syscall (what pthread_kill
+	// makes) on the thread's Mach port, which harness.c stores in g_signal_self_port: the signal
+	// goes to this thread, and it is delivered on the return from the syscall, here in guest
+	// code (a call into libc would deliver it there and clobber the guest registers).
 	b.WriteString(`_test_signal_self:
     stp  x0, x1, [sp, #-32]!
     str  x16, [sp, #16]
-    mov  x16, #20
-    svc  #0x80
+    adrp x0, _g_signal_self_port@PAGE
+    ldr  w0, [x0, _g_signal_self_port@PAGEOFF]
     mov  x1, #30
-    mov  x16, #37
+    mov  x16, #328
     svc  #0x80
     ldr  x16, [sp, #16]
     ldp  x0, x1, [sp], #32
@@ -238,6 +244,7 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"fiber/coroutines", "fiber", nil, false},
 		{"fiber/threads", "fiber", []string{"PS4_FIBER_THREADS=1"}, false},
 		{"exception-handler-in-shim", "exception", nil, false},
+		{"exception-handler-keeps-thread-state", "exception-state", nil, false},
 		{"shim-sets-gprs", "gprs", nil, false},
 		{"xmm-arguments-and-results", "xmm", nil, false},
 		{"enter-guest-keeps-d8-d15", "callee-saved-fp", nil, false},

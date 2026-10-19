@@ -29,6 +29,15 @@ for n in 1 2 3; do
   [ "$(wc -l < "$T/slow_nohandler.txt")" -lt 20001 ] || { echo "log_abort_test: lines were not lost without the SIGABRT handler; the test has no teeth"; exit 1; }
 done
 echo "log_abort_test: PASS"
+# Fiber endpoint lookups from signal handlers while guest threads exit and fibers are finalized,
+# under AddressSanitizer: no lookup may read a freed worker or fiber. Both fiber modes.
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address -I "$R/pkg/runtime/core" -I "$R/pkg/runtime/kernel/threading" \
+  -I "$R/pkg/runtime/modules/libSceFiber" "$R/tests/host/fiber_lookup_test.c" "$R/pkg/runtime/modules/libSceFiber/ps4_fiber.c" \
+  -o "$T/fiber_lookup_test"
+for n in 1 2; do
+  "$T/fiber_lookup_test" 60
+  PS4_FIBER_THREADS=1 "$T/fiber_lookup_test" 60
+done
 G="$R/pkg/runtime/modules/libSceGnmDriver"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
