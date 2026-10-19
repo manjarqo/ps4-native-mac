@@ -586,10 +586,14 @@ static void test_signal_in_helper(void) {
     fail("%d of %d handler invocations saw a stale interrupted state", atomic_load(&g_uc_bad), atomic_load(&g_uc_seen));
 }
 
+// The Mach port of the thread _test_signal_self (boundary_test.go) sends SIGUSR1 to.
+uint32_t g_signal_self_port;
+
 // An exception delivered after a helper returned and before the lifted code read its result
 // from ctx: the handler must leave ctx->rcx as the helper wrote it.
 static void test_signal_after_helper(void) {
   expect("sceKernelInstallExceptionHandler", (uint64_t)(int64_t)sceKernelInstallExceptionHandler(30, ADDR_UC_CHECK), 0);
+  g_signal_self_port = pthread_mach_thread_np(pthread_self());
   g_uc_rsp = g_proc->rsp - 8;
   recomp_call_guest(g_proc, ADDR_HELPER_WINDOW);
   expect("exceptions handled", (uint64_t)atomic_load(&g_uc_seen), 200);
