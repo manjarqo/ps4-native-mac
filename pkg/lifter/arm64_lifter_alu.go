@@ -620,7 +620,7 @@ func (l *Arm64Lifter) liftShift(inst disasm.Instruction, nextPC uint64, lines []
 		return lines, nil
 	}
 	if immCount == 0 {
-		return lines, nil
+		return append(lines, zeroCountZext(inst)...), nil
 	}
 	rotate := op == x86asm.ROL || op == x86asm.ROR
 	flags := !inst.SkipFlags
@@ -2069,7 +2069,7 @@ func (l *Arm64Lifter) liftShldShrd(inst disasm.Instruction, nextPC uint64, lines
 	case x86asm.Imm:
 		immCount = int(c) & mask
 		if immCount == 0 {
-			return lines, nil
+			return append(lines, zeroCountZext(inst)...), nil
 		}
 		lines = append(lines, fmt.Sprintf("    mov w1, #%d", immCount))
 	case x86asm.Reg:
@@ -2218,7 +2218,7 @@ func (l *Arm64Lifter) liftRclRcr(inst disasm.Instruction, nextPC uint64, lines [
 			immCount %= bits + 1
 		}
 		if immCount == 0 {
-			return lines, nil
+			return append(lines, zeroCountZext(inst)...), nil
 		}
 		lines = append(lines, fmt.Sprintf("    mov w1, #%d", immCount))
 	case x86asm.Reg:
@@ -2289,8 +2289,20 @@ func (l *Arm64Lifter) liftRclRcr(inst disasm.Instruction, nextPC uint64, lines [
 	lines = append(lines, store(res)...)
 	if skip != "" {
 		lines = append(lines, skip+":")
+		lines = append(lines, zeroCountZext(inst)...)
 	}
 	return lines, nil
+}
+
+// zeroCountZext is what a shift or rotate of a 32-bit register by a masked count of 0 still
+// does: it writes the register, which zero-extends it to 64 bits (flags and value unchanged).
+func zeroCountZext(inst disasm.Instruction) []string {
+	if r, ok := inst.Inst.Args[0].(x86asm.Reg); ok {
+		if d, okD := arm64RegMap[r]; okD && d.Size == 4 {
+			return []string{fmt.Sprintf("    mov %s, %s", d.W, d.W)}
+		}
+	}
+	return nil
 }
 
 // liftCrc32 handles CRC32.
