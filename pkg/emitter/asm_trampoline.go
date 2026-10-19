@@ -72,24 +72,29 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 //
 // Guest -> host, _recomp_call_shim (x0 = shim, x1 = its guest address; the shim stub branches
 // here in place of a guest function): ctx = the TCB slot. Stores the shim's guest address to
-// ctx->rip (guest code itself never writes ctx->rip) and the 16 GPRs and xmm0-7 to ctx, calls
-// shim(ctx), then reloads from that same ctx (kept in the bridge frame, not looked up again)
-// all 16 GPRs, xmm0-7, the FS base and the memory base. Host code runs with the default
-// FPCR (0: round to nearest, no flush to zero); the bridge keeps the guest FPCR in its frame
-// and restores it on return. A shim reads its arguments and
-// returns its results through ctx (rax/rdx, xmm0/xmm1) and may set any GPR (rsp included),
-// e.g. to resume at a longjmp target. xmm8-15, the ymm upper halves (ctx->ymmh is never
-// written) and the flags are not synced: System V makes them caller-saved, so guest code
-// does not expect them to survive a call, and no shim reads them.
+// ctx->rip (guest code itself never writes ctx->rip) and the 16 GPRs and xmm0-7 to ctx,
+// calls shim(ctx), then reloads from that same ctx (kept in the bridge frame, not looked up
+// again) all 16 GPRs, xmm0-7, the FS base and the memory base. Host code runs with the
+// default FPCR (0: round to nearest, no flush to zero); the bridge keeps the guest FPCR in
+// its frame and restores it on return. A shim reads its arguments and returns its results
+// through ctx (rax/rdx, xmm0/xmm1) and may set any GPR (rsp included). xmm8-15, the ymm
+// upper halves (ctx->ymmh is never written) and the flags are not synced: System V makes
+// them caller-saved, so guest code does not expect them to survive a call, and no shim
+// reads them.
 //
 // A shim that switches context (sceFiberRun/Switch/ReturnToThread) switches host stacks
 // inside the shim. The bridge frame of a call lives on the host stack of the context that
 // made the call, so when that context is resumed, its own frame finishes the call: it
 // reloads the guest registers that context stored and its FPCR, and the FS base from
-// ctx->fs_base, which
-// the fiber runtime updates when a fiber resumes on another guest thread. The runtime must
-// point the TCB slot of a guest thread at the GuestContext of the endpoint it switches to,
-// before the switch.
+// ctx->fs_base, which the fiber runtime updates when a fiber resumes on another guest
+// thread. The runtime must point the TCB slot of a guest thread at the GuestContext of the
+// endpoint it switches to, before the switch.
+//
+// Not supported: guest non-local transfers (longjmp, C++ unwinding) RET to another frame,
+// but each guest RET returns through its own host frame; libc's longjmp and __cxa_throw
+// are shims that report and abort (shim_guest_nonlocal_jump, shim_guest_cxa_throw).
+// Helpers the lifter calls inside one instruction (recomp_vpcmpistri, recomp_vpcmpe_stri,
+// recomp_vaeskeygenassist below) keep every vector register.
 // --------------------------------------------------------------------------------------
 
 // void recomp_enter_guest(GuestContext *ctx, uint64_t target_fn)
