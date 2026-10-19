@@ -46,8 +46,10 @@ static void register_thread(RecompThread *t) {
   pthread_mutex_unlock(&g_threads_mutex);
 }
 
+// Handle 0 finds no thread (join, detach, cancel and RaiseException report ESRCH or do
+// nothing). AttrGet, Rename and Getname treat 0 as the calling thread themselves.
 RecompThread *recomp_find_thread(uint64_t handle) {
-  if (handle == 0) return g_current_thread;
+  if (handle == 0) return NULL;
   pthread_mutex_lock(&g_threads_mutex);
   RecompThread *curr = g_threads;
   while (curr) {
@@ -979,7 +981,7 @@ void shim_scePthreadGetname(GuestContext *ctx) {
   uint64_t thread_handle = ctx->rdi;
   uint64_t buf_ptr = ctx->rsi;
   if (buf_ptr) {
-    RecompThread *t = find_thread(thread_handle);
+    RecompThread *t = thread_handle ? find_thread(thread_handle) : g_current_thread;
     if (t && t->host_thread) {
       char name[64] = {0};
       pthread_getname_np(t->host_thread, name, sizeof(name));
@@ -1085,7 +1087,7 @@ void shim_scePthreadRename(GuestContext *ctx) {
   uint64_t name_addr = ctx->rsi;
   const char *name = (name_addr && ctx->mem_base) ? (const char *)(ctx->mem_base + name_addr) : NULL;
   if (name) {
-    RecompThread *t = find_thread(handle);
+    RecompThread *t = handle ? find_thread(handle) : g_current_thread;
     if (t) {
 #if defined(__APPLE__)
       if (t == g_current_thread || (t->ctx && t->ctx == g_current_ctx)) {
