@@ -36,16 +36,18 @@ func TestX87M80LoadStoreMatchesX86(t *testing.T) {
 
 	// Host side: the two lowerings in functions that set up the registers they use. x28 (memory
 	// base) is 0, so guest addresses are host addresses; x27 (FS base) points at a block whose
-	// +0x70 slot holds the GuestContext pointer, as the TCB does; x19 is RAX.
+	// +0x70 slot holds the GuestContext pointer, as the TCB does; x19 is RAX. NZCV is seeded from
+	// the third argument and returned: the lowerings must keep it (x87 loads and stores leave
+	// EFLAGS alone).
 	var asm strings.Builder
 	fn := func(name string, lines []string) {
 		asm.WriteString(".globl _" + name + "\n.p2align 2\n_" + name + ":\n")
 		asm.WriteString("    stp x19, x20, [sp, #-48]!\n    stp x27, x28, [sp, #16]\n")
-		asm.WriteString("    mov x27, x0\n    mov x19, x1\n    mov x28, #0\n")
+		asm.WriteString("    mov x27, x0\n    mov x19, x1\n    mov x28, #0\n    msr nzcv, x2\n")
 		for _, l := range lines {
 			asm.WriteString(l + "\n")
 		}
-		asm.WriteString("    ldp x27, x28, [sp, #16]\n    ldp x19, x20, [sp], #48\n    ret\n")
+		asm.WriteString("    mrs x0, nzcv\n    ldp x27, x28, [sp, #16]\n    ldp x19, x20, [sp], #48\n    ret\n")
 	}
 	asm.WriteString(".text\n")
 	fn("lifted_fld_m80", liftBlock(t, "db28")[0])  // fld tbyte [rax]
@@ -59,8 +61,9 @@ func TestX87M80LoadStoreMatchesX86(t *testing.T) {
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-void lifted_fld_m80(void *tcb, const void *m80);
-void lifted_fstp_m80(void *tcb, void *m80);
+uint64_t lifted_fld_m80(void *tcb, const void *m80, uint64_t nzcv);
+uint64_t lifted_fstp_m80(void *tcb, void *m80, uint64_t nzcv);
+static uint64_t seed(uint32_t i) { return (uint64_t)((i * 0x9u) & 0xf) << 28; }
 static uint8_t ctx[0x400] __attribute__((aligned(16)));
 static uint8_t tcb[0x100] __attribute__((aligned(16)));
 int main(int argc, char **argv) {
@@ -70,7 +73,7 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < n80; i++) {
         uint8_t m[16] = {0}; fread(m, 10, 1, in);
         int32_t top = 0; memcpy(ctx + 0x2e0, &top, 4);
-        lifted_fld_m80(tcb, m);
+        if (lifted_fld_m80(tcb, m, seed(i)) != seed(i)) { fprintf(stderr, "fld: NZCV changed\n"); return 1; }
         memcpy(&top, ctx + 0x2e0, 4);
         fwrite(ctx + 0x2a0 + 8 * (top & 7), 8, 1, out);
     }
@@ -78,7 +81,7 @@ int main(int argc, char **argv) {
         double d; fread(&d, 8, 1, in);
         int32_t top = 3; memcpy(ctx + 0x2e0, &top, 4); memcpy(ctx + 0x2a0 + 8 * 3, &d, 8);
         uint8_t m[16]; memset(m, 0xcc, sizeof m);
-        lifted_fstp_m80(tcb, m);
+        if (lifted_fstp_m80(tcb, m, seed(i)) != seed(i)) { fprintf(stderr, "fstp: NZCV changed\n"); return 1; }
         memcpy(&top, ctx + 0x2e0, 4);
         if (top != 4) { fprintf(stderr, "fstp: TOP %d, want 4\n", top); return 1; }
         fwrite(m, 10, 1, out);
