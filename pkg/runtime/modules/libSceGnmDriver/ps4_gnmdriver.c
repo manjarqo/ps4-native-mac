@@ -1094,10 +1094,14 @@ int32_t sceGnmRequestFlipAndSubmitDoneForWorkload(GuestContext *ctx, uint64_t wo
     (void)workload;
 
     if (gpu_addr != 0 && gpu_addr_size_in_bytes > 0) {
-        pthread_mutex_lock(&g_gnm_mutex);
-        if (!g_gnm_initialized) {
-            ps4_gnmdriver_init(ctx);
+        // Same limit as sceGnmSubmitCommandBuffers / SubmitAndFlipCommandBuffers.
+        if (gpu_addr_size_in_bytes > 0x3ffffc) {
+            return ORBIS_GNM_ERROR_INVALID_VALUE;
         }
+        // ps4_gnmdriver_init takes g_gnm_mutex itself (and is idempotent), so it runs before
+        // the lock is taken here.
+        ps4_gnmdriver_init(ctx);
+        pthread_mutex_lock(&g_gnm_mutex);
         ps4_gnm_process_command_buffers(ctx, 1, &gpu_addr, &gpu_addr_size_in_bytes, NULL, NULL);
         pthread_mutex_unlock(&g_gnm_mutex);
     }
