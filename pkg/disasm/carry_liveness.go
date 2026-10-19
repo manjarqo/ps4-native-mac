@@ -194,8 +194,9 @@ func shiftImmCount(inst x86asm.Inst) (uint64, bool) {
 
 // blockSuccessors returns the start addresses of the blocks control can reach from the end of b
 // inside fn; unknown is true when a successor cannot be determined (indirect jump without a
-// recovered table, fallthrough into an address that is not a block of fn).
-func blockSuccessors(fn *Function, b *BasicBlock) (succs []uint64, unknown bool) {
+// recovered table, fallthrough into an address that is not a block of fn, direct jump to an
+// address outside fn that isFunc does not accept as a function entry).
+func blockSuccessors(fn *Function, b *BasicBlock, isFunc func(uint64) bool) (succs []uint64, unknown bool) {
 	if len(b.Insts) == 0 {
 		return nil, true
 	}
@@ -204,8 +205,13 @@ func blockSuccessors(fn *Function, b *BasicBlock) (succs []uint64, unknown bool)
 	local := func(t uint64) {
 		if fn.Blocks[t] != nil {
 			succs = append(succs, t)
+			return
 		}
-		// A transfer out of the function is a tail call: flags are dead there.
+		// A transfer to another function is a tail call: flags are dead there (System V ABI).
+		// Any other target continues somewhere unknown with the flags possibly live.
+		if isFunc == nil || !isFunc(t) {
+			unknown = true
+		}
 	}
 	switch op := last.Inst.Op; {
 	case op == x86asm.RET || op == x86asm.LRET || op == x86asm.UD2 || op == x86asm.HLT || op == x86asm.INT:
@@ -213,13 +219,13 @@ func blockSuccessors(fn *Function, b *BasicBlock) (succs []uint64, unknown bool)
 	case op == x86asm.JMP:
 		if rel, ok := last.Inst.Args[0].(x86asm.Rel); ok {
 			local(uint64(int64(nextPC) + int64(rel)))
-			return succs, false
+			return succs, unknown
 		}
 		if ts, ok := fn.JumpTables[last.Address]; ok && len(ts) > 0 {
 			for _, t := range ts {
 				local(t)
 			}
-			return succs, false
+			return succs, unknown
 		}
 		return nil, true
 	case isJcc(op):
@@ -242,8 +248,9 @@ func blockSuccessors(fn *Function, b *BasicBlock) (succs []uint64, unknown bool)
 }
 
 // analyzeCarryOverflowLiveness sets Instruction.CarryDead / OverflowDead for every instruction
-// of fn (see the comment at the top of the file).
-func analyzeCarryOverflowLiveness(fn *Function) {
+// of fn (see the comment at the top of the file). isFunc reports whether a direct branch target
+// outside fn is a function entry (a tail call).
+func analyzeCarryOverflowLiveness(fn *Function, isFunc func(uint64) bool) {
 	if fn == nil || len(fn.Blocks) == 0 {
 		return
 	}
@@ -254,7 +261,7 @@ func analyzeCarryOverflowLiveness(fn *Function) {
 	}
 	infos := make(map[uint64]*info, len(fn.Blocks))
 	for addr, b := range fn.Blocks {
-		s, u := blockSuccessors(fn, b)
+		s, u := blockSuccessors(fn, b, isFunc)
 		infos[addr] = &info{succs: s, unknown: u}
 	}
 	all := flagCF | flagOF

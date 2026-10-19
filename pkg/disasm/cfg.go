@@ -355,6 +355,13 @@ func (d *Disassembler) WalkReachable(entryAddrs []uint64, visit func(fn *Functio
 	return nil
 }
 
+// isTailCallTarget reports whether a direct branch out of a function lands on a function entry:
+// every such target in code is queued as a function by WalkReachable (the decoders add it to
+// their discovered calls), so it is lifted as one and entered by a tail call.
+func (d *Disassembler) isTailCallTarget(addr uint64) bool {
+	return d != nil && d.inCode(addr)
+}
+
 // seedableFunc reports whether a RIP-relative address is worth queuing as a
 // new function. With unwind extents, only real entries qualify. Otherwise the
 // prologue heuristic is the filter.
@@ -624,7 +631,7 @@ func (d *Disassembler) disasmLinearFunction(entryAddr uint64, size uint64) (*Fun
 	fn.UsesYmm = usesYmm(fn)
 	d.analyzeBlockFlagLiveness(fn)
 	if !d.SkipFlagLiveness {
-		analyzeCarryOverflowLiveness(fn)
+		analyzeCarryOverflowLiveness(fn, d.isTailCallTarget)
 	}
 	return fn, discoveredCalls, nil
 }
@@ -995,7 +1002,7 @@ func (d *Disassembler) disasmBranchFollowing(entryAddr uint64) (*Function, []uin
 	fn.UsesYmm = usesYmm(fn)
 	d.analyzeBlockFlagLiveness(fn)
 	if !d.SkipFlagLiveness {
-		analyzeCarryOverflowLiveness(fn)
+		analyzeCarryOverflowLiveness(fn, d.isTailCallTarget)
 	}
 	return fn, discoveredCalls, nil
 }

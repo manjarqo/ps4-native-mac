@@ -13,7 +13,8 @@ import (
 // is the hex encoding of a non-branch instruction or a branch written as
 //
 //	"jcc:OP:LABEL"   conditional branch (Jcc, LOOP) to a block of the function
-//	"jmp:LABEL"      direct jump; LABEL "out" is outside the function (a tail call)
+//	"jmp:LABEL"      direct jump; LABEL "out" is a function outside (a tail call), "nofn" an
+//	                 address outside that is no function entry
 //	"call:out"       direct call outside the function
 type testBlock struct {
 	label string
@@ -22,14 +23,21 @@ type testBlock struct {
 
 var testOps = map[string]x86asm.Op{"JE": x86asm.JE, "JNE": x86asm.JNE, "JB": x86asm.JB, "LOOP": x86asm.LOOP}
 
-const testOutside = 0x900000
+// testOutside is a function entry outside the function under test, testNotFunc an address
+// outside it that is no function entry (testIsFunc).
+const (
+	testOutside = 0x900000
+	testNotFunc = 0x800000
+)
+
+func testIsFunc(addr uint64) bool { return addr == testOutside }
 
 // buildFunction lays the blocks out contiguously from 0x1000 and returns the function and the
 // address of each block. jumpTables maps the label of a block ending in an indirect jump to the
 // labels of its table targets.
 func buildFunction(t *testing.T, blocks []testBlock, jumpTables map[string][]string) (*Function, map[string]uint64) {
 	t.Helper()
-	addrs := map[string]uint64{"out": testOutside}
+	addrs := map[string]uint64{"out": testOutside, "nofn": testNotFunc}
 	type pending struct {
 		block, idx int
 		label      string
@@ -172,6 +180,17 @@ func TestCarryOverflowLiveness(t *testing.T) {
 		{"tail jump out of the function", []testBlock{
 			{"entry", []string{addRR, "jmp:out"}},
 		}, nil, []want{{label: "entry", idx: 0, carryDead: true}}},
+		{"jump out of the function to a non-function target: unknown", []testBlock{
+			{"entry", []string{addRR, "jmp:nofn"}},
+		}, nil, []want{{label: "entry", idx: 0, carryDead: false, overDead: false, checkOver: true}}},
+		{"Jcc out of the function to a non-function target: unknown", []testBlock{
+			{"entry", []string{addRR, "jcc:JE:nofn"}},
+			{"fall", []string{xorEax, ret}},
+		}, nil, []want{{label: "entry", idx: 0, carryDead: false}}},
+		{"Jcc out of the function to a function: tail call", []testBlock{
+			{"entry", []string{addRR, "jcc:JE:out"}},
+			{"fall", []string{xorEax, ret}},
+		}, nil, []want{{label: "entry", idx: 0, carryDead: true}}},
 		{"jump table with a CF reader", []testBlock{
 			{"entry", []string{addRR, jmpRax}},
 			{"t1", []string{ret}},
@@ -220,7 +239,7 @@ func TestCarryOverflowLiveness(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fn, addrs := buildFunction(t, tc.blocks, tc.tables)
-			analyzeCarryOverflowLiveness(fn)
+			analyzeCarryOverflowLiveness(fn, testIsFunc)
 			for _, w := range tc.want {
 				in := fn.Blocks[addrs[w.label]].Insts[w.idx]
 				if in.CarryDead != w.carryDead {
