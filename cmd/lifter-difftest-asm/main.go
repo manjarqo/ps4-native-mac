@@ -222,7 +222,9 @@ func skipClass(inst x86asm.Inst) string {
 	if strings.HasPrefix(s, "PREFETCH") {
 		return "fences and prefetches"
 	}
-	if strings.HasPrefix(s, "F") && (inst.MemBytes == 10 || inst.MemBytes == 0) {
+	// FLD m80 / FSTP m80 (DB /5, DB /7) are lifted (pkg/lifter x87LoadM80/x87StoreM80) and tested.
+	m80LoadStore := (op == x86asm.FLD || op == x86asm.FSTP) && inst.Opcode>>24 == 0xdb
+	if strings.HasPrefix(s, "F") && (inst.MemBytes == 10 || inst.MemBytes == 0) && !m80LoadStore {
 		for _, a := range inst.Args {
 			if _, ok := a.(x86asm.Mem); ok { // x86asm reports m80 operands with MemBytes 0
 				return "x87 m80 and BCD forms (Task 5)"

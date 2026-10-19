@@ -429,6 +429,8 @@ func TestRegressLoop(t *testing.T) {
 func TestRegressX87KeepsXmm(t *testing.T) {
 	for _, tc := range []struct{ name, hex string }{
 		{"fld dword [rax]", "d900"},
+		{"fld tbyte [rax]", "db28"},
+		{"fstp tbyte [rax]", "db38"},
 		{"fstp qword [rax]", "dd18"},
 		{"fadd st0, st2", "d8c2"},
 		{"fmul dword [rax]", "d808"},

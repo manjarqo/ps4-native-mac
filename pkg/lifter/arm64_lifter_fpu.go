@@ -124,7 +124,10 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		}
 		if mem, ok := args[0].(x86asm.Mem); ok {
 			lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-			if defMemSz == 8 {
+			if isX87M80(inst) {
+				lines = append(lines, "    add  x1, x28, x16")
+				lines = append(lines, x87LoadM80()...)
+			} else if defMemSz == 8 {
 				lines = append(lines, "    ldr d28, [x28, x16]")
 			} else {
 				lines = append(lines,
@@ -176,7 +179,11 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			// Read ST(0) before computing the address: the stack helpers use x16 for the
 			// GuestContext pointer.
 			lines = append(lines, loadFpuSt("d28", 0)...)
-			if defMemSz == 8 {
+			if isX87M80(inst) {
+				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
+				lines = append(lines, "    add  x1, x28, x16")
+				lines = append(lines, x87StoreM80()...)
+			} else if defMemSz == 8 {
 				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 				lines = append(lines, "    str d28, [x28, x16]")
 			} else {
@@ -652,6 +659,144 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 
 	lines = append(lines, l.emitUnsupported(inst, fmt.Sprintf("unsupported fpu: %v", op))...)
 	return lines, nil
+}
+
+// isX87M80 reports FLD m80 (DB /5) and FSTP m80 (DB /7). x86asm decodes them as FLD/FSTP with
+// a memory operand and MemBytes 0 (the m32/m64 forms report 4 or 8).
+func isX87M80(inst disasm.Instruction) bool {
+	if inst.Inst.Op != x86asm.FLD && inst.Inst.Op != x86asm.FSTP {
+		return false
+	}
+	if _, ok := inst.Inst.Args[0].(x86asm.Mem); !ok {
+		return false
+	}
+	return inst.Inst.MemBytes == 0 && inst.Inst.Opcode>>24 == 0xdb
+}
+
+// x87LoadM80 converts the 80-bit extended value at host address x1 to the double in d28 (the
+// x87 stack holds doubles). The 64-bit significand is rounded to 53 bits by UCVTF (the current
+// rounding mode), exponents beyond the double range give +-inf, small ones a denormal (rounded
+// to nearest even) or +-0.
+// Unsupported encodings (unnormals, pseudo-infinities and pseudo-NaNs: integer bit clear with a
+// nonzero exponent) load the real indefinite, as the invalid-operand response of the x87.
+// NaN payloads keep their top 51 fraction bits and are made quiet. NZCV is preserved. Scratch: x0, x2-x4, x6, x7.
+func x87LoadM80() []string {
+	return []string{
+		"    mrs  x7, nzcv",
+		"    ldr  x2, [x1]",           // significand
+		"    ldrh w3, [x1, #8]",       // sign and exponent
+		"    and  w4, w3, #0x7fff",    // biased exponent (bias 16383)
+		"    and  x3, x3, #0x8000",
+		"    lsl  x3, x3, #48",        // sign in bit 63
+		"    mov  w6, #0x7fff",
+		"    cmp  w4, w6",
+		"    b.eq 3f",
+		"    cbz  w4, 1f",
+		"    tbz  x2, #63, 4f",        // unnormal
+		"    b    2f",
+		"1:",
+		"    cbz  x2, 5f",             // +-0
+		"    mov  w4, #1",             // denormals and pseudo-denormals use exponent 1
+		"2:",
+		"    clz  x6, x2",
+		"    lsl  x2, x2, x6",
+		"    mov  x0, x2",             // normalized significand, for the denormal path
+		"    sub  w4, w4, w6",         // biased exponent of 1.f after normalization
+		"    ucvtf d28, x2",           // 2^63 <= value <= 2^64: double exponent field 1086 (1087)
+		"    fmov x2, d28",
+		"    mov  w6, #16446",         // 16383 + 63
+		"    sub  w4, w4, w6",
+		"    sxtw x4, w4",             // value = ucvtf result * 2^x4
+		"    add  x6, x4, #1086",
+		"    cmp  x6, #2047",
+		"    b.ge 6f",
+		"    cmp  x6, #0",
+		"    b.le 7f",
+		"    add  x2, x2, x4, lsl #52",
+		"    b    8f",
+		"7:",                          // denormal result: significand x0 >> s, rounded to nearest even
+		"    mov  x6, #-1074",
+		"    sub  x6, x6, x4",         // s = -1074 - x4 >= 12
+		"    cmp  x6, #64",
+		"    b.gt 5f",                 // below half the smallest denormal: +-0
+		"    b.eq 10f",
+		"    lsr  x2, x0, x6",
+		"    neg  x4, x6",
+		"    lsl  x6, x0, x4",         // the bits shifted out, left-aligned
+		"    tbz  x6, #63, 8f",        // below half: truncate
+		"    lsl  x6, x6, #1",
+		"    cbnz x6, 11f",            // above half
+		"    tbz  x2, #0, 8f",         // tie: to even
+		"11:",
+		"    add  x2, x2, #1",         // may carry into the smallest normal: still the right bits
+		"    b    8f",
+		"10:",                         // s = 64: half the smallest denormal or more
+		"    lsl  x6, x0, #1",
+		"    cmp  x6, #0",
+		"    cset x2, ne",
+		"    b    8f",
+		"3:",
+		"    tbz  x2, #63, 4f",        // pseudo-infinity / pseudo-NaN
+		"    lsl  x6, x2, #1",
+		"    cbz  x6, 6f",             // infinity
+		"    lsr  x6, x6, #12",
+		"    orr  x2, x6, #0x7ff8000000000000", // quiet, as the x87 delivers a signaling NaN
+		"    b    8f",
+		"6:",
+		"    mov  x2, #0x7ff0000000000000",
+		"    b    8f",
+		"4:",
+		"    mov  x2, #0xfff8000000000000", // real indefinite
+		"    mov  x3, #0",
+		"    b    8f",
+		"5:",
+		"    mov  x2, #0",
+		"8:",
+		"    orr  x2, x2, x3",
+		"    fmov d28, x2",
+		"    msr  nzcv, x7",
+	}
+}
+
+// x87StoreM80 stores the double in d28 as an 80-bit extended value at host address x1 (exact:
+// every double is representable; a signaling NaN is stored quiet). NZCV is preserved. Scratch: x0, x2-x4, x6, x7.
+func x87StoreM80() []string {
+	return []string{
+		"    mrs  x7, nzcv",
+		"    fmov x2, d28",
+		"    lsr  x3, x2, #63",
+		"    lsl  x3, x3, #15",        // sign in bit 15 of the exponent word
+		"    ubfx x4, x2, #52, #11",   // double exponent field
+		"    and  x6, x2, #0xfffffffffffff",
+		"    cbz  x4, 1f",
+		"    mov  x0, #0x7ff",
+		"    cmp  x4, x0",
+		"    b.eq 2f",
+		"    mov  x0, #15360",         // 16383 - 1023
+		"    add  x4, x4, x0",
+		"    lsl  x6, x6, #11",
+		"    orr  x6, x6, #0x8000000000000000",
+		"    b    4f",
+		"1:",
+		"    cbz  x6, 4f",             // +-0
+		"    clz  x0, x6",             // denormal: normalize the fraction
+		"    lsl  x6, x6, x0",
+		"    mov  x4, #15372",         // 16383 - 1074 + 63
+		"    sub  x4, x4, x0",
+		"    b    4f",
+		"2:",
+		"    mov  x4, #0x7fff",        // infinity or NaN
+		"    cbz  x6, 3f",
+		"    orr  x6, x6, #0x0008000000000000", // NaN: quiet (x87 registers never hold an SNaN loaded from m64)
+		"3:",
+		"    lsl  x6, x6, #11",
+		"    orr  x6, x6, #0x8000000000000000",
+		"4:",
+		"    orr  x4, x4, x3",
+		"    str  x6, [x1]",
+		"    strh w4, [x1, #8]",
+		"    msr  nzcv, x7",
+	}
 }
 
 // fpToInt16X86 converts the double in src (d<n>) to int16 in dst (w register) with x86 FIST
