@@ -78,10 +78,12 @@ void shim_writev(GuestContext *ctx) {
   SHIM_RETURN();
 }
 
-// Exit (does not return)
+// Exit (does not return). Through ps4_host_quit, as the host's own quit paths: the pipeline
+// archive is saved and the log drained, and no static destructors run while game threads and
+// Metal completion handlers still use global state.
 void shim_exit(GuestContext *ctx) {
   int status = (int)ctx->rdi;
-  exit(status);
+  ps4_host_quit(status);
 }
 
 // errno pointer (allocated within dynamic TLS space)
@@ -1144,7 +1146,7 @@ void shim_syscall(GuestContext *ctx) {
   switch (num) {
   case 1: { // SYS_exit
     int status = (int)ctx->rsi;
-    exit(status);
+    ps4_host_quit(status); // as shim_exit
     break;
   }
   case 3: { // SYS_read

@@ -939,7 +939,9 @@ bool StoreMslInDiskCache(uint64_t mh, const char* msl) {
     } else {
         // The frame does not wait for the disk. A write still pending at quit is lost; the
         // shader is then translated again in the next session.
-        static dispatch_queue_t writer = dispatch_queue_create("ps4.gnm.msl_cache.writer", DISPATCH_QUEUE_SERIAL);
+        // Utility QoS: otherwise the queue would run at the QoS of the CP thread that submits.
+        static dispatch_queue_t writer = dispatch_queue_create(
+            "ps4.gnm.msl_cache.writer", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
         auto* job = new std::pair<std::string, std::string>(path, msl);
         dispatch_async(writer, ^{
             char tmp[1300];
@@ -2599,7 +2601,9 @@ void VerifyGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up) {
 // copied on the GPU in the upload command buffer (committed before the current one): the CPU
 // detile of a big texture costs milliseconds on the encoder thread. Small textures, and copies
 // that cannot be encoded, keep the CPU upload. PS4_GNM_GPU_UPLOAD_MIN_KB: threshold (default
-// 256; 0: every size; -1: off).
+// 256; 0: every size; -1: off). -1 turns off only this bind-time GPU path: the hazard path
+// (GpuUploadTexture, for memory with GPU writes still pending) still copies on the GPU through
+// the shared staging pool (S.detile_staging) with EncodeGpuUpload's up-front bounds check.
 id<MTLTexture> SampledTexture(const ImageDesc& img) {
     static const int64_t min_kb = [] {
         const char* v = getenv("PS4_GNM_GPU_UPLOAD_MIN_KB");

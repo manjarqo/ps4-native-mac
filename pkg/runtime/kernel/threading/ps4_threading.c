@@ -1133,24 +1133,20 @@ static int stall_symbolize(uint64_t pc, uint64_t *start, const char **name) {
 // One sample of every guest thread: PC, LR and the saved return addresses along the
 // frame-pointer chain. Threads are suspended only while their registers and stack are read;
 // nothing that can take a lock (malloc, dladdr) runs while one is suspended.
+// g_threads_mutex is held for the whole walk, so no entry is unregistered and freed meanwhile,
+// and a detached thread that is exiting waits in unregister_thread before pthread_exit, which
+// keeps its pthread_t valid. A suspended thread cannot hold the mutex (the watchdog does). Locks
+// taken under it: libpthread's thread-list lock inside pthread_mach_thread_np (only while no
+// thread is suspended; libpthread never waits for other locks while holding it). A joinable
+// thread can still be joined (its pthread_t freed) during the walk; pthread_mach_thread_np looks
+// the pthread_t up in libpthread's thread list and returns MACH_PORT_NULL for one that is gone.
 static void stall_profile_sample_all(void) {
-  struct {
-    pthread_t th;
-    uint64_t id;
-    char name[32];
-  } list[STALL_PROFILE_MAX_THREADS];
   int n = 0;
   pthread_mutex_lock(&g_threads_mutex);
   for (RecompThread *t = g_threads; t && n < STALL_PROFILE_MAX_THREADS; t = t->next) {
     if (t->finished || !t->ctx) continue;
-    list[n].th = t->host_thread;
-    list[n].id = t->thread_id;
-    snprintf(list[n].name, sizeof(list[n].name), "%s", t->name[0] ? t->name : "unnamed");
     n++;
-  }
-  pthread_mutex_unlock(&g_threads_mutex);
-  for (int i = 0; i < n; i++) {
-    const mach_port_t port = pthread_mach_thread_np(list[i].th);
+    const mach_port_t port = pthread_mach_thread_np(t->host_thread);
     if (port == MACH_PORT_NULL || thread_suspend(port) != KERN_SUCCESS) continue;
     uint64_t pcs[STALL_PROFILE_DEPTH];
     int np = 0;
@@ -1173,11 +1169,12 @@ static void stall_profile_sample_all(void) {
     }
     thread_resume(port);
     if (np) {
-      const int slot = stall_profile_slot(list[i].id);
-      stall_profile_add(g_stall_prof, slot, list[i].name, pcs, np);
-      stall_profile_thread_cpu(g_stall_prof, slot, stall_profile_thread_cpu_us(list[i].th));
+      const int slot = stall_profile_slot(t->thread_id);
+      stall_profile_add(g_stall_prof, slot, t->name[0] ? t->name : "unnamed", pcs, np);
+      stall_profile_thread_cpu(g_stall_prof, slot, stall_profile_thread_cpu_us(t->host_thread));
     }
   }
+  pthread_mutex_unlock(&g_threads_mutex);
 }
 
 static _Atomic uint64_t g_last_present_ns;

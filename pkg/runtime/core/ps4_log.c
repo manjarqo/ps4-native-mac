@@ -46,7 +46,9 @@ static struct sigaction g_old_abort;
 
 static void *log_drain_thread(void *arg) {
   LogStream *st = (LogStream *)arg;
-  pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+  // Highest class: the thread is idle almost all the time, and a writer whose pipe fills up waits
+  // for it, so it must not queue behind the job workers (user-initiated).
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   pthread_setname_np("ps4-log");
   char *buf = malloc(LOG_CHUNK);
   int sink_ok = buf != NULL;
