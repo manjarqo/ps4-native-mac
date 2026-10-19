@@ -664,13 +664,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "movq mm1, [rsi]",
 			bytes:    []byte{0x0f, 0x6f, 0x0e},
 			pc:       0x1000,
-			expected: []string{"str x17, [x5, #760]"},
+			expected: []string{"ldr x17, [x28, x16]", "str x17, [x5, #760]"},
 		},
 		{
 			name:     "pmullw mm1, mm2",
 			bytes:    []byte{0x0f, 0xd5, 0xca},
 			pc:       0x1000,
-			expected: []string{"ldr d16, [x5, #760]", "ldr d17, [x5, #768]"},
+			expected: []string{"ldr d16, [x5, #760]", "ldr d17, [x5, #768]", "mul v16.4h, v16.4h, v17.4h"},
 		},
 		{
 			name:     "movsd string",

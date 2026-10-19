@@ -20,11 +20,18 @@ import (
 // treated as live everywhere, the conservative default) and returns the lowering of each.
 func liftBlock(t *testing.T, insts ...string) [][]string {
 	t.Helper()
+	return liftBlockIn(t, false, insts...)
+}
+
+// liftBlockIn is liftBlock in a function with (usesYmm) or without YMM instructions.
+func liftBlockIn(t *testing.T, usesYmm bool, insts ...string) [][]string {
+	t.Helper()
 	l := NewArm64Lifter(nil)
 	fn := &disasm.Function{
 		EntryAddr: 0x1000,
 		EndAddr:   0x9000,
 		Blocks:    map[uint64]*disasm.BasicBlock{0x1000: {StartAddr: 0x1000}},
+		UsesYmm:   usesYmm,
 	}
 	pc := uint64(0x1000)
 	var out [][]string
@@ -244,6 +251,18 @@ func TestRegressYmmUpperHalves(t *testing.T) {
 			t.Errorf("vptest ymm writes v%d (a source's upper half):\n%s", n, strings.Join(l[0], "\n"))
 		}
 	}
+
+	// In a function with YMM code the other upper halves a lowering uses as scratch are saved
+	// and restored: v30 (YMM14's upper half) for the memory operand of VADDPS, and v16 for legacy
+	// SQRTSS, which must keep XMM0's upper half.
+	l = liftBlockIn(t, true, "c5f05883c0000000") // vaddps xmm0, xmm1, [rbx+0xc0]
+	requireInOrder(t, "vaddps in a YMM function", l[0], "str q30, [sp, #-16]!", "ldr q30, [x28, x16]",
+		"fadd v0.4s, v1.4s, v30.4s", "movi v16.16b, #0", "ldr q30, [sp], #16")
+	l = liftBlockIn(t, true, "f30f51c0") // sqrtss xmm0, xmm0
+	requireInOrder(t, "sqrtss in a YMM function", l[0], "str q16, [sp, #-16]!", "fsqrt s16, s16", "ldr q16, [sp], #16")
+	// Without YMM code no upper half is live: nothing is saved.
+	l = liftBlock(t, "c5f05883c0000000")
+	forbid(t, "vaddps outside a YMM function", l[0], "str q30, [sp, #-16]!")
 }
 
 // SSE/AVX semantics: MAX/MIN return the second operand for NaN and signed zeros (ARM FMAX/FMIN
