@@ -142,6 +142,9 @@ const (
 	// regsetPopf: [stackTop] holds a valid RFLAGS image for POPFQ (arithmetic flags random,
 	// IF and bit 1 set, TF/DF/AC clear).
 	regsetPopf = 1 << 58
+	// regsetX87Full: the instruction names ST(7); all eight x87 registers hold values (by
+	// default ST(7) is empty so that a push does not overflow).
+	regsetX87Full = 1 << 57
 )
 
 // readsPF reports whether the instruction's result depends on PF.
@@ -939,6 +942,9 @@ func writeRegsets(b *strings.Builder, tests []*test) {
 		}
 		if strings.HasPrefix(t.sig, "POPFQ") {
 			mask |= regsetPopf
+		}
+		if strings.Contains(t.text, "st7") {
+			mask |= regsetX87Full
 		}
 		fmt.Fprintf(b, "  .quad 0x%x", mask)
 		for _, v := range vals {

@@ -20,7 +20,8 @@ typedef struct DtState {
     /* x87 state, kept by the C drivers (the test stubs do not touch it): ST(0)..ST(7) in stack
        order as doubles, TOP, control and status words, and which ST(i) hold a value (the native
        tag word; the lifter does not track tags). Inputs: ST(0)..ST(6) hold values, ST(7) is
-       empty so that one push does not overflow the stack. */
+       empty so that one push does not overflow the stack (all eight hold values for an
+       instruction that names ST(7)). */
     double st[8];
     uint32_t ftop;
     uint16_t fcw, fsw;
@@ -147,6 +148,10 @@ static inline void dt_make_state(DtState *st, uint8_t *scratch, unsigned test, u
     st->st[7] = 0;
     st->ftop = (test * 5 + trial * 3) & 7;
     st->ftag = 0x7f;
+    if (regset[0] >> 57 & 1) { /* the instruction names ST(7): all eight registers hold values */
+        st->st[7] = dt_double(&s, special);
+        st->ftag = 0xff;
+    }
     st->fcw = 0x37f;
     st->fsw = (uint16_t)(st->ftop << 11);
     if (regset[0] >> 58 & 1) { /* POPFQ: a valid RFLAGS image at the stack top (DT_MEM_TARGET + 64) */
