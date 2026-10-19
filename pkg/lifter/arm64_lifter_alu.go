@@ -1659,9 +1659,25 @@ func (l *Arm64Lifter) liftMovbe(inst disasm.Instruction, nextPC uint64, lines []
 	return lines, nil
 }
 
-// liftRdtsc handles RDTSC (Read Time-Stamp Counter).
+// guestTscFreq is the TSC frequency the guest sees: RECOMP_TSC_FREQ in
+// pkg/runtime/core/recomp_context.h, which sceKernelGetTscFrequency reports and
+// sceKernelReadTsc counts in (TestRdtscMatchesRuntimeTsc checks that they agree).
+const guestTscFreq = 2130000000
+
+// liftRdtsc handles RDTSC (Read Time-Stamp Counter): the host counter scaled to guestTscFreq,
+// floor(cntvct * F / cntfrq) as recomp_rdtsc computes it, without a 128-bit product:
+// q*F + (r*F)/cntfrq with q, r = cntvct divmod cntfrq (r*F < cntfrq*F fits in 64 bits).
+// Flags are not touched. Scratch: x0-x2, x16, x17.
 func (l *Arm64Lifter) liftRdtsc(lines []string) []string {
 	lines = append(lines, "    mrs x16, cntvct_el0")
+	lines = append(lines, "    mrs x17, cntfrq_el0")
+	lines = append(lines, "    udiv x0, x16, x17")
+	lines = append(lines, "    msub x1, x0, x17, x16")
+	lines = append(lines, loadImm64("x2", guestTscFreq)...)
+	lines = append(lines, "    mul x0, x0, x2")
+	lines = append(lines, "    mul x1, x1, x2")
+	lines = append(lines, "    udiv x1, x1, x17")
+	lines = append(lines, "    add x16, x0, x1")
 	lines = append(lines, "    mov w19, w16")
 	lines = append(lines, "    lsr x16, x16, #32")
 	lines = append(lines, "    mov w22, w16")
