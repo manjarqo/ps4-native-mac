@@ -490,3 +490,11 @@ func TestRegressInt41Continues(t *testing.T) {
 	requireInOrder(t, "int3", liftBlock(t, "cc")[0], "brk #0")
 	requireInOrder(t, "int 0x80", liftBlock(t, "cd80")[0], "brk #0")
 }
+
+// CALL [RSP+X] reads its target before the return address is pushed (TLOU 20, U4 13 sites);
+// TestExecStackRsp checks PUSH/POP with RSP operands by execution.
+func TestRegressCallRspOperand(t *testing.T) {
+	lines := liftBlock(t, "ff542438")[0] // call qword ptr [rsp+0x38]
+	requireInOrder(t, "call [rsp+0x38]", lines, "mov x16, x26", "add x16, x16, #56", "ldr x0, [x28, x16]",
+		"sub x26, x26, #8", "bl _recomp_indirect_call")
+}

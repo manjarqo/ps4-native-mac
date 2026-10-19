@@ -193,3 +193,38 @@ func TestExecStringOps(t *testing.T) {
 	}
 	runExecCases(t, cases)
 }
+
+// Stack operations that address through RSP: PUSH RSP pushes the value before the decrement,
+// POP RSP loads RSP from the old top (no increment after), PUSH [RSP+X] reads its operand
+// before the decrement, POP [RSP+X] computes the address after the increment.
+func TestExecStackRsp(t *testing.T) {
+	stack := make([]byte, 0x40)
+	for i := range stack {
+		stack[i] = byte(0xa0 + i)
+	}
+	top := uint64(execRSP - 0x20)
+	var cases []execCase
+	for _, c := range []struct {
+		name string
+		code []string
+	}{
+		{"push rsp", []string{"54"}},
+		{"push rsp; pop rax", []string{"54", "58"}},
+		{"pop rsp", []string{"5c"}},
+		{"push rsp; pop rsp", []string{"54", "5c"}},
+		{"push qword [rsp+8]", []string{"ff742408"}},
+		{"push qword [rsp]", []string{"ff3424"}},
+		{"pop qword [rsp+8]", []string{"8f442408"}},
+		{"pop qword [rsp]", []string{"8f0424"}},
+		{"push qword [rsp+8]; pop rbx", []string{"ff742408", "5b"}},
+	} {
+		cases = append(cases, execCase{
+			name: c.name,
+			code: c.code,
+			regs: map[x86asm.Reg]uint64{x86asm.RSP: top},
+			// pop rsp loads this value: a valid address in the window
+			mem: map[int][]byte{int(top-execMemBase) - 0x20: stack, int(top - execMemBase): le64(execMemBase + 0x1000)},
+		})
+	}
+	runExecCases(t, cases)
+}

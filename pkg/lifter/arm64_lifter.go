@@ -1102,6 +1102,11 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 
 	case x86asm.PUSH:
 		if reg, ok := args[0].(x86asm.Reg); ok {
+			if reg == x86asm.RSP {
+				// PUSH RSP stores the value RSP had before the instruction.
+				lines = append(lines, "    sub x16, x26, #8", "    str x26, [x28, x16]", "    mov x26, x16")
+				return lines, nil
+			}
 			if desc, okDesc := arm64RegMap[reg]; okDesc {
 				lines = append(lines, "    sub x26, x26, #8")
 				lines = append(lines, fmt.Sprintf("    str %s, [x28, x26]", desc.X))
@@ -1123,6 +1128,11 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 
 	case x86asm.POP:
 		if reg, ok := args[0].(x86asm.Reg); ok {
+			if reg == x86asm.RSP {
+				// POP RSP: RSP is the value loaded from the old top; the increment is lost.
+				lines = append(lines, "    ldr x26, [x28, x26]")
+				return lines, nil
+			}
 			if desc, okDesc := arm64RegMap[reg]; okDesc {
 				lines = append(lines, fmt.Sprintf("    ldr %s, [x28, x26]", desc.X))
 				lines = append(lines, "    add x26, x26, #8")
