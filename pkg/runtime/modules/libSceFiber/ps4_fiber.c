@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <mach/mach_time.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -90,20 +91,23 @@ typedef struct FiberWorker {
   GuestContext *ctx;
   RecompThread *thread;
   FiberBaton baton;
-  struct FiberHost *current;
+  // The fiber that runs on this guest thread, if any. A fiber that is IDLE (and so may be
+  // finalized) is never any worker's current fiber (ps4_fiber_endpoint_host_thread).
+  struct FiberHost *_Atomic current;
   uint64_t return_arg;
   // Coroutine mode: saved host stack pointer of the thread's own code while
   // a fiber runs, and the fiber to mark IDLE once we are back on it.
   void *sp;
   _Atomic uint32_t *release;
   pthread_t host; // the guest thread's host thread
+  int slot;       // index in g_workers, or -1
 } FiberWorker;
 
 typedef struct FiberHost {
   uint64_t guest_addr;
   GuestContext *fctx;
   pthread_t host_thread;
-  bool host_started;
+  _Atomic bool host_started; // host_thread is valid
   bool kill;
   FiberBaton baton;
   FiberWorker *worker;
@@ -223,18 +227,33 @@ void ps4_fiber_print_stats(int frames) {
           (unsigned long long)atomic_load(&g_fstat_creates));
 }
 
-// Every worker, for ps4_fiber_endpoint_host_thread: append-only, read without locks (also
-// from signal handlers); a destroyed worker's entry is cleared before it is freed.
+// Every worker, for ps4_fiber_endpoint_host_thread, which runs in signal handlers and so can
+// neither lock nor wait. A lookup counts itself in g_lookups while it uses workers and fibers it
+// found through the table. Whoever frees a worker or a fiber first makes it unreachable from the
+// table (clears the worker's slot; a fiber is unreachable once it is IDLE, see
+// FiberWorker.current) and then waits in lookup_quiesce until no lookup is in progress, so a
+// lookup never reads freed memory. Every access is sequentially consistent: a lookup either
+// counted itself before the freer looked at g_lookups (the freer waits for it) or reads the
+// table after the object became unreachable. A lookup blocks signals while it runs, so no signal
+// handler on its thread (a guest exception handler may finalize a fiber) waits for it.
+// Freed slots are reused.
 #define MAX_WORKERS 1024
 static FiberWorker *_Atomic g_workers[MAX_WORKERS];
-static _Atomic int g_nworkers;
+static _Atomic int g_nworkers; // slots in use or used before (at most MAX_WORKERS)
+static _Atomic unsigned g_lookups;
+
+static void lookup_quiesce(void) {
+  for (unsigned spins = 0; atomic_load(&g_lookups) != 0; spins++)
+    if (spins >= 64) sched_yield();
+}
 
 static void worker_destroy(void *p) {
   FiberWorker *w = (FiberWorker *)p;
   if (!w) return;
-  const int n = atomic_load(&g_nworkers);
-  for (int i = 0; i < n && i < MAX_WORKERS; i++)
-    if (atomic_load(&g_workers[i]) == w) atomic_store(&g_workers[i], NULL);
+  if (w->slot >= 0) {
+    atomic_store(&g_workers[w->slot], NULL);
+    lookup_quiesce();
+  }
   baton_destroy(&w->baton);
   free(w);
 }
@@ -242,21 +261,47 @@ static void worker_destroy(void *p) {
 bool ps4_fiber_threads_mode(void) { return g_fiber_threads; }
 
 bool ps4_fiber_endpoint_host_thread(const GuestContext *ctx, pthread_t *out) {
+  // Asynchronous signals stay pending until the lookup is done; faults are not blocked.
+  sigset_t all, old;
+  sigfillset(&all);
+  sigdelset(&all, SIGSEGV);
+  sigdelset(&all, SIGBUS);
+  sigdelset(&all, SIGILL);
+  sigdelset(&all, SIGFPE);
+  sigdelset(&all, SIGTRAP);
+  pthread_sigmask(SIG_BLOCK, &all, &old);
+  atomic_fetch_add(&g_lookups, 1);
+  bool found = false;
   const int n = atomic_load(&g_nworkers);
-  for (int i = 0; i < n && i < MAX_WORKERS; i++) {
+  for (int i = 0; i < n && !found; i++) {
     FiberWorker *w = atomic_load(&g_workers[i]);
     if (!w) continue;
-    FiberHost *h = w->current;
+    FiberHost *h = atomic_load(&w->current);
     if (w->ctx == ctx) {
-      *out = g_fiber_threads && h && h->host_started ? h->host_thread : w->host;
-      return true;
-    }
-    if (h && h->fctx == ctx) {
-      *out = g_fiber_threads && h->host_started ? h->host_thread : w->host;
-      return true;
+      *out = g_fiber_threads && h && atomic_load(&h->host_started) ? h->host_thread : w->host;
+      found = true;
+    } else if (h && h->fctx == ctx) {
+      *out = g_fiber_threads && atomic_load(&h->host_started) ? h->host_thread : w->host;
+      found = true;
     }
   }
-  return false;
+  atomic_fetch_sub(&g_lookups, 1);
+  pthread_sigmask(SIG_SETMASK, &old, NULL);
+  return found;
+}
+
+// Puts w into a free slot of g_workers (or a new one); -1 when the table is full.
+static int worker_publish(FiberWorker *w) {
+  for (;;) {
+    int n = atomic_load(&g_nworkers);
+    for (int i = 0; i < n; i++) {
+      FiberWorker *expected = NULL;
+      if (atomic_compare_exchange_strong(&g_workers[i], &expected, w)) return i;
+    }
+    if (n >= MAX_WORKERS) return -1;
+    // Grow by one slot; whoever gets to the new slot first takes it, so scan again.
+    atomic_compare_exchange_strong(&g_nworkers, &n, n + 1);
+  }
 }
 
 static void worker_key_init(void) {
@@ -274,11 +319,10 @@ static FiberWorker *get_worker(GuestContext *ctx) {
   baton_init(&w->baton);
   pthread_setspecific(g_worker_key, w);
   tl_worker = w;
-  const int i = atomic_fetch_add(&g_nworkers, 1);
-  if (i < MAX_WORKERS)
-    atomic_store(&g_workers[i], w);
-  else if (i == MAX_WORKERS)
-    fprintf(stderr, "[ps4-fiber] more than %d guest threads run fibers: guest exceptions for the "
+  w->slot = worker_publish(w);
+  static _Atomic bool warned;
+  if (w->slot < 0 && !atomic_exchange(&warned, true))
+    fprintf(stderr, "[ps4-fiber] more than %d live guest threads run fibers: guest exceptions for the "
                     "later ones go to their own host thread, not to the fiber they run\n", MAX_WORKERS);
   return w;
 }
@@ -334,7 +378,10 @@ static void tcb_set_running(const GuestContext *t, GuestContext *running) {
     *(uint64_t *)(t->mem_base + t->fs_base + 0x70ULL) = (uint64_t)(uintptr_t)running;
 }
 
+// h is finalized (it was IDLE, so no worker's current fiber): wait for lookups that may
+// still use it, then free it.
 static void fiber_free_host(FiberHost *h) {
+  lookup_quiesce();
   baton_destroy(&h->baton);
   if (h->stack) munmap(h->stack, FIBER_HOST_STACK_SIZE);
   free(h->fctx);
@@ -726,13 +773,15 @@ static int32_t fiber_switch(GuestContext *ctx, uint64_t addr, uint64_t addr_cont
   // On Orbis the switch is atomic: once sceFiberSwitch is called the current
   // fiber can immediately be run/switched to from another thread. Mark it
   // idle before handing the worker to the target; a resume that races with
-  // us just posts our baton, which fiber_suspend consumes right away.
+  // us just posts our baton, which fiber_suspend consumes right away. The
+  // target is the worker's current fiber first: an IDLE fiber may be finalized.
+  w->current = h;
   atomic_store(&self_obj->state, FIBER_STATE_IDLE);
   int err = fiber_resume(h, w, arg_on_run_to, FSTAT_SWITCH);
   if (err != 0) {
     uint32_t idle = FIBER_STATE_IDLE;
-    atomic_compare_exchange_strong(&self_obj->state, &idle, FIBER_STATE_RUNNING);
-    w->current = self;
+    // Unless another thread has claimed us meanwhile (then we may be finalized), we run on.
+    w->current = atomic_compare_exchange_strong(&self_obj->state, &idle, FIBER_STATE_RUNNING) ? self : NULL;
     atomic_store(&f->state, FIBER_STATE_IDLE);
     return (int32_t)ORBIS_FIBER_ERROR_INVALID;
   }
