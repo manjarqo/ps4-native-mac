@@ -469,6 +469,9 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     }
 
     // Save full guest state to restore after exception handler returns
+    // ctx as it was when the signal arrived, restored afterwards. saved_ctx is the interrupted
+    // state the guest handler gets in its ucontext: in guest code the live registers.
+    const GuestContext orig_ctx = *ctx;
     GuestContext saved_ctx = *ctx;
 
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
@@ -548,8 +551,11 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     recomp_dispatch(ctx, handler);
     *slot = saved_slot;
 
-    // Restore guest registers exactly as before signal interruption
-    *ctx = saved_ctx;
+    // Restore ctx exactly as before the signal. Not saved_ctx: in guest code its GPRs are the
+    // live registers, which may not hold what the code wrote to ctx just before (a helper's
+    // rcx result the lifted code has not loaded yet); the live registers come back by
+    // sigreturn anyway.
+    *ctx = orig_ctx;
 }
 
 int32_t sceKernelInstallExceptionHandler(int32_t signum, uint64_t handler) {

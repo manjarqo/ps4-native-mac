@@ -77,6 +77,8 @@ void guest_spin(void);
 #define SPIN_HANDLE (D + 0x608)
 void guest_crash(void);
 void guest_helper_loop(void);
+void guest_helper_window(void);
+#define ADDR_HELPER_WINDOW 0x500300ULL
 void guest_shim_bench(void);
 #define ADDR_SHIM_BENCH 0x401300ULL
 void guest_uc_check(void);
@@ -504,7 +506,7 @@ static void test_profile(void) {
 
 // Exceptions raised while guest code runs a helper call (the lifted vpcmpistri loop): every
 // handler invocation must see the live guest registers in its ucontext, with the ucontext
-// below the red zone of the live guest stack.
+// below the red zone of the live guest stack, and no helper result in ctx (rcx) may be lost.
 static _Atomic int g_uc_seen, g_uc_bad;
 static uint64_t g_uc_rsp;
 
@@ -530,7 +532,7 @@ void shim_test_check_uc(GuestContext *ctx) {
 static void *raise_during_helper_loop(void *arg) {
   (void)arg;
   usleep(20 * 1000);
-  for (int i = 0; i < 300; i++) {
+  for (int i = 0; i < 3000; i++) {
     const int before = atomic_load(&g_uc_seen);
     if (sceKernelRaiseException(1000, 30) != 0) break;
     for (int k = 0; k < 2000 && atomic_load(&g_uc_seen) == before; k++) usleep(50);
@@ -546,9 +548,21 @@ static void test_signal_in_helper(void) {
   pthread_create(&th, NULL, raise_during_helper_loop, NULL);
   recomp_call_guest(g_proc, ADDR_HELPER_LOOP);
   pthread_join(th, NULL);
-  if (atomic_load(&g_uc_seen) < 100) fail("only %d exceptions handled", atomic_load(&g_uc_seen));
+  if (atomic_load(&g_uc_seen) < 1000) fail("only %d exceptions handled", atomic_load(&g_uc_seen));
+  expect("helper calls whose rcx result was lost", *gmem64(HELPER_LOOP_FLAG + 8), 0);
   if (atomic_load(&g_uc_bad))
     fail("%d of %d handler invocations saw a stale interrupted state", atomic_load(&g_uc_bad), atomic_load(&g_uc_seen));
+}
+
+// An exception delivered after a helper returned and before the lifted code read its result
+// from ctx: the handler must leave ctx->rcx as the helper wrote it.
+static void test_signal_after_helper(void) {
+  expect("sceKernelInstallExceptionHandler", (uint64_t)(int64_t)sceKernelInstallExceptionHandler(30, ADDR_UC_CHECK), 0);
+  g_uc_rsp = g_proc->rsp - 8;
+  recomp_call_guest(g_proc, ADDR_HELPER_WINDOW);
+  expect("exceptions handled", (uint64_t)atomic_load(&g_uc_seen), 200);
+  expect("handler invocations with a stale interrupted state", (uint64_t)atomic_load(&g_uc_bad), 0);
+  expect("helper calls whose rcx result was lost", *gmem64(HELPER_LOOP_FLAG + 8), 0);
 }
 
 // An exception raised on a guest thread while it runs a fiber that waits in a shim: the
@@ -596,6 +610,7 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_SPIN, (recomp_fn_t)guest_spin);
   recomp_register_fn(ADDR_CRASH, (recomp_fn_t)guest_crash);
   recomp_register_fn(ADDR_HELPER_LOOP, (recomp_fn_t)guest_helper_loop);
+  recomp_register_fn(ADDR_HELPER_WINDOW, (recomp_fn_t)guest_helper_window);
   recomp_register_fn(ADDR_SHIM_BENCH, (recomp_fn_t)guest_shim_bench);
   recomp_register_fn(ADDR_UC_CHECK, (recomp_fn_t)guest_uc_check);
   recomp_register_fn(ADDR_EXC_FIBER_MAIN, (recomp_fn_t)guest_exc_fiber_main);
@@ -636,6 +651,8 @@ int main(int argc, char **argv) {
     recomp_call_guest(g_proc, ADDR_SHIM_BENCH);
     const double ns = (double)(mach_absolute_time() - t0) * tb.numer / tb.denom;
     printf("bench-shim mxcsr 0x%x: %.2f ns per shim call\n", g_proc->mxcsr, ns / 1e7);
+  } else if (strcmp(c, "signal-after-helper") == 0) {
+    test_signal_after_helper();
   } else if (strcmp(c, "signal-in-helper") == 0) {
     test_signal_in_helper();
   } else if (strcmp(c, "exception-fiber") == 0) {

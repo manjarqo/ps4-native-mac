@@ -106,7 +106,7 @@ func writeLiftedHelperFns(t *testing.T, path string) {
 	fns := b.String()
 	// _guest_helper_loop: rbx, rbp, r12-r15 = 0xf001, 0xf002, 0xf00c-0xf00f, then the lifted
 	// vpcmpistri xmm2, xmm3, 0x38 in a loop until the guest word at 0x1000800 is set
-	// (harness.c test_signal_in_helper raises exceptions meanwhile).
+	// (harness.c test_signal_in_helper raises exceptions meanwhile), checking rcx after each.
 	inst, err := x86asm.Decode(liftedHelperFns[0].code, 64)
 	if err != nil {
 		t.Fatal(err)
@@ -121,10 +121,50 @@ func writeLiftedHelperFns(t *testing.T, path string) {
 	for r, v := range map[int]int{20: 0xf001, 25: 0xf002, 12: 0xf00c, 13: 0xf00d, 14: 0xf00e, 15: 0xf00f} {
 		fmt.Fprintf(&b, "    movz x%d, #0x%x\n", r, v)
 	}
-	fmt.Fprintf(&b, "Lhelper_loop:\n%s\n", strings.Join(lines, "\n"))
+	// rcx gets a stale value before every vpcmpistri, which must leave ECX = 0; a nonzero rcx
+	// after it counts in the guest word at 0x1000808.
+	b.WriteString("    movi v2.16b, #0x42\n    movi v3.16b, #0x43\n") // differ in byte 0: ECX = 0
+	b.WriteString("Lhelper_loop:\n    movz x21, #0x5555\n")
+	fmt.Fprintf(&b, "%s\n    cbz x21, Lhelper_rcx_ok\n", strings.Join(lines, "\n"))
+	li("x16", 0x1000808)
+	b.WriteString("    ldr x0, [x28, x16]\n    add x0, x0, #1\n    str x0, [x28, x16]\nLhelper_rcx_ok:\n")
 	li("x16", 0x1000800)
 	b.WriteString("    ldr x0, [x28, x16]\n    cbz x0, Lhelper_loop\n")
 	b.WriteString("    ldr x16, [x28, x26]\n    add x26, x26, #8\n    ldr x30, [sp], #16\n    ret\n")
+	// _guest_helper_window: 200 times the same vpcmpistri, with a SIGUSR1 delivered right after
+	// the helper returned, before the lifted code loads rcx from ctx (the stub below sends it
+	// with raw syscalls, so it arrives at a PC in guest code).
+	var win []string
+	for _, ln := range lines {
+		win = append(win, ln)
+		if strings.Contains(ln, "bl   _recomp_vpcmpistri") {
+			win = append(win, "    bl   _test_signal_self")
+		}
+	}
+	b.WriteString(".globl _guest_helper_window\n_guest_helper_window:\n    str x30, [sp, #-16]!\n")
+	for r, v := range map[int]int{20: 0xf001, 25: 0xf002, 12: 0xf00c, 13: 0xf00d, 14: 0xf00e, 15: 0xf00f} {
+		fmt.Fprintf(&b, "    movz x%d, #0x%x\n", r, v)
+	}
+	b.WriteString("    movi v2.16b, #0x42\n    movi v3.16b, #0x43\n    movz x9, #200\n")
+	b.WriteString("Lhelper_window:\n    movz x21, #0x5555\n")
+	fmt.Fprintf(&b, "%s\n    cbz x21, Lhelper_window_ok\n", strings.Join(win, "\n"))
+	li("x16", 0x1000808)
+	b.WriteString("    ldr x0, [x28, x16]\n    add x0, x0, #1\n    str x0, [x28, x16]\nLhelper_window_ok:\n")
+	b.WriteString("    subs x9, x9, #1\n    b.ne Lhelper_window\n")
+	b.WriteString("    ldr x16, [x28, x26]\n    add x26, x26, #8\n    ldr x30, [sp], #16\n    ret\n\n")
+	// kill(getpid(), SIGUSR1); the signal is delivered on the return from the syscall.
+	b.WriteString(`_test_signal_self:
+    stp  x0, x1, [sp, #-32]!
+    str  x16, [sp, #16]
+    mov  x16, #20
+    svc  #0x80
+    mov  x1, #30
+    mov  x16, #37
+    svc  #0x80
+    ldr  x16, [sp, #16]
+    ldp  x0, x1, [sp], #32
+    ret
+`)
 	if err := os.WriteFile(strings.TrimSuffix(path, ".s")+"_loop.s", []byte(b.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -209,6 +249,7 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"crash-in-guest-code", "crash", nil, true},
 		{"guest-longjmp-stops", "longjmp", nil, true},
 		{"exception-in-helper", "signal-in-helper", nil, false},
+		{"exception-after-helper", "signal-after-helper", nil, false},
 		{"exception-in-fiber/coroutines", "exception-fiber", nil, false},
 		{"exception-in-fiber/threads", "exception-fiber", []string{"PS4_FIBER_THREADS=1"}, false},
 	}
