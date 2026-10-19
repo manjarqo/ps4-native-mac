@@ -426,6 +426,39 @@ func defMemSz(inst disasm.Instruction) int {
 	return sz
 }
 
+// unsupportedAddressing reports memory operand forms that computeEffAddr cannot express, which
+// therefore trap instead of accessing a wrong address. None occurs in TLOU or U4 (CUSA00557,
+// CUSA04529):
+//   - the address-size prefix (addr32): the address would have to wrap at 4 GiB;
+//   - MOV with a 64-bit absolute address (moffs, opcodes A0-A3): x86asm reports it like a
+//     RIP-relative operand and the displacement does not fit the 32-bit path;
+//   - GS: the guest GS base is not kept anywhere.
+// NOP and the prefetches do not access memory and are exempt.
+func unsupportedAddressing(inst x86asm.Inst) string {
+	switch inst.Op {
+	case x86asm.NOP, x86asm.PREFETCHT0, x86asm.PREFETCHNTA, x86asm.PREFETCHT1, x86asm.PREFETCHT2, x86asm.PREFETCHW:
+		return ""
+	}
+	for _, a := range inst.Args {
+		if a == nil {
+			break
+		}
+		m, ok := a.(x86asm.Mem)
+		if !ok {
+			continue
+		}
+		switch {
+		case inst.AddrSize == 32:
+			return "addr32 memory operand (32-bit address wrap not lowered)"
+		case inst.Op == x86asm.MOV && inst.Opcode>>24 >= 0xa0 && inst.Opcode>>24 <= 0xa3:
+			return "mov with a 64-bit absolute address (moffs) not lowered"
+		case m.Segment == x86asm.GS:
+			return "GS segment override not lowered"
+		}
+	}
+	return ""
+}
+
 // computeEffAddr generates instructions to compute a guest memory effective address into targetReg (usually x16).
 func computeEffAddr(mem x86asm.Mem, nextPC uint64, targetReg string) []string {
 	var lines []string
@@ -439,7 +472,18 @@ func computeEffAddr(mem x86asm.Mem, nextPC uint64, targetReg string) []string {
 		return loadImm64(targetReg, effAddr)
 	}
 
-	// 2. Segment-based (FS: [fs_base + disp])
+	// 2. FS: [fs_base + disp]; with a base or index register the address is computed as usual
+	// and fs_base added at the end.
+	if mem.Segment == x86asm.FS && (mem.Base != 0 || mem.Index != 0) {
+		plain := mem
+		plain.Segment = 0
+		if plain.Base == x86asm.RIP {
+			lines = append(lines, loadImm64(targetReg, uint64(int64(nextPC)+disp))...)
+		} else {
+			lines = append(lines, computeEffAddr(plain, nextPC, targetReg)...)
+		}
+		return append(lines, fmt.Sprintf("    add %s, %s, x27", targetReg, targetReg))
+	}
 	if mem.Segment == x86asm.FS {
 		if disp != 0 {
 			if disp >= 0 && disp <= 4095 {
@@ -835,6 +879,11 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 
 	comment := fmt.Sprintf("    // 0x%x: %s", inst.Address, inst.Inst.String())
 	lines = append(lines, comment)
+
+	if reason := unsupportedAddressing(inst.Inst); reason != "" {
+		lines = append(lines, l.emitUnsupported(inst, reason)...)
+		return lines, nil
+	}
 
 	if hasLockPrefix(inst.Inst) {
 		if out, ok := l.liftLocked(inst, nextPC, lines); ok {

@@ -515,3 +515,24 @@ func TestRegressX87UnusedTrap(t *testing.T) {
 		requireInOrder(t, tc.name, liftBlock(t, tc.hex)[0], "b _recomp_unsupported_instruction")
 	}
 }
+
+// FS:[base+index*scale+disp] ignored base and index (0 sites); the address is now computed as
+// usual and the FS base (x27) added. Forms computeEffAddr cannot express trap (0 sites each):
+// addr32, MOV moffs64 (A0-A3), GS.
+func TestRegressAddressingForms(t *testing.T) {
+	requireInOrder(t, "mov rax, fs:[rax+8]", liftBlock(t, "64488b4008")[0],
+		"mov x16, x19", "add x16, x16, #8", "add x16, x16, x27", "ldr x19, [x28, x16]")
+	requireInOrder(t, "mov rax, fs:[rax+8*rcx]", liftBlock(t, "64488b04c8")[0],
+		"mov x16, x19", "add x16, x16, x21, lsl #3", "add x16, x16, x27", "ldr x19, [x28, x16]")
+	requireInOrder(t, "mov rax, fs:[0x28]", liftBlock(t, "64488b042528000000")[0], "add x16, x27, #40", "ldr x19, [x28, x16]")
+	for _, tc := range []struct{ name, hex string }{
+		{"mov eax, [moffs64]", "a10000001000000000"},
+		{"mov [moffs64], rax", "48a30000001000000000"},
+		{"mov rax, gs:[0]", "65488b042500000000"},
+		{"mov eax, [edi]", "678b07"},
+		{"lea rax, [edi+eax]", "67488d0407"},
+	} {
+		requireInOrder(t, tc.name, liftBlock(t, tc.hex)[0], "b _recomp_unsupported_instruction")
+	}
+	forbid(t, "nop [rax+rax]", liftBlock(t, "0f1f440000")[0], "b _recomp_unsupported_instruction")
+}
