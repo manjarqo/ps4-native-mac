@@ -1,0 +1,174 @@
+// Guest-state boundary tests of the ARM64 assembly backend (boundary_test.go builds this with
+// the emitted trampoline, the generated shim stubs, guest.s and the runtime sources).
+// Usage: harness <case>; prints "PASS <case>" and exits 0, or prints what differs and exits 1.
+#include "recomp_runtime.h"
+#include "ps4_fiber.h"
+#include "ps4_threading.h"
+
+#include <stdarg.h>
+
+// Guest data layout (guest.s has the same addresses).
+#define D 0x1000000ULL
+#define FIBER_A (D + 0x000)
+#define FIBER_B (D + 0x100)
+#define NAME_A (D + 0x200)
+#define NAME_B (D + 0x210)
+#define ARGRET1 (D + 0x300)
+#define ARGRET2 (D + 0x308)
+#define ARGRUN_A (D + 0x310)
+#define ARGRUN_A2 (D + 0x318)
+#define ARGRUN_B (D + 0x320)
+#define ARGRUN_A3 (D + 0x328)
+#define STACK_A 0x1100000ULL
+#define STACK_B 0x1200000ULL
+#define FIBER_STACK_SIZE 0x10000ULL
+
+enum { RES_M1, RES_A1, RES_A2, RES_B1, RES_M2, RES_A_ARGS, RES_B_ARGS, RES_A_PRE, RES_B_PRE, RES_M1_PRE, RES_M2_PRE };
+// Result block words (guest.s STORE_REGS).
+enum { W_RAX, W_RBX, W_RCX, W_RDX, W_RSI, W_RDI, W_RBP, W_RSP, W_R8, W_R15 = W_R8 + 7, W_FS, W_MEM };
+
+// Guest addresses of the guest functions.
+#define ADDR_FIBER_MAIN1 0x400000ULL
+#define ADDR_FIBER_MAIN2 0x400100ULL
+#define ADDR_FIBER_A 0x400200ULL
+#define ADDR_FIBER_B 0x400300ULL
+
+void guest_fiber_main1(void);
+void guest_fiber_main2(void);
+void guest_fiber_a(void);
+void guest_fiber_b(void);
+
+static GuestContext *g_proc;
+static int g_failures;
+
+static uint64_t *gmem64(uint64_t addr) { return (uint64_t *)(g_proc->mem_base + addr); }
+static uint64_t *res(int n) { return gmem64(D + 0x1000 + (uint64_t)n * 0x100); }
+
+static void fail(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  printf("FAIL: ");
+  vprintf(fmt, ap);
+  printf("\n");
+  va_end(ap);
+  g_failures++;
+}
+
+static void expect(const char *what, uint64_t got, uint64_t want) {
+  if (got != want) fail("%s = 0x%llx, want 0x%llx", what, (unsigned long long)got, (unsigned long long)want);
+}
+
+// The registers guest.s SET_PATTERN set (only those a call must preserve are checked) and the
+// guest stack pointer, FS base and memory base of block n.
+static void check_pattern(const char *name, int n, uint64_t p, uint64_t rsp, uint64_t fs) {
+  char what[64];
+  const uint64_t *r = res(n);
+  snprintf(what, sizeof what, "%s rbx", name);
+  expect(what, r[W_RBX], p + 0x01);
+  snprintf(what, sizeof what, "%s rbp", name);
+  expect(what, r[W_RBP], p + 0x02);
+  for (int i = 12; i <= 15; i++) {
+    snprintf(what, sizeof what, "%s r%d", name, i);
+    expect(what, r[W_R8 + i - 8], p + (uint64_t)i);
+  }
+  snprintf(what, sizeof what, "%s rsp", name);
+  expect(what, r[W_RSP], rsp);
+  snprintf(what, sizeof what, "%s FS base (x27)", name);
+  expect(what, r[W_FS], fs);
+  snprintf(what, sizeof what, "%s memory base (x28)", name);
+  expect(what, r[W_MEM], (uint64_t)(uintptr_t)g_proc->mem_base);
+}
+
+// Calls a shim from C the way guest code does: return address and a stack argument on the
+// guest stack, integer arguments in the System V registers.
+static uint64_t call_shim(GuestContext *ctx, void (*shim)(GuestContext *), uint64_t a1, uint64_t a2, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6, uint64_t stack7) {
+  const uint64_t rsp = ctx->rsp;
+  ctx->rsp -= 16;
+  *gmem64(ctx->rsp) = 0;
+  *gmem64(ctx->rsp + 8) = stack7;
+  ctx->rdi = a1;
+  ctx->rsi = a2;
+  ctx->rdx = a3;
+  ctx->rcx = a4;
+  ctx->r8 = a5;
+  ctx->r9 = a6;
+  shim(ctx);
+  ctx->rsp = rsp;
+  return ctx->rax;
+}
+
+// A shim that does nothing: it only makes the bridge store and reload the guest registers.
+void shim_test_noop(GuestContext *ctx) { SHIM_RETURN(); }
+
+static uint64_t tcb_slot(const GuestContext *t) { return *gmem64(t->fs_base + 0x70); }
+
+static void *run_fiber_main2(void *arg) {
+  GuestContext *t2 = (GuestContext *)arg;
+  g_current_ctx = t2;
+  recomp_call_guest(t2, ADDR_FIBER_MAIN2);
+  return NULL;
+}
+
+// sceFiberRun/Switch/ReturnToThread: every context resumes with its own registers, also
+// when a fiber resumes on another guest thread (FS base of that thread).
+static void test_fiber(void) {
+  GuestContext *t1 = g_proc;
+  strcpy((char *)g_proc->mem_base + NAME_A, "A");
+  strcpy((char *)g_proc->mem_base + NAME_B, "B");
+  expect("init A", call_shim(t1, shim_sceFiberInitializeImpl, FIBER_A, NAME_A, ADDR_FIBER_A, 0xa1a1, STACK_A,
+                             FIBER_STACK_SIZE, 0), 0);
+  expect("init B", call_shim(t1, shim_sceFiberInitializeImpl, FIBER_B, NAME_B, ADDR_FIBER_B, 0xb1b1, STACK_B,
+                             FIBER_STACK_SIZE, 0), 0);
+  recomp_call_guest(t1, ADDR_FIBER_MAIN1);
+
+  GuestContext *t2 = recomp_create_thread_context(t1, 0x10000);
+  pthread_t th;
+  pthread_create(&th, NULL, run_fiber_main2, t2);
+  pthread_join(th, NULL);
+
+  const uint64_t fs1 = t1->fs_base, fs2 = t2->fs_base;
+  expect("A argOnInitialize", res(RES_A_ARGS)[W_RDI], 0xa1a1);
+  expect("A argOnRun", res(RES_A_ARGS)[W_RSI], 0x5150);
+  expect("B argOnInitialize", res(RES_B_ARGS)[W_RDI], 0xb1b1);
+  expect("B argOnRun", res(RES_B_ARGS)[W_RSI], 0x5151);
+  check_pattern("A after Switch(B) on thread 1", RES_A1, 0xa000, res(RES_A_PRE)[W_RSP], fs1);
+  expect("A argOnRun from B", *gmem64(ARGRUN_A), 0x5353);
+  expect("A rax after Switch", res(RES_A1)[W_RAX], 0);
+  check_pattern("thread 1 after Run(A)", RES_M1, 0x1100, res(RES_M1_PRE)[W_RSP], fs1);
+  expect("thread 1 argOnReturn", *gmem64(ARGRET1), 0x77);
+  check_pattern("A after ReturnToThread, resumed on thread 2", RES_A2, 0xa000, res(RES_A_PRE)[W_RSP], fs2);
+  expect("A argOnRun from thread 2", *gmem64(ARGRUN_A2), 0x5250);
+  check_pattern("B after Switch(A), resumed on thread 2", RES_B1, 0xb000, res(RES_B_PRE)[W_RSP], fs2);
+  expect("B argOnRun from A", *gmem64(ARGRUN_B), 0x5252);
+  check_pattern("thread 2 after Run(A)", RES_M2, 0x2200, res(RES_M2_PRE)[W_RSP], fs2);
+  expect("thread 2 argOnReturn", *gmem64(ARGRET2), 0x88);
+  expect("thread 1 TCB slot", tcb_slot(t1), (uint64_t)(uintptr_t)t1);
+  expect("thread 2 TCB slot", tcb_slot(t2), (uint64_t)(uintptr_t)t2);
+}
+
+int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0);
+  if (argc < 2) {
+    fprintf(stderr, "usage: %s <case>\n", argv[0]);
+    return 2;
+  }
+  g_proc = recomp_init_runtime(256ULL << 20, NULL, 0, "boundary_test");
+  if (!g_proc) return 2;
+  recomp_init_main_thread(g_proc);
+  recomp_register_fn(ADDR_FIBER_MAIN1, (recomp_fn_t)guest_fiber_main1);
+  recomp_register_fn(ADDR_FIBER_MAIN2, (recomp_fn_t)guest_fiber_main2);
+  recomp_register_fn(ADDR_FIBER_A, (recomp_fn_t)guest_fiber_a);
+  recomp_register_fn(ADDR_FIBER_B, (recomp_fn_t)guest_fiber_b);
+
+  const char *c = argv[1];
+  if (strcmp(c, "fiber") == 0) {
+    test_fiber();
+  } else {
+    fprintf(stderr, "unknown case %s\n", c);
+    return 2;
+  }
+  if (g_failures) return 1;
+  printf("PASS %s\n", c);
+  return 0;
+}

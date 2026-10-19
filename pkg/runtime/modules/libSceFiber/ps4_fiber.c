@@ -288,6 +288,15 @@ static void fiber_release_thread(const GuestContext *f, GuestContext *t) {
   memcpy(t->tls_keys, f->tls_keys, sizeof(t->tls_keys));
 }
 
+// Guest code and the shim bridge find the GuestContext of what runs on a guest thread
+// through the TCB slot [fs_base + 0x70] (see the contract at recomp_enter_guest): the
+// thread's own context, or the fiber's while a fiber runs. Every hand-over points it at the
+// endpoint that runs next on thread t, before that endpoint runs.
+static void tcb_set_running(const GuestContext *t, GuestContext *running) {
+  if (t->mem_base && t->fs_base)
+    *(uint64_t *)(t->mem_base + t->fs_base + 0x70ULL) = (uint64_t)(uintptr_t)running;
+}
+
 static void fiber_free_host(FiberHost *h) {
   baton_destroy(&h->baton);
   if (h->stack) munmap(h->stack, FIBER_HOST_STACK_SIZE);
@@ -343,6 +352,7 @@ static int fiber_resume(FiberHost *h, FiberWorker *w, uint64_t arg, int kind) {
     h->host_started = true;
     atomic_fetch_add_explicit(&g_fstat_creates, 1, memory_order_relaxed);
   }
+  tcb_set_running(w->ctx, h->fctx);
   baton_post(&h->baton, kind);
   return 0;
 }
@@ -470,6 +480,7 @@ static void co_enter(FiberHost *h, FiberWorker *w, uint64_t arg, _Atomic uint32_
   w->current = h;
   tl_fiber_self = h;
   g_current_ctx = h->fctx;
+  tcb_set_running(w->ctx, h->fctx);
 }
 
 // ---- Guest API ----
@@ -729,6 +740,7 @@ void shim_sceFiberReturnToThread(GuestContext *ctx) {
   fiber_release_thread(self->fctx, w->ctx);
   w->return_arg = ctx->rdi;
   w->current = NULL;
+  tcb_set_running(w->ctx, w->ctx);
   uint64_t arg;
   if (!g_fiber_threads) {
     fstat_count(FSTAT_RETURN);

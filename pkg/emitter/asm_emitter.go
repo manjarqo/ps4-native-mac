@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -307,10 +308,7 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 	for _, addr := range chunkAddrs {
 		if shim, isShimmed := e.shimMap[addr]; isShimmed {
 			// Forward directly to host shim via bridge
-			fmt.Fprintf(w, ".globl _fn_0x%x\n_fn_0x%x:\n", addr, addr)
-			fmt.Fprintf(w, "    adrp x0, _%s@PAGE\n", shim)
-			fmt.Fprintf(w, "    add  x0, x0, _%s@PAGEOFF\n", shim)
-			fmt.Fprintf(w, "    b    _recomp_call_shim\n\n")
+			writeShimStub(w, fmt.Sprintf("_fn_0x%x", addr), shim)
 			continue
 		}
 
@@ -370,6 +368,15 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 	return writeFileIfChanged(path, buf.Bytes())
 }
 
+// writeShimStub emits the guest-callable symbol sym of a host shim: guest code calls it like
+// any recompiled function, and it hands the shim to _recomp_call_shim.
+func writeShimStub(w io.Writer, sym, shim string) {
+	fmt.Fprintf(w, ".globl %s\n%s:\n", sym, sym)
+	fmt.Fprintf(w, "    adrp x0, _%s@PAGE\n", shim)
+	fmt.Fprintf(w, "    add  x0, x0, _%s@PAGEOFF\n", shim)
+	fmt.Fprintf(w, "    b    _recomp_call_shim\n\n")
+}
+
 func (e *AsmEmitter) emitChunkRegistration(path string, chunkIdx int, chunkAddrs []uint64) error {
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
@@ -392,291 +399,10 @@ func (e *AsmEmitter) emitChunkRegistration(path string, chunkIdx int, chunkAddrs
 	return writeFileIfChanged(path, buf.Bytes())
 }
 
-// EmitTrampoline generates the ARM64 assembly bridge between host C and guest assembly.
+// EmitTrampoline writes the ARM64 assembly bridge between the host C runtime and guest
+// assembly (trampolineAsm).
 func (e *AsmEmitter) EmitTrampoline(path string) error {
-	content := `// ARM64 Assembly Bridge between host C runtime and guest assembly
-.text
-.p2align 2
-
-// Global pointer to active GuestContext
-// void recomp_enter_guest(GuestContext *ctx, uint64_t target_fn)
-// x0 = ctx, x1 = target_fn
-.globl _recomp_enter_guest
-_recomp_enter_guest:
-    // 1. Save host callee-saved registers, frame pointer, and ctx on host stack
-    stp x29, x30, [sp, #-112]!
-    mov x29, sp
-    stp x19, x20, [sp, #16]
-    stp x21, x22, [sp, #32]
-    stp x23, x24, [sp, #48]
-    stp x25, x26, [sp, #64]
-    stp x27, x28, [sp, #80]
-    str x0,       [sp, #96]
-
-    // 2. Load guest registers from GuestContext (x0)
-    ldr x19, [x0, #0x0]   // rax
-    ldr x21, [x0, #0x8]   // rcx
-    ldr x22, [x0, #0x10]  // rdx
-    ldr x20, [x0, #0x18]  // rbx
-    ldr x26, [x0, #0x20]  // rsp
-    ldr x25, [x0, #0x28]  // rbp
-    ldr x23, [x0, #0x30]  // rsi
-    ldr x24, [x0, #0x38]  // rdi
-    ldr x8,  [x0, #0x40]  // r8
-    ldr x9,  [x0, #0x48]  // r9
-    ldr x10, [x0, #0x50]  // r10
-    ldr x11, [x0, #0x58]  // r11
-    ldr x12, [x0, #0x60]  // r12
-    ldr x13, [x0, #0x68]  // r13
-    ldr x14, [x0, #0x70]  // r14
-    ldr x15, [x0, #0x78]  // r15
-    ldr x27, [x0, #0x88]  // fs_base
-    ldr x28, [x0, #0x330] // mem_base (offset 816 in GuestContext)
-
-    // 3. Jump to target guest function (x1)
-    blr x1
-
-    // 4. On return: save guest registers back to GuestContext (from thread host stack)
-    ldr  x0, [sp, #96]
-    str x19, [x0, #0x0]   // rax
-    str x21, [x0, #0x8]   // rcx
-    str x22, [x0, #0x10]  // rdx
-    str x20, [x0, #0x18]  // rbx
-    str x26, [x0, #0x20]  // rsp
-    str x25, [x0, #0x28]  // rbp
-    str x23, [x0, #0x30]  // rsi
-    str x24, [x0, #0x38]  // rdi
-    str x8,  [x0, #0x40]  // r8
-    str x9,  [x0, #0x48]  // r9
-    str x10, [x0, #0x50]  // r10
-    str x11, [x0, #0x58]  // r11
-    str x12, [x0, #0x60]  // r12
-    str x13, [x0, #0x68]  // r13
-    str x14, [x0, #0x70]  // r14
-    str x15, [x0, #0x78]  // r15
-
-    // 5. Restore host callee-saved registers
-    ldp x19, x20, [sp, #16]
-    ldp x21, x22, [sp, #32]
-    ldp x23, x24, [sp, #48]
-    ldp x25, x26, [sp, #64]
-    ldp x27, x28, [sp, #80]
-    ldp x29, x30, [sp], #112
-    ret
-
-// _recomp_call_shim: calls a host C shim from guest assembly
-// x0 = host shim function pointer
-.globl _recomp_call_shim
-_recomp_call_shim:
-    // Save LR and allocate frame (160 bytes: 32 for fp/lr/x0 + 128 for q0-q7)
-    stp x29, x30, [sp, #-160]!
-    mov x29, sp
-    str x0, [sp, #16]
-    stp q0, q1, [sp, #32]
-    stp q2, q3, [sp, #64]
-    stp q4, q5, [sp, #96]
-    stp q6, q7, [sp, #128]
-
-    // Load active thread ctx into x1 from [x28, x27 + 0x70] (thread-local TCB)
-    add  x1, x27, #0x70
-    ldr  x1, [x28, x1]
-
-    // Sync registers to ctx before calling shim
-    str x19, [x1, #0x0]   // rax
-    str x21, [x1, #0x8]   // rcx
-    str x22, [x1, #0x10]  // rdx
-    str x20, [x1, #0x18]  // rbx
-    str x26, [x1, #0x20]  // rsp
-    str x25, [x1, #0x28]  // rbp
-    str x23, [x1, #0x30]  // rsi
-    str x24, [x1, #0x38]  // rdi
-    str x8,  [x1, #0x40]  // r8
-    str x9,  [x1, #0x48]  // r9
-    str x10, [x1, #0x50]  // r10
-    str x11, [x1, #0x58]  // r11
-    str x12, [x1, #0x60]  // r12
-    str x13, [x1, #0x68]  // r13
-    str x14, [x1, #0x70]  // r14
-    str x15, [x1, #0x78]  // r15
-
-    // Call shim: shim(GuestContext *ctx)
-    mov x0, x1
-    ldr x2, [sp, #16]
-    blr x2
-
-    // Reload active thread ctx from [x28, x27 + 0x70]
-    add  x1, x27, #0x70
-    ldr  x1, [x28, x1]
-
-    // Reload return value (rax, rdx) and caller-saved registers
-    ldr x19, [x1, #0x0]   // rax
-    ldr x22, [x1, #0x10]  // rdx
-    ldr x26, [x1, #0x20]  // rsp
-    ldr x8,  [x1, #0x40]  // r8
-    ldr x9,  [x1, #0x48]  // r9
-    ldr x10, [x1, #0x50]  // r10
-    ldr x11, [x1, #0x58]  // r11
-    ldr x12, [x1, #0x60]  // r12
-    ldr x13, [x1, #0x68]  // r13
-    ldr x14, [x1, #0x70]  // r14
-    ldr x15, [x1, #0x78]  // r15
-    ldr x27, [x1, #0x88]  // fs_base
-    ldr x28, [x1, #0x330] // mem_base
-
-    ldp q0, q1, [sp, #32]
-    ldp q2, q3, [sp, #64]
-    ldp q4, q5, [sp, #96]
-    ldp q6, q7, [sp, #128]
-    ldp x29, x30, [sp], #160
-    ret
-
-// _recomp_indirect_call: calls a guest function via dispatch
-// x0 = guest target RIP
-.globl _recomp_indirect_call
-_recomp_indirect_call:
-    adrp x16, _g_dispatch_l1@PAGE
-    add  x16, x16, _g_dispatch_l1@PAGEOFF
-    lsr  x17, x0, #32
-    and  x17, x17, #0xffff
-    ldr  x16, [x16, x17, lsl #3]
-    cbz  x16, 99f
-    lsr  x17, x0, #16
-    and  x17, x17, #0xffff
-    ldr  x16, [x16, x17, lsl #3]
-    cbz  x16, 99f
-    and  x17, x0, #0xffff
-    ldr  x16, [x16, x17, lsl #3]
-    cbz  x16, 99f
-    br   x16
-99:
-    stp x29, x30, [sp, #-32]!
-    mov x29, sp
-    str x0, [sp, #16]
-    add x2, x27, #0x70
-    ldr x2, [x28, x2]
-    cbz  x2, 98f
-    str x19, [x2, #0x0]   // rax
-    str x21, [x2, #0x8]   // rcx
-    str x22, [x2, #0x10]  // rdx
-    str x20, [x2, #0x18]  // rbx
-    str x26, [x2, #0x20]  // rsp
-    str x25, [x2, #0x28]  // rbp
-    str x23, [x2, #0x30]  // rsi
-    str x24, [x2, #0x38]  // rdi
-    str x8,  [x2, #0x40]  // r8
-    str x9,  [x2, #0x48]  // r9
-    str x10, [x2, #0x50]  // r10
-    str x11, [x2, #0x58]  // r11
-    str x12, [x2, #0x60]  // r12
-    str x13, [x2, #0x68]  // r13
-    str x14, [x2, #0x70]  // r14
-    str x15, [x2, #0x78]  // r15
-
-98:
-    ldr x1, [sp, #16]
-    mov x0, x2
-    bl   _recomp_dispatch_external
-
-    add x0, x27, #0x70
-    ldr x0, [x28, x0]
-    cbz  x0, 97f
-    ldr x19, [x0, #0x0]   // rax
-    ldr x21, [x0, #0x8]   // rcx
-    ldr x22, [x0, #0x10]  // rdx
-    ldr x20, [x0, #0x18]  // rbx
-    ldr x26, [x0, #0x20]  // rsp
-    ldr x25, [x0, #0x28]  // rbp
-    ldr x23, [x0, #0x30]  // rsi
-    ldr x24, [x0, #0x38]  // rdi
-    ldr x8,  [x0, #0x40]  // r8
-    ldr x9,  [x0, #0x48]  // r9
-    ldr x10, [x0, #0x50]  // r10
-    ldr x11, [x0, #0x58]  // r11
-    ldr x12, [x0, #0x60]  // r12
-    ldr x13, [x0, #0x68]  // r13
-    ldr x14, [x0, #0x70]  // r14
-    ldr x15, [x0, #0x78]  // r15
-    ldr x27, [x0, #0x88]  // fs_base
-    ldr x28, [x0, #0x330] // mem_base
-
-97:
-    ldp x29, x30, [sp], #32
-    ret
-
-// _recomp_indirect_jump: jumps to a guest function via dispatch
-// x0 = guest target RIP
-.globl _recomp_indirect_jump
-_recomp_indirect_jump:
-    adrp x16, _g_dispatch_l1@PAGE
-    add  x16, x16, _g_dispatch_l1@PAGEOFF
-    lsr  x17, x0, #32
-    and  x17, x17, #0xffff
-    ldr  x16, [x16, x17, lsl #3]
-    cbz  x16, 99f
-    lsr  x17, x0, #16
-    and  x17, x17, #0xffff
-    ldr  x16, [x16, x17, lsl #3]
-    cbz  x16, 99f
-    and  x17, x0, #0xffff
-    ldr  x16, [x16, x17, lsl #3]
-    cbz  x16, 99f
-    br   x16
-99:
-    stp x29, x30, [sp, #-32]!
-    mov x29, sp
-    str x0, [sp, #16]
-    add x2, x27, #0x70
-    ldr x2, [x28, x2]
-    cbz  x2, 98f
-    str x19, [x2, #0x0]   // rax
-    str x21, [x2, #0x8]   // rcx
-    str x22, [x2, #0x10]  // rdx
-    str x20, [x2, #0x18]  // rbx
-    str x26, [x2, #0x20]  // rsp
-    str x25, [x2, #0x28]  // rbp
-    str x23, [x2, #0x30]  // rsi
-    str x24, [x2, #0x38]  // rdi
-    str x8,  [x2, #0x40]  // r8
-    str x9,  [x2, #0x48]  // r9
-    str x10, [x2, #0x50]  // r10
-    str x11, [x2, #0x58]  // r11
-    str x12, [x2, #0x60]  // r12
-    str x13, [x2, #0x68]  // r13
-    str x14, [x2, #0x70]  // r14
-    str x15, [x2, #0x78]  // r15
-
-98:
-    ldr x1, [sp, #16]
-    mov x0, x2
-    bl   _recomp_dispatch_external
-
-    add x0, x27, #0x70
-    ldr x0, [x28, x0]
-    cbz  x0, 97f
-    ldr x19, [x0, #0x0]   // rax
-    ldr x21, [x0, #0x8]   // rcx
-    ldr x22, [x0, #0x10]  // rdx
-    ldr x20, [x0, #0x18]  // rbx
-    ldr x26, [x0, #0x20]  // rsp
-    ldr x25, [x0, #0x28]  // rbp
-    ldr x23, [x0, #0x30]  // rsi
-    ldr x24, [x0, #0x38]  // rdi
-    ldr x8,  [x0, #0x40]  // r8
-    ldr x9,  [x0, #0x48]  // r9
-    ldr x10, [x0, #0x50]  // r10
-    ldr x11, [x0, #0x58]  // r11
-    ldr x12, [x0, #0x60]  // r12
-    ldr x13, [x0, #0x68]  // r13
-    ldr x14, [x0, #0x70]  // r14
-    ldr x15, [x0, #0x78]  // r15
-    ldr x27, [x0, #0x88]  // fs_base
-    ldr x28, [x0, #0x330] // mem_base
-
-97:
-    ldp x29, x30, [sp], #32
-    ret
-`
-	return writeFileIfChanged(path, []byte(content))
+	return writeFileIfChanged(path, []byte(trampolineAsm))
 }
 
 // EmitDispatch ties all chunk registrations together.
@@ -1027,10 +753,7 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 	sw := bufio.NewWriter(&sBuf)
 	sw.WriteString("// Synthetic shims ARM64 bridge\n.text\n.p2align 2\n\n")
 	for _, entry := range synthList {
-		fmt.Fprintf(sw, ".globl _fn_0x%x\n_fn_0x%x:\n", entry.addr, entry.addr)
-		fmt.Fprintf(sw, "    adrp x0, _%s@PAGE\n", entry.shim)
-		fmt.Fprintf(sw, "    add  x0, x0, _%s@PAGEOFF\n", entry.shim)
-		fmt.Fprintf(sw, "    b    _recomp_call_shim\n\n")
+		writeShimStub(sw, fmt.Sprintf("_fn_0x%x", entry.addr), entry.shim)
 	}
 	if err := sw.Flush(); err != nil {
 		return err
