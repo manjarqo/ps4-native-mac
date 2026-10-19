@@ -140,11 +140,14 @@ def main():
     x87_ulp = OrderedDict()  # opcode -> tests accepted within the 80-bit/double tolerance
     x87_partial = OrderedDict()  # opcode -> FPREM tests with a native partial remainder
     rosetta_nan = OrderedDict()  # opcode -> tests whose NaN sign Rosetta 2 flips (ROSETTA_NEG_NAN)
+    rosetta_cx = OrderedDict()  # opcode -> CMPXCHG tests checked against Rosetta 2's CMPXCHG deviations
     by_op = OrderedDict()  # opcode -> {kind -> [count, example]}
     for t in range(n):
         idx, addr, sig, text, rule, vregs, vdest = tests[t]
         dest = None if vdest == "-" else int(vdest)
         op = sig.split(" ")[0]
+        if op == "LOCK":
+            op = sig.split(" ")[1]
         approx = op in APPROX
         diffs = []
         kinds = set()
@@ -153,6 +156,8 @@ def main():
         saw_ulp = False
         saw_partial = False
         saw_rosetta_nan = False
+        saw_rosetta_cx = False
+        cx32 = op == "CMPXCHG" and ",r32" in sig
         for k in range(TRIALS):
             o = (t * TRIALS + k) * REC
             s1, g1, f1, m1, cl, y1, mem1, x1 = parse(nat, o)
@@ -165,8 +170,29 @@ def main():
                 kinds.add("crash")
                 break
             fl, defined = flags_for(rule, cl)
+            # CMPXCHG under Rosetta 2 (checked with a native test): the flags are those of
+            # DEST - accumulator, not of accumulator - DEST (SDM, Bochs, QEMU, the C backend), and
+            # a 32-bit compare that succeeds clears RAX[63:32] (the SDM writes the accumulator
+            # only on failure). On a failed compare (ZF = 0) exactly one of each pair of
+            # opposite orders is "below" / "less", so the lifted B and L conditions must be the
+            # negation of the native ones; on success both orders give the same flags.
+            cx_fail = op == "CMPXCHG" and not (f1 >> 6 & 1) and fl
+            if cx_fail:
+                want_l = "S" in fl and "O" in fl
+                want_b = "C" in fl
+                fl = "Z"
+                if want_b and (f2 >> (32 + 2) & 1) != 1 - (f1 & 1):
+                    diffs.append("CMPXCHG cond B: lifted %d, want !native %d" % (f2 >> 34 & 1, f1 & 1))
+                    kinds.add("cond-B")
+                if want_l and (f2 >> (32 + 12) & 1) != 1 - ((f1 >> 7 ^ f1 >> 11) & 1):
+                    diffs.append("CMPXCHG cond L: lifted %d, want !native %d" % (f2 >> 44 & 1, (f1 >> 7 ^ f1 >> 11) & 1))
+                    kinds.add("cond-L")
+                saw_rosetta_cx = True
             if defined:
                 for i in range(16):
+                    if (cx32 and i == 0 and f1 >> 6 & 1 and g1[0] != g2[0] and g1[0] == g2[0] & 0xFFFFFFFF):
+                        saw_rosetta_cx = True
+                        continue
                     if g1[i] != g2[i] and not (op == "LAHF" and i == 0 and
                                                (g1[i] ^ g2[i]) & ~LAHF_UNMODELED == 0):
                         diffs.append("%s: native %016x lifted %016x" % (GPR[i], g1[i], g2[i]))
@@ -279,6 +305,8 @@ def main():
             x87_partial[op] = x87_partial.get(op, 0) + 1
         if not diffs and saw_rosetta_nan:
             rosetta_nan[op] = rosetta_nan.get(op, 0) + 1
+        if not diffs and saw_rosetta_cx:
+            rosetta_cx[op] = rosetta_cx.get(op, 0) + 1
         if diffs:
             bad += 1
             print("FAIL #%s %s  | %s  [%s] flags=%s" % (idx, sig, text, addr, rule))
@@ -299,6 +327,9 @@ def main():
     if rosetta_nan:
         extra += "; accepted: Rosetta 2 NaN sign flip in %d tests (%s)" % (
             sum(rosetta_nan.values()), ", ".join("%s %d" % kv for kv in rosetta_nan.items()))
+    if rosetta_cx:
+        extra += "; accepted: Rosetta 2 CMPXCHG flag order / RAX[63:32] in %d tests (%s)" % (
+            sum(rosetta_cx.values()), ", ".join("%s %d" % kv for kv in rosetta_cx.items()))
     if x87_partial:
         extra += "; accepted: x87 partial remainder (native C2 = 1) in %d tests (%s)" % (
             sum(x87_partial.values()), ", ".join("%s %d" % kv for kv in x87_partial.items()))

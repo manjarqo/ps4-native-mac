@@ -145,6 +145,11 @@ const (
 	// regsetX87Full: the instruction names ST(7); all eight x87 registers hold values (by
 	// default ST(7) is empty so that a push does not overflow).
 	regsetX87Full = 1 << 57
+	// regsetCasEqual: CMPXCHG/CMPXCHG16B; in trials 4-7 the memory operand holds RAX (and RDX
+	// at +8), so that the compare succeeds and the store path runs.
+	regsetCasEqual = 1 << 56
+	// regsetCas8b: CMPXCHG8B; in trials 4-7 the memory operand holds EDX:EAX.
+	regsetCas8b = 1 << 55
 )
 
 // readsPF reports whether the instruction's result depends on PF.
@@ -157,6 +162,7 @@ func readsPF(op x86asm.Op) bool {
 }
 
 type test struct {
+	op      x86asm.Op
 	addr    uint64
 	bytes   []byte
 	text    string
@@ -525,7 +531,7 @@ func main() {
 	}
 	var tests []*test
 	add := func(in x86asm.Inst, b []byte, addr uint64, key string, setRegs map[int]uint64) {
-		base := test{addr: addr, bytes: b, text: safeText(in, addr), sig: key, setRegs: setRegs,
+		base := test{op: in.Op, addr: addr, bytes: b, text: safeText(in, addr), sig: key, setRegs: setRegs,
 			flags: flagRule(in), vregs: vectorRegs(in), vdest: vectorDest(in), clShift: shiftByCL(in),
 			stackOp: in.Op == x86asm.PUSHFQ || in.Op == x86asm.POPFQ}
 		ln, ro, err := lift(in, addr, modeBlockStart)
@@ -590,39 +596,20 @@ func main() {
 	}
 	siteCount := map[string]int{}
 	sampledOut := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
-	seenAddr := map[uint64]bool{}
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		c := strings.IndexByte(line, ':')
-		if c <= 0 {
-			continue
-		}
-		addr, err := strconv.ParseUint(strings.TrimPrefix(line[:c], "0x"), 16, 64)
-		if err != nil || addr >= uint64(len(img)) || seenAddr[addr] {
-			continue
-		}
-		seenAddr[addr] = true
-		inst, err := x86asm.Decode(img[addr:], 64)
-		if err != nil || inst.Len == 0 {
-			filter("decode error", x86asm.Inst{}, addr)
-			continue
-		}
-		switch img[addr] {
+	// process samples one instruction encoding (a listing site, or a synthesized one: force skips
+	// the per-opcode limit).
+	process := func(inst x86asm.Inst, code []byte, addr uint64, force bool) {
+		switch code[0] {
 		case 0x62:
 			filter("prefix: EVEX", inst, addr)
-			continue
-		case 0xf0:
-			filter("prefix: LOCK (Task 4)", inst, addr)
-			continue
+			return
 		case 0x64, 0x65:
 			filter("prefix: FS/GS segment", inst, addr)
-			continue
+			return
 		}
 		if c := skipClass(inst); c != "" {
 			filter(c, inst, addr)
-			continue
+			return
 		}
 		// operand signature; RIP/RSP use and other untestable operands are filtered
 		var sig []string
@@ -677,15 +664,15 @@ func main() {
 		}
 		if bad != "" {
 			filter(bad, inst, addr)
-			continue
+			return
 		}
 		if mem != nil && mem.Base >= x86asm.EAX && mem.Base <= x86asm.R15L {
 			filter("memory: 32-bit address (addr32)", inst, addr)
-			continue
+			return
 		}
 		if mem != nil && mem.Base == 0 {
 			filter("memory: index without base", inst, addr)
-			continue
+			return
 		}
 		// register aliasing pattern (dest == src2 etc. exercises copy-order bugs)
 		var regs []x86asm.Reg
@@ -707,10 +694,16 @@ func main() {
 			}
 		}
 		key := inst.Op.String() + " " + strings.Join(sig, ",") + alias
+		if lockPrefixed(inst) {
+			key = "LOCK " + key // sampled apart from the plain form: a different lowering
+		}
+		if force && seen[key] {
+			key += " {" + safeText(inst, addr) + "}" // a synthesized form: keep AH-DH and aliasing apart
+		}
 		siteCount[key]++
-		if seen[key] || perOp[inst.Op] >= *maxPerOp {
+		if seen[key] || (!force && perOp[inst.Op] >= *maxPerOp) {
 			sampledOut++
-			continue
+			return
 		}
 		setRegs := map[int]uint64{}
 		if inst.Op == x86asm.PUSHFQ || inst.Op == x86asm.POPFQ {
@@ -737,21 +730,31 @@ func main() {
 				}
 				setRegs[bi] = memTarget - disp - iv*scale
 			}
+			switch inst.Op {
+			case x86asm.BT, x86asm.BTS, x86asm.BTR, x86asm.BTC:
+				if r, ok := inst.Args[1].(x86asm.Reg); ok {
+					if i, ok := gprIndex[r]; ok {
+						if _, used := setRegs[i]; !used {
+							setRegs[i] = btOffset(r)
+						}
+					}
+				}
+			}
 		}
 		lines, _, err := lift(inst, addr, modeBlockStart)
 		if err != nil {
 			noteSkip("lift error: "+err.Error(), inst, addr, key)
-			continue
+			return
 		}
 		seen[key] = true
 		if ok, why := selfContained(lines); !ok {
 			noteSkip(why, inst, addr, key)
-			continue
+			return
 		}
 		perOp[inst.Op]++
-		add(inst, append([]byte(nil), img[addr:addr+uint64(inst.Len)]...), addr, key, setRegs)
+		add(inst, append([]byte(nil), code...), addr, key, setRegs)
 		// Synthesized aliasing variants of VEX register forms: src2 = dst, src1 = dst.
-		for _, v := range vexAliasVariants(img[addr : addr+uint64(inst.Len)]) {
+		for _, v := range vexAliasVariants(code) {
 			vi, err := x86asm.Decode(v, 64)
 			if err != nil || vi.Op != inst.Op || vi.Len != len(v) || !regArgsOK(vi) {
 				continue
@@ -766,6 +769,38 @@ func main() {
 			seen[vk] = true
 			add(vi, v, addr, key+" [synth]", setRegs)
 		}
+	}
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	seenAddr := map[uint64]bool{}
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		c := strings.IndexByte(line, ':')
+		if c <= 0 {
+			continue
+		}
+		addr, err := strconv.ParseUint(strings.TrimPrefix(line[:c], "0x"), 16, 64)
+		if err != nil || addr >= uint64(len(img)) || seenAddr[addr] {
+			continue
+		}
+		seenAddr[addr] = true
+		inst, err := x86asm.Decode(img[addr:], 64)
+		if err != nil || inst.Len == 0 {
+			filter("decode error", x86asm.Inst{}, addr)
+			continue
+		}
+		process(inst, img[addr:addr+uint64(inst.Len)], addr, false)
+	}
+	// Every LOCK form and operand size, also those neither eboot uses: the atomic lowerings of
+	// the forms TLOU and U4 lack would otherwise never run.
+	for i, code := range lockForms {
+		inst, err := x86asm.Decode(code, 64)
+		if err != nil || inst.Len != len(code) {
+			fmt.Fprintf(os.Stderr, "lock form %x: bad encoding\n", code)
+			os.Exit(1)
+		}
+		process(inst, code, synthLockAddr+uint64(16*i), true)
 	}
 	sort.SliceStable(tests, func(i, j int) bool { return tests[i].sig < tests[j].sig })
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
@@ -945,6 +980,12 @@ func writeRegsets(b *strings.Builder, tests []*test) {
 		}
 		if strings.Contains(t.text, "st7") {
 			mask |= regsetX87Full
+		}
+		switch t.op {
+		case x86asm.CMPXCHG, x86asm.CMPXCHG16B:
+			mask |= regsetCasEqual
+		case x86asm.CMPXCHG8B:
+			mask |= regsetCas8b
 		}
 		fmt.Fprintf(b, "  .quad 0x%x", mask)
 		for _, v := range vals {
@@ -1130,4 +1171,86 @@ func vexAliasVariants(b []byte) [][]byte {
 	w[vb] = (w[vb] &^ 0x78) | byte((^reg&0xf)<<3)
 	out = append(out, w)
 	return out
+}
+
+// lockPrefixed reports an F0 LOCK prefix. x86asm records the second byte of a VEX prefix in the
+// prefix list too, so VEX instructions never count.
+func lockPrefixed(inst x86asm.Inst) bool {
+	for _, p := range inst.Prefix {
+		if p == 0 {
+			break
+		}
+		if p.IsVEX() || p.IsEVEX() {
+			return false
+		}
+		if p&0xFF == x86asm.PrefixLOCK {
+			return true
+		}
+	}
+	return false
+}
+
+// synthLockAddr is the (fake) address of the synthesized LOCK forms, outside any guest image.
+const synthLockAddr = 0xf0000000
+
+// lockForms: every LOCK read-modify-write form in every operand size, with register and
+// immediate sources, AH-DH operands and base/source aliasing, plus XCHG with memory (implicitly
+// locked) and CMPXCHG8B/16B. The memory operand is [rdi] unless noted.
+var lockForms = [][]byte{
+	// ADD: byte al, byte ah, word, dword, qword, byte imm, dword imm8, qword imm8, qword imm32
+	{0xf0, 0x00, 0x07}, {0xf0, 0x00, 0x27}, {0x66, 0xf0, 0x01, 0x07}, {0xf0, 0x01, 0x07}, {0xf0, 0x48, 0x01, 0x07},
+	{0xf0, 0x80, 0x07, 0x7f}, {0xf0, 0x83, 0x07, 0x80}, {0xf0, 0x48, 0x83, 0x07, 0x01},
+	{0xf0, 0x48, 0x81, 0x07, 0x78, 0x56, 0x34, 0x12},
+	// SUB
+	{0xf0, 0x28, 0x07}, {0x66, 0xf0, 0x29, 0x07}, {0xf0, 0x29, 0x07}, {0xf0, 0x48, 0x29, 0x07},
+	{0xf0, 0x83, 0x2f, 0x05}, {0xf0, 0x48, 0x83, 0x2f, 0xff}, {0x66, 0xf0, 0x83, 0x2f, 0x01},
+	// AND
+	{0xf0, 0x20, 0x07}, {0x66, 0xf0, 0x21, 0x07}, {0xf0, 0x21, 0x07}, {0xf0, 0x48, 0x21, 0x07},
+	{0xf0, 0x83, 0x27, 0xf0}, {0xf0, 0x80, 0x27, 0x0f},
+	// OR
+	{0xf0, 0x08, 0x07}, {0x66, 0xf0, 0x09, 0x07}, {0xf0, 0x09, 0x07}, {0xf0, 0x48, 0x09, 0x07},
+	{0xf0, 0x83, 0x0f, 0x01},
+	// XOR
+	{0xf0, 0x30, 0x07}, {0x66, 0xf0, 0x31, 0x07}, {0xf0, 0x31, 0x07}, {0xf0, 0x48, 0x31, 0x07},
+	{0xf0, 0x83, 0x37, 0xff},
+	// INC, DEC (also [rdi+8])
+	{0xf0, 0xfe, 0x07}, {0x66, 0xf0, 0xff, 0x07}, {0xf0, 0xff, 0x07}, {0xf0, 0x48, 0xff, 0x07},
+	{0xf0, 0xfe, 0x0f}, {0x66, 0xf0, 0xff, 0x0f}, {0xf0, 0xff, 0x0f}, {0xf0, 0x48, 0xff, 0x0f},
+	{0xf0, 0x48, 0xff, 0x4f, 0x08},
+	// NOT, NEG
+	{0xf0, 0xf6, 0x17}, {0x66, 0xf0, 0xf7, 0x17}, {0xf0, 0xf7, 0x17}, {0xf0, 0x48, 0xf7, 0x17},
+	{0xf0, 0xf6, 0x1f}, {0x66, 0xf0, 0xf7, 0x1f}, {0xf0, 0xf7, 0x1f}, {0xf0, 0x48, 0xf7, 0x1f},
+	// ADC, SBB (byte ah, imm8)
+	{0xf0, 0x10, 0x07}, {0x66, 0xf0, 0x11, 0x07}, {0xf0, 0x11, 0x07}, {0xf0, 0x48, 0x11, 0x07},
+	{0xf0, 0x83, 0x17, 0x01},
+	{0xf0, 0x18, 0x07}, {0xf0, 0x18, 0x27}, {0x66, 0xf0, 0x19, 0x07}, {0xf0, 0x19, 0x07}, {0xf0, 0x48, 0x19, 0x07},
+	{0xf0, 0x83, 0x1f, 0x01},
+	// BTS, BTR, BTC: register offsets (eax/ecx, see btOffset) and immediates
+	{0xf0, 0x0f, 0xab, 0x07}, {0x66, 0xf0, 0x0f, 0xab, 0x0f}, {0xf0, 0x48, 0x0f, 0xab, 0x0f},
+	{0xf0, 0x0f, 0xba, 0x2f, 0x1f}, {0xf0, 0x48, 0x0f, 0xba, 0x2f, 0x3f}, {0x66, 0xf0, 0x0f, 0xba, 0x2f, 0x13},
+	{0xf0, 0x0f, 0xb3, 0x0f}, {0x66, 0xf0, 0x0f, 0xb3, 0x07}, {0xf0, 0x48, 0x0f, 0xb3, 0x07},
+	{0xf0, 0x0f, 0xba, 0x37, 0x03}, {0xf0, 0x48, 0x0f, 0xba, 0x37, 0x21},
+	{0xf0, 0x0f, 0xbb, 0x07}, {0x66, 0xf0, 0x0f, 0xbb, 0x0f}, {0xf0, 0x48, 0x0f, 0xbb, 0x0f},
+	{0xf0, 0x0f, 0xba, 0x3f, 0x07},
+	// XADD: byte al, byte ah, word, dword, qword, qword [rdi], rdi
+	{0xf0, 0x0f, 0xc0, 0x07}, {0xf0, 0x0f, 0xc0, 0x27}, {0x66, 0xf0, 0x0f, 0xc1, 0x07}, {0xf0, 0x0f, 0xc1, 0x07},
+	{0xf0, 0x48, 0x0f, 0xc1, 0x07}, {0xf0, 0x48, 0x0f, 0xc1, 0x3f},
+	// XCHG with memory, with and without an explicit LOCK
+	{0x86, 0x07}, {0x86, 0x27}, {0x66, 0x87, 0x07}, {0x87, 0x07}, {0x48, 0x87, 0x07}, {0xf0, 0x48, 0x87, 0x37},
+	// CMPXCHG: byte cl, byte ch, word, dword, qword, source = accumulator, [rax] base
+	{0xf0, 0x0f, 0xb0, 0x0f}, {0xf0, 0x0f, 0xb0, 0x2f}, {0x66, 0xf0, 0x0f, 0xb1, 0x0f}, {0xf0, 0x0f, 0xb1, 0x0f},
+	{0xf0, 0x48, 0x0f, 0xb1, 0x0f}, {0xf0, 0x0f, 0xb1, 0x07}, {0xf0, 0x48, 0x0f, 0xb1, 0x07},
+	{0xf0, 0x48, 0x0f, 0xb1, 0x08},
+	// CMPXCHG8B, CMPXCHG16B
+	{0xf0, 0x0f, 0xc7, 0x0f}, {0x0f, 0xc7, 0x0f}, {0xf0, 0x48, 0x0f, 0xc7, 0x0f},
+}
+
+// btOffset is the bit offset register value of BT/BTS/BTR/BTC with a memory operand: a random
+// offset would address far outside the scratch area. The EAX family gets a positive offset into
+// the next operand, every other register a negative one (the offset is signed).
+func btOffset(r x86asm.Reg) uint64 {
+	if gprIndex[r] == 0 {
+		return 77
+	}
+	return uint64(0xffffffffffffffd3) // -45
 }

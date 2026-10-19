@@ -163,6 +163,14 @@ static inline void dt_make_state(DtState *st, uint8_t *scratch, unsigned test, u
         uint16_t v = (uint16_t)(0x0040 | (m & 0x3f) | (m & 0x0f00));
         memcpy(scratch + (DT_MEM_TARGET - DT_SCRATCH_BASE), &v, 2);
     }
+    if (regset[0] >> 56 & 1 && trial & 4) { /* CMPXCHG/CMPXCHG16B: m = RAX, [m+8] = RDX (compare succeeds) */
+        memcpy(scratch + (DT_MEM_TARGET - DT_SCRATCH_BASE), &st->gpr[0], 8);
+        memcpy(scratch + (DT_MEM_TARGET - DT_SCRATCH_BASE) + 8, &st->gpr[2], 8);
+    }
+    if (regset[0] >> 55 & 1 && trial & 4) { /* CMPXCHG8B: m64 = EDX:EAX (compare succeeds) */
+        uint64_t v = (st->gpr[0] & 0xFFFFFFFFULL) | (st->gpr[2] << 32);
+        memcpy(scratch + (DT_MEM_TARGET - DT_SCRATCH_BASE), &v, 8);
+    }
     if (regset[0] >> 61 & 1) { /* a valid MXCSR value for (V)LDMXCSR */
         uint64_t m = dt_rng(&s);
         uint32_t v = 0x1f80 | (uint32_t)(m & 0x3f) | (uint32_t)(m & 0x40) | (uint32_t)(m & 0x6000) |

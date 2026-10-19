@@ -8,6 +8,10 @@
 # the "// 0xADDR: INST" comment that precedes every lifted instruction in <dir>/code_*.s. That is
 # exactly the set of instructions the recompiler lifts for the eboot.
 #
+# LOCK forms: listing sites with a LOCK prefix are sampled apart from their plain form, and every
+# LOCK form in every size (main.go lockForms) is added to each run. The harness is single-threaded:
+# it checks values and flags of the atomic lowerings, not atomicity (pkg/lifter TestLockFullBarrier).
+#
 # Environment: MAX_PER_OP (default 40), SPECIAL=1 adds special FP values (inf/nan/denormals),
 # STAGE_TIMEOUT (seconds per stage, default 900).
 #
