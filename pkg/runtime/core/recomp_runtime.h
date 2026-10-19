@@ -53,6 +53,8 @@ void ps4_host_run_main_loop(void);
 // Ends the process from an exit path (window close, Cmd+Q) without running static
 // destructors: game threads and Metal completion handlers still use global state.
 void ps4_host_quit(int code) __attribute__((noreturn));
+// Waits (up to timeout_s) until buffered stdout/stderr output has been written out.
+void ps4_log_flush(double timeout_s);
 // Startup settings (libSceSystemService/ps4_settings.m): resolved once before the guest starts.
 void ps4_host_settings_init(void);
 void ps4_stall_watchdog_note_present(void); // frame stall diagnostics (PS4_STALL_WATCHDOG)

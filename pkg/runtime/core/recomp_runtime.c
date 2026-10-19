@@ -3,6 +3,9 @@
 #include "ps4_vfs.h"
 
 #include <signal.h>
+#include <errno.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <execinfo.h>
@@ -1760,8 +1763,96 @@ uint64_t ps4_hitch_take_ns(int kind) {
 // definition; the pipeline archive module provides the strong one.
 __attribute__((weak)) void ps4_gnm_pso_archive_save_for_quit(double timeout_s) { (void)timeout_s; }
 
+// ---- Asynchronous log output ---------------------------------------------------------------
+// stdout/stderr are unbuffered, so every printf from a guest or renderer thread is a write() to
+// the log file or pipe, and a slow sink (disk under memory pressure, a blocked reader) stalls
+// the calling thread for hundreds of milliseconds (a frame's job, the command processor).
+// When stdout/stderr are not terminals, each is replaced by a pipe that a drain thread copies to
+// the original file, so writers only block when the pipe (64 KB) is full. Order within a stream
+// is kept. The guest's own write() calls on fd 1 and 2 land in the same pipe, synchronously from
+// its point of view. PS4_SYNC_LOG=1 keeps direct writes.
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/time.h>
+
+#define PS4_LOG_STREAMS 2
+static struct {
+  int rd, orig;
+  atomic_int busy; // set while a chunk read from the pipe is not yet written out
+} g_log_stream[PS4_LOG_STREAMS];
+static int g_log_active;
+
+static void *log_drain_thread(void *arg) {
+  int idx = (int)(intptr_t)arg;
+  pthread_setname_np(idx == 0 ? "ps4-log-out" : "ps4-log-err");
+  static __thread char buf[65536];
+  for (;;) {
+    ssize_t n = read(g_log_stream[idx].rd, buf, sizeof buf);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return NULL;
+    atomic_store(&g_log_stream[idx].busy, 1);
+    for (ssize_t off = 0; off < n;) {
+      ssize_t w = write(g_log_stream[idx].orig, buf + off, (size_t)(n - off));
+      if (w < 0 && errno == EINTR) continue;
+      if (w <= 0) break; // sink is gone; drop the rest
+      off += w;
+    }
+    atomic_store(&g_log_stream[idx].busy, 0);
+  }
+}
+
+// Waits until the pipes are empty and written out (or the timeout passes).
+void ps4_log_flush(double timeout_s) {
+  fflush(NULL);
+  if (!g_log_active) return;
+  struct timeval t0, t;
+  gettimeofday(&t0, NULL);
+  for (;;) {
+    int pending = 0;
+    for (int i = 0; i < PS4_LOG_STREAMS; i++) {
+      int avail = 0;
+      if (g_log_stream[i].rd < 0) continue;
+      if (ioctl(g_log_stream[i].rd, FIONREAD, &avail) != 0) avail = 0;
+      if (avail > 0 || atomic_load(&g_log_stream[i].busy)) pending = 1;
+    }
+    gettimeofday(&t, NULL);
+    if (!pending || (t.tv_sec - t0.tv_sec) + (t.tv_usec - t0.tv_usec) * 1e-6 > timeout_s) return;
+    usleep(500);
+  }
+}
+
+static void log_atexit(void) { ps4_log_flush(1.0); }
+
+__attribute__((constructor)) static void ps4_log_init(void) {
+  const char *sync = getenv("PS4_SYNC_LOG");
+  if (sync && sync[0] == '1') return;
+  for (int i = 0; i < PS4_LOG_STREAMS; i++) g_log_stream[i].rd = -1;
+  int started = 0;
+  for (int i = 0; i < PS4_LOG_STREAMS; i++) {
+    int fd = i + 1;
+    if (isatty(fd) || fcntl(fd, F_GETFD) < 0) continue;
+    int p[2], orig = dup(fd);
+    if (orig < 0) continue;
+    if (pipe(p) != 0) { close(orig); continue; }
+    pthread_t th;
+    g_log_stream[i].rd = p[0];
+    g_log_stream[i].orig = orig;
+    if (dup2(p[1], fd) < 0 || pthread_create(&th, NULL, log_drain_thread, (void *)(intptr_t)i) != 0) {
+      dup2(orig, fd);
+      g_log_stream[i].rd = -1;
+      close(p[0]); close(p[1]); close(orig);
+      continue;
+    }
+    pthread_detach(th);
+    close(p[1]);
+    started = 1;
+  }
+  g_log_active = started;
+  if (started) atexit(log_atexit);
+}
+
 void ps4_host_quit(int code) {
   ps4_gnm_pso_archive_save_for_quit(2.0);
-  fflush(NULL);
+  ps4_log_flush(1.0);
   _exit(code);
 }
