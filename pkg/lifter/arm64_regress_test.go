@@ -168,3 +168,22 @@ func TestRegressBitOps(t *testing.T) {
 	l = liftBlock(t, "c4e278f3c9") // blsr eax, ecx: CF = (src == 0)
 	requireInOrder(t, "blsr", l[0], "cmp w0, #0", "cset w2, eq", "tst w1, w1", "rmif x2, #63, #2", "mov w19, w1")
 }
+
+// Narrow operands: 16-bit CMOVcc, CDQ (a 32-bit write clears RDX[63:32]), and XCHG/XADD/CMPXCHG
+// on bytes and words (XCHG accessed 8 bytes, XADD/CMPXCHG flags came from 32-bit arithmetic).
+func TestRegressNarrowOperands(t *testing.T) {
+	l := liftBlock(t, "660f42c1") // cmovb ax, cx
+	requireInOrder(t, "cmovb ax, cx", l[0], "csel w16, w21, w19, cc", "bfi x19, x16, #0, #16")
+
+	l = liftBlock(t, "99") // cdq
+	requireInOrder(t, "cdq", l[0], "asr w22, w19, #31")
+
+	l = liftBlock(t, "8610") // xchg byte [rax], dl
+	requireInOrder(t, "xchg byte", l[0], "and w0, w22, #0xff", "ldaxrb w17, [x16]", "stlxrb w1, w0, [x16]", "bfi x22, x17, #0, #8")
+
+	l = liftBlock(t, "0fc008") // xadd byte [rax], cl
+	requireInOrder(t, "xadd byte", l[0], "and w2, w21, #0xff", "ldaxrb w17, [x16]", "lsl w3, w17, #24", "adds w3, w3, w2, lsl #24")
+
+	l = liftBlock(t, "660fb108") // cmpxchg word [rax], cx
+	requireInOrder(t, "cmpxchg word", l[0], "ldaxrh w17, [x16]", "lsl w0, w19, #16", "cmp w0, w17, lsl #16")
+}

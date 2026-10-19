@@ -778,7 +778,7 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		return l.liftXchg(inst, nextPC, lines)
 
 	case x86asm.CDQ:
-		lines = append(lines, "    asr x22, x19, #31")
+		lines = append(lines, "    asr w22, w19, #31") // EDX = sign of EAX; RDX upper half cleared
 		return lines, nil
 
 	case x86asm.CQO:

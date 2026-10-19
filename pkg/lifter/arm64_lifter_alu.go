@@ -1111,97 +1111,64 @@ func (l *Arm64Lifter) liftDiv(inst disasm.Instruction, nextPC uint64, lines []st
 	return lines, nil
 }
 
-// liftXadd handles atomic/non-atomic XADD instruction.
+// liftXadd handles XADD: TEMP = DEST + SRC; SRC = DEST; DEST = TEMP, with ADD flags (8/16-bit
+// from top-aligned operands; carryAdd). The memory form uses an exclusive load/store loop.
 func (l *Arm64Lifter) liftXadd(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	dst := inst.Inst.Args[0]
-	src := inst.Inst.Args[1]
-	sz := defMemSz(inst)
-
-	srcReg, okSrc := src.(x86asm.Reg)
-	if !okSrc {
-		lines = append(lines, "    brk #0 // unsupported xadd src")
-		return lines, nil
-	}
+	srcReg, okSrc := inst.Inst.Args[1].(x86asm.Reg)
 	srcDesc, okSrcDesc := arm64RegMap[srcReg]
-	if !okSrcDesc {
-		lines = append(lines, "    brk #0 // unmapped xadd src")
+	if !okSrc || !okSrcDesc {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported xadd src")...)
 		return lines, nil
 	}
-	if srcDesc.Size > 0 {
-		sz = srcDesc.Size
+	sz := srcDesc.Size
+	r := "w"
+	if sz == 8 {
+		r = "x"
 	}
-
-	l.labelCounter++
-	if mem, okMem := dst.(x86asm.Mem); okMem {
-		lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-		lines = append(lines, "    add x16, x28, x16")
-		loopLbl := fmt.Sprintf("L_xadd_loop_%d", l.labelCounter)
-
-		lines = append(lines, fmt.Sprintf("%s:", loopLbl))
-		switch sz {
-		case 1:
-			lines = append(lines, "    ldaxrb w17, [x16]")
-			lines = append(lines, fmt.Sprintf("    add w0, w17, %s", srcDesc.W))
-			lines = append(lines, "    stlxrb w1, w0, [x16]")
-			lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-			lines = append(lines, fmt.Sprintf("    adds w0, w17, %s", srcDesc.W))
-			lines = append(lines, fmt.Sprintf("    bfi %s, x17, #0, #8", srcDesc.X))
-		case 2:
-			lines = append(lines, "    ldaxrh w17, [x16]")
-			lines = append(lines, fmt.Sprintf("    add w0, w17, %s", srcDesc.W))
-			lines = append(lines, "    stlxrh w1, w0, [x16]")
-			lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-			lines = append(lines, fmt.Sprintf("    adds w0, w17, %s", srcDesc.W))
-			lines = append(lines, fmt.Sprintf("    bfi %s, x17, #0, #16", srcDesc.X))
-		case 4:
-			lines = append(lines, "    ldaxr w17, [x16]")
-			lines = append(lines, fmt.Sprintf("    add w0, w17, %s", srcDesc.W))
-			lines = append(lines, "    stlxr w1, w0, [x16]")
-			lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-			lines = append(lines, fmt.Sprintf("    adds w0, w17, %s", srcDesc.W))
-			lines = append(lines, fmt.Sprintf("    mov %s, w17", srcDesc.W))
-		default: // 8
-			lines = append(lines, "    ldaxr x17, [x16]")
-			lines = append(lines, fmt.Sprintf("    add x0, x17, %s", srcDesc.X))
-			lines = append(lines, "    stlxr w1, x0, [x16]")
-			lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-			lines = append(lines, fmt.Sprintf("    adds x0, x17, %s", srcDesc.X))
-			lines = append(lines, fmt.Sprintf("    mov %s, x17", srcDesc.X))
+	rc, _ := readRegTo(srcReg, "x2", "w2")
+	lines = append(lines, rc...)
+	flags := func() {
+		if inst.SkipFlags {
+			return
 		}
+		if sz < 4 {
+			sh := 32 - 8*sz
+			lines = append(lines, fmt.Sprintf("    lsl w3, w17, #%d", sh), fmt.Sprintf("    adds w3, w3, w2, lsl #%d", sh))
+		} else {
+			lines = append(lines, fmt.Sprintf("    adds %s3, %s17, %s2", r, r, r))
+		}
+		l.cpol = carryAdd
+	}
+	if mem, okMem := dst.(x86asm.Mem); okMem {
+		suffix := map[int]string{1: "b", 2: "h", 4: "", 8: ""}[sz]
+		l.labelCounter++
+		loopLbl := fmt.Sprintf("L_xadd_loop_%d", l.labelCounter)
+		lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
+		lines = append(lines, "    add x16, x28, x16", fmt.Sprintf("%s:", loopLbl),
+			fmt.Sprintf("    ldaxr%s %s17, [x16]", suffix, r),
+			fmt.Sprintf("    add %s0, %s17, %s2", r, r, r),
+			fmt.Sprintf("    stlxr%s w1, %s0, [x16]", suffix, r),
+			fmt.Sprintf("    cbnz w1, %s", loopLbl))
+		flags()
+		wc, _ := writeRegFrom(srcReg, "x17", "w17")
+		lines = append(lines, wc...)
 		return lines, nil
 	}
-
 	if dstReg, okDst := dst.(x86asm.Reg); okDst {
-		if dstDesc, okDstDesc := arm64RegMap[dstReg]; okDstDesc {
-			switch sz {
-			case 1:
-				lines = append(lines, fmt.Sprintf("    add w0, %s, %s", dstDesc.W, srcDesc.W))
-				lines = append(lines, fmt.Sprintf("    adds w1, %s, %s", dstDesc.W, srcDesc.W))
-				lines = append(lines, fmt.Sprintf("    mov w16, %s", dstDesc.W))
-				lines = append(lines, fmt.Sprintf("    bfi %s, x16, #0, #8", srcDesc.X))
-				lines = append(lines, fmt.Sprintf("    bfi %s, x0, #0, #8", dstDesc.X))
-			case 2:
-				lines = append(lines, fmt.Sprintf("    add w0, %s, %s", dstDesc.W, srcDesc.W))
-				lines = append(lines, fmt.Sprintf("    adds w1, %s, %s", dstDesc.W, srcDesc.W))
-				lines = append(lines, fmt.Sprintf("    mov w16, %s", dstDesc.W))
-				lines = append(lines, fmt.Sprintf("    bfi %s, x16, #0, #16", srcDesc.X))
-				lines = append(lines, fmt.Sprintf("    bfi %s, x0, #0, #16", dstDesc.X))
-			case 4:
-				lines = append(lines, fmt.Sprintf("    add w0, %s, %s", dstDesc.W, srcDesc.W))
-				lines = append(lines, fmt.Sprintf("    adds w1, %s, %s", dstDesc.W, srcDesc.W))
-				lines = append(lines, fmt.Sprintf("    mov %s, %s", srcDesc.W, dstDesc.W))
-				lines = append(lines, fmt.Sprintf("    mov %s, w0", dstDesc.W))
-			default:
-				lines = append(lines, fmt.Sprintf("    add x0, %s, %s", dstDesc.X, srcDesc.X))
-				lines = append(lines, fmt.Sprintf("    adds x1, %s, %s", dstDesc.X, srcDesc.X))
-				lines = append(lines, fmt.Sprintf("    mov %s, %s", srcDesc.X, dstDesc.X))
-				lines = append(lines, fmt.Sprintf("    mov %s, x0", dstDesc.X))
-			}
+		if _, ok := arm64RegMap[dstReg]; ok {
+			rd, _ := readRegTo(dstReg, "x17", "w17")
+			lines = append(lines, rd...)
+			lines = append(lines, fmt.Sprintf("    add %s0, %s17, %s2", r, r, r))
+			flags()
+			ws, _ := writeRegFrom(srcReg, "x17", "w17")
+			wd, _ := writeRegFrom(dstReg, "x0", "w0")
+			lines = append(lines, ws...)
+			lines = append(lines, wd...)
 			return lines, nil
 		}
 	}
-
-	lines = append(lines, "    brk #0 // unsupported xadd")
+	lines = append(lines, l.emitUnsupported(inst, "unsupported xadd")...)
 	return lines, nil
 }
 
@@ -1225,6 +1192,7 @@ func (l *Arm64Lifter) liftCmpxchg(inst disasm.Instruction, nextPC uint64, lines 
 		sz = srcDesc.Size
 	}
 
+	l.cpol = carrySub // flags of CMP accumulator, destination
 	l.labelCounter++
 	loopLbl := fmt.Sprintf("L_cmpxchg_loop_%d", l.labelCounter)
 	failLbl := fmt.Sprintf("L_cmpxchg_fail_%d", l.labelCounter)
@@ -1238,8 +1206,8 @@ func (l *Arm64Lifter) liftCmpxchg(inst disasm.Instruction, nextPC uint64, lines 
 		switch sz {
 		case 1:
 			lines = append(lines, "    ldaxrb w17, [x16]")
-			lines = append(lines, "    and w0, w19, #0xff")
-			lines = append(lines, "    cmp w0, w17")
+			lines = append(lines, "    lsl w0, w19, #24")
+			lines = append(lines, "    cmp w0, w17, lsl #24") // flags of the 8-bit compare
 			lines = append(lines, fmt.Sprintf("    b.ne %s", failLbl))
 			lines = append(lines, fmt.Sprintf("    stlxrb w1, %s, [x16]", srcDesc.W))
 			lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
@@ -1250,8 +1218,8 @@ func (l *Arm64Lifter) liftCmpxchg(inst disasm.Instruction, nextPC uint64, lines 
 			lines = append(lines, fmt.Sprintf("%s:", endLbl))
 		case 2:
 			lines = append(lines, "    ldaxrh w17, [x16]")
-			lines = append(lines, "    and w0, w19, #0xffff")
-			lines = append(lines, "    cmp w0, w17")
+			lines = append(lines, "    lsl w0, w19, #16")
+			lines = append(lines, "    cmp w0, w17, lsl #16") // flags of the 16-bit compare
 			lines = append(lines, fmt.Sprintf("    b.ne %s", failLbl))
 			lines = append(lines, fmt.Sprintf("    stlxrh w1, %s, [x16]", srcDesc.W))
 			lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
@@ -1290,9 +1258,8 @@ func (l *Arm64Lifter) liftCmpxchg(inst disasm.Instruction, nextPC uint64, lines 
 		if dstDesc, okDstDesc := arm64RegMap[dstReg]; okDstDesc {
 			switch sz {
 			case 1:
-				lines = append(lines, "    and w0, w19, #0xff")
-				lines = append(lines, fmt.Sprintf("    and w1, %s, #0xff", dstDesc.W))
-				lines = append(lines, "    cmp w0, w1")
+				lines = append(lines, "    lsl w0, w19, #24")
+				lines = append(lines, fmt.Sprintf("    cmp w0, %s, lsl #24", dstDesc.W))
 				lines = append(lines, fmt.Sprintf("    b.ne %s", failLbl))
 				lines = append(lines, fmt.Sprintf("    bfi %s, %s, #0, #8", dstDesc.X, srcDesc.X))
 				lines = append(lines, fmt.Sprintf("    b %s", endLbl))
@@ -1300,9 +1267,8 @@ func (l *Arm64Lifter) liftCmpxchg(inst disasm.Instruction, nextPC uint64, lines 
 				lines = append(lines, fmt.Sprintf("    bfi x19, %s, #0, #8", dstDesc.X))
 				lines = append(lines, fmt.Sprintf("%s:", endLbl))
 			case 2:
-				lines = append(lines, "    and w0, w19, #0xffff")
-				lines = append(lines, fmt.Sprintf("    and w1, %s, #0xffff", dstDesc.W))
-				lines = append(lines, "    cmp w0, w1")
+				lines = append(lines, "    lsl w0, w19, #16")
+				lines = append(lines, fmt.Sprintf("    cmp w0, %s, lsl #16", dstDesc.W))
 				lines = append(lines, fmt.Sprintf("    b.ne %s", failLbl))
 				lines = append(lines, fmt.Sprintf("    bfi %s, %s, #0, #16", dstDesc.X, srcDesc.X))
 				lines = append(lines, fmt.Sprintf("    b %s", endLbl))
@@ -1334,52 +1300,78 @@ func (l *Arm64Lifter) liftCmpxchg(inst disasm.Instruction, nextPC uint64, lines 
 	return lines, nil
 }
 
-// liftXchg handles XCHG instruction.
+// liftXchg handles XCHG. The memory form is atomic (implicit LOCK) and uses an exclusive
+// load/store pair of the operand's size; 8/16-bit registers (including AH-DH) exchange only
+// their own bits.
 func (l *Arm64Lifter) liftXchg(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	dst := inst.Inst.Args[0]
 	src := inst.Inst.Args[1]
-	sz := defMemSz(inst)
 
 	// Reg <-> Reg
 	if dstReg, okDst := dst.(x86asm.Reg); okDst {
 		if srcReg, okSrc := src.(x86asm.Reg); okSrc {
-			dDesc := arm64RegMap[dstReg]
-			sDesc := arm64RegMap[srcReg]
-			if dDesc.Size == 4 {
-				lines = append(lines, fmt.Sprintf("    mov w16, %s", dDesc.W))
-				lines = append(lines, fmt.Sprintf("    mov %s, %s", dDesc.W, sDesc.W))
-				lines = append(lines, fmt.Sprintf("    mov %s, w16", sDesc.W))
-			} else {
-				lines = append(lines, fmt.Sprintf("    mov x16, %s", dDesc.X))
-				lines = append(lines, fmt.Sprintf("    mov %s, %s", dDesc.X, sDesc.X))
-				lines = append(lines, fmt.Sprintf("    mov %s, x16", sDesc.X))
+			dDesc, ok1 := arm64RegMap[dstReg]
+			sDesc, ok2 := arm64RegMap[srcReg]
+			if !ok1 || !ok2 {
+				lines = append(lines, l.emitUnsupported(inst, "unmapped xchg register")...)
+				return lines, nil
+			}
+			switch dDesc.Size {
+			case 8:
+				lines = append(lines, fmt.Sprintf("    mov x16, %s", dDesc.X),
+					fmt.Sprintf("    mov %s, %s", dDesc.X, sDesc.X), fmt.Sprintf("    mov %s, x16", sDesc.X))
+			case 4:
+				lines = append(lines, fmt.Sprintf("    mov w16, %s", dDesc.W),
+					fmt.Sprintf("    mov %s, %s", dDesc.W, sDesc.W), fmt.Sprintf("    mov %s, w16", sDesc.W))
+			default:
+				r1, _ := readRegTo(dstReg, "x16", "w16")
+				r2, _ := readRegTo(srcReg, "x17", "w17")
+				w1, _ := writeRegFrom(dstReg, "x17", "w17")
+				w2, _ := writeRegFrom(srcReg, "x16", "w16")
+				lines = append(lines, r1...)
+				lines = append(lines, r2...)
+				lines = append(lines, w1...)
+				lines = append(lines, w2...)
 			}
 			return lines, nil
 		}
 	}
 
-	// Mem <-> Reg
-	if mem, okMem := dst.(x86asm.Mem); okMem {
-		if srcReg, okSrc := src.(x86asm.Reg); okSrc {
-			sDesc := arm64RegMap[srcReg]
-			l.labelCounter++
-			loopLbl := fmt.Sprintf("L_xchg_loop_%d", l.labelCounter)
-			lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-			lines = append(lines, "    add x16, x28, x16")
-			lines = append(lines, fmt.Sprintf("%s:", loopLbl))
-			if sz == 4 {
-				lines = append(lines, "    ldaxr w17, [x16]")
-				lines = append(lines, fmt.Sprintf("    stlxr w1, %s, [x16]", sDesc.W))
-				lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-				lines = append(lines, fmt.Sprintf("    mov %s, w17", sDesc.W))
-			} else {
-				lines = append(lines, "    ldaxr x17, [x16]")
-				lines = append(lines, fmt.Sprintf("    stlxr w1, %s, [x16]", sDesc.X))
-				lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-				lines = append(lines, fmt.Sprintf("    mov %s, x17", sDesc.X))
-			}
+	// Mem <-> Reg (x86asm puts the memory operand first or second)
+	mem, okMem := dst.(x86asm.Mem)
+	regArg := src
+	if !okMem {
+		mem, okMem = src.(x86asm.Mem)
+		regArg = dst
+	}
+	reg, okReg := regArg.(x86asm.Reg)
+	if okMem && okReg {
+		if _, ok := arm64RegMap[reg]; !ok {
+			lines = append(lines, l.emitUnsupported(inst, "unmapped xchg register")...)
 			return lines, nil
 		}
+		sz := arm64RegMap[reg].Size
+		suffix := map[int]string{1: "b", 2: "h", 4: "", 8: ""}[sz]
+		val := "w0"
+		if sz == 8 {
+			val = "x0"
+		}
+		rc, _ := readRegTo(reg, "x0", "w0")
+		l.labelCounter++
+		loopLbl := fmt.Sprintf("L_xchg_loop_%d", l.labelCounter)
+		lines = append(lines, rc...)
+		lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
+		lines = append(lines, "    add x16, x28, x16")
+		lines = append(lines, fmt.Sprintf("%s:", loopLbl))
+		lines = append(lines, fmt.Sprintf("    ldaxr%s %s, [x16]", suffix, "w17"))
+		if sz == 8 {
+			lines[len(lines)-1] = "    ldaxr x17, [x16]"
+		}
+		lines = append(lines, fmt.Sprintf("    stlxr%s w1, %s, [x16]", suffix, val))
+		lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
+		wc, _ := writeRegFrom(reg, "x17", "w17")
+		lines = append(lines, wc...)
+		return lines, nil
 	}
 
 	lines = append(lines, l.emitUnsupported(inst, "unsupported xchg")...)
