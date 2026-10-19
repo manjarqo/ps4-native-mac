@@ -1716,9 +1716,15 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		return l.liftFpu(inst, nextPC, lines)
 
 	case x86asm.HLT, x86asm.INT, x86asm.INTO, x86asm.ICEBP:
-		// INT 0x41 is the Orbis debugger break that Naughty Dog's HALT/ASSERT macros issue after
-		// printing the message; without a debugger the process continues (the C backend's no-op,
-		// and how TLOU recovers from "A frame did not complete in 2.00 seconds").
+		// Software interrupts. Sites in the lifted TLOU / U4 code: INT 0x41 8233 / 13037,
+		// INT3 (CC) 300 / 212, INT 0x44 151 / 151, INTO and ICEBP 0. The C backend made every
+		// INT a no-op. Here only INT 0x41 is one: it is the Orbis debugger break that Naughty
+		// Dog's HALT/ASSERT macros issue after printing the message; without a debugger the
+		// process continues, and TLOU relies on it to recover from "A frame did not complete in
+		// 2.00 seconds" (Task 8). INT3 (assert breaks in game code) and INT 0x44 (a trap with
+		// a code in ECX in the system modules' failure paths) stop a PS4 process without a
+		// debugger, and no asm run so far has reached one, so they keep trapping (BRK, reported
+		// by the signal handler), as do HLT, INTO and ICEBP.
 		if imm, ok := inst.Inst.Args[0].(x86asm.Imm); ok && inst.Inst.Op == x86asm.INT && imm == 0x41 {
 			lines = append(lines, "    // int 0x41: debugger break, no debugger attached")
 			return lines, nil

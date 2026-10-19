@@ -19,6 +19,13 @@ import (
 // compare-and-swap that fails does not write and has only acquire semantics; the failure path
 // of CMPXCHG/CMPXCHG8B/CMPXCHG16B therefore runs a DMB ISH.
 //
+// Alignment: an LSE atomic or exclusive access must not cross a 16-byte boundary (FEAT_LSE2
+// allows any alignment inside a 16-byte granule). A misaligned guest LOCK operand that crosses
+// one raises SIGBUS; there is no split fallback, because two halves could not be updated
+// atomically anyway. x86 handles it (as a bus lock); compilers never emit it for C11/C++
+// atomics, which are naturally aligned. Ordinary loads and stores under TSO have a fenced
+// fallback for this case (orderedAccess).
+//
 // The destination register of an LSE atomic is never WZR/XZR: with a zero destination the
 // instruction loses its acquire semantics (LDADDAL WZR is not an acquire). The flags are
 // recomputed from the old value the atomic returns, with the same rules (operand top-alignment

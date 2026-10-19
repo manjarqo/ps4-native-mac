@@ -113,6 +113,11 @@ func (l *Arm64Lifter) applyTSO(inst disasm.Instruction, lines []string, start in
 			used[m[1]] = true
 		}
 	}
+	// The scratch register is written and consumed inside each rewritten access only, so it
+	// must merely not hold a value of the lowering at that point. A lowering that calls a
+	// helper (bl/blr) passes and receives values in registers it names in its own text (the
+	// helper's other caller-saved registers are dead after the call), so a register absent
+	// from the text is free on both sides of the call as well.
 	scratch := ""
 	for _, n := range []string{"7", "6", "5", "4", "3", "2", "1", "0"} {
 		if !used[n] {

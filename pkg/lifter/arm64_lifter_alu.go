@@ -1667,6 +1667,8 @@ const guestTscFreq = 2130000000
 // liftRdtsc handles RDTSC (Read Time-Stamp Counter): the host counter scaled to guestTscFreq,
 // floor(cntvct * F / cntfrq) as recomp_rdtsc computes it, without a 128-bit product:
 // q*F + (r*F)/cntfrq with q, r = cntvct divmod cntfrq (r*F < cntfrq*F fits in 64 bits).
+// cntfrq_el0 is never 0 on Apple silicon (24 MHz, set by the firmware), so the divisions are
+// safe. RDTSCP (which would also write ECX = TSC_AUX) has no site in TLOU or U4 and is not lifted.
 // Flags are not touched. Scratch: x0-x2, x16, x17.
 func (l *Arm64Lifter) liftRdtsc(lines []string) []string {
 	lines = append(lines, "    mrs x16, cntvct_el0")
@@ -2020,7 +2022,11 @@ func (l *Arm64Lifter) liftFlagsOp(inst disasm.Instruction, lines []string) ([]st
 			l.cpol = carryAdd
 		}
 	case x86asm.LAHF:
-		// AH = SF:ZF:0:AF:0:PF:1:CF
+		// AH = SF:ZF:0:AF:0:PF:1:CF. AF and PF are not modelled (0 here; PF exists only after FP
+		// compares, in V). Evidence from the lifted TLOU and U4 listings: every PF reader
+		// (JP/JNP/SETP/CMOVP) follows a (V)(U)COMIS or FUCOMI(P); the AF/PF consumers are clang's
+		// LAHF ... SAHF pairs around an overflow check (2 TLOU / 5 U4 sites, AH only restored)
+		// and one PUSHFQ in a context save. None reads AF or PF of an integer operation.
 		lines = append(lines,
 			"    cset w0, mi",
 			"    cset w1, eq",
