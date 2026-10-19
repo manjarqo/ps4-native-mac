@@ -571,28 +571,9 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		}
 
 	case x86asm.FCOS:
-		// Runtime call: cos() takes and returns its argument in d0 (and may clobber v0-v7 and
-		// v16-v31; x87 helpers are Task 5's).
-		lines = append(lines, loadFpuSt("d28", 0)...)
-		lines = append(lines,
-			"    fmov d0, d28",
-			"    sub  sp, sp, #96",
-			"    stp  x29, x30, [sp, #80]",
-			"    add  x29, sp, #80",
-			"    stp  x8,  x9,  [sp, #0]",
-			"    stp  x10, x11, [sp, #16]",
-			"    stp  x12, x13, [sp, #32]",
-			"    stp  x14, x15, [sp, #48]",
-			"    bl   _cos",
-			"    ldp  x8,  x9,  [sp, #0]",
-			"    ldp  x10, x11, [sp, #16]",
-			"    ldp  x12, x13, [sp, #32]",
-			"    ldp  x14, x15, [sp, #48]",
-			"    ldp  x29, x30, [sp, #80]",
-			"    add  sp, sp, #96",
-			"    fmov d28, d0",
-		)
-		lines = append(lines, storeFpuSt("d28", 0)...)
+		// 0 sites in TLOU and U4. A libm call here would have to keep XMM0-XMM7, the YMM upper
+		// halves in v16-v31 and NZCV, which bl _cos clobbers: trap instead of lowering it wrongly.
+		lines = append(lines, l.emitUnsupported(inst, "fcos (not lowered: no call site in the supported games)")...)
 		return lines, nil
 
 	case x86asm.FLDL2T:

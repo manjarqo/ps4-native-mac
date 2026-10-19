@@ -833,7 +833,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "fcos",
 			bytes:    []byte{0xd9, 0xff},
 			pc:       0x1000,
-			expected: []string{"bl   _cos"},
+			expected: []string{"b _recomp_unsupported_instruction"},
 		},
 		{
 			name:     "frndint",
