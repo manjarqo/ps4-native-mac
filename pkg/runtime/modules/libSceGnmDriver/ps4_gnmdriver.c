@@ -2438,3 +2438,33 @@ void shim_sceGnmDrawIndirectMulti(GuestContext *ctx) {
                                                           instance_sgpr, flags);
     SHIM_RETURN();
 }
+
+// ---------------------------------------------------------------------------------
+// Two libSceGnmDriver entry points the NID database has no names for. shadPS4 calls them
+// Func_4774D83BB4DDBF9A (NID R3TYO7Tdv5o) and Func_BADE7B4C199140DD (NID ut57TBmRQN0) and
+// registers them under the sub-library "libSceGnmWaitFreeSubmit".
+//
+// Uncharted 4 calls them as an on/off pair: function 0x176aca0 flips a flag and calls
+// ut57TBmRQN0 when the flag was set, R3TYO7Tdv5o otherwise; R3TYO7Tdv5o is also called once,
+// unconditionally, at boot (0x22000b, with no arguments).
+//
+// Class N (documented no-op). The console would switch a driver mode, but nothing the guest
+// can observe depends on it here:
+//  * The result is never used. Disassembly of the recompiled call sites of both functions
+//    (0x22000b, 0x207568, 0x207750, 0x176acc0, 0x176accb): none reads EAX/RAX afterwards;
+//    the next instruction overwrites it (a call, a load into RAX, XOR EAX / MOV AL, 1 in
+//    the toggle) or ignores it (a store, a LEA).
+//  * The host never waits for free ring space: sceGnmSubmitCommandBuffers (above) hands the
+//    command buffers to ps4_gnm_process_command_buffers inside the call, under g_gnm_mutex,
+//    with no ring-capacity wait anywhere, so there is no wait such a mode could gate.
+// Both return SCE_OK, as shadPS4 does (its stubs only log).
+// ---------------------------------------------------------------------------------
+void shim_Func_4774D83BB4DDBF9A(GuestContext *ctx) {
+    ctx->rax = 0;
+    SHIM_RETURN();
+}
+
+void shim_Func_BADE7B4C199140DD(GuestContext *ctx) {
+    ctx->rax = 0;
+    SHIM_RETURN();
+}

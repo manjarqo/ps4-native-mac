@@ -363,6 +363,9 @@ void shim_sceGnmSubmitAndFlipCommandBuffersForWorkload(GuestContext *ctx);
 void shim_sceGnmSubmitDone(GuestContext *ctx);
 void shim_sceGnmRequestFlipAndSubmitDone(GuestContext *ctx);
 void shim_sceGnmRequestFlipAndSubmitDoneForWorkload(GuestContext *ctx);
+// NID-only entry points (R3TYO7Tdv5o, ut57TBmRQN0), documented no-ops
+void shim_Func_4774D83BB4DDBF9A(GuestContext *ctx);
+void shim_Func_BADE7B4C199140DD(GuestContext *ctx);
 
 #ifdef __cplusplus
 }

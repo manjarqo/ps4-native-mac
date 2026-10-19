@@ -421,6 +421,10 @@ var shimAliases = map[string]string{
 	"FFVZcCu3zWU": "shim_sceGnmGetOffChipTessellationBufferSize",
 	"Fwvh++m9IQI": "shim_sceGnmGetGpuCoreClockFrequency",
 	"b08AgtPlHPg": "shim_sceGnmAreSubmitsAllowed",
+	// libSceGnmDriver functions without names in the NID database (documented no-ops, see
+	// ps4_gnmdriver.c); the Func_ names are shadPS4's.
+	"R3TYO7Tdv5o": "shim_Func_4774D83BB4DDBF9A",
+	"ut57TBmRQN0": "shim_Func_BADE7B4C199140DD",
 	"yb2cRhagD1I": "shim_sceGnmDrawInitDefaultHardwareState350",
 	"im2ZuItabu4": "shim_sceGnmDrawInitToDefaultContextState400",
 	"nF6bFRUBRAU": "shim_sceGnmDispatchInitDefaultHardwareState",
