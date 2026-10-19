@@ -52,8 +52,9 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 //   FS base x27, guest memory base x28; xmm0-15 (low 128 bits) v0-v15, the upper halves
 //   of ymm0-15 v16-v31; the flags in NZCV; MXCSR.RC/FZ in FPCR (RMode, FZ).
 // x0-x7, x16 and x17 are scratch, x18 is never touched, x29 is not maintained (guest code
-// builds no frame records). Each active guest function keeps its host return address (x30)
-// in a 16-byte slot on the host stack.
+// builds no frame records, so a frame-pointer walk from guest code finds only the host frames
+// below recomp_enter_guest; the stall profiler records just the PC there). Each active guest
+// function keeps its host return address (x30) in a 16-byte slot on the host stack.
 // Code that runs in this state (recompiled functions, shim stubs, the indirect-branch entry
 // points below) is in the __TEXT,__recomp_guest section: a host PC there means the pinned
 // registers are the guest registers; anywhere else the GuestContext holds what the last
@@ -69,8 +70,9 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 // calls fn, and on return stores the 16 GPRs and xmm0-7 back to ctx (a callback's vector
 // arguments and result) and restores the host FPCR.
 //
-// Guest -> host, _recomp_call_shim (x0 = shim; the shim stub branches here in place of a
-// guest function): ctx = the TCB slot. Stores the 16 GPRs and xmm0-7 to ctx, calls
+// Guest -> host, _recomp_call_shim (x0 = shim, x1 = its guest address; the shim stub branches
+// here in place of a guest function): ctx = the TCB slot. Stores the shim's guest address to
+// ctx->rip (guest code itself never writes ctx->rip) and the 16 GPRs and xmm0-7 to ctx, calls
 // shim(ctx), then reloads from that same ctx (kept in the bridge frame, not looked up again)
 // all 16 GPRs, xmm0-7, the FS base and the memory base. Host code runs with the default
 // FPCR (0: round to nearest, no flush to zero); the bridge keeps the guest FPCR in its frame
@@ -153,25 +155,28 @@ _recomp_enter_guest:
     ret
 
 // _recomp_call_shim: calls a host C shim from guest code (see the contract above).
-// x0 = shim. Frame: [sp] x29, x30; [sp+16] shim, ctx; [sp+32] guest FPCR.
+// x0 = shim, x1 = guest address of the shimmed function (stored to ctx->rip).
+// Frame: [sp] x29, x30; [sp+16] shim, ctx; [sp+32] guest FPCR. The frame record makes host
+// backtraces from inside a shim reach the guest function that called it (x30).
 .globl _recomp_call_shim
 _recomp_call_shim:
     stp  x29, x30, [sp, #-48]!
     mov  x29, sp
-    add  x1, x27, #0x70
-    ldr  x1, [x28, x1]           // ctx: the TCB slot
-    stp  x0, x1, [sp, #16]
-    SAVE_GPRS x1
-    SAVE_XMM0_7 x1
-    mrs  x2, fpcr                // host code runs with the default FPCR
-    str  x2, [sp, #32]
-    cbz  x2, 1f
+    add  x2, x27, #0x70
+    ldr  x2, [x28, x2]           // ctx: the TCB slot
+    stp  x0, x2, [sp, #16]
+    str  x1, [x2, #0x80]         // rip
+    SAVE_GPRS x2
+    SAVE_XMM0_7 x2
+    mrs  x3, fpcr                // host code runs with the default FPCR
+    str  x3, [sp, #32]
+    cbz  x3, 1f
     msr  fpcr, xzr
 1:
 
-    mov  x0, x1
-    ldr  x2, [sp, #16]
-    blr  x2
+    mov  x0, x2
+    ldr  x3, [sp, #16]
+    blr  x3
 
     // The ctx this call stored into. A context switch inside the shim may have changed the
     // TCB slot, and x27 may name another guest thread's TCB by now.

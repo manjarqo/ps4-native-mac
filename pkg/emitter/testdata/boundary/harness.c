@@ -70,6 +70,17 @@ void guest_xmm(void);
 void guest_xmm_callback(void);
 void guest_clobber_fp(void);
 void guest_fpcr(void);
+void guest_spin(void);
+#define ADDR_SPIN 0x400d00ULL
+#define SPIN_FLAG (D + 0x600)
+#define SPIN_HANDLE (D + 0x608)
+void guest_crash(void);
+#define ADDR_CRASH 0x400e00ULL
+void guest_rip(void);
+#define ADDR_RIP 0x400c00ULL
+// boundary_test.go boundaryStubAddr: guest address of the n-th generated shim stub.
+#define STUB_ADDR(n) (0x7f0000000ULL + (uint64_t)(n) * 0x10)
+#define STUB_TEST_RIP 12
 void guest_thread_main(void);
 void guest_thread_entry(void);
 #define ADDR_THREAD_MAIN 0x400b00ULL
@@ -450,6 +461,33 @@ static void test_thread(void) {
   expect("creator .tbss word (the new thread wrote its own)", *gmem64(fs1 - 16), 0);
 }
 
+static uint64_t g_shim_rip;
+
+void shim_test_rip(GuestContext *ctx) {
+  g_shim_rip = ctx->rip;
+  SHIM_RETURN();
+}
+
+// ctx->rip names the shim (its stub's guest address) while the shim runs.
+static void test_rip(void) {
+  recomp_call_guest(g_proc, ADDR_RIP);
+  expect("ctx->rip in the shim", g_shim_rip, STUB_ADDR(STUB_TEST_RIP));
+}
+
+// A stall while a guest thread is busy in guest code (PS4_STALL_PROFILE=20): the profile
+// attributes its samples to the guest function and notes once that guest code samples have no
+// frame chain (boundary_test.go checks the note).
+static void test_profile(void) {
+  GuestContext *t = g_proc;
+  expect("pthread_create", call_shim(t, shim_pthread_create, SPIN_HANDLE, 0, ADDR_SPIN, 0, 0, 0, 0), 0);
+  ps4_stall_watchdog_note_present();
+  usleep(150 * 1000);
+  ps4_stall_watchdog_note_present(); // ends the stall: the watchdog prints its profile
+  usleep(50 * 1000);
+  *gmem64(SPIN_FLAG) = 1;
+  call_shim(t, shim_pthread_join, *gmem64(SPIN_HANDLE), 0, 0, 0, 0, 0, 0);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -469,6 +507,9 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_XMM, (recomp_fn_t)guest_xmm);
   recomp_register_fn(ADDR_XMM_CALLBACK, (recomp_fn_t)guest_xmm_callback);
   recomp_register_fn(ADDR_FPCR, (recomp_fn_t)guest_fpcr);
+  recomp_register_fn(ADDR_RIP, (recomp_fn_t)guest_rip);
+  recomp_register_fn(ADDR_SPIN, (recomp_fn_t)guest_spin);
+  recomp_register_fn(ADDR_CRASH, (recomp_fn_t)guest_crash);
   recomp_register_fn(ADDR_THREAD_MAIN, (recomp_fn_t)guest_thread_main);
   recomp_register_fn(ADDR_THREAD_ENTRY, (recomp_fn_t)guest_thread_entry);
   recomp_register_fn(ADDR_LIFTED_VPCMPISTRI, (recomp_fn_t)guest_lifted_vpcmpistri);
@@ -491,6 +532,14 @@ int main(int argc, char **argv) {
     test_helpers();
   } else if (strcmp(c, "thread") == 0) {
     test_thread();
+  } else if (strcmp(c, "rip") == 0) {
+    test_rip();
+  } else if (strcmp(c, "profile") == 0) {
+    test_profile();
+  } else if (strcmp(c, "crash") == 0) {
+    // The crash handler reports and exits 1; boundary_test.go checks its report.
+    recomp_call_guest(g_proc, ADDR_CRASH);
+    fail("guest_crash returned");
   } else {
     fprintf(stderr, "unknown case %s\n", c);
     return 2;

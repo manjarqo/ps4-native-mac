@@ -324,6 +324,29 @@ GUEST_FN _guest_thread_entry
     add  x19, x19, #1
     GUEST_RET
 
+// ---- A guest thread busy in guest code, for the stall profiler: spins until the flag is set.
+.set SPIN_FLAG, D + 0x600
+
+GUEST_FN _guest_spin
+    LI   x16, SPIN_FLAG
+1:  ldr  x0, [x28, x16]
+    cbz  x0, 1b
+    GUEST_RET
+
+// ---- A fault in guest code (a load 256 GB past the guest memory base).
+
+GUEST_FN _guest_crash
+    SET_PATTERN 0xd000
+    movz x16, #0x40, lsl #32
+    ldr  x0, [x28, x16]
+    GUEST_RET
+
+// ---- A shim sees the guest address of its stub in ctx->rip.
+
+GUEST_FN _guest_rip
+    GUEST_CALL _stub_test_rip
+    GUEST_RET
+
 // ---- recomp_enter_guest is called from C: it must keep the AAPCS64 callee-saved d8-d15,
 // which guest code overwrites (they are the low halves of xmm8-15).
 

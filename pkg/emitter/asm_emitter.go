@@ -308,7 +308,7 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 	for _, addr := range chunkAddrs {
 		if shim, isShimmed := e.shimMap[addr]; isShimmed {
 			// Forward directly to host shim via bridge
-			writeShimStub(w, fmt.Sprintf("_fn_0x%x", addr), shim)
+			writeShimStub(w, fmt.Sprintf("_fn_0x%x", addr), shim, addr)
 			continue
 		}
 
@@ -373,12 +373,19 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 // runtime tells guest code from host code by this section (recomp_pc_in_guest_code).
 const guestTextSection = ".section __TEXT,__recomp_guest,regular,pure_instructions"
 
-// writeShimStub emits the guest-callable symbol sym of a host shim: guest code calls it like
-// any recompiled function, and it hands the shim to _recomp_call_shim.
-func writeShimStub(w io.Writer, sym, shim string) {
+// writeShimStub emits the guest-callable symbol sym of a host shim for guest address addr:
+// guest code calls it like any recompiled function, and it hands the shim and addr (stored
+// to ctx->rip, so diagnostics name the shim a thread is in) to _recomp_call_shim.
+func writeShimStub(w io.Writer, sym, shim string, addr uint64) {
 	fmt.Fprintf(w, ".globl %s\n%s:\n", sym, sym)
 	fmt.Fprintf(w, "    adrp x0, _%s@PAGE\n", shim)
 	fmt.Fprintf(w, "    add  x0, x0, _%s@PAGEOFF\n", shim)
+	fmt.Fprintf(w, "    movz x1, #0x%x\n", addr&0xffff)
+	for shift := 16; shift < 64; shift += 16 {
+		if chunk := (addr >> shift) & 0xffff; chunk != 0 {
+			fmt.Fprintf(w, "    movk x1, #0x%x, lsl #%d\n", chunk, shift)
+		}
+	}
 	fmt.Fprintf(w, "    b    _recomp_call_shim\n\n")
 }
 
@@ -758,7 +765,7 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 	sw := bufio.NewWriter(&sBuf)
 	sw.WriteString("// Synthetic shims ARM64 bridge\n" + guestTextSection + "\n.p2align 2\n\n")
 	for _, entry := range synthList {
-		writeShimStub(sw, fmt.Sprintf("_fn_0x%x", entry.addr), entry.shim)
+		writeShimStub(sw, fmt.Sprintf("_fn_0x%x", entry.addr), entry.shim, entry.addr)
 	}
 	if err := sw.Flush(); err != nil {
 		return err

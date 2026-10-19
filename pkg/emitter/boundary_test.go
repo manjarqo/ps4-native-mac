@@ -30,7 +30,18 @@ var boundaryStubs = [][2]string{
 	{"_stub_pthread_join", "shim_pthread_join"},
 	{"_stub___tls_get_addr", "shim___tls_get_addr"},
 	{"_stub_test_record_ctx", "shim_test_record_ctx"},
+	{"_stub_test_rip", "shim_test_rip"},
 }
+
+// boundaryOutputChecks are further strings a case's output must contain exactly once.
+var boundaryOutputChecks = map[string][]string{
+	"profile": {"[stall-profile] samples in recompiled guest code: PC only (no frame chain)\n",
+		"[stall-profile]   unnamed: busy 100%", ": guest_spin 100%\n"},
+	"crash": {"In recompiled guest code (guest_crash+0x", "RBX=0xd001 RCX=", " R12=0xd00c R13=0xd00d R14=0xd00e R15=0xd00f "},
+}
+
+// boundaryStubAddr is the guest address of boundaryStubs[i] (harness.c: STUB_ADDR).
+func boundaryStubAddr(i int) uint64 { return 0x7f0000000 + uint64(i)*0x10 }
 
 // boundaryRuntimeSources are the runtime files the boundary tests run against, compiled with
 // the flags of the game build (pkg/cli: -O2 -ffp-contract=off).
@@ -108,8 +119,8 @@ func buildBoundaryHarness(t *testing.T) string {
 	}
 	var stubs bytes.Buffer
 	stubs.WriteString(guestTextSection + "\n.p2align 2\n\n")
-	for _, s := range boundaryStubs {
-		writeShimStub(&stubs, s[0], s[1])
+	for i, s := range boundaryStubs {
+		writeShimStub(&stubs, s[0], s[1], boundaryStubAddr(i))
 	}
 	stubPath := filepath.Join(dir, "stubs_gen.s")
 	if err := os.WriteFile(stubPath, stubs.Bytes(), 0o644); err != nil {
@@ -154,24 +165,37 @@ func TestGuestStateBoundary(t *testing.T) {
 	cases := []struct {
 		name, arg string
 		env       []string
+		crash     bool // the case ends in the crash handler (exit status 1, no PASS line)
 	}{
-		{"fiber/coroutines", "fiber", nil},
-		{"fiber/threads", "fiber", []string{"PS4_FIBER_THREADS=1"}},
-		{"exception-handler-in-shim", "exception", nil},
-		{"shim-sets-gprs", "gprs", nil},
-		{"xmm-arguments-and-results", "xmm", nil},
-		{"enter-guest-keeps-d8-d15", "callee-saved-fp", nil},
-		{"fpcr", "fpcr", nil},
-		{"helper-calls-keep-registers", "helpers", nil},
-		{"thread-start-and-tls", "thread", nil},
+		{"fiber/coroutines", "fiber", nil, false},
+		{"fiber/threads", "fiber", []string{"PS4_FIBER_THREADS=1"}, false},
+		{"exception-handler-in-shim", "exception", nil, false},
+		{"shim-sets-gprs", "gprs", nil, false},
+		{"xmm-arguments-and-results", "xmm", nil, false},
+		{"enter-guest-keeps-d8-d15", "callee-saved-fp", nil, false},
+		{"fpcr", "fpcr", nil, false},
+		{"helper-calls-keep-registers", "helpers", nil, false},
+		{"thread-start-and-tls", "thread", nil, false},
+		{"shim-sets-ctx-rip", "rip", nil, false},
+		{"stall-profile-in-guest-code", "profile", []string{"PS4_STALL_PROFILE=20"}, false},
+		{"crash-in-guest-code", "crash", nil, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			cmd := exec.Command(bin, c.arg)
 			cmd.Env = append(os.Environ(), c.env...)
 			out, err := cmd.CombinedOutput()
-			if err != nil || !strings.Contains(string(out), "PASS "+c.arg) {
+			if c.crash {
+				if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+					t.Fatalf("%s: %v, want the crash handler's exit status 1\n%s", c.arg, err, out)
+				}
+			} else if err != nil || !strings.Contains(string(out), "PASS "+c.arg) {
 				t.Fatalf("%s: %v\n%s", c.arg, err, out)
+			}
+			for _, want := range boundaryOutputChecks[c.arg] {
+				if n := strings.Count(string(out), want); n != 1 {
+					t.Fatalf("%s: %q appears %d times, want once\n%s", c.arg, want, n, out)
+				}
 			}
 		})
 	}

@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <unistd.h>
 #if defined(__APPLE__)
+#include <dlfcn.h>
 #include <execinfo.h>
 #include <libgen.h>
 #include <mach-o/dyld.h>
@@ -88,6 +89,34 @@ static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
     }
 #if defined(__APPLE__) && defined(__arm64__)
     arm_thread_state64_t *state = (arm_thread_state64_t *)&(((ucontext_t *)ucontext)->uc_mcontext->__ss);
+    if (recomp_pc_in_guest_code(state->__pc)) {
+      // The registers above are what the last shim call stored; in guest code the pinned host
+      // registers are the live guest registers (contract at recomp_enter_guest).
+      Dl_info di;
+      const int named = dladdr((void *)state->__pc, &di) && di.dli_sname;
+      const uint64_t *x = state->__x;
+      fprintf(stderr,
+              "In recompiled guest code (%s+0x%llx); live guest registers:\n"
+              "RSP=0x%llx RBP=0x%llx RAX=0x%llx RBX=0x%llx RCX=0x%llx RDX=0x%llx RSI=0x%llx RDI=0x%llx\n"
+              "R8=0x%llx R9=0x%llx R10=0x%llx R11=0x%llx R12=0x%llx R13=0x%llx R14=0x%llx R15=0x%llx FS=0x%llx\n",
+              named ? di.dli_sname : "?", named ? (unsigned long long)(state->__pc - (uint64_t)(uintptr_t)di.dli_saddr) : 0ULL,
+              (unsigned long long)x[26], (unsigned long long)x[25], (unsigned long long)x[19], (unsigned long long)x[20],
+              (unsigned long long)x[21], (unsigned long long)x[22], (unsigned long long)x[23], (unsigned long long)x[24],
+              (unsigned long long)x[8], (unsigned long long)x[9], (unsigned long long)x[10], (unsigned long long)x[11],
+              (unsigned long long)x[12], (unsigned long long)x[13], (unsigned long long)x[14], (unsigned long long)x[15],
+              (unsigned long long)x[27]);
+      if (x[28] == (uint64_t)(uintptr_t)g_current_ctx->mem_base && x[26] < g_current_ctx->mem_size) {
+        fprintf(stderr, "Guest code addresses on the live stack:");
+        const uint64_t *sp = (const uint64_t *)(g_current_ctx->mem_base + x[26]);
+        for (int i = 0, shown = 0; i < 512 && shown < 24 && x[26] + (uint64_t)i * 8 + 8 <= g_current_ctx->mem_size; i++) {
+          if (sp[i] >= 0x10000 && sp[i] < 0x1474000) {
+            fprintf(stderr, " %llx", (unsigned long long)sp[i]);
+            shown++;
+          }
+        }
+        fprintf(stderr, "\n");
+      }
+    }
     fprintf(stderr, "Host PC: 0x%llx (ARM64)\n", (unsigned long long)state->__pc);
     for (int i = 0; i < 29; i++) {
       fprintf(stderr, "x%d=0x%llx ", i, (unsigned long long)state->__x[i]);
