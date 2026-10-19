@@ -778,6 +778,23 @@ int main(int argc, char **argv) {
 	return writeFileIfChanged(path, []byte(content))
 }
 
+// ownSegments returns the segments of the main image itself. MergeImages appends the
+// segments of merged companion modules (e.g. libSceFios2) to the main image, but the eboot's
+// module info must list only its own mapped segments.
+func ownSegments(elf *elfloader.LoadedELF) []*elfloader.Segment {
+	end := elf.OrigMaxVAddr
+	if end == 0 {
+		end = elf.MaxVAddr
+	}
+	var segs []*elfloader.Segment
+	for _, s := range elf.Segments {
+		if s.Vaddr >= elf.OrigMinVAddr && s.Vaddr < end {
+			segs = append(segs, s)
+		}
+	}
+	return segs
+}
+
 // EmitGuestModules writes the runtime export tables, synthetic shims, and unwind registrations.
 func (e *AsmEmitter) EmitGuestModules(path string) error {
 	var buf bytes.Buffer
@@ -902,13 +919,14 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 		if endAddr == 0 {
 			endAddr = e.elf.MaxVAddr
 		}
-		numSegs := len(e.elf.Segments)
+		mainSegs := ownSegments(e.elf)
+		numSegs := len(mainSegs)
 		if numSegs > 4 {
 			numSegs = 4
 		}
 		var segsInit strings.Builder
 		for si := 0; si < numSegs; si++ {
-			s := e.elf.Segments[si]
+			s := mainSegs[si]
 			prot := 0
 			if s.Flags&1 != 0 {
 				prot |= 1
