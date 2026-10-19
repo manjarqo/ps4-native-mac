@@ -63,10 +63,14 @@ static void *log_drain_thread(void *arg) {
     }
   }
   free(buf);
+  // Whatever ended the loop (EOF, read error, no buffer): writers must never block on an unread
+  // pipe, so point the standard descriptors back at the originals first.
+  for (int j = 0; j < st->nfds; j++) dup2(st->orig[j], st->fd[j]);
   atomic_store(&st->done, 1);
   return NULL;
 }
 
+// Note: on timeout this returns while a drain thread may still be inside a slow write().
 void ps4_log_drain_sync(double timeout_s) {
   if (!g_nstreams) return;
   for (int i = 0; i < g_nstreams; i++)
@@ -80,15 +84,15 @@ void ps4_log_drain_sync(double timeout_s) {
     if (!pending) return;
     clock_gettime(CLOCK_MONOTONIC, &t);
     if ((t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) * 1e-9 > timeout_s) return;
-    usleep(1000);
+    nanosleep(&(struct timespec){0, 1000000}, NULL);
   }
 }
 
-static void log_abort_handler(int sig) {
+static void log_abort_handler(int sig, siginfo_t *si, void *uc) {
   ps4_log_drain_sync(1.0);
   const struct sigaction *old = &g_old_abort;
   if (old->sa_flags & SA_SIGINFO) {
-    if (old->sa_sigaction) old->sa_sigaction(sig, NULL, NULL);
+    if (old->sa_sigaction) old->sa_sigaction(sig, si, uc);
   } else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
     old->sa_handler(sig);
   }
@@ -156,8 +160,13 @@ __attribute__((constructor)) static void ps4_log_init(void) {
     if (r2) { const int f = 2; redirect(&f, 1); }
   }
   if (!g_nstreams) return;
+#ifdef PS4_LOG_TEST
+  // Test-only: lets the host test show that it detects a missing SIGABRT handler.
+  if (getenv("PS4_LOG_TEST_NO_ABORT_HANDLER")) { atexit(log_atexit); return; }
+#endif
   struct sigaction sa = {0};
-  sa.sa_handler = log_abort_handler;
+  sa.sa_flags = SA_SIGINFO;
+  sa.sa_sigaction = log_abort_handler;
   sigemptyset(&sa.sa_mask);
   sigaction(SIGABRT, &sa, &g_old_abort);
   atexit(log_atexit);

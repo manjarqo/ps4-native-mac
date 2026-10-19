@@ -9,6 +9,8 @@ clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/kernel/threading" "$R/tests/ho
 # Asynchronous stdout/stderr: nothing is lost on abort() or exit(), with one shared file and with two.
 clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/core" "$R/tests/host/log_abort_test.c" "$R/pkg/runtime/core/ps4_log.c" \
   -o "$T/log_abort_test"
+clang -std=gnu11 -Wall -Werror -DPS4_LOG_TEST -I "$R/pkg/runtime/core" "$R/tests/host/log_abort_test.c" "$R/pkg/runtime/core/ps4_log.c" \
+  -o "$T/log_abort_test_hook"
 for mode in abort exit; do
   for n in $(seq 20); do
     { "$T/log_abort_test" $mode > "$T/log1.txt" 2>&1 || true; } 2>/dev/null
@@ -17,6 +19,14 @@ for mode in abort exit; do
     [ "$(cat "$T/log_out.txt" "$T/log_err.txt" | wc -l)" -eq 201 ] || { echo "log_abort_test $mode (two files) run $n lost lines"; exit 1; }
     grep -q "FATAL last line" "$T/log1.txt" || { echo "log_abort_test $mode run $n: FATAL line missing"; exit 1; }
   done
+done
+# Slow consumer, ~20,000 lines (far over the 64 KB pipe): abort() must not lose any. Without the
+# SIGABRT handler the same run must lose lines, which proves the test can fail.
+for n in 1 2 3; do
+  { "$T/log_abort_test" drive abort 20000 "$T/slow.txt" || true; } 2>/dev/null
+  [ "$(wc -l < "$T/slow.txt")" -eq 20001 ] || { echo "log_abort_test slow consumer run $n: $(wc -l < "$T/slow.txt") of 20001 lines"; exit 1; }
+  { PS4_LOG_TEST_NO_ABORT_HANDLER=1 "$T/log_abort_test_hook" drive abort 20000 "$T/slow_nohandler.txt" || true; } 2>/dev/null
+  [ "$(wc -l < "$T/slow_nohandler.txt")" -lt 20001 ] || { echo "log_abort_test: lines were not lost without the SIGABRT handler; the test has no teeth"; exit 1; }
 done
 echo "log_abort_test: PASS"
 G="$R/pkg/runtime/modules/libSceGnmDriver"
