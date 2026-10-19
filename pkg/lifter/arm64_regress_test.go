@@ -210,13 +210,13 @@ func TestRegressNarrowOperands(t *testing.T) {
 	requireInOrder(t, "cdq", l[0], "asr w22, w19, #31")
 
 	l = liftBlock(t, "8610") // xchg byte [rax], dl
-	requireInOrder(t, "xchg byte", l[0], "and w0, w22, #0xff", "ldaxrb w17, [x16]", "stlxrb w1, w0, [x16]", "bfi x22, x17, #0, #8")
+	requireInOrder(t, "xchg byte", l[0], "and w2, w22, #0xff", "swpalb w2, w17, [x16]", "bfi x22, x17, #0, #8")
 
 	l = liftBlock(t, "0fc008") // xadd byte [rax], cl
-	requireInOrder(t, "xadd byte", l[0], "and w2, w21, #0xff", "ldaxrb w17, [x16]", "lsl w3, w17, #24", "adds w3, w3, w2, lsl #24")
+	requireInOrder(t, "xadd byte", l[0], "and w2, w21, #0xff", "ldaddalb w2, w17, [x16]", "lsl w3, w17, #24", "cmn w3, w2, lsl #24")
 
 	l = liftBlock(t, "660fb108") // cmpxchg word [rax], cx
-	requireInOrder(t, "cmpxchg word", l[0], "ldaxrh w17, [x16]", "lsl w0, w19, #16", "cmp w0, w17, lsl #16")
+	requireInOrder(t, "cmpxchg word", l[0], "and w0, w19, #0xffff", "casalh w0, w2, [x16]", "lsl w1, w19, #16", "cmp w1, w0, lsl #16")
 }
 
 // Compare and test flags: (U)COMIS* and FCOMI give ZF = PF = CF = 1 for unordered and SF = 0

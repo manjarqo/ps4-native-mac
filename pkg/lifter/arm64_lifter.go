@@ -831,6 +831,12 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 	comment := fmt.Sprintf("    // 0x%x: %s", inst.Address, inst.Inst.String())
 	lines = append(lines, comment)
 
+	if hasLockPrefix(inst.Inst) {
+		if out, ok := l.liftLocked(inst, nextPC, lines); ok {
+			return out, nil
+		}
+	}
+
 	switch op {
 	case x86asm.NOP, x86asm.FNOP, x86asm.FWAIT,
 		x86asm.PREFETCHT0, x86asm.PREFETCHNTA, x86asm.PREFETCHT1, x86asm.PREFETCHT2, x86asm.PREFETCHW:

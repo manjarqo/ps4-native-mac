@@ -1112,7 +1112,7 @@ func (l *Arm64Lifter) liftDiv(inst disasm.Instruction, nextPC uint64, lines []st
 }
 
 // liftXadd handles XADD: TEMP = DEST + SRC; SRC = DEST; DEST = TEMP, with ADD flags (8/16-bit
-// from top-aligned operands; carryAdd). The memory form uses an exclusive load/store loop.
+// from top-aligned operands; carryAdd). The memory form is atomic (liftAtomicXadd).
 func (l *Arm64Lifter) liftXadd(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	dst := inst.Inst.Args[0]
 	srcReg, okSrc := inst.Inst.Args[1].(x86asm.Reg)
@@ -1125,6 +1125,9 @@ func (l *Arm64Lifter) liftXadd(inst disasm.Instruction, nextPC uint64, lines []s
 	r := "w"
 	if sz == 8 {
 		r = "x"
+	}
+	if mem, okMem := dst.(x86asm.Mem); okMem {
+		return l.liftAtomicXadd(inst, mem, srcReg, nextPC, lines), nil
 	}
 	rc, _ := readRegTo(srcReg, "x2", "w2")
 	lines = append(lines, rc...)
@@ -1139,21 +1142,6 @@ func (l *Arm64Lifter) liftXadd(inst disasm.Instruction, nextPC uint64, lines []s
 			lines = append(lines, fmt.Sprintf("    adds %s3, %s17, %s2", r, r, r))
 		}
 		l.cpol = carryAdd
-	}
-	if mem, okMem := dst.(x86asm.Mem); okMem {
-		suffix := map[int]string{1: "b", 2: "h", 4: "", 8: ""}[sz]
-		l.labelCounter++
-		loopLbl := fmt.Sprintf("L_xadd_loop_%d", l.labelCounter)
-		lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-		lines = append(lines, "    add x16, x28, x16", fmt.Sprintf("%s:", loopLbl),
-			fmt.Sprintf("    ldaxr%s %s17, [x16]", suffix, r),
-			fmt.Sprintf("    add %s0, %s17, %s2", r, r, r),
-			fmt.Sprintf("    stlxr%s w1, %s0, [x16]", suffix, r),
-			fmt.Sprintf("    cbnz w1, %s", loopLbl))
-		flags()
-		wc, _ := writeRegFrom(srcReg, "x17", "w17")
-		lines = append(lines, wc...)
-		return lines, nil
 	}
 	if dstReg, okDst := dst.(x86asm.Reg); okDst {
 		if _, ok := arm64RegMap[dstReg]; ok {
@@ -1172,7 +1160,7 @@ func (l *Arm64Lifter) liftXadd(inst disasm.Instruction, nextPC uint64, lines []s
 	return lines, nil
 }
 
-// liftCmpxchg handles CMPXCHG instruction.
+// liftCmpxchg handles CMPXCHG. The memory form is atomic (liftAtomicCmpxchg).
 func (l *Arm64Lifter) liftCmpxchg(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	dst := inst.Inst.Args[0]
 	src := inst.Inst.Args[1]
@@ -1192,67 +1180,14 @@ func (l *Arm64Lifter) liftCmpxchg(inst disasm.Instruction, nextPC uint64, lines 
 		sz = srcDesc.Size
 	}
 
+	if mem, okMem := dst.(x86asm.Mem); okMem {
+		return l.liftAtomicCmpxchg(mem, srcReg, nextPC, lines), nil
+	}
+
 	l.cpol = carrySub // flags of CMP accumulator, destination
 	l.labelCounter++
-	loopLbl := fmt.Sprintf("L_cmpxchg_loop_%d", l.labelCounter)
 	failLbl := fmt.Sprintf("L_cmpxchg_fail_%d", l.labelCounter)
 	endLbl := fmt.Sprintf("L_cmpxchg_end_%d", l.labelCounter)
-
-	// Accumulator is RAX / EAX / AX / AL (mapped to x19)
-	if mem, okMem := dst.(x86asm.Mem); okMem {
-		lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-		lines = append(lines, "    add x16, x28, x16")
-		lines = append(lines, fmt.Sprintf("%s:", loopLbl))
-		switch sz {
-		case 1:
-			lines = append(lines, "    ldaxrb w17, [x16]")
-			lines = append(lines, "    lsl w0, w19, #24")
-			lines = append(lines, "    cmp w0, w17, lsl #24") // flags of the 8-bit compare
-			lines = append(lines, fmt.Sprintf("    b.ne %s", failLbl))
-			lines = append(lines, fmt.Sprintf("    stlxrb w1, %s, [x16]", srcDesc.W))
-			lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-			lines = append(lines, fmt.Sprintf("    b %s", endLbl))
-			lines = append(lines, fmt.Sprintf("%s:", failLbl))
-			lines = append(lines, "    clrex")
-			lines = append(lines, "    bfi x19, x17, #0, #8")
-			lines = append(lines, fmt.Sprintf("%s:", endLbl))
-		case 2:
-			lines = append(lines, "    ldaxrh w17, [x16]")
-			lines = append(lines, "    lsl w0, w19, #16")
-			lines = append(lines, "    cmp w0, w17, lsl #16") // flags of the 16-bit compare
-			lines = append(lines, fmt.Sprintf("    b.ne %s", failLbl))
-			lines = append(lines, fmt.Sprintf("    stlxrh w1, %s, [x16]", srcDesc.W))
-			lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-			lines = append(lines, fmt.Sprintf("    b %s", endLbl))
-			lines = append(lines, fmt.Sprintf("%s:", failLbl))
-			lines = append(lines, "    clrex")
-			lines = append(lines, "    bfi x19, x17, #0, #16")
-			lines = append(lines, fmt.Sprintf("%s:", endLbl))
-		case 4:
-			lines = append(lines, "    ldaxr w17, [x16]")
-			lines = append(lines, "    cmp w19, w17")
-			lines = append(lines, fmt.Sprintf("    b.ne %s", failLbl))
-			lines = append(lines, fmt.Sprintf("    stlxr w1, %s, [x16]", srcDesc.W))
-			lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-			lines = append(lines, fmt.Sprintf("    b %s", endLbl))
-			lines = append(lines, fmt.Sprintf("%s:", failLbl))
-			lines = append(lines, "    clrex")
-			lines = append(lines, "    mov w19, w17")
-			lines = append(lines, fmt.Sprintf("%s:", endLbl))
-		default: // 8
-			lines = append(lines, "    ldaxr x17, [x16]")
-			lines = append(lines, "    cmp x19, x17")
-			lines = append(lines, fmt.Sprintf("    b.ne %s", failLbl))
-			lines = append(lines, fmt.Sprintf("    stlxr w1, %s, [x16]", srcDesc.X))
-			lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-			lines = append(lines, fmt.Sprintf("    b %s", endLbl))
-			lines = append(lines, fmt.Sprintf("%s:", failLbl))
-			lines = append(lines, "    clrex")
-			lines = append(lines, "    mov x19, x17")
-			lines = append(lines, fmt.Sprintf("%s:", endLbl))
-		}
-		return lines, nil
-	}
 
 	if dstReg, okDst := dst.(x86asm.Reg); okDst {
 		if dstDesc, okDstDesc := arm64RegMap[dstReg]; okDstDesc {
@@ -1300,9 +1235,8 @@ func (l *Arm64Lifter) liftCmpxchg(inst disasm.Instruction, nextPC uint64, lines 
 	return lines, nil
 }
 
-// liftXchg handles XCHG. The memory form is atomic (implicit LOCK) and uses an exclusive
-// load/store pair of the operand's size; 8/16-bit registers (including AH-DH) exchange only
-// their own bits.
+// liftXchg handles XCHG. The memory form is atomic (implicit LOCK, liftAtomicXchg); 8/16-bit
+// registers (including AH-DH) exchange only their own bits.
 func (l *Arm64Lifter) liftXchg(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	dst := inst.Inst.Args[0]
 	src := inst.Inst.Args[1]
@@ -1350,28 +1284,7 @@ func (l *Arm64Lifter) liftXchg(inst disasm.Instruction, nextPC uint64, lines []s
 			lines = append(lines, l.emitUnsupported(inst, "unmapped xchg register")...)
 			return lines, nil
 		}
-		sz := arm64RegMap[reg].Size
-		suffix := map[int]string{1: "b", 2: "h", 4: "", 8: ""}[sz]
-		val := "w0"
-		if sz == 8 {
-			val = "x0"
-		}
-		rc, _ := readRegTo(reg, "x0", "w0")
-		l.labelCounter++
-		loopLbl := fmt.Sprintf("L_xchg_loop_%d", l.labelCounter)
-		lines = append(lines, rc...)
-		lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-		lines = append(lines, "    add x16, x28, x16")
-		lines = append(lines, fmt.Sprintf("%s:", loopLbl))
-		lines = append(lines, fmt.Sprintf("    ldaxr%s %s, [x16]", suffix, "w17"))
-		if sz == 8 {
-			lines[len(lines)-1] = "    ldaxr x17, [x16]"
-		}
-		lines = append(lines, fmt.Sprintf("    stlxr%s w1, %s, [x16]", suffix, val))
-		lines = append(lines, fmt.Sprintf("    cbnz w1, %s", loopLbl))
-		wc, _ := writeRegFrom(reg, "x17", "w17")
-		lines = append(lines, wc...)
-		return lines, nil
+		return l.liftAtomicXchg(mem, reg, nextPC, lines), nil
 	}
 
 	lines = append(lines, l.emitUnsupported(inst, "unsupported xchg")...)
