@@ -182,48 +182,141 @@ type Arm64Lifter struct {
 	currentFn     *disasm.Function
 	unsuppCounter uint64
 	labelCounter  uint64
-	lastFlagOp    x86asm.Op
+	// cpol is how ARM C holds x86 CF at the current point of the block being lifted.
+	cpol carryPol
 }
 
-func isSubFlagOp(op x86asm.Op) bool {
-	switch op {
-	case x86asm.CMP, x86asm.SUB, x86asm.BT, x86asm.BTS, x86asm.BTR, x86asm.BTC, x86asm.NEG, x86asm.CLC, x86asm.STC, x86asm.CMC,
-		x86asm.TZCNT, x86asm.LZCNT:
-		return true
-	default:
-		return false
-	}
-}
+// x86 flags live in NZCV: N = SF, Z = ZF, V = OF (PF after an FP compare, the only place PF
+// is modeled), and C = CF in one of the senses below. The sense is tracked statically while a
+// block is lifted; at every block boundary it is carrySub.
+type carryPol uint8
 
-func isAddFlagOp(op x86asm.Op) bool {
-	switch op {
-	case x86asm.ADD, x86asm.ADC:
-		return true
-	default:
-		return false
-	}
-}
+const (
+	// carrySub: C = !CF, ARM's borrow convention after SUBS/CMP.
+	carrySub carryPol = iota
+	// carryAdd: C = CF, after ADDS/ADCS and the lowerings that insert CF into C directly.
+	carryAdd
+	// carryClear: C = 0 and CF = 0, after ANDS/TST and the other logical operations.
+	carryClear
+)
 
-func isLogicalFlagOp(op x86asm.Op) bool {
-	switch op {
-	case x86asm.TEST, x86asm.AND, x86asm.OR, x86asm.XOR,
-		x86asm.SHL, x86asm.SHR, x86asm.SAR,
-		x86asm.BSF, x86asm.BSR:
-		return true
-	default:
-		return false
-	}
-}
-
-func isFlagSettingOp(op x86asm.Op) bool {
-	return isSubFlagOp(op) || isAddFlagOp(op) || isLogicalFlagOp(op) || op == x86asm.SBB
-}
-
-// ResetFlags clears the tracked lastFlagOp.
+// ResetFlags starts a block: C holds CF in the block-boundary sense (carrySub).
 func (l *Arm64Lifter) ResetFlags() {
 	if l != nil {
-		l.lastFlagOp = 0
+		l.cpol = carrySub
 	}
+}
+
+// normalizeCarry returns the instructions that bring C into the block-boundary sense
+// (C = !CF) and records that sense.
+func (l *Arm64Lifter) normalizeCarry() []string {
+	if l.cpol == carrySub {
+		return nil
+	}
+	l.cpol = carrySub
+	return []string{"    cfinv"}
+}
+
+// EndBlock returns the code that ends a block falling through from its last instruction:
+// the next block starts in the carrySub sense, so C is inverted when CF is live there.
+func (l *Arm64Lifter) EndBlock(last disasm.Instruction) []string {
+	if l == nil || last.CarryDead {
+		return nil
+	}
+	return l.normalizeCarry()
+}
+
+// carryCond returns the ARM condition that is true when x86 CF == want, in the current sense.
+func (l *Arm64Lifter) carryCond(want bool) string {
+	if (l.cpol == carrySub) == want {
+		return "cc"
+	}
+	return "cs"
+}
+
+// x86CondIndex maps Jcc/SETcc/CMOVcc to the x86 condition encoding (O=0 ... G=15).
+func x86CondIndex(op x86asm.Op) (int, bool) {
+	switch op {
+	case x86asm.JO, x86asm.SETO, x86asm.CMOVO:
+		return 0, true
+	case x86asm.JNO, x86asm.SETNO, x86asm.CMOVNO:
+		return 1, true
+	case x86asm.JB, x86asm.SETB, x86asm.CMOVB:
+		return 2, true
+	case x86asm.JAE, x86asm.SETAE, x86asm.CMOVAE:
+		return 3, true
+	case x86asm.JE, x86asm.SETE, x86asm.CMOVE:
+		return 4, true
+	case x86asm.JNE, x86asm.SETNE, x86asm.CMOVNE:
+		return 5, true
+	case x86asm.JBE, x86asm.SETBE, x86asm.CMOVBE:
+		return 6, true
+	case x86asm.JA, x86asm.SETA, x86asm.CMOVA:
+		return 7, true
+	case x86asm.JS, x86asm.SETS, x86asm.CMOVS:
+		return 8, true
+	case x86asm.JNS, x86asm.SETNS, x86asm.CMOVNS:
+		return 9, true
+	case x86asm.JP, x86asm.SETP, x86asm.CMOVP:
+		return 10, true
+	case x86asm.JNP, x86asm.SETNP, x86asm.CMOVNP:
+		return 11, true
+	case x86asm.JL, x86asm.SETL, x86asm.CMOVL:
+		return 12, true
+	case x86asm.JGE, x86asm.SETGE, x86asm.CMOVGE:
+		return 13, true
+	case x86asm.JLE, x86asm.SETLE, x86asm.CMOVLE:
+		return 14, true
+	case x86asm.JG, x86asm.SETG, x86asm.CMOVG:
+		return 15, true
+	}
+	return 0, false
+}
+
+// condFor returns the ARM condition for x86 condition cc in the current carry sense, and the
+// instructions that must run before it is used (A/BE after an addition first invert C, which
+// changes the tracked sense).
+func (l *Arm64Lifter) condFor(cc int) ([]string, string) {
+	switch cc {
+	case 0, 10: // O; P (V holds PF after FP compares)
+		return nil, "vs"
+	case 1, 11:
+		return nil, "vc"
+	case 2: // B: CF = 1
+		return nil, l.carryCond(true)
+	case 3: // AE: CF = 0
+		return nil, l.carryCond(false)
+	case 4:
+		return nil, "eq"
+	case 5:
+		return nil, "ne"
+	case 6, 7: // BE: CF = 1 or ZF = 1; A: CF = 0 and ZF = 0
+		var pre []string
+		switch l.cpol {
+		case carryClear:
+			if cc == 6 {
+				return nil, "eq"
+			}
+			return nil, "ne"
+		case carryAdd:
+			pre = l.normalizeCarry()
+		}
+		if cc == 6 {
+			return pre, "ls"
+		}
+		return pre, "hi"
+	case 8:
+		return nil, "mi"
+	case 9:
+		return nil, "pl"
+	case 12:
+		return nil, "lt"
+	case 13:
+		return nil, "ge"
+	case 14:
+		return nil, "le"
+	}
+	return nil, "gt"
 }
 
 // NewArm64Lifter creates a new ARM64 assembly lifter.
@@ -519,54 +612,6 @@ func writeMemFrom(mem x86asm.Mem, nextPC uint64, size int, srcX string, srcW str
 	return lines
 }
 
-// arm64Cond converts an x86 condition code to ARM64 condition suffix.
-func arm64Cond(op x86asm.Op, lastFlagOp x86asm.Op) (string, bool) {
-	if isAddFlagOp(lastFlagOp) {
-		switch op {
-		case x86asm.JB:
-			return "cs", true // After ADD/ADC: x86 CF=1 (carry) is ARM C=1 (Carry Set)
-		case x86asm.JAE:
-			return "cc", true // After ADD/ADC: x86 CF=0 (no carry) is ARM C=0 (Carry Clear)
-		}
-	}
-	switch op {
-	case x86asm.JE:
-		return "eq", true
-	case x86asm.JNE:
-		return "ne", true
-	case x86asm.JB:
-		return "cc", true // Carry clear (unsigned lower)
-	case x86asm.JAE:
-		return "cs", true // Carry set (unsigned higher or same)
-	case x86asm.JA:
-		return "hi", true // Unsigned higher
-	case x86asm.JBE:
-		return "ls", true // Unsigned lower or same
-	case x86asm.JL:
-		return "lt", true // Signed less than
-	case x86asm.JGE:
-		return "ge", true // Signed greater or equal
-	case x86asm.JLE:
-		return "le", true // Signed less or equal
-	case x86asm.JG:
-		return "gt", true // Signed greater than
-	case x86asm.JS:
-		return "mi", true // Negative (minus)
-	case x86asm.JNS:
-		return "pl", true // Positive or zero (plus)
-	case x86asm.JO:
-		return "vs", true // Overflow set
-	case x86asm.JNO:
-		return "vc", true // Overflow clear
-	case x86asm.JP:
-		return "vs", true // Parity / FP unordered
-	case x86asm.JNP:
-		return "vc", true // No parity / FP ordered
-	default:
-		return "", false
-	}
-}
-
 func invertArm64Cond(cond string) string {
 	switch cond {
 	case "eq":
@@ -602,112 +647,12 @@ func invertArm64Cond(cond string) string {
 	}
 }
 
-// setccCond returns ARM64 condition suffix for SETcc opcodes.
-func setccCond(op x86asm.Op, lastFlagOp x86asm.Op) (string, bool) {
-	if isAddFlagOp(lastFlagOp) {
-		switch op {
-		case x86asm.SETB:
-			return "cs", true
-		case x86asm.SETAE:
-			return "cc", true
-		}
-	}
-	switch op {
-	case x86asm.SETE:
-		return "eq", true
-	case x86asm.SETNE:
-		return "ne", true
-	case x86asm.SETB:
-		return "cc", true
-	case x86asm.SETAE:
-		return "cs", true
-	case x86asm.SETA:
-		return "hi", true
-	case x86asm.SETBE:
-		return "ls", true
-	case x86asm.SETL:
-		return "lt", true
-	case x86asm.SETGE:
-		return "ge", true
-	case x86asm.SETLE:
-		return "le", true
-	case x86asm.SETG:
-		return "gt", true
-	case x86asm.SETS:
-		return "mi", true
-	case x86asm.SETNS:
-		return "pl", true
-	case x86asm.SETO:
-		return "vs", true
-	case x86asm.SETNO:
-		return "vc", true
-	case x86asm.SETP:
-		return "vs", true // Parity / FP unordered
-	case x86asm.SETNP:
-		return "vc", true // No parity / FP ordered
-	default:
-		return "", false
-	}
-}
-
-// cmovccCond returns ARM64 condition suffix for CMOVcc opcodes.
-func cmovccCond(op x86asm.Op, lastFlagOp x86asm.Op) (string, bool) {
-	if isAddFlagOp(lastFlagOp) {
-		switch op {
-		case x86asm.CMOVB:
-			return "cs", true
-		case x86asm.CMOVAE:
-			return "cc", true
-		}
-	}
-	switch op {
-	case x86asm.CMOVE:
-		return "eq", true
-	case x86asm.CMOVNE:
-		return "ne", true
-	case x86asm.CMOVB:
-		return "cc", true
-	case x86asm.CMOVAE:
-		return "cs", true
-	case x86asm.CMOVA:
-		return "hi", true
-	case x86asm.CMOVBE:
-		return "ls", true
-	case x86asm.CMOVL:
-		return "lt", true
-	case x86asm.CMOVGE:
-		return "ge", true
-	case x86asm.CMOVLE:
-		return "le", true
-	case x86asm.CMOVG:
-		return "gt", true
-	case x86asm.CMOVS:
-		return "mi", true
-	case x86asm.CMOVNS:
-		return "pl", true
-	case x86asm.CMOVO:
-		return "vs", true
-	case x86asm.CMOVNO:
-		return "vc", true
-	case x86asm.CMOVP:
-		return "vs", true // Parity / FP unordered
-	case x86asm.CMOVNP:
-		return "vc", true // No parity / FP ordered
-	default:
-		return "", false
-	}
-}
-
 // LiftInstructionToBuf translates a single x86 instruction into ARM64 assembly instructions.
 func (l *Arm64Lifter) LiftInstructionToBuf(inst disasm.Instruction, nextPC uint64, fn *disasm.Function, dst []string) ([]string, error) {
 	lines, err := l.liftInstructionInternal(inst, nextPC, fn, dst)
-	if err == nil {
-		op := inst.Inst.Op
-		if isFlagSettingOp(op) && !inst.SkipFlags {
-			l.lastFlagOp = op
-		} else if op == x86asm.CALL {
-			l.lastFlagOp = 0
-		}
+	if err == nil && inst.Inst.Op == x86asm.CALL {
+		// Flags are dead after a call (System V ABI); any sense is consistent.
+		l.cpol = carrySub
 	}
 	return lines, err
 }
@@ -715,7 +660,7 @@ func (l *Arm64Lifter) LiftInstructionToBuf(inst disasm.Instruction, nextPC uint6
 func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC uint64, fn *disasm.Function, dst []string) ([]string, error) {
 	if fn != l.currentFn {
 		l.currentFn = fn
-		l.lastFlagOp = 0
+		l.cpol = carrySub
 	}
 	op := inst.Inst.Op
 	args := inst.Inst.Args
@@ -1022,6 +967,9 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		if rel, ok := args[0].(x86asm.Rel); ok {
 			target := uint64(int64(nextPC) + int64(rel))
 			if fn != nil && fn.Blocks[target] != nil {
+				if !inst.CarryDead {
+					lines = append(lines, l.normalizeCarry()...)
+				}
 				lines = append(lines, fmt.Sprintf("    b L_fn_0x%x_loc_0x%x", fn.EntryAddr, target))
 			} else if l.IsKnownFunc(target) {
 				lines = append(lines, "    ldr x30, [sp], #16")
@@ -1772,18 +1720,28 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		return l.liftStr(inst, nextPC, lines)
 
 	default:
-		// Check SETcc
-		if cond, ok := setccCond(op, l.lastFlagOp); ok {
-			return l.liftSetcc(inst, nextPC, cond, lines)
-		}
-
-		// Check CMOVcc
-		if cond, ok := cmovccCond(op, l.lastFlagOp); ok {
-			return l.liftCmovcc(inst, nextPC, cond, lines)
+		if cc, ok := x86CondIndex(op); ok {
+			opName := op.String()
+			if strings.HasPrefix(opName, "SET") {
+				pre, cond := l.condFor(cc)
+				lines = append(lines, pre...)
+				return l.liftSetcc(inst, nextPC, cond, lines)
+			}
+			if strings.HasPrefix(opName, "CMOV") {
+				pre, cond := l.condFor(cc)
+				lines = append(lines, pre...)
+				return l.liftCmovcc(inst, nextPC, cond, lines)
+			}
 		}
 
 		// Check conditional branches
-		if cond, ok := arm64Cond(op, l.lastFlagOp); ok {
+		if cc, ok := x86CondIndex(op); ok {
+			// The targets start in the block-boundary carry sense; invert first if CF is live.
+			if !inst.CarryDead {
+				lines = append(lines, l.normalizeCarry()...)
+			}
+			pre, cond := l.condFor(cc)
+			lines = append(lines, pre...)
 			if rel, ok := args[0].(x86asm.Rel); ok {
 				target := uint64(int64(nextPC) + int64(rel))
 				if fn != nil && fn.Blocks[target] != nil {

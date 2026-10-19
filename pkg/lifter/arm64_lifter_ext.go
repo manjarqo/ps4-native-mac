@@ -512,43 +512,36 @@ func (l *Arm64Lifter) liftAes(inst disasm.Instruction, nextPC uint64, lines []st
 	return lines, nil
 }
 
-// liftPushfq handles PUSHFQ.
+// liftPushfq handles PUSHFQ: SF, ZF, CF (in the tracked carry sense) and OF from NZCV, IF and
+// bit 1 set; AF and PF are not modeled.
 func (l *Arm64Lifter) liftPushfq(inst disasm.Instruction, lines []string) ([]string, error) {
 	lines = append(lines,
-		"    mrs  x16, nzcv",
-		"    ubfx w17, w16, #31, #1", // N -> SF (bit 7)
-		"    lsl  w17, w17, #7",
-		"    ubfx w18, w16, #30, #1", // Z -> ZF (bit 6)
-		"    add  w17, w17, w18, lsl #6",
-		"    ubfx w18, w16, #29, #1", // C -> NOT CF (bit 0)
-		"    eor  w18, w18, #1",
-		"    add  w17, w17, w18",
-		"    ubfx w18, w16, #28, #1", // V -> OF (bit 11)
-		"    add  w17, w17, w18, lsl #11",
-		"    movz w18, #0x202",
-		"    orr  w17, w17, w18",
-		"    sub  x26, x26, #8",
-		"    str  x17, [x28, x26]",
+		"    cset w0, mi",
+		"    cset w1, eq",
+		fmt.Sprintf("    cset w2, %s", l.carryCond(true)),
+		"    cset w3, vs",
+		"    orr w0, w2, w0, lsl #7",
+		"    orr w0, w0, w1, lsl #6",
+		"    orr w0, w0, w3, lsl #11",
+		"    mov w1, #0x202",
+		"    orr w0, w0, w1",
+		"    sub x26, x26, #8",
+		"    str x0, [x28, x26]",
 	)
 	return lines, nil
 }
 
-// liftPopfq handles POPFQ.
+// liftPopfq handles POPFQ: N = SF, Z = ZF, C = CF (carryAdd), V = OF.
 func (l *Arm64Lifter) liftPopfq(inst disasm.Instruction, lines []string) ([]string, error) {
 	lines = append(lines,
-		"    ldr  x17, [x28, x26]",
-		"    add  x26, x26, #8",
-		"    ubfx w16, w17, #7, #1", // SF -> N (bit 31)
-		"    lsl  w16, w16, #31",
-		"    ubfx w18, w17, #6, #1", // ZF -> Z (bit 30)
-		"    add  w16, w16, w18, lsl #30",
-		"    ubfx w18, w17, #0, #1", // CF -> NOT C (bit 29)
-		"    eor  w18, w18, #1",
-		"    add  w16, w16, w18, lsl #29",
-		"    ubfx w18, w17, #11, #1", // OF -> V (bit 28)
-		"    add  w16, w16, w18, lsl #28",
-		"    msr  nzcv, x16",
+		"    ldr x0, [x28, x26]",
+		"    add x26, x26, #8",
+		"    rmif x0, #4, #12", // N = bit 7, Z = bit 6
+		"    rmif x0, #63, #2", // C = bit 0
+		"    ubfx w1, w0, #11, #1",
+		"    rmif x1, #0, #1", // V = bit 11
 	)
+	l.cpol = carryAdd
 	return lines, nil
 }
 

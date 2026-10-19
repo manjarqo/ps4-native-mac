@@ -16,6 +16,11 @@ type Instruction struct {
 	Address   uint64
 	Inst      x86asm.Inst
 	SkipFlags bool
+	// CarryDead / OverflowDead: CF / OF cannot be read after this instruction before being
+	// redefined, in this block or any successor (see carry_liveness.go). False is the
+	// conservative default.
+	CarryDead    bool
+	OverflowDead bool
 }
 
 // BasicBlock represents a straight-line sequence of instructions.
@@ -613,6 +618,9 @@ func (d *Disassembler) disasmLinearFunction(entryAddr uint64, size uint64) (*Fun
 	slices.Sort(fn.BlockOrder)
 
 	d.analyzeBlockFlagLiveness(fn)
+	if !d.SkipFlagLiveness {
+		analyzeCarryOverflowLiveness(fn)
+	}
 	return fn, discoveredCalls, nil
 }
 
@@ -980,6 +988,9 @@ func (d *Disassembler) disasmBranchFollowing(entryAddr uint64) (*Function, []uin
 	fn.EndAddr = maxEnd
 
 	d.analyzeBlockFlagLiveness(fn)
+	if !d.SkipFlagLiveness {
+		analyzeCarryOverflowLiveness(fn)
+	}
 	return fn, discoveredCalls, nil
 }
 

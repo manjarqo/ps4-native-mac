@@ -142,13 +142,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "adc r14, 0",
 			bytes:    []byte{0x49, 0x83, 0xd6, 0x00}, // adc r14, 0
 			pc:       0x1000,
-			expected: []string{"cset x16, cc", "adds x14, x14, x16"},
+			expected: []string{"cfinv", "adcs x14, x14, xzr"},
 		},
 		{
 			name:     "adc eax, 0",
 			bytes:    []byte{0x83, 0xd0, 0x00}, // adc eax, 0
 			pc:       0x1000,
-			expected: []string{"cset w16, cc", "adds w19, w19, w16"},
+			expected: []string{"cfinv", "adcs w19, w19, wzr"},
 		},
 		{
 			name:     "bt eax, 13",
@@ -436,7 +436,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "not qword [rdx]",
 			bytes:    []byte{0x48, 0xf7, 0x12}, // not qword [rdx]
 			pc:       0x1000,
-			expected: []string{"ldr x16, [x28, x16]", "mvn x16, x16", "str x16, [x28, x17]"},
+			expected: []string{"ldr x17, [x28, x16]", "mvn x17, x17", "str x17, [x28, x16]"},
 		},
 		{
 			name:     "bts rax, 5",
@@ -568,13 +568,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "clc",
 			bytes:    []byte{0xf8}, // clc
 			pc:       0x1000,
-			expected: []string{"mrs x16, nzcv", "orr x16, x16, #(1 << 29)", "msr nzcv, x16"},
+			expected: []string{"rmif xzr, #0, #2"},
 		},
 		{
 			name:     "stc",
 			bytes:    []byte{0xf9}, // stc
 			pc:       0x1000,
-			expected: []string{"mrs x16, nzcv", "bic x16, x16, #(1 << 29)", "msr nzcv, x16"},
+			expected: []string{"rmif xzr, #0, #2"},
 		},
 		{
 			name:     "leave",
@@ -760,13 +760,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "pushfq",
 			bytes:    []byte{0x9c},
 			pc:       0x1000,
-			expected: []string{"mrs  x16, nzcv", "sub  x26, x26, #8", "str  x17, [x28, x26]"},
+			expected: []string{"cset w2, cc", "sub x26, x26, #8", "str x0, [x28, x26]"},
 		},
 		{
 			name:     "popfq",
 			bytes:    []byte{0x9d},
 			pc:       0x1000,
-			expected: []string{"ldr  x17, [x28, x26]", "add  x26, x26, #8", "msr  nzcv, x16"},
+			expected: []string{"ldr x0, [x28, x26]", "add x26, x26, #8", "rmif x0, #4, #12", "rmif x0, #63, #2"},
 		},
 		{
 			name:     "xlatb",
@@ -881,21 +881,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "or al, [rbp - 0x10]",
 			bytes:    []byte{0x0a, 0x45, 0xf0},
 			pc:       0x1000,
-			expected: []string{
-				"sub x16, x16, #16",
-				"ldrb w16, [x28, x16]",
-				"and w17, w19, #0xff",
-				"orr w17, w17, w16",
-				"bfi x19, x17, #0, #8",
-				"sxtb w16, w17",
-				"tst w16, w16",
-			},
+			expected: []string{"lsl w17, w17, #24", "orr w17, w17, w16, lsl #24", "tst w17, w17", "lsr w17, w17, #24", "bfi x19, x17, #0, #8"},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			lifter.lastFlagOp = 0
+			lifter.ResetFlags()
 			inst, err := x86asm.Decode(tc.bytes, 64)
 			if err != nil {
 				t.Fatalf("failed to decode: %v", err)
@@ -943,7 +935,8 @@ func TestAddJccCarryPolarity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode jae failed: %v", err)
 	}
-	dJae := disasm.Instruction{Address: 0x1003, Inst: jaeInst}
+	// CF dead after the branch: JAE reads C in the ADD sense (C = CF).
+	dJae := disasm.Instruction{Address: 0x1003, Inst: jaeInst, CarryDead: true}
 	lines, err := lifter.LiftInstructionToBuf(dJae, 0x1005, fn, nil)
 	if err != nil {
 		t.Fatalf("lift jae failed: %v", err)
@@ -952,9 +945,25 @@ func TestAddJccCarryPolarity(t *testing.T) {
 	if !strings.Contains(joined, "b.cc") {
 		t.Errorf("expected b.cc for JAE following ADD, got:\n%s", joined)
 	}
-	if strings.Contains(joined, "b.cs") {
-		t.Errorf("unexpected b.cs for JAE following ADD, got:\n%s", joined)
+	if strings.Contains(joined, "b.cs") || strings.Contains(joined, "cfinv") {
+		t.Errorf("unexpected b.cs/cfinv for JAE following ADD with CF dead, got:\n%s", joined)
 	}
+
+	// CF live after the branch: C is first brought into the block-boundary sense (C = !CF).
+	lifter.ResetFlags()
+	if _, err := lifter.LiftInstructionToBuf(dAdd, 0x1003, fn, nil); err != nil {
+		t.Fatalf("lift add failed: %v", err)
+	}
+	dJae.CarryDead = false
+	lines, err = lifter.LiftInstructionToBuf(dJae, 0x1005, fn, nil)
+	if err != nil {
+		t.Fatalf("lift jae failed: %v", err)
+	}
+	joined = strings.Join(lines, "\n")
+	if !strings.Contains(joined, "cfinv") || !strings.Contains(joined, "b.cs") {
+		t.Errorf("expected cfinv + b.cs for JAE following ADD with CF live, got:\n%s", joined)
+	}
+	dJae.CarryDead = true
 
 	// 3. Reset and lift CMP followed by JAE -> after CMP, A >= B (no borrow) must be b.cs!
 	lifter.ResetFlags()

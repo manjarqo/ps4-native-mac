@@ -347,6 +347,13 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 					}
 				}
 			}
+			// A block that falls through hands the next one CF in the block-boundary sense.
+			if n := len(block.Insts); n > 0 {
+				for _, line := range e.lifter.EndBlock(block.Insts[n-1]) {
+					w.WriteString(line)
+					w.WriteByte('\n')
+				}
+			}
 		}
 		w.WriteString("    ldr x30, [sp], #16\n    ret\n\n")
 	}
