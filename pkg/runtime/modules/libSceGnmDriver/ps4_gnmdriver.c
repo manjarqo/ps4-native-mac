@@ -2274,7 +2274,11 @@ static void gnm_raise_submit_thread_qos(void) {
     done = 1;
     const char *e = getenv("PS4_GNM_CP_QOS");
     if (e && e[0] == '0') return;
-    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) != 0) return;
+    int err = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    if (err != 0) {
+        printf("[gnm] raising the submit thread to USER_INTERACTIVE failed: error %d\n", err);
+        return;
+    }
     char name[64] = {0};
     pthread_getname_np(pthread_self(), name, sizeof(name));
     printf("[gnm] submit thread '%s' raised to USER_INTERACTIVE\n", name[0] ? name : "unnamed");
