@@ -4,7 +4,7 @@
 // host stack slot per active function for x30, x86 calls push a return address on the guest
 // stack. The shim stubs (_stub_*) are generated with the emitter's writeShimStub.
 // Addresses are the guest data layout of harness.c.
-.text
+.section __TEXT,__recomp_guest,regular,pure_instructions
 .p2align 2
 
 .set D, 0x1000000
@@ -28,6 +28,9 @@
 .set RES_B_PRE, RES + 0x800
 .set RES_M1_PRE, RES + 0x900
 .set RES_M2_PRE, RES + 0xa00
+.set RES_EXC_PRE, RES + 0xb00
+.set RES_EXC, RES + 0xc00
+.set RES_EXC_HANDLER, RES + 0xd00
 
 .macro LI reg, val
     movz \reg, #((\val) & 0xffff)
@@ -143,3 +146,17 @@ GUEST_FN _guest_fiber_b
     movz x23, #0
     GUEST_CALL _stub_sceFiberReturnToThread
     brk  #2
+
+// ---- Guest exception handler (SIGUSR1) delivered while the thread is inside a shim.
+
+GUEST_FN _guest_exc_main
+    SET_PATTERN 0xe000
+    STORE_REGS RES_EXC_PRE
+    GUEST_CALL _stub_test_wait_signal
+    STORE_REGS RES_EXC
+    GUEST_RET
+
+// void handler(int signum, void *ucontext)
+GUEST_FN _guest_exc_handler
+    STORE_REGS RES_EXC_HANDLER
+    GUEST_RET

@@ -301,7 +301,7 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
 
-	if _, err := fmt.Fprintf(w, "// Chunk %d (%d functions)\n.text\n.p2align 2\n\n", chunkIdx, len(chunkAddrs)); err != nil {
+	if _, err := fmt.Fprintf(w, "// Chunk %d (%d functions)\n%s\n.p2align 2\n\n", chunkIdx, len(chunkAddrs), guestTextSection); err != nil {
 		return err
 	}
 
@@ -367,6 +367,11 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 	}
 	return writeFileIfChanged(path, buf.Bytes())
 }
+
+// guestTextSection holds all code that runs with the guest registers pinned in host registers:
+// recompiled functions, shim stubs and the indirect-branch entry points of the trampoline. The
+// runtime tells guest code from host code by this section (recomp_pc_in_guest_code).
+const guestTextSection = ".section __TEXT,__recomp_guest,regular,pure_instructions"
 
 // writeShimStub emits the guest-callable symbol sym of a host shim: guest code calls it like
 // any recompiled function, and it hands the shim to _recomp_call_shim.
@@ -751,7 +756,7 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 	synthPath := strings.TrimSuffix(path, ".c") + "_synth.s"
 	var sBuf bytes.Buffer
 	sw := bufio.NewWriter(&sBuf)
-	sw.WriteString("// Synthetic shims ARM64 bridge\n.text\n.p2align 2\n\n")
+	sw.WriteString("// Synthetic shims ARM64 bridge\n" + guestTextSection + "\n.p2align 2\n\n")
 	for _, entry := range synthList {
 		writeShimStub(sw, fmt.Sprintf("_fn_0x%x", entry.addr), entry.shim)
 	}

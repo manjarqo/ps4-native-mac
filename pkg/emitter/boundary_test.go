@@ -17,6 +17,7 @@ var boundaryStubs = [][2]string{
 	{"_stub_sceFiberSwitch", "shim_sceFiberSwitch"},
 	{"_stub_sceFiberReturnToThread", "shim_sceFiberReturnToThread"},
 	{"_stub_test_noop", "shim_test_noop"},
+	{"_stub_test_wait_signal", "shim_test_wait_signal"},
 }
 
 // boundaryRuntimeSources are the runtime files the boundary tests run against.
@@ -25,6 +26,7 @@ var boundaryRuntimeSources = []string{
 	"kernel/threading/ps4_threading.c",
 	"kernel/threading/ps4_stall_profile.c",
 	"modules/libSceFiber/ps4_fiber.c",
+	"modules/libkernel/ps4_kernel_sys.c",
 }
 
 // buildBoundaryHarness links the emitted trampoline and shim stubs with guest.s, harness.c
@@ -40,7 +42,7 @@ func buildBoundaryHarness(t *testing.T) string {
 		t.Fatal(err)
 	}
 	var stubs bytes.Buffer
-	stubs.WriteString(".text\n.p2align 2\n\n")
+	stubs.WriteString(guestTextSection + "\n.p2align 2\n\n")
 	for _, s := range boundaryStubs {
 		writeShimStub(&stubs, s[0], s[1])
 	}
@@ -88,6 +90,7 @@ func TestGuestStateBoundary(t *testing.T) {
 	}{
 		{"fiber/coroutines", "fiber", nil},
 		{"fiber/threads", "fiber", []string{"PS4_FIBER_THREADS=1"}},
+		{"exception-handler-in-shim", "exception", nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

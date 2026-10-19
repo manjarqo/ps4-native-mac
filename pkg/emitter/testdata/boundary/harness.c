@@ -4,8 +4,10 @@
 #include "recomp_runtime.h"
 #include "ps4_fiber.h"
 #include "ps4_threading.h"
+#include "ps4_kernel_sys.h"
 
 #include <stdarg.h>
+#include <stdatomic.h>
 
 // Guest data layout (guest.s has the same addresses).
 #define D 0x1000000ULL
@@ -23,7 +25,10 @@
 #define STACK_B 0x1200000ULL
 #define FIBER_STACK_SIZE 0x10000ULL
 
-enum { RES_M1, RES_A1, RES_A2, RES_B1, RES_M2, RES_A_ARGS, RES_B_ARGS, RES_A_PRE, RES_B_PRE, RES_M1_PRE, RES_M2_PRE };
+enum {
+  RES_M1, RES_A1, RES_A2, RES_B1, RES_M2, RES_A_ARGS, RES_B_ARGS, RES_A_PRE, RES_B_PRE, RES_M1_PRE, RES_M2_PRE,
+  RES_EXC_PRE, RES_EXC, RES_EXC_HANDLER,
+};
 // Result block words (guest.s STORE_REGS).
 enum { W_RAX, W_RBX, W_RCX, W_RDX, W_RSI, W_RDI, W_RBP, W_RSP, W_R8, W_R15 = W_R8 + 7, W_FS, W_MEM };
 
@@ -32,11 +37,15 @@ enum { W_RAX, W_RBX, W_RCX, W_RDX, W_RSI, W_RDI, W_RBP, W_RSP, W_R8, W_R15 = W_R
 #define ADDR_FIBER_MAIN2 0x400100ULL
 #define ADDR_FIBER_A 0x400200ULL
 #define ADDR_FIBER_B 0x400300ULL
+#define ADDR_EXC_MAIN 0x400400ULL
+#define ADDR_EXC_HANDLER 0x400500ULL
 
 void guest_fiber_main1(void);
 void guest_fiber_main2(void);
 void guest_fiber_a(void);
 void guest_fiber_b(void);
+void guest_exc_main(void);
+void guest_exc_handler(void);
 
 static GuestContext *g_proc;
 static int g_failures;
@@ -147,6 +156,60 @@ static void test_fiber(void) {
   expect("thread 2 TCB slot", tcb_slot(t2), (uint64_t)(uintptr_t)t2);
 }
 
+// 0: the guest thread has not reached shim_test_wait_signal; 1: it waits in it; 2: released.
+static atomic_int g_wait_state;
+
+// Blocks until released, the way a shim blocks in a wait. Host code keeps host values in the
+// registers that hold the guest registers in guest code: x8-x15 and x19-x25 hold other values
+// while the signal arrives, x26 and x28 hold the guest stack pointer and memory base, as they
+// do in any shim that does not reuse them.
+void shim_test_wait_signal(GuestContext *ctx) {
+  atomic_store(&g_wait_state, 1);
+  __asm__ volatile("mov x26, %1\n"
+                   "mov x28, %2\n"
+                   "mov x8, #0xdead\n mov x9, #0xdead\n mov x10, #0xdead\n mov x11, #0xdead\n"
+                   "mov x12, #0xdead\n mov x13, #0xdead\n mov x14, #0xdead\n mov x15, #0xdead\n"
+                   "mov x19, #0xdead\n mov x20, #0xdead\n mov x21, #0xdead\n mov x22, #0xdead\n"
+                   "mov x23, #0xdead\n mov x24, #0xdead\n mov x25, #0xdead\n"
+                   "1: ldar w16, [%0]\n"
+                   "cmp w16, #2\n"
+                   "b.ne 1b\n"
+                   :
+                   : "r"(&g_wait_state), "r"(ctx->rsp), "r"(ctx->mem_base)
+                   : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x19", "x20", "x21", "x22",
+                     "x23", "x24", "x25", "x26", "x28", "cc", "memory");
+  ctx->rax = 0;
+  SHIM_RETURN();
+}
+
+static void *raise_exception_in_wait(void *arg) {
+  (void)arg;
+  while (atomic_load(&g_wait_state) != 1) usleep(100);
+  expect("sceKernelRaiseException", (uint64_t)(int64_t)sceKernelRaiseException(1000, 30), 0);
+  volatile uint64_t *signum = &res(RES_EXC_HANDLER)[W_RDI];
+  for (int i = 0; i < 20000 && *signum != 30; i++) usleep(100);
+  atomic_store(&g_wait_state, 2);
+  return NULL;
+}
+
+// A guest exception handler (sceKernelRaiseException, SIGUSR1) runs while the thread waits
+// in a shim: it sees the guest registers of the interrupted call, and the guest registers the
+// shim returns with are unchanged.
+static void test_exception(void) {
+  GuestContext *t = g_proc;
+  expect("sceKernelInstallExceptionHandler", (uint64_t)(int64_t)sceKernelInstallExceptionHandler(30, ADDR_EXC_HANDLER), 0);
+  pthread_t th;
+  pthread_create(&th, NULL, raise_exception_in_wait, NULL);
+  recomp_call_guest(t, ADDR_EXC_MAIN);
+  pthread_join(th, NULL);
+  expect("handler signum", res(RES_EXC_HANDLER)[W_RDI], 30);
+  const uint64_t uc = res(RES_EXC_HANDLER)[W_RSI];
+  expect("ucontext r12", *gmem64(uc + 0xa0), 0xe00c);
+  expect("ucontext rbx", *gmem64(uc + 0x80), 0xe001);
+  expect("ucontext rbp", *gmem64(uc + 0x88), 0xe002);
+  check_pattern("after the shim the handler interrupted", RES_EXC, 0xe000, res(RES_EXC_PRE)[W_RSP], t->fs_base);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -160,10 +223,14 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_FIBER_MAIN2, (recomp_fn_t)guest_fiber_main2);
   recomp_register_fn(ADDR_FIBER_A, (recomp_fn_t)guest_fiber_a);
   recomp_register_fn(ADDR_FIBER_B, (recomp_fn_t)guest_fiber_b);
+  recomp_register_fn(ADDR_EXC_MAIN, (recomp_fn_t)guest_exc_main);
+  recomp_register_fn(ADDR_EXC_HANDLER, (recomp_fn_t)guest_exc_handler);
 
   const char *c = argv[1];
   if (strcmp(c, "fiber") == 0) {
     test_fiber();
+  } else if (strcmp(c, "exception") == 0) {
+    test_exception();
   } else {
     fprintf(stderr, "unknown case %s\n", c);
     return 2;

@@ -3,6 +3,7 @@
 #include "ps4_log.h"
 #include "ps4_sysmodule.h"
 #include "ps4_vfs.h"
+#include "ps4_syscalls.h"
 
 volatile uint64_t g_ps4_videoout_flip_count;
 
@@ -29,3 +30,13 @@ uint64_t recomp_resolve_symbol(const char *module_name, const char *symbol) {
   (void)symbol;
   return 0;
 }
+int ps4_host_setting_pro_mode(void) { return 0; }
+const RecompModuleUnwindInfo *recomp_module_find_by_addr(uint64_t addr) {
+  (void)addr;
+  return NULL;
+}
+const RecompModuleUnwindInfo *recomp_module_find_by_handle(int32_t handle) {
+  (void)handle;
+  return NULL;
+}
+void shim_clock_gettime(GuestContext *ctx) { SHIM_RETURN(); }

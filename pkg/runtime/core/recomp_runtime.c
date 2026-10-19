@@ -767,6 +767,22 @@ void recomp_dispatch_external(GuestContext *ctx, uint64_t target) {
   recomp_dispatch(ctx, target);
 }
 
+#if defined(__APPLE__)
+// Bounds of the __TEXT,__recomp_guest section, provided by the linker (empty when there is no
+// guest code, as in host tests).
+extern const char g_recomp_guest_text_start[] __asm("section$start$__TEXT$__recomp_guest");
+extern const char g_recomp_guest_text_end[] __asm("section$end$__TEXT$__recomp_guest");
+
+bool recomp_pc_in_guest_code(uint64_t pc) {
+  return pc >= (uint64_t)(uintptr_t)g_recomp_guest_text_start && pc < (uint64_t)(uintptr_t)g_recomp_guest_text_end;
+}
+#else
+bool recomp_pc_in_guest_code(uint64_t pc) {
+  (void)pc;
+  return false;
+}
+#endif
+
 void recomp_free_runtime(GuestContext *ctx) {
   if (!ctx)
     return;

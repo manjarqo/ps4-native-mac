@@ -40,6 +40,10 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 // x0-x7, x16 and x17 are scratch, x18 is never touched, x29 is not maintained (guest code
 // builds no frame records). Each active guest function keeps its host return address (x30)
 // in a 16-byte slot on the host stack.
+// Code that runs in this state (recompiled functions, shim stubs, the indirect-branch entry
+// points below) is in the __TEXT,__recomp_guest section: a host PC there means the pinned
+// registers are the guest registers; anywhere else the GuestContext holds what the last
+// guest -> host transition stored (recomp_pc_in_guest_code; signal handlers rely on it).
 // The rest of the guest state (x87 stack, MMX, MXCSR) lives in the GuestContext of the
 // execution context that runs, found through the TCB slot [x28 + x27 + 0x70]. The runtime
 // keeps that slot pointing at the context that runs on the guest thread: the thread's own
@@ -174,6 +178,10 @@ _recomp_call_shim:
     cbz  x16, 99f
     br   x16
 .endm
+
+// The indirect-branch entry points run with the guest registers live: guest code section.
+.section __TEXT,__recomp_guest,regular,pure_instructions
+.p2align 2
 
 // _recomp_indirect_call: calls a guest function via dispatch. x0 = guest target RIP.
 .globl _recomp_indirect_call

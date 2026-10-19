@@ -456,10 +456,15 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     GuestContext saved_ctx = *ctx;
 
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+    // Interrupted in recompiled guest code: the guest registers are the pinned host registers.
+    // Anywhere else (a shim, the bridge, a helper) the host registers hold host values and ctx
+    // holds the guest registers the bridge stored; ctx is restored from saved_ctx below, so
+    // taking host registers there would hand them to the guest when the shim returns.
     if (ucontext_raw) {
         arm_thread_state64_t *state = (arm_thread_state64_t *)&(((ucontext_t *)ucontext_raw)->uc_mcontext->__ss);
         uint64_t host_x26 = state->__x[26];
-        if (state->__x[28] == (uint64_t)ctx->mem_base &&
+        if (recomp_pc_in_guest_code((uint64_t)state->__pc) &&
+            state->__x[28] == (uint64_t)ctx->mem_base &&
             host_x26 >= 0x10000ULL && host_x26 < ctx->mem_size) {
             saved_ctx.rax = state->__x[19];
             saved_ctx.rbx = state->__x[20];

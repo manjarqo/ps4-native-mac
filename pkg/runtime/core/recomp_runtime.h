@@ -17,6 +17,11 @@ void recomp_init_tls(GuestContext *ctx, uint64_t tls_vaddr, uint64_t tls_filesz,
 uint64_t recomp_tls_block_offset(const GuestContext *ctx);
 void recomp_setup_entry_args(GuestContext *ctx, int argc, char **argv, uint64_t entry_addr);
 void recomp_dispatch_external(GuestContext *ctx, uint64_t target);
+// True when host pc is in recompiled guest code (the __recomp_guest section: recompiled
+// functions, shim stubs, indirect-branch entry points). There the guest registers are live in
+// the pinned host registers; in host code (shims, the bridge, helpers) the GuestContext holds
+// what the last guest -> host transition stored. Async-signal-safe.
+bool recomp_pc_in_guest_code(uint64_t pc);
 void recomp_free_runtime(GuestContext *ctx);
 GuestContext *recomp_create_thread_context(GuestContext *parent, uint64_t stack_size);
 uint64_t recomp_vm_alloc(GuestContext *ctx, size_t size);
