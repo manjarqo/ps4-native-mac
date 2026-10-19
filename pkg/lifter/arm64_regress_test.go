@@ -226,7 +226,7 @@ func TestRegressCompareFlags(t *testing.T) {
 	requireInOrder(t, "vucomiss", l[0], "fcmp s0, s0", "cset w2, vs", "axflag", "rmif x2, #0, #1")
 
 	l = liftBlock(t, "dbf1") // fcomi st, st(1)
-	requireInOrder(t, "fcomi", l[0], "fcmp d0, d1", "axflag")
+	requireInOrder(t, "fcomi", l[0], "fcmp d28, d29", "axflag")
 
 	// add rax, rbx; vptest xmm0, xmm1; jb: JB reads the C that PTEST wrote (C = !CF).
 	l = liftBlock(t, "4801d8", "c4e27917c1", "720e")
@@ -361,9 +361,9 @@ func lastWriteBefore(lines []string, end int, reg string) string {
 // reload x16 with the GuestContext pointer: the value went to [x28 + ctx pointer].
 func TestRegressX87Stores(t *testing.T) {
 	for _, tc := range []struct{ name, hex, store string }{
-		{"fstp dword [rax]", "d918", "str s0, [x28, x16]"},
-		{"fstp qword [rax]", "dd18", "str d0, [x28, x16]"},
-		{"fst dword [rax]", "d910", "str s0, [x28, x16]"},
+		{"fstp dword [rax]", "d918", "str s28, [x28, x16]"},
+		{"fstp qword [rax]", "dd18", "str d28, [x28, x16]"},
+		{"fst dword [rax]", "d910", "str s28, [x28, x16]"},
 		{"fistp dword [rax]", "db18", "str w17, [x28, x16]"},
 		{"fisttp qword [rax]", "dd08", "str x17, [x28, x16]"},
 		{"fist word [rax]", "df10", "strh w17, [x28, x16]"},
@@ -395,13 +395,13 @@ func TestRegressX87Stores(t *testing.T) {
 // conditions instead of the tracked carry sense.
 func TestRegressFcmov(t *testing.T) {
 	l := liftBlock(t, "dbd2")[0] // fcmovnbe st0, st2
-	requireInOrder(t, "fcmovnbe st0, st2", l, "add w17, w17, #2", "ldr d1, [x5, w17, uxtw #3]", "fcsel d0, d1, d0, hi")
+	requireInOrder(t, "fcmovnbe st0, st2", l, "add w17, w17, #2", "ldr d29, [x5, w17, uxtw #3]", "fcsel d28, d29, d28, hi")
 
 	l = liftBlock(t, "4801d8", "dbd2")[1] // add rax, rbx; fcmovnbe st0, st2: C = CF after ADD
-	requireInOrder(t, "fcmovnbe after add", l, "cfinv", "fcsel d0, d1, d0, hi")
+	requireInOrder(t, "fcmovnbe after add", l, "cfinv", "fcsel d28, d29, d28, hi")
 
 	l = liftBlock(t, "4801d8", "dac1")[1] // add rax, rbx; fcmovb st0, st1: CF = 1 is C = 1 after ADD
-	requireInOrder(t, "fcmovb after add", l, "add w17, w17, #1", "fcsel d0, d1, d0, cs")
+	requireInOrder(t, "fcmovb after add", l, "add w17, w17, #1", "fcsel d28, d29, d28, cs")
 }
 
 // LOOP/LOOPE/LOOPNE decremented RCX with SUBS, which overwrote the guest flags, LOOPE/LOOPNE
@@ -421,5 +421,30 @@ func TestRegressLoop(t *testing.T) {
 		forbid(t, tc.name, l, "subs ...", "cfinv")
 		// After an ADD (C = CF) the branch targets need C = !CF.
 		requireInOrder(t, tc.name+" after add", liftBlock(t, "4801d8", tc.hex)[1], "cfinv", "sub x21, x21, #1")
+	}
+}
+
+// The x87 lowerings worked in d0-d2, the low halves of XMM0-XMM2: any x87 instruction
+// overwrote XMM0 (and XMM1/XMM2 for two-operand forms).
+func TestRegressX87KeepsXmm(t *testing.T) {
+	for _, tc := range []struct{ name, hex string }{
+		{"fld dword [rax]", "d900"},
+		{"fstp qword [rax]", "dd18"},
+		{"fadd st0, st2", "d8c2"},
+		{"fmul dword [rax]", "d808"},
+		{"fxch st1", "d9c9"},
+		{"fucomip st0, st1", "dfe9"},
+		{"fcmovnbe st0, st2", "dbd2"},
+		{"fistp dword [rax]", "db18"},
+		{"fscale", "d9fd"},
+		{"fprem1", "d9f5"},
+		{"fxtract", "d9f4"},
+	} {
+		l := liftBlock(t, tc.hex)[0]
+		for n := 0; n < 16; n++ {
+			if writesVecReg(l, n) {
+				t.Errorf("%s writes v%d (XMM%d):\n%s", tc.name, n, n, strings.Join(l, "\n"))
+			}
+		}
 	}
 }

@@ -622,13 +622,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "fldz",
 			bytes:    []byte{0xd9, 0xee}, // fldz
 			pc:       0x1000,
-			expected: []string{"fmov d0, xzr", "add  x16, x27, #0x70", "str  w17, [x16, #0x2e0]"},
+			expected: []string{"fmov d28, xzr", "add  x16, x27, #0x70", "str  w17, [x16, #0x2e0]"},
 		},
 		{
 			name:     "fld1",
 			bytes:    []byte{0xd9, 0xe8}, // fld1
 			pc:       0x1000,
-			expected: []string{"fmov d0, #1.0", "add  x16, x27, #0x70"},
+			expected: []string{"fmov d28, #1.0", "add  x16, x27, #0x70"},
 		},
 		{
 			name:     "fstp st(0)",
@@ -646,13 +646,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "faddp st(1), st(0)",
 			bytes:    []byte{0xde, 0xc1}, // faddp st(1), st(0)
 			pc:       0x1000,
-			expected: []string{"fadd d0, d0, d1", "add  w17, w17, #1"},
+			expected: []string{"fadd d28, d28, d29", "add  w17, w17, #1"},
 		},
 		{
 			name:     "fchs",
 			bytes:    []byte{0xd9, 0xe0}, // fchs
 			pc:       0x1000,
-			expected: []string{"fneg d0, d0"},
+			expected: []string{"fneg d28, d28"},
 		},
 		{
 			name:     "pxor mm0, mm0",
@@ -784,13 +784,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "fscale",
 			bytes:    []byte{0xd9, 0xfd},
 			pc:       0x1000,
-			expected: []string{"frintz d1, d1", "fmul  d0, d0, d2"},
+			expected: []string{"frintz d29, d29", "fmul  d28, d28, d27"},
 		},
 		{
 			name:     "fprem1",
 			bytes:    []byte{0xd9, 0xf5},
 			pc:       0x1000,
-			expected: []string{"fdiv   d2, d0, d1", "fnmsub d0, d2, d1, d0"},
+			expected: []string{"fdiv   d27, d28, d29", "fnmsub d28, d27, d29, d28"},
 		},
 		{
 			name:     "vaesenc x0, x0, x1",
@@ -838,7 +838,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "frndint",
 			bytes:    []byte{0xd9, 0xfc},
 			pc:       0x1000,
-			expected: []string{"frinti d0, d0"},
+			expected: []string{"frinti d28, d28"},
 		},
 		{
 			name:     "vpclmulqdq x0, x1, x2, 0",

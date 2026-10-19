@@ -8,7 +8,8 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
-// liftFpu handles x87 FPU stack instructions for the ARM64 assembly backend.
+// liftFpu handles x87 FPU stack instructions for the ARM64 assembly backend. The stack values
+// are worked on in d27-d29 (d0-d15 are XMM0-XMM15, which x87 code must not change).
 // In the assembly runtime:
 // GuestContext pointer is in global _g_current_guest_ctx.
 // fpu_stack is at offset 0x2a0 (8 doubles = 64 bytes).
@@ -28,7 +29,7 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		}
 	}
 
-	// Helper to emit fpu_push(double in d0)
+	// Helper to emit fpu_push(double in d28)
 	// top = (top - 1) & 7
 	// stack[top] = val
 	emitFpuPushD0 := func() []string {
@@ -40,12 +41,12 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			"    and  w17, w17, #7",           // w17 = (top - 1) & 7
 			"    str  w17, [x16, #0x2e0]",     // update fpu_top
 			"    add  x5, x16, #0x2a0",       // x5 = &fpu_stack[0]
-			"    str  d0, [x5, w17, uxtw #3]", // fpu_stack[top] = d0
+			"    str  d28, [x5, w17, uxtw #3]", // fpu_stack[top] = d28
 		)
 		return code
 	}
 
-	// Helper to emit fpu_pop() -> result in d0
+	// Helper to emit fpu_pop() -> result in d28
 	// val = stack[top]
 	// top = (top + 1) & 7
 	emitFpuPopD0 := func() []string {
@@ -54,7 +55,7 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		code = append(code,
 			"    ldr  w17, [x16, #0x2e0]",     // w17 = fpu_top
 			"    add  x5, x16, #0x2a0",       // x5 = &fpu_stack[0]
-			"    ldr  d0, [x5, w17, uxtw #3]", // d0 = fpu_stack[top]
+			"    ldr  d28, [x5, w17, uxtw #3]", // d28 = fpu_stack[top]
 			"    add  w17, w17, #1",           // w17 = top + 1
 			"    and  w17, w17, #7",           // w17 = (top + 1) & 7
 			"    str  w17, [x16, #0x2e0]",     // update fpu_top
@@ -62,7 +63,7 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		return code
 	}
 
-	// Helper to read FPU ST(idx) into a target float reg (e.g. d0, d1)
+	// Helper to read FPU ST(idx) into a target float reg (e.g. d28, d29)
 	loadFpuSt := func(targetD string, idx int) []string {
 		var code []string
 		code = append(code, loadCtxPtr("x16")...)
@@ -76,7 +77,7 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		return code
 	}
 
-	// Helper to store a float reg (e.g. d0) into FPU ST(idx)
+	// Helper to store a float reg (e.g. d28) into FPU ST(idx)
 	storeFpuSt := func(srcD string, idx int) []string {
 		var code []string
 		code = append(code, loadCtxPtr("x16")...)
@@ -105,30 +106,30 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 
 	switch op {
 	case x86asm.FLDZ:
-		lines = append(lines, "    fmov d0, xzr")
+		lines = append(lines, "    fmov d28, xzr")
 		lines = append(lines, emitFpuPushD0()...)
 		return lines, nil
 
 	case x86asm.FLD1:
-		lines = append(lines, "    fmov d0, #1.0")
+		lines = append(lines, "    fmov d28, #1.0")
 		lines = append(lines, emitFpuPushD0()...)
 		return lines, nil
 
 	case x86asm.FLD:
 		if reg, ok := args[0].(x86asm.Reg); ok && reg >= x86asm.F0 && reg <= x86asm.F7 {
 			idx := int(reg - x86asm.F0)
-			lines = append(lines, loadFpuSt("d0", idx)...)
+			lines = append(lines, loadFpuSt("d28", idx)...)
 			lines = append(lines, emitFpuPushD0()...)
 			return lines, nil
 		}
 		if mem, ok := args[0].(x86asm.Mem); ok {
 			lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 			if defMemSz == 8 {
-				lines = append(lines, "    ldr d0, [x28, x16]")
+				lines = append(lines, "    ldr d28, [x28, x16]")
 			} else {
 				lines = append(lines,
-					"    ldr s0, [x28, x16]",
-					"    fcvt d0, s0",
+					"    ldr s28, [x28, x16]",
+					"    fcvt d28, s28",
 				)
 			}
 			lines = append(lines, emitFpuPushD0()...)
@@ -141,17 +142,17 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			if defMemSz == 8 {
 				lines = append(lines,
 					"    ldr x17, [x28, x16]",
-					"    scvtf d0, x17",
+					"    scvtf d28, x17",
 				)
 			} else if defMemSz == 2 {
 				lines = append(lines,
 					"    ldrsh w17, [x28, x16]",
-					"    scvtf d0, w17",
+					"    scvtf d28, w17",
 				)
 			} else {
 				lines = append(lines,
 					"    ldrsw x17, [x28, x16]",
-					"    scvtf d0, x17",
+					"    scvtf d28, x17",
 				)
 			}
 			lines = append(lines, emitFpuPushD0()...)
@@ -162,9 +163,9 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		isPop := (op == x86asm.FSTP)
 		if reg, ok := args[0].(x86asm.Reg); ok && reg >= x86asm.F0 && reg <= x86asm.F7 {
 			idx := int(reg - x86asm.F0)
-			lines = append(lines, loadFpuSt("d0", 0)...)
+			lines = append(lines, loadFpuSt("d28", 0)...)
 			if idx != 0 {
-				lines = append(lines, storeFpuSt("d0", idx)...)
+				lines = append(lines, storeFpuSt("d28", idx)...)
 			}
 			if isPop {
 				lines = append(lines, emitFpuDiscard()...)
@@ -174,14 +175,14 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		if mem, ok := args[0].(x86asm.Mem); ok {
 			// Read ST(0) before computing the address: the stack helpers use x16 for the
 			// GuestContext pointer.
-			lines = append(lines, loadFpuSt("d0", 0)...)
+			lines = append(lines, loadFpuSt("d28", 0)...)
 			if defMemSz == 8 {
 				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-				lines = append(lines, "    str d0, [x28, x16]")
+				lines = append(lines, "    str d28, [x28, x16]")
 			} else {
-				lines = append(lines, "    fcvt s0, d0")
+				lines = append(lines, "    fcvt s28, d28")
 				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-				lines = append(lines, "    str s0, [x28, x16]")
+				lines = append(lines, "    str s28, [x28, x16]")
 			}
 			if isPop {
 				lines = append(lines, emitFpuDiscard()...)
@@ -193,22 +194,22 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		if mem, ok := args[0].(x86asm.Mem); ok {
 			// Value first, address second (the stack helpers use x16), then the store.
 			if op == x86asm.FIST {
-				lines = append(lines, loadFpuSt("d0", 0)...)
+				lines = append(lines, loadFpuSt("d28", 0)...)
 			} else {
 				lines = append(lines, emitFpuPopD0()...)
 			}
 			trunc := op == x86asm.FISTTP
 			switch defMemSz {
 			case 8:
-				lines = append(lines, fpToIntX86("x17", "d0", trunc)...)
+				lines = append(lines, fpToIntX86("x17", "d28", trunc)...)
 				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 				lines = append(lines, "    str x17, [x28, x16]")
 			case 2:
-				lines = append(lines, fpToInt16X86("w17", "d0", trunc)...)
+				lines = append(lines, fpToInt16X86("w17", "d28", trunc)...)
 				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 				lines = append(lines, "    strh w17, [x28, x16]")
 			default:
-				lines = append(lines, fpToIntX86("w17", "d0", trunc)...)
+				lines = append(lines, fpToIntX86("w17", "d28", trunc)...)
 				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 				lines = append(lines, "    str w17, [x28, x16]")
 			}
@@ -223,28 +224,28 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			}
 		}
 		// Swap ST(0) and ST(idx)
-		lines = append(lines, loadFpuSt("d0", 0)...)
-		lines = append(lines, loadFpuSt("d1", idx)...)
-		lines = append(lines, storeFpuSt("d1", 0)...)
-		lines = append(lines, storeFpuSt("d0", idx)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
+		lines = append(lines, loadFpuSt("d29", idx)...)
+		lines = append(lines, storeFpuSt("d29", 0)...)
+		lines = append(lines, storeFpuSt("d28", idx)...)
 		return lines, nil
 
 	case x86asm.FCHS:
-		lines = append(lines, loadFpuSt("d0", 0)...)
-		lines = append(lines, "    fneg d0, d0")
-		lines = append(lines, storeFpuSt("d0", 0)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
+		lines = append(lines, "    fneg d28, d28")
+		lines = append(lines, storeFpuSt("d28", 0)...)
 		return lines, nil
 
 	case x86asm.FABS:
-		lines = append(lines, loadFpuSt("d0", 0)...)
-		lines = append(lines, "    fabs d0, d0")
-		lines = append(lines, storeFpuSt("d0", 0)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
+		lines = append(lines, "    fabs d28, d28")
+		lines = append(lines, storeFpuSt("d28", 0)...)
 		return lines, nil
 
 	case x86asm.FSQRT:
-		lines = append(lines, loadFpuSt("d0", 0)...)
-		lines = append(lines, "    fsqrt d0, d0")
-		lines = append(lines, storeFpuSt("d0", 0)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
+		lines = append(lines, "    fsqrt d28, d28")
+		lines = append(lines, storeFpuSt("d28", 0)...)
 		return lines, nil
 
 	// Binary arithmetic: FADD, FADDP, FSUB, FSUBP, FSUBR, FSUBRP, FMUL, FMULP, FDIV, FDIVP, FDIVR, FDIVRP
@@ -289,14 +290,14 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 						srcIdx = int(reg1 - x86asm.F0)
 					}
 				}
-				lines = append(lines, loadFpuSt("d0", dstIdx)...)
-				lines = append(lines, loadFpuSt("d1", srcIdx)...)
+				lines = append(lines, loadFpuSt("d28", dstIdx)...)
+				lines = append(lines, loadFpuSt("d29", srcIdx)...)
 				if isRev {
-					lines = append(lines, fmt.Sprintf("    %s d0, d1, d0", armFpOp))
+					lines = append(lines, fmt.Sprintf("    %s d28, d29, d28", armFpOp))
 				} else {
-					lines = append(lines, fmt.Sprintf("    %s d0, d0, d1", armFpOp))
+					lines = append(lines, fmt.Sprintf("    %s d28, d28, d29", armFpOp))
 				}
-				lines = append(lines, storeFpuSt("d0", dstIdx)...)
+				lines = append(lines, storeFpuSt("d28", dstIdx)...)
 				if isPop {
 					lines = append(lines, emitFpuDiscard()...)
 				}
@@ -306,20 +307,20 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			if mem, okMem := args[0].(x86asm.Mem); okMem {
 				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 				if defMemSz == 8 {
-					lines = append(lines, "    ldr d1, [x28, x16]")
+					lines = append(lines, "    ldr d29, [x28, x16]")
 				} else {
 					lines = append(lines,
-						"    ldr s1, [x28, x16]",
-						"    fcvt d1, s1",
+						"    ldr s29, [x28, x16]",
+						"    fcvt d29, s29",
 					)
 				}
-				lines = append(lines, loadFpuSt("d0", 0)...)
+				lines = append(lines, loadFpuSt("d28", 0)...)
 				if isRev {
-					lines = append(lines, fmt.Sprintf("    %s d0, d1, d0", armFpOp))
+					lines = append(lines, fmt.Sprintf("    %s d28, d29, d28", armFpOp))
 				} else {
-					lines = append(lines, fmt.Sprintf("    %s d0, d0, d1", armFpOp))
+					lines = append(lines, fmt.Sprintf("    %s d28, d28, d29", armFpOp))
 				}
-				lines = append(lines, storeFpuSt("d0", 0)...)
+				lines = append(lines, storeFpuSt("d28", 0)...)
 				if isPop {
 					lines = append(lines, emitFpuDiscard()...)
 				}
@@ -328,14 +329,14 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		}
 
 		// Default implicit ST(1) op ST(0)
-		lines = append(lines, loadFpuSt("d0", 1)...)
-		lines = append(lines, loadFpuSt("d1", 0)...)
+		lines = append(lines, loadFpuSt("d28", 1)...)
+		lines = append(lines, loadFpuSt("d29", 0)...)
 		if isRev {
-			lines = append(lines, fmt.Sprintf("    %s d0, d1, d0", armFpOp))
+			lines = append(lines, fmt.Sprintf("    %s d28, d29, d28", armFpOp))
 		} else {
-			lines = append(lines, fmt.Sprintf("    %s d0, d0, d1", armFpOp))
+			lines = append(lines, fmt.Sprintf("    %s d28, d28, d29", armFpOp))
 		}
-		lines = append(lines, storeFpuSt("d0", 1)...)
+		lines = append(lines, storeFpuSt("d28", 1)...)
 		if isPop {
 			lines = append(lines, emitFpuDiscard()...)
 		}
@@ -348,26 +349,26 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			if defMemSz == 2 {
 				lines = append(lines,
 					"    ldrsh w17, [x28, x16]",
-					"    scvtf d1, w17",
+					"    scvtf d29, w17",
 				)
 			} else {
 				lines = append(lines,
 					"    ldrsw x17, [x28, x16]",
-					"    scvtf d1, x17",
+					"    scvtf d29, x17",
 				)
 			}
-			lines = append(lines, loadFpuSt("d0", 0)...)
+			lines = append(lines, loadFpuSt("d28", 0)...)
 			switch op {
 			case x86asm.FIADD:
-				lines = append(lines, "    fadd d0, d0, d1")
+				lines = append(lines, "    fadd d28, d28, d29")
 			case x86asm.FISUB:
-				lines = append(lines, "    fsub d0, d0, d1")
+				lines = append(lines, "    fsub d28, d28, d29")
 			case x86asm.FIMUL:
-				lines = append(lines, "    fmul d0, d0, d1")
+				lines = append(lines, "    fmul d28, d28, d29")
 			case x86asm.FIDIV:
-				lines = append(lines, "    fdiv d0, d0, d1")
+				lines = append(lines, "    fdiv d28, d28, d29")
 			}
-			lines = append(lines, storeFpuSt("d0", 0)...)
+			lines = append(lines, storeFpuSt("d28", 0)...)
 			return lines, nil
 		}
 
@@ -379,15 +380,15 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 				idx = int(reg - x86asm.F0)
 			}
 		}
-		lines = append(lines, loadFpuSt("d0", 0)...)
-		lines = append(lines, loadFpuSt("d1", idx)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
+		lines = append(lines, loadFpuSt("d29", idx)...)
 		// fcmp sets NZCV directly!
 		// In ARM64:
 		// EQ -> Z=1, C=1
 		// LT -> C=0, Z=0
 		// GT -> C=1, Z=0
 		// Unordered -> V=1, C=1, Z=0
-		lines = append(lines, "    fcmp d0, d1")
+		lines = append(lines, "    fcmp d28, d29")
 		lines = append(lines, l.fpCompareFlags()...)
 		if op == x86asm.FUCOMIP {
 			lines = append(lines, emitFpuDiscard()...)
@@ -411,10 +412,10 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		}[op]
 		pre, cond := l.condFor(cc)
 		lines = append(lines, pre...)
-		lines = append(lines, loadFpuSt("d0", 0)...)
-		lines = append(lines, loadFpuSt("d1", idx)...)
-		lines = append(lines, fmt.Sprintf("    fcsel d0, d1, d0, %s", cond))
-		lines = append(lines, storeFpuSt("d0", 0)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
+		lines = append(lines, loadFpuSt("d29", idx)...)
+		lines = append(lines, fmt.Sprintf("    fcsel d28, d29, d28, %s", cond))
+		lines = append(lines, storeFpuSt("d28", 0)...)
 		return lines, nil
 
 	// Status and Control Word
@@ -468,28 +469,28 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		return lines, nil
 
 	case x86asm.FSCALE:
-		lines = append(lines, loadFpuSt("d0", 0)...)
-		lines = append(lines, loadFpuSt("d1", 1)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
+		lines = append(lines, loadFpuSt("d29", 1)...)
 		lines = append(lines,
-			"    frintz d1, d1",
-			"    fcvtzs x16, d1",
+			"    frintz d29, d29",
+			"    fcvtzs x16, d29",
 			"    add   x16, x16, #1023",
 			"    lsl   x16, x16, #52",
-			"    fmov  d2, x16",
-			"    fmul  d0, d0, d2",
+			"    fmov  d27, x16",
+			"    fmul  d28, d28, d27",
 		)
-		lines = append(lines, storeFpuSt("d0", 0)...)
+		lines = append(lines, storeFpuSt("d28", 0)...)
 		return lines, nil
 
 	case x86asm.FPREM, x86asm.FPREM1:
-		lines = append(lines, loadFpuSt("d0", 0)...)
-		lines = append(lines, loadFpuSt("d1", 1)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
+		lines = append(lines, loadFpuSt("d29", 1)...)
 		lines = append(lines,
-			"    fdiv   d2, d0, d1",
-			"    frintn d2, d2",
-			"    fnmsub d0, d2, d1, d0",
+			"    fdiv   d27, d28, d29",
+			"    frintn d27, d27",
+			"    fnmsub d28, d27, d29, d28",
 		)
-		lines = append(lines, storeFpuSt("d0", 0)...)
+		lines = append(lines, storeFpuSt("d28", 0)...)
 		return lines, nil
 
 	case x86asm.FFREE, x86asm.FFREEP:
@@ -529,8 +530,11 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		}
 
 	case x86asm.FCOS:
-		lines = append(lines, loadFpuSt("d0", 0)...)
+		// Runtime call: cos() takes and returns its argument in d0 (and may clobber v0-v7 and
+		// v16-v31; x87 helpers are Task 5's).
+		lines = append(lines, loadFpuSt("d28", 0)...)
 		lines = append(lines,
+			"    fmov d0, d28",
 			"    sub  sp, sp, #96",
 			"    stp  x29, x30, [sp, #80]",
 			"    add  x29, sp, #80",
@@ -545,8 +549,9 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			"    ldp  x14, x15, [sp, #48]",
 			"    ldp  x29, x30, [sp, #80]",
 			"    add  sp, sp, #96",
+			"    fmov d28, d0",
 		)
-		lines = append(lines, storeFpuSt("d0", 0)...)
+		lines = append(lines, storeFpuSt("d28", 0)...)
 		return lines, nil
 
 	case x86asm.FLDL2T:
@@ -555,73 +560,73 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			"    movk x16, #0x0979, lsl #16",
 			"    movk x16, #0x934f, lsl #32",
 			"    movk x16, #0x400a, lsl #48",
-			"    fmov d0, x16",
+			"    fmov d28, x16",
 		)
 		lines = append(lines, emitFpuPushD0()...)
 		return lines, nil
 
 	case x86asm.FRNDINT:
-		lines = append(lines, loadFpuSt("d0", 0)...)
-		lines = append(lines, "    frinti d0, d0")
-		lines = append(lines, storeFpuSt("d0", 0)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
+		lines = append(lines, "    frinti d28, d28")
+		lines = append(lines, storeFpuSt("d28", 0)...)
 		return lines, nil
 
 	case x86asm.FXTRACT:
-		lines = append(lines, loadFpuSt("d0", 0)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
 		lines = append(lines,
-			"    fmov d1, d0",
-			"    fmov x16, d0",
+			"    fmov d29, d28",
+			"    fmov x16, d28",
 			"    ubfx x17, x16, #52, #11",
 			"    sub  x17, x17, #1023",
-			"    scvtf d2, x17",
+			"    scvtf d27, x17",
 			"    movz x5, #1023",
 			"    bfi  x16, x5, #52, #11",
-			"    fmov d0, x16",
+			"    fmov d28, x16",
 		)
-		lines = append(lines, storeFpuSt("d0", 0)...)
-		lines = append(lines, "    fmov d0, d2")
+		lines = append(lines, storeFpuSt("d28", 0)...)
+		lines = append(lines, "    fmov d28, d27")
 		lines = append(lines, emitFpuPushD0()...)
 		return lines, nil
 
 	case x86asm.FCOM, x86asm.FCOMP, x86asm.FCOMPP, x86asm.FICOM, x86asm.FICOMP:
-		lines = append(lines, loadFpuSt("d0", 0)...)
+		lines = append(lines, loadFpuSt("d28", 0)...)
 		isInteger := (op == x86asm.FICOM || op == x86asm.FICOMP)
 		if len(args) > 0 && args[0] != nil {
 			if reg, ok := args[0].(x86asm.Reg); ok && reg >= x86asm.F0 && reg <= x86asm.F7 {
-				lines = append(lines, loadFpuSt("d1", int(reg-x86asm.F0))...)
+				lines = append(lines, loadFpuSt("d29", int(reg-x86asm.F0))...)
 			} else if mem, ok := args[0].(x86asm.Mem); ok {
 				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 				if isInteger {
 					if defMemSz == 2 {
 						lines = append(lines,
 							"    ldrsh w17, [x28, x16]",
-							"    scvtf d1, w17",
+							"    scvtf d29, w17",
 						)
 					} else {
 						lines = append(lines,
 							"    ldr  w17, [x28, x16]",
-							"    scvtf d1, w17",
+							"    scvtf d29, w17",
 						)
 					}
 				} else {
 					if defMemSz == 4 {
 						lines = append(lines,
-							"    ldr  s1, [x28, x16]",
-							"    fcvt d1, s1",
+							"    ldr  s29, [x28, x16]",
+							"    fcvt d29, s29",
 						)
 					} else {
 						lines = append(lines,
-							"    ldr  d1, [x28, x16]",
+							"    ldr  d29, [x28, x16]",
 						)
 					}
 				}
 			}
 		} else {
-			lines = append(lines, loadFpuSt("d1", 1)...)
+			lines = append(lines, loadFpuSt("d29", 1)...)
 		}
 		lines = append(lines, loadCtxPtr("x16")...)
 		lines = append(lines,
-			"    fcmp d0, d1",
+			"    fcmp d28, d29",
 			"    ldrh w17, [x16, #0x2e6]",
 			"    movz w5, #0x4500",
 			"    bic  w17, w17, w5",
