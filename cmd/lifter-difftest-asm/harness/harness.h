@@ -67,6 +67,11 @@ static inline void dt_make_state(DtState *st, uint8_t *scratch, unsigned test, u
     st->pad = (uint32_t)(st->gpr[1] & 0xff);
     uint64_t r = dt_rng(&s);
     st->flags = 0x202 | (r & 0x8D5); /* CF PF AF ZF SF OF */
+    if (regset[0] >> 63 & 1) {
+        /* FP-compare result (greater, less, equal, unordered): ZF PF CF, OF = SF = AF = 0 */
+        static const uint64_t fc[4] = {0x000, 0x001, 0x040, 0x045};
+        st->flags = 0x202 | fc[(r >> 20) & 3];
+    }
     st->mxcsr = 0x1F80;
     for (int i = 0; i < 16; i++)
         for (int k = 0; k < 8; k++) {

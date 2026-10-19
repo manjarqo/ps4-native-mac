@@ -29,9 +29,14 @@ int main(int argc, char **argv) {
     if (scr != (uint8_t *)DT_SCRATCH_BASE) { perror("mmap"); return 1; }
     FILE *out = fopen(argv[1], "wb");
     if (!out) { perror("fopen"); return 1; }
+    /* The handler runs on its own stack: a test that corrupts the stack pointer must not take
+       the process down (or, under Rosetta 2, make it grow without bound). */
+    static uint8_t altstack[1 << 16];
+    stack_t ss = {.ss_sp = altstack, .ss_size = sizeof(altstack), .ss_flags = 0};
+    sigaltstack(&ss, NULL);
     struct sigaction sa = {0};
     sa.sa_handler = on_sig;
-    sa.sa_flags = SA_NODEFER;
+    sa.sa_flags = SA_NODEFER | SA_ONSTACK;
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);

@@ -107,7 +107,25 @@ const (
 	modeAfterAdd
 	// modeNoFlags: the instruction's flags are dead (disasm sets SkipFlags); flags not compared.
 	modeNoFlags
+	// modeFpCmp: the input flags are those of an FP compare (ZF/PF/CF in {000, 001, 100, 111},
+	// OF = SF = AF = 0) and NZCV holds them the way the lifter's COMIS lowering leaves them
+	// (Z = ZF, C = !CF, V = PF, N = 0). The lifter models PF only there, so the PF readers
+	// (SETP/SETNP/CMOVP/CMOVNP) are tested in this mode instead of modeBlockStart.
+	modeFpCmp
 )
+
+// regsetFpCmp is the bit of a test's regset mask (word 0 of nt_regsets/lt_regsets) that tells
+// dt_make_state to generate FP-compare input flags (modeFpCmp).
+const regsetFpCmp = 1 << 63
+
+// readsPF reports whether the instruction's result depends on PF.
+func readsPF(op x86asm.Op) bool {
+	switch op {
+	case x86asm.SETP, x86asm.SETNP, x86asm.CMOVP, x86asm.CMOVNP:
+		return true
+	}
+	return false
+}
 
 type test struct {
 	addr    uint64
@@ -120,6 +138,8 @@ type test struct {
 	mode    entryMode
 	flags   string // flag rule passed to compare.py
 	vregs   string // vector registers named by the instruction (comma-separated indexes)
+	vdest   string // vector register the instruction writes ("-" if none)
+	fpcmp   bool   // input flags are an FP-compare result (modeFpCmp)
 }
 
 func skipOp(op x86asm.Op) bool {
@@ -170,7 +190,9 @@ func flagRule(inst x86asm.Inst) string {
 	switch op {
 	case x86asm.COMISS, x86asm.UCOMISS, x86asm.COMISD, x86asm.UCOMISD,
 		x86asm.VCOMISS, x86asm.VUCOMISS, x86asm.VCOMISD, x86asm.VUCOMISD:
-		return "CZSOP"
+		// OF (= 0) is not compared: after an FP compare the lifter keeps PF in ARM V, the
+		// register that holds OF everywhere else, so JO/SETO there read PF (model limit).
+		return "CZSP"
 	case x86asm.BSF, x86asm.BSR:
 		return "Z" // CF/OF/SF undefined
 	case x86asm.TZCNT, x86asm.LZCNT:
@@ -213,6 +235,24 @@ func flagRule(inst x86asm.Inst) string {
 		return fmt.Sprintf("shift:%s:%d:%s", op, size, count)
 	}
 	return "CZSO"
+}
+
+// vectorDest returns the index of the XMM/YMM register the instruction writes, or "-".
+func vectorDest(inst x86asm.Inst) string {
+	switch inst.Op {
+	case x86asm.COMISS, x86asm.UCOMISS, x86asm.COMISD, x86asm.UCOMISD, x86asm.VCOMISS, x86asm.VUCOMISS,
+		x86asm.VCOMISD, x86asm.VUCOMISD, x86asm.PTEST, x86asm.VPTEST, x86asm.VTESTPS, x86asm.VTESTPD:
+		return "-"
+	}
+	if r, ok := inst.Args[0].(x86asm.Reg); ok {
+		if r >= x86asm.X0 && r <= x86asm.X15 {
+			return strconv.Itoa(int(r - x86asm.X0))
+		}
+		if r >= x86asm.Y0 && r <= x86asm.Y15 {
+			return strconv.Itoa(int(r - x86asm.Y0))
+		}
+	}
+	return "-"
 }
 
 // vectorRegs lists the XMM/YMM register indexes the instruction names explicitly.
@@ -284,6 +324,28 @@ func selfContained(lines []string) (bool, string) {
 	return true, ""
 }
 
+// regArgsOK reports whether the register operands of a (re-encoded) instruction can be tested:
+// no RSP (the stubs keep their frame there), no RIP, no x87/MMX/segment registers. The
+// synthesized VEX aliasing variants can turn a GPR operand into RSP (vmovq rsp, xmm4), which
+// would leave the native stub without a stack.
+func regArgsOK(inst x86asm.Inst) bool {
+	for _, a := range inst.Args {
+		if a == nil {
+			break
+		}
+		if r, ok := a.(x86asm.Reg); ok {
+			if idx, ok := gprIndex[r]; ok && idx == 4 {
+				return false
+			}
+			cl := regClass(r)
+			if r == x86asm.RIP || strings.HasPrefix(cl, "other") || cl == "st" || cl == "mm" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 type skipInfo struct {
 	count   int
 	example string
@@ -352,7 +414,7 @@ func main() {
 	var tests []*test
 	add := func(in x86asm.Inst, b []byte, addr uint64, key string, setRegs map[int]uint64) {
 		base := test{addr: addr, bytes: b, text: safeText(in, addr), sig: key, setRegs: setRegs,
-			flags: flagRule(in), vregs: vectorRegs(in)}
+			flags: flagRule(in), vregs: vectorRegs(in), vdest: vectorDest(in)}
 		ln, ro, err := lift(in, addr, modeBlockStart)
 		if err != nil {
 			return
@@ -362,8 +424,13 @@ func main() {
 		}
 		t := base
 		t.lifted, t.readout, t.mode = ln, ro, modeBlockStart
+		if readsPF(in.Op) {
+			// OF = 0 in an FP-compare state while ARM V holds PF: OF is not compared.
+			t.mode, t.flags, t.fpcmp = modeFpCmp, "CZSP", true
+			t.sig += " [fpcmp]"
+		}
 		tests = append(tests, &t)
-		if readsFlags(in.Op) {
+		if readsFlags(in.Op) && !readsPF(in.Op) {
 			if ln2, ro2, err := lift(in, addr, modeAfterAdd); err == nil {
 				if ok, _ := selfContained(ln2); ok {
 					t2 := base
@@ -516,7 +583,7 @@ func main() {
 		// Synthesized aliasing variants of VEX register forms: src2 = dst, src1 = dst.
 		for _, v := range vexAliasVariants(img[addr : addr+uint64(inst.Len)]) {
 			vi, err := x86asm.Decode(v, 64)
-			if err != nil || vi.Op != inst.Op || vi.Len != len(v) {
+			if err != nil || vi.Op != inst.Op || vi.Len != len(v) || !regArgsOK(vi) {
 				continue
 			}
 			vk := "VAR " + safeText(vi, addr)
@@ -542,7 +609,7 @@ func main() {
 func writeList(path string, tests []*test) {
 	var b strings.Builder
 	for i, t := range tests {
-		fmt.Fprintf(&b, "%d\t0x%x\t%s\t%s\t%s\t%s\n", i, t.addr, t.sig, t.text, t.flags, t.vregs)
+		fmt.Fprintf(&b, "%d\t0x%x\t%s\t%s\t%s\t%s\t%s\n", i, t.addr, t.sig, t.text, t.flags, t.vregs, t.vdest)
 	}
 	os.WriteFile(path, []byte(b.String()), 0o644)
 }
@@ -641,6 +708,9 @@ func writeRegsets(b *strings.Builder, tests []*test) {
 			mask |= 1 << uint(r)
 			vals[r] = v
 		}
+		if t.fpcmp {
+			mask |= regsetFpCmp
+		}
 		fmt.Fprintf(b, "  .quad 0x%x", mask)
 		for _, v := range vals {
 			fmt.Fprintf(b, ", 0x%x", v)
@@ -695,7 +765,11 @@ func writeAsm(path string, tests []*test) {
 			b.WriteString("    eor x3, x3, #1\n") // C = !CF (subtract polarity, lastFlagOp reset)
 		}
 		b.WriteString("    orr x4, x4, x3, lsl #29\n")
-		b.WriteString("    ubfx x3, x2, #11, #1\n    orr x4, x4, x3, lsl #28\n") // OF -> V
+		if t.mode == modeFpCmp {
+			b.WriteString("    ubfx x3, x2, #2, #1\n    orr x4, x4, x3, lsl #28\n") // PF -> V
+		} else {
+			b.WriteString("    ubfx x3, x2, #11, #1\n    orr x4, x4, x3, lsl #28\n") // OF -> V
+		}
 		b.WriteString("    msr nzcv, x4\n    msr fpcr, xzr\n")
 		b.WriteString("    mov x27, x1\n    mov x28, #0\n")
 		for r := 0; r < 16; r++ {

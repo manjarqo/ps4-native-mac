@@ -3,12 +3,14 @@
 
 Usage: compare.py native.bin asm.bin tests.txt [--low] [--strict-nan] [--summary FILE]
 
-tests.txt columns: index, guest address, signature, instruction text, flag rule, vector regs.
+tests.txt columns: index, guest address, signature, instruction text, flag rule, vector regs,
+destination vector register.
 Flag rule: letters of the flags compared (C Z S O P), "-" for none, or shift:OP:SIZE:COUNT,
 resolved per trial from the masked shift count (the input CL is stored in DtState.pad).
-Vector registers are compared over all 256 bits; differences in a register the instruction
-does not name are reported as "clobber" (scratch-register aliasing) rather than as a
-semantic difference of the instruction itself.
+Vector registers are compared over all 256 bits; differences in a register the instruction does
+not write (column 7: destination vector register) are reported as "clobber" (scratch-register
+aliasing, mostly YMM upper halves in v16-v31) rather than as a semantic difference of the
+instruction itself.
 """
 import struct, sys
 from collections import OrderedDict
@@ -57,6 +59,23 @@ def flags_for(rule, cl):
     return "CZSO", True
 
 
+# LAHF: AF and PF (AH bits 4 and 2) are not modeled by the lifter's NZCV flags (PF only after
+# FP compares, where it is in V), so LAHF stores 0 there.
+LAHF_UNMODELED = (1 << 12) | (1 << 10)
+
+# Approximation instructions: x86 guarantees |relative error| <= 1.5 * 2^-12, the exact bits are
+# implementation specific (Intel and AMD differ), so the lifted result only has to meet that bound.
+APPROX = {"RCPPS", "RCPSS", "RSQRTPS", "RSQRTSS", "VRCPPS", "VRCPSS", "VRSQRTPS", "VRSQRTSS"}
+
+
+def close_approx(ua, ub):
+    fa = struct.unpack("<f", struct.pack("<I", ua))[0]
+    fb = struct.unpack("<f", struct.pack("<I", ub))[0]
+    if fa != fa or fb != fb or fa in (float("inf"), float("-inf")) or fa == 0:
+        return False
+    return abs(fb - fa) <= abs(fa) * 1.5 * 2.0 ** -12 * 2  # native is itself within 1.5*2^-12 of exact
+
+
 def nan32(u):
     return (u & 0x7f800000) == 0x7f800000 and (u & 0x7fffff) != 0
 
@@ -82,8 +101,10 @@ def main():
     native_faults = 0
     by_op = OrderedDict()  # opcode -> {kind -> [count, example]}
     for t in range(n):
-        idx, addr, sig, text, rule, vregs = tests[t]
-        named = set() if vregs == "-" else {int(v) for v in vregs.split(",")}
+        idx, addr, sig, text, rule, vregs, vdest = tests[t]
+        dest = None if vdest == "-" else int(vdest)
+        op = sig.split(" ")[0]
+        approx = op in APPROX
         diffs = []
         kinds = set()
         native_fault = False
@@ -101,14 +122,16 @@ def main():
             fl, defined = flags_for(rule, cl)
             if defined:
                 for i in range(16):
-                    if g1[i] != g2[i]:
+                    if g1[i] != g2[i] and not (op == "LAHF" and i == 0 and
+                                               (g1[i] ^ g2[i]) & ~LAHF_UNMODELED == 0):
                         diffs.append("%s: native %016x lifted %016x" % (GPR[i], g1[i], g2[i]))
                         kinds.add("gpr")
             for i in range(16):
                 if y1[i] == y2[i]:
                     continue
                 a = struct.unpack("<8I", y1[i]); b = struct.unpack("<8I", y2[i])
-                same = [a[j] == b[j] or (ignore_nan and nan32(a[j]) and nan32(b[j])) for j in range(8)]
+                same = [a[j] == b[j] or (ignore_nan and nan32(a[j]) and nan32(b[j])) or
+                        (approx and i == dest and close_approx(a[j], b[j])) for j in range(8)]
                 if ignore_nan:
                     for j in range(0, 8, 2):
                         if nan64(a[j], a[j + 1]) and nan64(b[j], b[j + 1]):
@@ -116,13 +139,13 @@ def main():
                 lanes = [j for j in range(8) if not same[j] and (j < 4 or not low_only)]
                 if not lanes:
                     continue
-                if i not in named:
+                if i != dest:
                     kinds.add("clobber")
                 else:
                     kinds.add("vec" if lanes[0] < 4 else "vec-hi")
                 fa = struct.unpack("<8f", y1[i]); fb = struct.unpack("<8f", y2[i])
                 diffs.append("%symm%d lanes %s: native %s lifted %s (f: %s vs %s)" % (
-                    "CLOBBER " if i not in named else "", i, lanes,
+                    "CLOBBER " if i != dest else "", i, lanes,
                     " ".join("%08x" % a[j] for j in lanes), " ".join("%08x" % b[j] for j in lanes),
                     " ".join("%g" % fa[j] for j in lanes), " ".join("%g" % fb[j] for j in lanes)))
             if defined and mem1 != mem2:
@@ -160,7 +183,6 @@ def main():
             print("FAIL #%s %s  | %s  [%s] flags=%s" % (idx, sig, text, addr, rule))
             for d in diffs[:7]:
                 print("     ", d)
-            op = sig.split(" ")[0]
             ent = by_op.setdefault(op, {})
             for kd in sorted(kinds):
                 if kd not in ent:
