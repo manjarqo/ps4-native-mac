@@ -784,13 +784,13 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "fscale",
 			bytes:    []byte{0xd9, 0xfd},
 			pc:       0x1000,
-			expected: []string{"frintz d29, d29", "fmul  d28, d28, d27"},
+			expected: []string{"frintz d31, d29", "fcvtzs x2, d31", "fmul d28, d28, d31", "msr  nzcv, x7"},
 		},
 		{
 			name:     "fprem1",
 			bytes:    []byte{0xd9, 0xf5},
 			pc:       0x1000,
-			expected: []string{"fdiv   d27, d28, d29", "fnmsub d28, d27, d29, d28"},
+			expected: []string{"subs x1, x2, x3", "lsl  x2, x6, #1", "scvtf d28, x6", "msr  nzcv, x7"},
 		},
 		{
 			name:     "vaesenc x0, x0, x1",

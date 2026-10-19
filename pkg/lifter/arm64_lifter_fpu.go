@@ -471,26 +471,29 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 	case x86asm.FSCALE:
 		lines = append(lines, loadFpuSt("d28", 0)...)
 		lines = append(lines, loadFpuSt("d29", 1)...)
-		lines = append(lines,
-			"    frintz d29, d29",
-			"    fcvtzs x16, d29",
-			"    add   x16, x16, #1023",
-			"    lsl   x16, x16, #52",
-			"    fmov  d27, x16",
-			"    fmul  d28, d28, d27",
-		)
+		lines = append(lines, x87Scale()...)
 		lines = append(lines, storeFpuSt("d28", 0)...)
 		return lines, nil
 
 	case x86asm.FPREM, x86asm.FPREM1:
 		lines = append(lines, loadFpuSt("d28", 0)...)
 		lines = append(lines, loadFpuSt("d29", 1)...)
-		lines = append(lines,
-			"    fdiv   d27, d28, d29",
-			"    frintn d27, d27",
-			"    fnmsub d28, d27, d29, d28",
-		)
+		lines = append(lines, x87Remainder(op == x86asm.FPREM1)...) // quotient bits in x4
 		lines = append(lines, storeFpuSt("d28", 0)...)
+		// C2 = 0 (complete), C0 = Q2, C3 = Q1, C1 = Q0.
+		lines = append(lines, loadCtxPtr("x16")...)
+		lines = append(lines,
+			"    ldrh w6, [x16, #0x2e6]",
+			"    mov  w2, #0x4700",
+			"    bic  w6, w6, w2",
+			"    ubfx w2, w4, #2, #1",
+			"    orr  w6, w6, w2, lsl #8",
+			"    ubfx w2, w4, #1, #1",
+			"    orr  w6, w6, w2, lsl #14",
+			"    and  w2, w4, #1",
+			"    orr  w6, w6, w2, lsl #9",
+			"    strh w6, [x16, #0x2e6]",
+		)
 		return lines, nil
 
 	case x86asm.FFREE, x86asm.FFREEP:
@@ -572,19 +575,10 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		return lines, nil
 
 	case x86asm.FXTRACT:
+		// ST(0) = exponent, then push the significand: ST(0) = significand, ST(1) = exponent.
 		lines = append(lines, loadFpuSt("d28", 0)...)
-		lines = append(lines,
-			"    fmov d29, d28",
-			"    fmov x16, d28",
-			"    ubfx x17, x16, #52, #11",
-			"    sub  x17, x17, #1023",
-			"    scvtf d27, x17",
-			"    movz x5, #1023",
-			"    bfi  x16, x5, #52, #11",
-			"    fmov d28, x16",
-		)
-		lines = append(lines, storeFpuSt("d28", 0)...)
-		lines = append(lines, "    fmov d28, d27")
+		lines = append(lines, x87Extract()...)
+		lines = append(lines, storeFpuSt("d29", 0)...)
 		lines = append(lines, emitFpuPushD0()...)
 		return lines, nil
 
@@ -685,4 +679,238 @@ func fpToInt16X86(dst, src string, trunc bool) []string {
 		"    and w1, w1, #0x8000",
 		fmt.Sprintf("    orr %s, %s, w1", dst, dst))
 	return out
+}
+
+// The following x87 helpers work on d28 = ST(0) and d29 = ST(1), use x0-x7 and d30/d31 as
+// scratch, and preserve NZCV (x86 FSCALE/FPREM/FXTRACT do not change EFLAGS). They use numeric
+// local labels so that fixUpperHalves can still save the YMM upper halves around them.
+
+// x87Scale emits FSCALE: d28 = d28 * 2^trunc(d29), rounded once to double (musl scalbn's
+// stepping keeps the subnormal range correctly rounded). ST(1) = +inf gives d28 * inf, -inf
+// gives d28 * 0 (0 * inf and inf * 0 are the invalid cases).
+func x87Scale() []string {
+	return []string{
+		"    mrs  x7, nzcv",
+		"    fcmp d29, d29",
+		"    b.vs 8f",
+		"    fabs d30, d29",
+		"    fmov x6, d30",
+		"    movz x2, #0x7ff0, lsl #48",
+		"    cmp  x6, x2",
+		"    b.ne 1f",
+		"    movi d31, #0",
+		"    fcmp d29, #0.0",
+		"    fcsel d31, d30, d31, gt",
+		"    fmul d28, d28, d31",
+		"    b    7f",
+		"1:",
+		"    frintz d31, d29",
+		"    fcvtzs x2, d31",
+		"    mov  x6, #2200", // beyond +-2200 every finite non-zero double overflows or underflows
+		"    cmp  x2, x6",
+		"    csel x2, x6, x2, gt",
+		"    mov  x6, #-2200",
+		"    cmp  x2, x6",
+		"    csel x2, x6, x2, lt",
+		"    mov  x6, #1023",
+		"    movz x3, #0x7fe0, lsl #48", // 2^1023
+		"    fmov d31, x3",
+		"    cmp  x2, x6",
+		"    b.le 2f",
+		"    fmul d28, d28, d31",
+		"    sub  x2, x2, #1023",
+		"    cmp  x2, x6",
+		"    b.le 2f",
+		"    fmul d28, d28, d31",
+		"    sub  x2, x2, #1023",
+		"    cmp  x2, x6",
+		"    csel x2, x6, x2, gt",
+		"2:",
+		"    mov  x6, #-1022",
+		"    movz x3, #0x0360, lsl #48", // 2^-969 = 2^-1022 * 2^53
+		"    fmov d31, x3",
+		"    cmp  x2, x6",
+		"    b.ge 3f",
+		"    fmul d28, d28, d31",
+		"    add  x2, x2, #969",
+		"    cmp  x2, x6",
+		"    b.ge 3f",
+		"    fmul d28, d28, d31",
+		"    add  x2, x2, #969",
+		"    cmp  x2, x6",
+		"    csel x2, x6, x2, lt",
+		"3:",
+		"    add  x2, x2, #1023",
+		"    lsl  x2, x2, #52",
+		"    fmov d31, x2",
+		"    fmul d28, d28, d31",
+		"    b    7f",
+		"8:",
+		"    fadd d28, d28, d29", // NaN operand
+		"7:",
+		"    msr  nzcv, x7",
+	}
+}
+
+// x87Remainder emits FPREM (truncated quotient) or FPREM1 (nearest, ties to even): d28 = the
+// exact remainder of d28 / d29, by long division of the significands. The low quotient bits are
+// left in x4 (for C0/C3/C1). The reduction is always complete (C2 = 0): where x87 returns a
+// partial remainder (exponent difference >= 64) the result is the final one of the FPREM loop.
+// Invalid operands (x infinite, y zero) give the x86 indefinite NaN.
+func x87Remainder(nearest bool) []string {
+	out := []string{
+		"    mrs  x7, nzcv",
+		"    fmov x0, d28",
+		"    fmov x1, d29",
+		"    mov  x17, #0",
+		"    fcmp d28, d29",
+		"    b.vs 8f",
+		"    ubfx x2, x0, #52, #11",
+		"    ubfx x3, x1, #52, #11",
+		"    cmp  x2, #0x7ff",
+		"    b.eq 9f", // x = +-inf
+		"    lsl  x4, x1, #1",
+		"    cbz  x4, 9f", // y = +-0
+		"    cmp  x3, #0x7ff",
+		"    b.eq 7f", // y = +-inf: x
+		"    lsl  x4, x0, #1",
+		"    cbz  x4, 7f", // x = +-0: x
+		"    and  x4, x0, #0xfffffffffffff",
+		"    cbnz x2, 1f",
+		"    clz  x6, x4", // subnormal x: normalize
+		"    sub  x6, x6, #11",
+		"    lsl  x4, x4, x6",
+		"    mov  x2, #1",
+		"    sub  x2, x2, x6",
+		"    b    2f",
+		"1:",
+		"    orr  x4, x4, #0x10000000000000",
+		"2:",
+		"    and  x5, x1, #0xfffffffffffff",
+		"    cbnz x3, 1f",
+		"    clz  x6, x5", // subnormal y: normalize
+		"    sub  x6, x6, #11",
+		"    lsl  x5, x5, x6",
+		"    mov  x3, #1",
+		"    sub  x3, x3, x6",
+		"    b    2f",
+		"1:",
+		"    orr  x5, x5, #0x10000000000000",
+		"2:",
+		"    and  x0, x0, #0x8000000000000000", // sign of the result (that of x)
+		"    subs x1, x2, x3",                   // exponent difference
+		"    b.lt 6f",
+		"    mov  x6, x4", // r = (mx << d) mod my, one quotient bit per step
+		"3:",
+		"    cmp  x6, x5",
+		"    b.lo 4f",
+		"    sub  x6, x6, x5",
+		"    orr  x17, x17, #1",
+		"4:",
+		"    cbz  x1, 5f",
+		"    lsl  x6, x6, #1",
+		"    lsl  x17, x17, #1",
+		"    sub  x1, x1, #1",
+		"    b    3b",
+		"5:",
+	}
+	if nearest {
+		out = append(out,
+			"    lsl  x2, x6, #1", // 2r against my: round the quotient to nearest, ties to even
+			"    cmp  x2, x5",
+			"    b.lo 1f",
+			"    b.hi 2f",
+			"    tbz  x17, #0, 1f",
+			"2:",
+			"    sub  x6, x5, x6",
+			"    add  x17, x17, #1",
+			"    eor  x0, x0, #0x8000000000000000",
+			"1:")
+	}
+	out = append(out,
+		"    scvtf d28, x6", // r < 2^53: exact; r * 2^(ey - 1075) in two exact steps
+		"    sub  x3, x3, #1075",
+		"    asr  x2, x3, #1",
+		"    sub  x3, x3, x2",
+		"    add  x2, x2, #1023",
+		"    lsl  x2, x2, #52",
+		"    fmov d30, x2",
+		"    fmul d28, d28, d30",
+		"    add  x3, x3, #1023",
+		"    lsl  x3, x3, #52",
+		"    fmov d30, x3",
+		"    fmul d28, d28, d30",
+		"    fmov x6, d28",
+		"    orr  x6, x6, x0",
+		"    fmov d28, x6",
+		"    b    7f",
+		"6:") // |x| < |y| by exponent: quotient 0 ...
+	if nearest {
+		out = append(out,
+			"    cmn  x1, #1", // ... unless d = -1 and |x| > |y| / 2: quotient 1
+			"    b.ne 7f",
+			"    cmp  x4, x5",
+			"    b.ls 7f",
+			"    fabs d30, d28",
+			"    fabs d31, d29",
+			"    fsub d30, d30, d31", // |x| - |y|, exact (Sterbenz)
+			"    fmov x6, d30",
+			"    eor  x6, x6, x0",
+			"    fmov d28, x6",
+			"    mov  x17, #1")
+	}
+	out = append(out,
+		"    b    7f",
+		"8:",
+		"    fadd d28, d28, d29", // NaN operand
+		"    b    7f",
+		"9:",
+		"    movz x6, #0xfff8, lsl #48", // x86 real indefinite
+		"    fmov d28, x6",
+		"7:",
+		"    mov  x4, x17",
+		"    msr  nzcv, x7")
+	return out
+}
+
+// x87Extract emits FXTRACT on d28: d29 = the unbiased exponent, d28 = the significand (sign
+// kept, exponent 0). Subnormal doubles are normalized first (they are normal in the 80-bit
+// format). +-0 gives exponent -inf, +-inf gives +inf, a NaN gives NaN in both.
+func x87Extract() []string {
+	return []string{
+		"    mrs  x7, nzcv",
+		"    fmov x0, d28",
+		"    ubfx x2, x0, #52, #11",
+		"    and  x3, x0, #0xfffffffffffff",
+		"    cmp  x2, #0x7ff",
+		"    b.eq 5f",
+		"    cbnz x2, 2f",
+		"    cbz  x3, 4f",
+		"    clz  x6, x3",
+		"    sub  x6, x6, #11",
+		"    lsl  x3, x3, x6",
+		"    and  x3, x3, #0xfffffffffffff",
+		"    mov  x2, #1",
+		"    sub  x2, x2, x6",
+		"2:",
+		"    sub  x2, x2, #1023",
+		"    scvtf d29, x2",
+		"    and  x0, x0, #0x8000000000000000",
+		"    orr  x0, x0, x3",
+		"    orr  x0, x0, #0x3ff0000000000000",
+		"    fmov d28, x0",
+		"    b    7f",
+		"4:",
+		"    movz x6, #0xfff0, lsl #48",
+		"    fmov d29, x6",
+		"    b    7f",
+		"5:",
+		"    cbnz x3, 6f",
+		"    fabs d29, d28",
+		"    b    7f",
+		"6:",
+		"    fmov d29, d28",
+		"7:",
+		"    msr  nzcv, x7",
+	}
 }

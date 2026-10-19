@@ -448,3 +448,23 @@ func TestRegressX87KeepsXmm(t *testing.T) {
 		}
 	}
 }
+
+// FSCALE built 2^n from the exponent bits without range checks (garbage beyond 2^+-1023),
+// FPREM/FPREM1 used a rounded quotient (wrong remainders, FPREM rounded instead of truncating,
+// no quotient bits), and FXTRACT left the exponent and the significand swapped.
+func TestRegressX87Math(t *testing.T) {
+	l := liftBlock(t, "d9fd")[0] // fscale
+	requireInOrder(t, "fscale", l, "frintz d31, d29", "fcvtzs x2, d31", "mov x6, #2200", "csel x2, x6, x2, gt",
+		"movz x3, #0x7fe0, lsl #48", "movz x3, #0x0360, lsl #48", "fmul d28, d28, d31", "msr nzcv, x7")
+
+	l = liftBlock(t, "d9f5")[0] // fprem1: long division, round to nearest (ties to even)
+	requireInOrder(t, "fprem1", l, "subs x1, x2, x3", "sub x6, x6, x5", "lsl x6, x6, #1", "tbz x17, #0, 1f",
+		"scvtf d28, x6", "msr nzcv, x7", "orr w6, w6, w2, lsl #14", "strh w6, [x16, #0x2e6]")
+	l = liftBlock(t, "d9f8")[0] // fprem: truncated quotient, no rounding step
+	requireInOrder(t, "fprem", l, "subs x1, x2, x3", "scvtf d28, x6")
+	forbid(t, "fprem", l, "tbz x17, #0, 1f", "frintn ...")
+
+	l = liftBlock(t, "d9f4")[0] // fxtract: ST(0) = exponent, then push the significand
+	requireInOrder(t, "fxtract", l, "scvtf d29, x2", "orr x0, x0, #0x3ff0000000000000",
+		"str d29, [x5, w17, uxtw #3]", "sub w17, w17, #1", "str d28, [x5, w17, uxtw #3]")
+}
