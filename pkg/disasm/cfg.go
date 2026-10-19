@@ -1008,10 +1008,8 @@ func (d *Disassembler) analyzeBlockFlagLiveness(fn *Function) {
 		flagsLive := true // Conservatively assume flags are live at block boundary
 		for i := len(block.Insts) - 1; i >= 0; i-- {
 			inst := &block.Insts[i]
-			op := inst.Inst.Op
-
-			reads := usesFlags(op)
-			definesAll := definesAllFlags(op)
+			reads := readsAnyFlag(inst.Inst)
+			definesAll := definesAllFlags(inst.Inst)
 
 			if definesAll {
 				if !flagsLive {
@@ -1027,25 +1025,18 @@ func (d *Disassembler) analyzeBlockFlagLiveness(fn *Function) {
 	}
 }
 
-func usesFlags(op x86asm.Op) bool {
-	if isJcc(op) || isSetcc(op) || isCmovcc(op) {
-		return true
-	}
-	switch op {
-	case x86asm.ADC, x86asm.SBB:
-		return true
-	default:
-		return false
-	}
-}
-
-func definesAllFlags(op x86asm.Op) bool {
-	switch op {
+// definesAllFlags reports instructions that write (or leave undefined) every arithmetic flag, so
+// earlier flag values cannot be observed after them. A shift or rotate by CL or by a masked
+// count of 0 leaves the flags unchanged and does not count.
+func definesAllFlags(inst x86asm.Inst) bool {
+	switch inst.Op {
 	case x86asm.ADD, x86asm.SUB, x86asm.CMP, x86asm.TEST,
-		x86asm.AND, x86asm.OR, x86asm.XOR,
-		x86asm.NEG, x86asm.SHL, x86asm.SHR, x86asm.SAR,
+		x86asm.AND, x86asm.OR, x86asm.XOR, x86asm.NEG,
 		x86asm.TZCNT, x86asm.LZCNT, x86asm.BSF, x86asm.BSR:
 		return true
+	case x86asm.SHL, x86asm.SHR, x86asm.SAR:
+		c, ok := shiftImmCount(inst)
+		return ok && c != 0
 	default:
 		return false
 	}
@@ -1091,10 +1082,11 @@ func isPrivileged(op x86asm.Op) bool {
 	}
 }
 
+// isJcc reports the conditional branches: Jcc, JrCXZ and LOOP/LOOPE/LOOPNE.
 func isJcc(op x86asm.Op) bool {
 	switch op {
 	case x86asm.JA, x86asm.JAE, x86asm.JB, x86asm.JBE,
-		x86asm.JCXZ, x86asm.JECXZ, x86asm.JRCXZ,
+		x86asm.JCXZ, x86asm.JECXZ, x86asm.JRCXZ, x86asm.LOOP, x86asm.LOOPE, x86asm.LOOPNE,
 		x86asm.JE, x86asm.JG, x86asm.JGE,
 		x86asm.JL, x86asm.JLE, x86asm.JNE,
 		x86asm.JNO, x86asm.JNP, x86asm.JNS,
