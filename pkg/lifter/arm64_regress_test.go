@@ -187,3 +187,18 @@ func TestRegressNarrowOperands(t *testing.T) {
 	l = liftBlock(t, "660fb108") // cmpxchg word [rax], cx
 	requireInOrder(t, "cmpxchg word", l[0], "ldaxrh w17, [x16]", "lsl w0, w19, #16", "cmp w0, w17, lsl #16")
 }
+
+// Compare and test flags: (U)COMIS* and FCOMI give ZF = PF = CF = 1 for unordered and SF = 0
+// (the lifter used the raw FCMP NZCV), and PTEST leaves C in the subtract sense.
+func TestRegressCompareFlags(t *testing.T) {
+	l := liftBlock(t, "c5f82ec0") // vucomiss xmm0, xmm0
+	requireInOrder(t, "vucomiss", l[0], "fcmp s0, s0", "cset w2, vs", "axflag", "rmif x2, #0, #1")
+
+	l = liftBlock(t, "dbf1") // fcomi st, st(1)
+	requireInOrder(t, "fcomi", l[0], "fcmp d0, d1", "axflag")
+
+	// add rax, rbx; vptest xmm0, xmm1; jb: JB reads the C that PTEST wrote (C = !CF).
+	l = liftBlock(t, "4801d8", "c4e27917c1", "720e")
+	requireInOrder(t, "jb after vptest", l[2], "b.cs ...")
+	forbid(t, "jb after vptest", l[2], "cfinv")
+}

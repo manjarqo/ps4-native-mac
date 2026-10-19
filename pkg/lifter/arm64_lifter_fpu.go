@@ -406,6 +406,7 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		// GT -> C=1, Z=0
 		// Unordered -> V=1, C=1, Z=0
 		lines = append(lines, "    fcmp d0, d1")
+		lines = append(lines, l.fpCompareFlags()...)
 		if op == x86asm.FUCOMIP {
 			lines = append(lines, emitFpuDiscard()...)
 		}

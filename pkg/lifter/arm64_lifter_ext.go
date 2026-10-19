@@ -876,6 +876,7 @@ func (l *Arm64Lifter) liftPcmpistri(inst disasm.Instruction, nextPC uint64, line
 		"    ldp  x29, x30, [sp, #112]",
 		"    add  sp, sp, #128",
 	)
+	l.cpol = carrySub
 	return lines, nil
 }
 
@@ -953,5 +954,6 @@ func (l *Arm64Lifter) liftPcmpestri(inst disasm.Instruction, nextPC uint64, line
 		"    ldp  x29, x30, [sp, #112]",
 		"    add  sp, sp, #128",
 	)
+	l.cpol = carrySub
 	return lines, nil
 }

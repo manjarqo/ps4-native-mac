@@ -1914,6 +1914,7 @@ func (l *Arm64Lifter) liftPtestVtest(inst disasm.Instruction, nextPC uint64, lin
 		"    lsl w16, w16, #29",
 		"    msr nzcv, x16",
 	)
+	l.cpol = carrySub
 	return lines, nil
 }
 

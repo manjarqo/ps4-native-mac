@@ -45,6 +45,15 @@ func (l *Arm64Lifter) liftFpAlu(inst disasm.Instruction, nextPC uint64, armOp st
 	return lines, nil
 }
 
+// fpCompareFlags converts the NZCV of an ARM FCMP (lt 1000, eq 0110, gt 0010, unordered 0011)
+// into the lifter's x86 model of (U)COMIS/FCOMI flags: Z = ZF, C = !CF (carrySub), V = PF, N = 0
+// (lt 0000, eq 0110, gt 0010, unordered 0101). AXFLAG gives Z = ZF and C = !CF and clears N and
+// V; V is then set from the unordered result captured before.
+func (l *Arm64Lifter) fpCompareFlags() []string {
+	l.cpol = carrySub
+	return []string{"    cset w2, vs", "    axflag", "    rmif x2, #0, #1"}
+}
+
 // liftFpCmp handles UCOMISS, UCOMISD, COMISS, COMISD, VUCOMISS, VUCOMISD, VCOMISS, and VCOMISD.
 func (l *Arm64Lifter) liftFpCmp(inst disasm.Instruction, nextPC uint64, isDouble bool, lines []string) ([]string, error) {
 	dst := inst.Inst.Args[0]
@@ -69,6 +78,7 @@ func (l *Arm64Lifter) liftFpCmp(inst disasm.Instruction, nextPC uint64, isDouble
 				srcElem = srcLowD
 			}
 			lines = append(lines, fmt.Sprintf("    fcmp %s, %s", dstElem, srcElem))
+			lines = append(lines, l.fpCompareFlags()...)
 			return lines, nil
 		}
 	} else if mem, okMem := src.(x86asm.Mem); okMem {
@@ -80,6 +90,7 @@ func (l *Arm64Lifter) liftFpCmp(inst disasm.Instruction, nextPC uint64, isDouble
 			lines = append(lines, "    ldr s16, [x28, x16]")
 			lines = append(lines, fmt.Sprintf("    fcmp %s, s16", dstElem))
 		}
+		lines = append(lines, l.fpCompareFlags()...)
 		return lines, nil
 	}
 
