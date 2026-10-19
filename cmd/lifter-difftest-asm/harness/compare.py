@@ -187,6 +187,15 @@ def main():
                 if want_l and (f2 >> (32 + 12) & 1) != 1 - ((f1 >> 7 ^ f1 >> 11) & 1):
                     diffs.append("CMPXCHG cond L: lifted %d, want !native %d" % (f2 >> 44 & 1, (f1 >> 7 ^ f1 >> 11) & 1))
                     kinds.add("cond-L")
+                # SF and OF of the reversed subtraction: with r = acc - dest != 0, -r has the
+                # opposite sign and the same OF, except r = MIN (-r = r): SF = 1 on both sides
+                # and OF opposite. Lifted S/O conditions must fit one of the two.
+                if want_l:
+                    sl, ol = f2 >> (32 + 8) & 1, f2 >> 32 & 1
+                    sn, on = f1 >> 7 & 1, f1 >> 11 & 1
+                    if not ((sl != sn and ol == on) or (sl == sn == 1 and ol != on)):
+                        diffs.append("CMPXCHG SF/OF: lifted S=%d O=%d, native (reversed) S=%d O=%d" % (sl, ol, sn, on))
+                        kinds.add("cond-SO")
                 saw_rosetta_cx = True
             if defined:
                 for i in range(16):
