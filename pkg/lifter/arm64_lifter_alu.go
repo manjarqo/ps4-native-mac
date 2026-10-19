@@ -1575,230 +1575,122 @@ func (l *Arm64Lifter) liftAdcSbb(inst disasm.Instruction, nextPC uint64, isSbb b
 	return lines, nil
 }
 
-// liftBt handles BT, BTS, BTR, BTC.
+// liftBt handles BT, BTS, BTR, BTC. Only CF changes (ZF is kept, the others are undefined), so
+// the tested bit is inserted into C with RMIF (carryAdd) and nothing else in NZCV is touched.
+// With a register bit offset and a memory operand the offset is signed and selects the operand
+// at addr + (offset >> log2(bits)) * size, as on x86.
 func (l *Arm64Lifter) liftBt(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	op := inst.Inst.Op
 	dst := inst.Inst.Args[0]
 	src := inst.Inst.Args[1]
 
-	if dstReg, okDst := dst.(x86asm.Reg); okDst {
-		descDst, okDstD := arm64RegMap[dstReg]
-		if !okDstD {
+	size := 0
+	v := "" // the operand value
+	var store func() []string
+	switch d := dst.(type) {
+	case x86asm.Reg:
+		desc, ok := arm64RegMap[d]
+		if !ok {
 			lines = append(lines, l.emitUnsupported(inst, "unmapped bt dst")...)
 			return lines, nil
 		}
+		size = desc.Size
+		switch size {
+		case 8:
+			v = desc.X
+		case 4:
+			v = desc.W
+		default:
+			rc, _ := readRegTo(d, "x17", "w17")
+			lines = append(lines, rc...)
+			v = "w17"
+			store = func() []string { wc, _ := writeRegFrom(d, "x17", "w17"); return wc }
+		}
+	case x86asm.Mem:
+		size = defMemSz(inst)
+		lines = append(lines, computeEffAddr(d, nextPC, "x16")...)
+		v = "w17"
+		if size == 8 {
+			v = "x17"
+		}
+		store = func() []string {
+			st := map[int]string{1: "strb", 2: "strh", 4: "str", 8: "str"}[size]
+			return []string{fmt.Sprintf("    %s %s, [x28, x16]", st, v)}
+		}
+	default:
+		lines = append(lines, l.emitUnsupported(inst, "unsupported bt operand")...)
+		return lines, nil
+	}
+	bits := 8 * size
+	log2 := map[int]int{16: 4, 32: 5, 64: 6}[bits]
+	x := "x" + v[1:]
 
-		bitWidth := descDst.Size * 8
-
-		// Immediate bit index
-		if imm, okImm := src.(x86asm.Imm); okImm {
-			bitIdx := uint64(imm) % uint64(bitWidth)
-			if descDst.Size == 8 {
-				lines = append(lines, fmt.Sprintf("    ubfx x16, %s, #%d, #1", descDst.X, bitIdx))
-				lines = append(lines, "    cmp xzr, x16")
-				switch op {
-				case x86asm.BTS:
-					lines = append(lines, loadImm64("x18", uint64(1)<<bitIdx)...)
-					lines = append(lines, fmt.Sprintf("    orr %s, %s, x18", descDst.X, descDst.X))
-				case x86asm.BTR:
-					lines = append(lines, loadImm64("x18", uint64(1)<<bitIdx)...)
-					lines = append(lines, fmt.Sprintf("    bic %s, %s, x18", descDst.X, descDst.X))
-				case x86asm.BTC:
-					lines = append(lines, loadImm64("x18", uint64(1)<<bitIdx)...)
-					lines = append(lines, fmt.Sprintf("    eor %s, %s, x18", descDst.X, descDst.X))
-				}
-			} else if descDst.Size == 4 {
-				lines = append(lines, fmt.Sprintf("    ubfx w16, %s, #%d, #1", descDst.W, bitIdx))
-				lines = append(lines, "    cmp wzr, w16")
-				switch op {
-				case x86asm.BTS:
-					lines = append(lines, loadImm32("w18", uint32(1)<<bitIdx)...)
-					lines = append(lines, fmt.Sprintf("    orr %s, %s, w18", descDst.W, descDst.W))
-				case x86asm.BTR:
-					lines = append(lines, loadImm32("w18", uint32(1)<<bitIdx)...)
-					lines = append(lines, fmt.Sprintf("    bic %s, %s, w18", descDst.W, descDst.W))
-				case x86asm.BTC:
-					lines = append(lines, loadImm32("w18", uint32(1)<<bitIdx)...)
-					lines = append(lines, fmt.Sprintf("    eor %s, %s, w18", descDst.W, descDst.W))
-				}
-			} else {
-				rc, _ := readRegTo(dstReg, "x17", "w17")
-				lines = append(lines, rc...)
-				lines = append(lines, fmt.Sprintf("    ubfx w16, w17, #%d, #1", bitIdx))
-				lines = append(lines, "    cmp wzr, w16")
-				switch op {
-				case x86asm.BTS:
-					lines = append(lines, fmt.Sprintf("    orr w17, w17, #%d", uint32(1)<<bitIdx))
-					wc, _ := writeRegFrom(dstReg, "x17", "w17")
-					lines = append(lines, wc...)
-				case x86asm.BTR:
-					lines = append(lines, fmt.Sprintf("    bic w17, w17, #%d", uint32(1)<<bitIdx))
-					wc, _ := writeRegFrom(dstReg, "x17", "w17")
-					lines = append(lines, wc...)
-				case x86asm.BTC:
-					lines = append(lines, fmt.Sprintf("    eor w17, w17, #%d", uint32(1)<<bitIdx))
-					wc, _ := writeRegFrom(dstReg, "x17", "w17")
-					lines = append(lines, wc...)
-				}
-			}
+	imm, isImm := src.(x86asm.Imm)
+	k := 0
+	if isImm {
+		k = int(uint64(imm) % uint64(bits))
+	} else {
+		r, ok := src.(x86asm.Reg)
+		desc, okD := arm64RegMap[r]
+		if !ok || !okD {
+			lines = append(lines, l.emitUnsupported(inst, "unsupported bt bit offset")...)
 			return lines, nil
 		}
-
-		// Register bit index
-		if srcReg, okSrc := src.(x86asm.Reg); okSrc {
-			descSrc, okSrcD := arm64RegMap[srcReg]
-			if !okSrcD {
-				lines = append(lines, l.emitUnsupported(inst, "unmapped bt src")...)
-				return lines, nil
+		if _, isMem := dst.(x86asm.Mem); isMem {
+			// Signed bit offset: move the address by whole operands, keep the bit within one.
+			switch desc.Size {
+			case 8:
+				lines = append(lines, fmt.Sprintf("    mov x4, %s", desc.X))
+			case 4:
+				lines = append(lines, fmt.Sprintf("    sxtw x4, %s", desc.W))
+			default:
+				lines = append(lines, fmt.Sprintf("    sxth x4, %s", desc.W))
 			}
-			if descDst.Size == 8 {
-				lines = append(lines, fmt.Sprintf("    and x17, %s, #63", descSrc.X))
-				lines = append(lines, fmt.Sprintf("    lsr x16, %s, x17", descDst.X))
-				lines = append(lines, "    and x16, x16, #1")
-				lines = append(lines, "    cmp xzr, x16")
-				switch op {
-				case x86asm.BTS:
-					lines = append(lines, "    mov x18, #1", "    lsl x18, x18, x17")
-					lines = append(lines, fmt.Sprintf("    orr %s, %s, x18", descDst.X, descDst.X))
-				case x86asm.BTR:
-					lines = append(lines, "    mov x18, #1", "    lsl x18, x18, x17")
-					lines = append(lines, fmt.Sprintf("    bic %s, %s, x18", descDst.X, descDst.X))
-				case x86asm.BTC:
-					lines = append(lines, "    mov x18, #1", "    lsl x18, x18, x17")
-					lines = append(lines, fmt.Sprintf("    eor %s, %s, x18", descDst.X, descDst.X))
-				}
-			} else if descDst.Size == 4 {
-				lines = append(lines, fmt.Sprintf("    and w17, %s, #31", descSrc.W))
-				lines = append(lines, fmt.Sprintf("    lsr w16, %s, w17", descDst.W))
-				lines = append(lines, "    and w16, w16, #1")
-				lines = append(lines, "    cmp wzr, w16")
-				switch op {
-				case x86asm.BTS:
-					lines = append(lines, "    mov w18, #1", "    lsl w18, w18, w17")
-					lines = append(lines, fmt.Sprintf("    orr %s, %s, w18", descDst.W, descDst.W))
-				case x86asm.BTR:
-					lines = append(lines, "    mov w18, #1", "    lsl w18, w18, w17")
-					lines = append(lines, fmt.Sprintf("    bic %s, %s, w18", descDst.W, descDst.W))
-				case x86asm.BTC:
-					lines = append(lines, "    mov w18, #1", "    lsl w18, w18, w17")
-					lines = append(lines, fmt.Sprintf("    eor %s, %s, w18", descDst.W, descDst.W))
-				}
-			} else {
-				rcDst, _ := readRegTo(dstReg, "x16", "w16")
-				rcSrc, _ := readRegTo(srcReg, "x17", "w17")
-				lines = append(lines, rcDst...)
-				lines = append(lines, rcSrc...)
-				mask := bitWidth - 1
-				lines = append(lines, fmt.Sprintf("    and w17, w17, #%d", mask))
-				lines = append(lines, "    lsr w18, w16, w17")
-				lines = append(lines, "    and w18, w18, #1")
-				lines = append(lines, "    cmp wzr, w18")
-				switch op {
-				case x86asm.BTS:
-					lines = append(lines, "    mov w18, #1", "    lsl w18, w18, w17", "    orr w16, w16, w18")
-					wc, _ := writeRegFrom(dstReg, "x16", "w16")
-					lines = append(lines, wc...)
-				case x86asm.BTR:
-					lines = append(lines, "    mov w18, #1", "    lsl w18, w18, w17", "    bic w16, w16, w18")
-					wc, _ := writeRegFrom(dstReg, "x16", "w16")
-					lines = append(lines, wc...)
-				case x86asm.BTC:
-					lines = append(lines, "    mov w18, #1", "    lsl w18, w18, w17", "    eor w16, w16, w18")
-					wc, _ := writeRegFrom(dstReg, "x16", "w16")
-					lines = append(lines, wc...)
-				}
-			}
-			return lines, nil
-		}
-	} else if mem, okMem := dst.(x86asm.Mem); okMem {
-		sz := defMemSz(inst)
-		lines = append(lines, readMemTo(mem, nextPC, sz, "x16", "w16")...)
-		bitWidth := uint64(sz * 8)
-
-		if imm, okImm := src.(x86asm.Imm); okImm {
-			bitIdx := uint64(imm) % bitWidth
-			if sz == 8 {
-				lines = append(lines, fmt.Sprintf("    ubfx x17, x16, #%d, #1", bitIdx))
-				lines = append(lines, "    cmp xzr, x17")
-				switch op {
-				case x86asm.BTS:
-					lines = append(lines, loadImm64("x18", uint64(1)<<bitIdx)...)
-					lines = append(lines, "    orr x16, x16, x18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				case x86asm.BTR:
-					lines = append(lines, loadImm64("x18", uint64(1)<<bitIdx)...)
-					lines = append(lines, "    bic x16, x16, x18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				case x86asm.BTC:
-					lines = append(lines, loadImm64("x18", uint64(1)<<bitIdx)...)
-					lines = append(lines, "    eor x16, x16, x18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				}
-			} else {
-				lines = append(lines, fmt.Sprintf("    ubfx w17, w16, #%d, #1", bitIdx))
-				lines = append(lines, "    cmp wzr, w17")
-				switch op {
-				case x86asm.BTS:
-					lines = append(lines, loadImm32("w18", uint32(1)<<bitIdx)...)
-					lines = append(lines, "    orr w16, w16, w18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				case x86asm.BTR:
-					lines = append(lines, loadImm32("w18", uint32(1)<<bitIdx)...)
-					lines = append(lines, "    bic w16, w16, w18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				case x86asm.BTC:
-					lines = append(lines, loadImm32("w18", uint32(1)<<bitIdx)...)
-					lines = append(lines, "    eor w16, w16, w18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				}
-			}
-			return lines, nil
-		}
-
-		if srcReg, okSrc := src.(x86asm.Reg); okSrc {
-			descSrc, okSrcD := arm64RegMap[srcReg]
-			if !okSrcD {
-				lines = append(lines, l.emitUnsupported(inst, "unmapped bt src")...)
-				return lines, nil
-			}
-			if sz == 8 {
-				lines = append(lines, fmt.Sprintf("    and x17, %s, #63", descSrc.X))
-				lines = append(lines, "    lsr x18, x16, x17")
-				lines = append(lines, "    and x18, x18, #1")
-				lines = append(lines, "    cmp xzr, x18")
-				switch op {
-				case x86asm.BTS:
-					lines = append(lines, "    mov x18, #1", "    lsl x18, x18, x17", "    orr x16, x16, x18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				case x86asm.BTR:
-					lines = append(lines, "    mov x18, #1", "    lsl x18, x18, x17", "    bic x16, x16, x18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				case x86asm.BTC:
-					lines = append(lines, "    mov x18, #1", "    lsl x18, x18, x17", "    eor x16, x16, x18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				}
-			} else {
-				lines = append(lines, fmt.Sprintf("    and w17, %s, #31", descSrc.W))
-				lines = append(lines, "    lsr w18, w16, w17")
-				lines = append(lines, "    and w18, w18, #1")
-				lines = append(lines, "    cmp wzr, w18")
-				switch op {
-				case x86asm.BTS:
-					lines = append(lines, "    mov w18, #1", "    lsl w18, w18, w17", "    orr w16, w16, w18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				case x86asm.BTR:
-					lines = append(lines, "    mov w18, #1", "    lsl w18, w18, w17", "    bic w16, w16, w18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				case x86asm.BTC:
-					lines = append(lines, "    mov w18, #1", "    lsl w18, w18, w17", "    eor w16, w16, w18")
-					lines = append(lines, writeMemFrom(mem, nextPC, sz, "x16", "w16")...)
-				}
-			}
-			return lines, nil
+			lines = append(lines, fmt.Sprintf("    asr x5, x4, #%d", log2),
+				fmt.Sprintf("    add x16, x16, x5, lsl #%d", log2-3),
+				fmt.Sprintf("    and x1, x4, #%d", bits-1))
+		} else {
+			lines = append(lines, fmt.Sprintf("    and w1, %s, #%d", desc.W, bits-1))
 		}
 	}
+	if _, isMem := dst.(x86asm.Mem); isMem {
+		ld := map[int]string{1: "ldrb", 2: "ldrh", 4: "ldr", 8: "ldr"}[size]
+		lines = append(lines, fmt.Sprintf("    %s %s, [x28, x16]", ld, v))
+	}
 
-	lines = append(lines, l.emitUnsupported(inst, "unsupported bt operand")...)
+	if !inst.CarryDead {
+		if isImm {
+			lines = append(lines, fmt.Sprintf("    ubfx x2, %s, #%d, #1", x, k))
+		} else {
+			lines = append(lines, fmt.Sprintf("    lsr x2, %s, x1", x))
+		}
+		lines = append(lines, "    rmif x2, #63, #2") // C = tested bit (bit 0 of x2)
+		l.cpol = carryAdd
+	}
+	if op == x86asm.BT {
+		return lines, nil
+	}
+	arm := map[x86asm.Op]string{x86asm.BTS: "orr", x86asm.BTR: "bic", x86asm.BTC: "eor"}[op]
+	reg32 := size <= 4
+	if isImm {
+		if arm == "bic" {
+			if reg32 {
+				lines = append(lines, fmt.Sprintf("    and %s, %s, #0x%x", v, v, ^(uint32(1)<<k)))
+			} else {
+				lines = append(lines, fmt.Sprintf("    and %s, %s, #0x%x", v, v, ^(uint64(1)<<k)))
+			}
+		} else {
+			lines = append(lines, fmt.Sprintf("    %s %s, %s, #0x%x", arm, v, v, uint64(1)<<k))
+		}
+	} else {
+		lines = append(lines, "    mov x3, #1", "    lsl x3, x3, x1", fmt.Sprintf("    %s %s, %s, %s", arm, x, x, "x3"))
+		if size == 4 && v != "w17" {
+			lines = append(lines, fmt.Sprintf("    mov %s, %s", v, v)) // 32-bit write: clear the upper half
+		}
+	}
+	if store != nil {
+		lines = append(lines, store()...)
+	}
 	return lines, nil
 }
 
@@ -1862,57 +1754,135 @@ func (l *Arm64Lifter) liftRdtsc(lines []string) []string {
 	return lines
 }
 
-// liftPopcnt handles POPCNT instruction.
-func (l *Arm64Lifter) liftPopcnt(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
-	dst := inst.Inst.Args[0]
-	src := inst.Inst.Args[1]
+// bitSource loads the source of a bit-count instruction into x0/w0, zero-extended.
+func bitSource(arg x86asm.Arg, size int, nextPC uint64) ([]string, bool) {
+	switch v := arg.(type) {
+	case x86asm.Reg:
+		rc, ok := readRegTo(v, "x0", "w0")
+		return rc, ok
+	case x86asm.Mem:
+		return readMemTo(v, nextPC, size, "x0", "w0"), true
+	}
+	return nil, false
+}
 
-	dstReg, okDst := dst.(x86asm.Reg)
-	if !okDst {
+// liftPopcnt handles POPCNT with a scalar bit count (no vector scratch register). ZF = (src ==
+// 0); CF, OF, SF, PF are cleared: TST of the count gives exactly that (carryClear).
+func (l *Arm64Lifter) liftPopcnt(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
+	dstReg, okDst := inst.Inst.Args[0].(x86asm.Reg)
+	descDst, okDD := arm64RegMap[dstReg]
+	if !okDst || !okDD {
 		lines = append(lines, l.emitUnsupported(inst, "unsupported popcnt dst")...)
 		return lines, nil
 	}
-	descDst, okDD := arm64RegMap[dstReg]
-	if !okDD {
-		lines = append(lines, l.emitUnsupported(inst, "unmapped popcnt dst")...)
-		return lines, nil
-	}
-
 	sz := descDst.Size
-	if sz == 0 {
-		sz = 4
-	}
-
-	if srcReg, okSrc := src.(x86asm.Reg); okSrc {
-		loadCode, _ := readRegTo(srcReg, "x16", "w16")
-		lines = append(lines, loadCode...)
-	} else if mem, okMem := src.(x86asm.Mem); okMem {
-		lines = append(lines, readMemTo(mem, nextPC, sz, "x16", "w16")...)
-	} else {
+	ld, ok := bitSource(inst.Inst.Args[1], sz, nextPC)
+	if !ok {
 		lines = append(lines, l.emitUnsupported(inst, "unsupported popcnt src")...)
 		return lines, nil
 	}
-
-	if sz == 8 {
-		lines = append(lines, "    fmov d31, x16")
-		lines = append(lines, "    cnt v31.8b, v31.8b")
-		lines = append(lines, "    uaddlv h31, v31.8b")
-		lines = append(lines, "    fmov w16, s31")
-		lines = append(lines, "    uxtw x16, w16")
-		lines = append(lines, "    cmp x16, #0")
-	} else {
-		lines = append(lines, "    fmov s31, w16")
-		lines = append(lines, "    cnt v31.8b, v31.8b")
-		lines = append(lines, "    uaddlv h31, v31.8b")
-		lines = append(lines, "    fmov w16, s31")
-		lines = append(lines, "    cmp w16, #0")
+	lines = append(lines, ld...)
+	r := "x"
+	if sz < 8 {
+		r = "w"
 	}
-	storeCode, _ := writeRegFrom(dstReg, "x16", "w16")
-	lines = append(lines, storeCode...)
+	lines = append(lines,
+		fmt.Sprintf("    lsr %s1, %s0, #1", r, r),
+		fmt.Sprintf("    and %s1, %s1, #0x55555555%s", r, r, map[string]string{"x": "55555555", "w": ""}[r]),
+		fmt.Sprintf("    sub %s0, %s0, %s1", r, r, r),
+		fmt.Sprintf("    and %s1, %s0, #0x33333333%s", r, r, map[string]string{"x": "33333333", "w": ""}[r]),
+		fmt.Sprintf("    lsr %s0, %s0, #2", r, r),
+		fmt.Sprintf("    and %s0, %s0, #0x33333333%s", r, r, map[string]string{"x": "33333333", "w": ""}[r]),
+		fmt.Sprintf("    add %s0, %s0, %s1", r, r, r),
+		fmt.Sprintf("    add %s0, %s0, %s0, lsr #4", r, r, r),
+		fmt.Sprintf("    and %s0, %s0, #0x0f0f0f0f%s", r, r, map[string]string{"x": "0f0f0f0f", "w": ""}[r]),
+		fmt.Sprintf("    mov %s1, #0x01010101%s", r, map[string]string{"x": "01010101", "w": ""}[r]),
+		fmt.Sprintf("    mul %s0, %s0, %s1", r, r, r),
+		fmt.Sprintf("    lsr %s0, %s0, #%d", r, r, map[string]int{"x": 56, "w": 24}[r]))
+	if !inst.SkipFlags {
+		lines = append(lines, fmt.Sprintf("    tst %s0, %s0", r, r))
+		l.cpol = carryClear
+	}
+	wc, _ := writeRegFrom(dstReg, "x0", "w0")
+	lines = append(lines, wc...)
 	return lines, nil
 }
 
-// liftBextr handles BMI1 bit field extract (BEXTR).
+// liftBitScan handles TZCNT, LZCNT, BSF, BSR.
+//   - TZCNT/LZCNT: CF = (src == 0), ZF = (result == 0); the count of a zero source is the
+//     operand size. CMP src, #0 then CCMP result, #0 gives Z = (result == 0) and C = !CF.
+//   - BSF/BSR: ZF = (src == 0); a zero source leaves the destination unchanged.
+// The carry sense afterwards is carrySub.
+func (l *Arm64Lifter) liftBitScan(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
+	op := inst.Inst.Op
+	dstReg, okDst := inst.Inst.Args[0].(x86asm.Reg)
+	d, okD := arm64RegMap[dstReg]
+	if !okDst || !okD {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported bit scan dst")...)
+		return lines, nil
+	}
+	sz := d.Size
+	bits := 8 * sz
+	ld, ok := bitSource(inst.Inst.Args[1], sz, nextPC)
+	if !ok {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported bit scan src")...)
+		return lines, nil
+	}
+	lines = append(lines, ld...)
+	r := "w"
+	if sz == 8 {
+		r = "x"
+	}
+	// x1 = result (x0 = zero-extended source).
+	switch op {
+	case x86asm.TZCNT, x86asm.BSF:
+		if sz == 2 {
+			lines = append(lines, "    orr w1, w0, #0x10000", "    rbit w1, w1", "    clz w1, w1")
+		} else {
+			lines = append(lines, fmt.Sprintf("    rbit %s1, %s0", r, r), fmt.Sprintf("    clz %s1, %s1", r, r))
+		}
+	case x86asm.LZCNT:
+		if sz == 2 {
+			lines = append(lines, "    lsl w1, w0, #16", "    orr w1, w1, #0x8000", "    clz w1, w1")
+		} else {
+			lines = append(lines, fmt.Sprintf("    clz %s1, %s0", r, r))
+		}
+	case x86asm.BSR:
+		lines = append(lines, fmt.Sprintf("    clz %s1, %s0", r, r))
+		top := bits - 1
+		if sz == 2 {
+			top = 31 // clz of the zero-extended 32-bit value
+		}
+		lines = append(lines, fmt.Sprintf("    mov %s2, #%d", r, top), fmt.Sprintf("    sub %s1, %s2, %s1", r, r, r))
+	}
+	flags := !inst.SkipFlags
+	if op == x86asm.TZCNT || op == x86asm.LZCNT {
+		if flags {
+			// src != 0: flags of CMP result, #0 (Z = result == 0, C = 1 = !CF); src == 0:
+			// NZCV = 0000 (CF = 1, ZF = 0 as the result is the operand size).
+			lines = append(lines, fmt.Sprintf("    cmp %s0, #0", r), fmt.Sprintf("    ccmp %s1, #0, #0, ne", r))
+			l.cpol = carrySub
+		}
+		wc, _ := writeRegFrom(dstReg, "x1", "w1")
+		lines = append(lines, wc...)
+		return lines, nil
+	}
+	// BSF/BSR: keep the destination when the source is zero.
+	lines = append(lines, fmt.Sprintf("    cmp %s0, #0", r))
+	if sz == 2 {
+		lines = append(lines, fmt.Sprintf("    and w2, %s, #0xffff", d.W), "    csel w1, w2, w1, eq")
+		wc, _ := writeRegFrom(dstReg, "x1", "w1")
+		lines = append(lines, wc...)
+	} else {
+		lines = append(lines, fmt.Sprintf("    csel %s, %s, x1, eq", d.X, d.X))
+	}
+	l.cpol = carrySub // the CMP always runs
+	return lines, nil
+}
+
+// liftBextr handles BMI1 BEXTR: dst = (src >> start) & ((1 << len) - 1), with start = ctrl[7:0]
+// and len = ctrl[15:8]; a start >= the operand size gives 0 and a len >= it keeps all bits.
+// ZF = (dst == 0), CF = OF = 0 (TST: carryClear).
 func (l *Arm64Lifter) liftBextr(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	dstReg, okDst := inst.Inst.Args[0].(x86asm.Reg)
 	descDst, okDD := arm64RegMap[dstReg]
@@ -1922,60 +1892,36 @@ func (l *Arm64Lifter) liftBextr(inst disasm.Instruction, nextPC uint64, lines []
 		lines = append(lines, l.emitUnsupported(inst, "unsupported bextr operands")...)
 		return lines, nil
 	}
-
 	sz := descDst.Size
-	if sz == 0 {
-		sz = 4
-	}
-
-	src := inst.Inst.Args[1]
-	if srcReg, okSrc := src.(x86asm.Reg); okSrc {
-		loadCode, _ := readRegTo(srcReg, "x18", "w18")
-		lines = append(lines, loadCode...)
-	} else if mem, okMem := src.(x86asm.Mem); okMem {
-		lines = append(lines, readMemTo(mem, nextPC, sz, "x18", "w18")...)
-	} else {
+	bits := 8 * sz
+	// Read the control register first: dst may alias it.
+	lines = append(lines, fmt.Sprintf("    ubfx w1, %s, #0, #8", descCtrl.W), fmt.Sprintf("    ubfx w2, %s, #8, #8", descCtrl.W))
+	ld, ok := bitSource(inst.Inst.Args[1], sz, nextPC)
+	if !ok {
 		lines = append(lines, l.emitUnsupported(inst, "unsupported bextr src")...)
 		return lines, nil
 	}
-
-	l.labelCounter++
-	lblAll := fmt.Sprintf("L_bextr_all_%d", l.labelCounter)
-	lblDone := fmt.Sprintf("L_bextr_done_%d", l.labelCounter)
-
-	lines = append(lines, fmt.Sprintf("    ubfx w16, %s, #0, #8", descCtrl.W))
-	lines = append(lines, fmt.Sprintf("    ubfx w17, %s, #8, #8", descCtrl.W))
-
+	lines = append(lines, ld...)
+	r := "w"
 	if sz == 8 {
-		lines = append(lines, "    lsr x18, x18, x16")
-		lines = append(lines, "    cmp w17, #64")
-		lines = append(lines, fmt.Sprintf("    b.hs %s", lblAll))
-		lines = append(lines, "    mov x16, #1")
-		lines = append(lines, "    lsl x16, x16, x17")
-		lines = append(lines, "    sub x16, x16, #1")
-		lines = append(lines, "    and x18, x18, x16")
-		lines = append(lines, fmt.Sprintf("    b %s", lblDone))
-		lines = append(lines, fmt.Sprintf("%s:", lblAll))
-		lines = append(lines, fmt.Sprintf("%s:", lblDone))
-		storeCode, _ := writeRegFrom(dstReg, "x18", "w18")
-		lines = append(lines, storeCode...)
-		lines = append(lines, fmt.Sprintf("    cmp %s, #0", descDst.X))
-	} else {
-		lines = append(lines, "    lsr w18, w18, w16")
-		lines = append(lines, "    cmp w17, #32")
-		lines = append(lines, fmt.Sprintf("    b.hs %s", lblAll))
-		lines = append(lines, "    mov w16, #1")
-		lines = append(lines, "    lsl w16, w16, w17")
-		lines = append(lines, "    sub w16, w16, #1")
-		lines = append(lines, "    and w18, w18, w16")
-		lines = append(lines, fmt.Sprintf("    b %s", lblDone))
-		lines = append(lines, fmt.Sprintf("%s:", lblAll))
-		lines = append(lines, fmt.Sprintf("%s:", lblDone))
-		storeCode, _ := writeRegFrom(dstReg, "x18", "w18")
-		lines = append(lines, storeCode...)
-		lines = append(lines, fmt.Sprintf("    cmp %s, #0", descDst.W))
+		r = "x"
 	}
-
+	lines = append(lines,
+		fmt.Sprintf("    lsr %s0, %s0, %s1", r, r, r),
+		fmt.Sprintf("    cmp w1, #%d", bits),
+		fmt.Sprintf("    csel %s0, %szr, %s0, hs", r, r, r),
+		fmt.Sprintf("    mov %s3, #1", r),
+		fmt.Sprintf("    lsl %s3, %s3, %s2", r, r, r),
+		fmt.Sprintf("    sub %s3, %s3, #1", r, r),
+		fmt.Sprintf("    cmp w2, #%d", bits),
+		fmt.Sprintf("    csinv %s3, %s3, %szr, lo", r, r, r),
+		fmt.Sprintf("    and %s0, %s0, %s3", r, r, r))
+	if !inst.SkipFlags {
+		lines = append(lines, fmt.Sprintf("    tst %s0, %s0", r, r))
+		l.cpol = carryClear
+	}
+	wc, _ := writeRegFrom(dstReg, "x0", "w0")
+	lines = append(lines, wc...)
 	return lines, nil
 }
 
@@ -2077,45 +2023,54 @@ func (l *Arm64Lifter) liftXgetbv(lines []string) []string {
 	return lines
 }
 
-// liftAndn handles BMI1 ANDN: dst = (~src1) & src2.
+// liftAndn handles BMI1 ANDN: dst = (~src1) & src2. src2 is loaded first: a memory src2 computes
+// its address in x16, which must not hold src1. SF/ZF from the result, CF = OF = 0 (BICS clears
+// C and V: carryClear).
 func (l *Arm64Lifter) liftAndn(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	dstReg, okDst := inst.Inst.Args[0].(x86asm.Reg)
 	s1Reg, okS1 := inst.Inst.Args[1].(x86asm.Reg)
 	src2 := inst.Inst.Args[2]
 
 	descDst, okDD := arm64RegMap[dstReg]
-	_, okDS1 := arm64RegMap[s1Reg]
+	descS1, okDS1 := arm64RegMap[s1Reg]
 	if !okDst || !okDD || !okS1 || !okDS1 {
 		lines = append(lines, l.emitUnsupported(inst, "unsupported andn operands")...)
 		return lines, nil
 	}
-
 	sz := descDst.Size
-	if sz == 0 {
-		sz = 4
+	r := "w"
+	s1 := descS1.W
+	if sz == 8 {
+		r, s1 = "x", descS1.X
 	}
-
-	loadS1, _ := readRegTo(s1Reg, "x16", "w16")
-	lines = append(lines, loadS1...)
-
+	s2 := ""
 	if s2Reg, okS2 := src2.(x86asm.Reg); okS2 {
-		loadS2, _ := readRegTo(s2Reg, "x17", "w17")
-		lines = append(lines, loadS2...)
+		d2, ok := arm64RegMap[s2Reg]
+		if !ok {
+			lines = append(lines, l.emitUnsupported(inst, "unmapped andn src2")...)
+			return lines, nil
+		}
+		s2 = d2.W
+		if sz == 8 {
+			s2 = d2.X
+		}
 	} else if mem, okMem := src2.(x86asm.Mem); okMem {
 		lines = append(lines, readMemTo(mem, nextPC, sz, "x17", "w17")...)
+		s2 = r + "17"
 	} else {
 		lines = append(lines, l.emitUnsupported(inst, "unsupported andn src2")...)
 		return lines, nil
 	}
-
+	dst := descDst.W
 	if sz == 8 {
-		lines = append(lines, "    bics x18, x17, x16")
-	} else {
-		lines = append(lines, "    bics w18, w17, w16")
+		dst = descDst.X
 	}
-
-	storeDst, _ := writeRegFrom(dstReg, "x18", "w18")
-	lines = append(lines, storeDst...)
+	if inst.SkipFlags {
+		lines = append(lines, fmt.Sprintf("    bic %s, %s, %s", dst, s2, s1))
+	} else {
+		lines = append(lines, fmt.Sprintf("    bics %s, %s, %s", dst, s2, s1))
+		l.cpol = carryClear
+	}
 	return lines, nil
 }
 

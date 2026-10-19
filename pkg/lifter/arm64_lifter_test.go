@@ -154,7 +154,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "bt eax, 13",
 			bytes:    []byte{0x0f, 0xba, 0xe0, 0x0d}, // bt eax, 13
 			pc:       0x1000,
-			expected: []string{"ubfx w16, w19, #13, #1", "cmp wzr, w16"},
+			expected: []string{"ubfx x2, x19, #13, #1", "rmif x2, #63, #2"},
 		},
 		{
 			name:     "cvtss2sd xmm0, xmm1",
@@ -226,7 +226,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "bextr ecx, ecx, r8d",
 			bytes:    []byte{0xc4, 0xe2, 0x38, 0xf7, 0xc9}, // bextr ecx, ecx, r8d
 			pc:       0x1000,
-			expected: []string{"ubfx w16, w8, #0, #8", "ubfx w17, w8, #8, #8", "lsr w18, w18, w16", "cmp w21, #0"},
+			expected: []string{"ubfx w1, w8, #0, #8", "ubfx w2, w8, #8, #8", "lsr w0, w0, w1", "csel w0, wzr, w0, hs", "csinv w3, w3, wzr, lo", "tst w0, w0", "mov w21, w0"},
 		},
 		{
 			name:     "vcvttsd2si rax, xmm0",
@@ -370,7 +370,7 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "andn eax, ebx, ecx",
 			bytes:    []byte{0xc4, 0xe2, 0x60, 0xf2, 0xc1},
 			pc:       0x1000,
-			expected: []string{"bics w18, w17, w16", "mov w19, w18"},
+			expected: []string{"bics w19, w21, w20"},
 		},
 		{
 			name:     "vandnps x0, x1, x2",
@@ -442,19 +442,19 @@ func TestArm64LifterBasic(t *testing.T) {
 			name:     "bts rax, 5",
 			bytes:    []byte{0x48, 0x0f, 0xba, 0xe8, 0x05}, // bts rax, 5
 			pc:       0x1000,
-			expected: []string{"ubfx x16, x19, #5, #1", "cmp xzr, x16", "orr x19, x19, x18"},
+			expected: []string{"ubfx x2, x19, #5, #1", "rmif x2, #63, #2", "orr x19, x19, #0x20"},
 		},
 		{
 			name:     "btr rax, 5",
 			bytes:    []byte{0x48, 0x0f, 0xba, 0xf0, 0x05}, // btr rax, 5
 			pc:       0x1000,
-			expected: []string{"ubfx x16, x19, #5, #1", "cmp xzr, x16", "bic x19, x19, x18"},
+			expected: []string{"ubfx x2, x19, #5, #1", "rmif x2, #63, #2", "and x19, x19, #0xffffffffffffffdf"},
 		},
 		{
 			name:     "blsi eax, ebx",
 			bytes:    []byte{0xc4, 0xe2, 0x78, 0xf3, 0xdb}, // blsi eax, ebx
 			pc:       0x1000,
-			expected: []string{"neg w17, w16", "and w19, w16, w17", "msr nzcv"},
+			expected: []string{"neg w1, w0", "and w1, w0, w1", "tst w1, w1", "rmif x2, #63, #2", "mov w19, w1"},
 		},
 		{
 			name:     "shlx eax, ebx, ecx",
@@ -1113,8 +1113,9 @@ func TestTzcntLzcntBsfBsrFlags(t *testing.T) {
 		t.Fatalf("lift tzcnt failed: %v", err)
 	}
 	joinedTzcnt := strings.Join(linesTzcnt, "\n")
-	if !strings.Contains(joinedTzcnt, "cmp w22, #1") {
-		t.Errorf("expected 'cmp w22, #1' in TZCNT output, got:\n%s", joinedTzcnt)
+	// CF = (src == 0), ZF = (result == 0): CMP src then CCMP result.
+	if !strings.Contains(joinedTzcnt, "cmp w0, #0") || !strings.Contains(joinedTzcnt, "ccmp w1, #0, #0, ne") {
+		t.Errorf("expected 'cmp w0, #0' + 'ccmp w1, #0, #0, ne' in TZCNT output, got:\n%s", joinedTzcnt)
 	}
 
 	// 2. CMOVAE ECX, EAX: 0f 43 c8
@@ -1143,8 +1144,8 @@ func TestTzcntLzcntBsfBsrFlags(t *testing.T) {
 		t.Fatalf("lift lzcnt failed: %v", err)
 	}
 	joinedLzcnt := strings.Join(linesLzcnt, "\n")
-	if !strings.Contains(joinedLzcnt, "cmp w22, #1") {
-		t.Errorf("expected 'cmp w22, #1' in LZCNT output, got:\n%s", joinedLzcnt)
+	if !strings.Contains(joinedLzcnt, "cmp w0, #0") || !strings.Contains(joinedLzcnt, "ccmp w1, #0, #0, ne") {
+		t.Errorf("expected 'cmp w0, #0' + 'ccmp w1, #0, #0, ne' in LZCNT output, got:\n%s", joinedLzcnt)
 	}
 
 	// 4. BSF EAX, EDX: 0f bc c2
@@ -1158,8 +1159,8 @@ func TestTzcntLzcntBsfBsrFlags(t *testing.T) {
 		t.Fatalf("lift bsf failed: %v", err)
 	}
 	joinedBsf := strings.Join(linesBsf, "\n")
-	if !strings.Contains(joinedBsf, "tst w22, w22") {
-		t.Errorf("expected 'tst w22, w22' in BSF output, got:\n%s", joinedBsf)
+	if !strings.Contains(joinedBsf, "cmp w0, #0") {
+		t.Errorf("expected 'cmp w0, #0' in BSF output, got:\n%s", joinedBsf)
 	}
 }
 

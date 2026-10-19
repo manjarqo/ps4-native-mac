@@ -145,3 +145,26 @@ func TestRegressMulFlags(t *testing.T) {
 	l = liftBlock(t, "48f7e1") // mul rcx
 	requireInOrder(t, "mul rcx", l[0], "umulh x22, x19, x21", "cmp x2, #0", "rmif x2, #0, #3")
 }
+
+// Bit test, bit counts and BMI: BT changes only CF (it set ZF), TZCNT/LZCNT take CF from the
+// source and ZF from the result, BEXTR with a start >= 32 gives 0, ANDN read its first source
+// from a register its address computation had overwritten, BLSI/BLSR/BLSMSK set CF in the
+// wrong sense.
+func TestRegressBitOps(t *testing.T) {
+	// cmp rax, rbx; bt qword [rax+0x88], 0x20
+	l := liftBlock(t, "4839d8", "480fbaa08800000020")
+	requireInOrder(t, "bt", l[1], "ubfx x2, x17, #32, #1", "rmif x2, #63, #2")
+	forbid(t, "bt", l[1], "cmp ...", "tst ...", "msr nzcv...")
+
+	l = liftBlock(t, "f30fbcc1") // tzcnt eax, ecx
+	requireInOrder(t, "tzcnt", l[0], "rbit w1, w0", "clz w1, w1", "cmp w0, #0", "ccmp w1, #0, #0, ne", "mov w19, w1")
+
+	l = liftBlock(t, "c4e270f780c0000000") // bextr eax, [rax+0xc0], ecx
+	requireInOrder(t, "bextr", l[0], "lsr w0, w0, w1", "cmp w1, #32", "csel w0, wzr, w0, hs")
+
+	l = liftBlock(t, "c4e208f208") // andn ecx, r14d, [rax]
+	requireInOrder(t, "andn", l[0], "ldr w17, [x28, x16]", "bics w21, w17, w14")
+
+	l = liftBlock(t, "c4e278f3c9") // blsr eax, ecx: CF = (src == 0)
+	requireInOrder(t, "blsr", l[0], "cmp w0, #0", "cset w2, eq", "tst w1, w1", "rmif x2, #63, #2", "mov w19, w1")
+}
