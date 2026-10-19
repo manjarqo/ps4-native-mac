@@ -370,6 +370,15 @@ GUEST_FN _guest_exc_fiber_a
     GUEST_CALL _stub_sceFiberReturnToThread
     brk  #3
 
+// ---- Shim call cost: 10M calls of a shim that does nothing (harness.c bench-shim).
+
+GUEST_FN _guest_shim_bench
+    LI   x20, 10000000
+1:  GUEST_CALL _stub_test_noop
+    subs x20, x20, #1
+    b.ne 1b
+    GUEST_RET
+
 // ---- longjmp(env, 1) from guest code.
 
 GUEST_FN _guest_longjmp

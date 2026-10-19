@@ -93,9 +93,10 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 // here in place of a guest function): ctx = the TCB slot. Stores the shim's guest address to
 // ctx->rip (guest code itself never writes ctx->rip) and the 16 GPRs and xmm0-7 to ctx,
 // calls shim(ctx), then reloads from that same ctx (kept in the bridge frame, not looked up
-// again) all 16 GPRs, xmm0-7, the FS base and the memory base. Host code runs with the
-// default FPCR (0: round to nearest, no flush to zero); the bridge keeps the guest FPCR in
-// its frame and restores it on return. A shim reads its arguments and returns its results
+// again) all 16 GPRs, xmm0-7, the FS base and the memory base. Host code runs with
+// round to nearest, FZ as the guest set it; the bridge keeps the guest FPCR in its frame and
+// restores it on return. A nested callback that changes MXCSR leaves the outer guest's FPCR
+// as it was: MXCSR control is callee-saved in System V, so the callback restores it. A shim reads its arguments and returns its results
 // through ctx (rax/rdx, xmm0/xmm1) and may set any GPR (rsp included). xmm8-15, the ymm
 // upper halves (ctx->ymmh is never written) and the flags are not synced: System V makes
 // them caller-saved, so guest code does not expect them to survive a call, and no shim
@@ -207,10 +208,15 @@ _recomp_call_shim:
 
 HOST_SECTION
 Lcall_shim_host:
-    mrs  x3, fpcr                // host code runs with the default FPCR
+    // Host code runs with round to nearest. FZ stays as the guest set it (flush to zero only
+    // changes denormal results of host float math), so a guest with the default rounding mode
+    // - TLOU's threads run with FTZ|DAZ - costs no FPCR write (msr fpcr serialises: ~12 ns).
+    mrs  x3, fpcr
     str  x3, [sp, #32]
-    cbz  x3, 1f
-    msr  fpcr, xzr
+    tst  x3, #0xc00000           // RMode
+    b.eq 1f
+    and  x4, x3, #0xffffffffff3fffff
+    msr  fpcr, x4
 1:
 
     mov  x0, x2
@@ -221,7 +227,8 @@ Lcall_shim_host:
     // TCB slot, and x27 may name another guest thread's TCB by now.
     ldr  x1, [sp, #24]
     ldr  x2, [sp, #32]           // guest FPCR of this call (the frame is the caller's)
-    cbz  x2, 2f                  // host code leaves FPCR at 0
+    tst  x2, #0xc00000           // unchanged unless the guest rounding mode was cleared
+    b.eq 2f
     msr  fpcr, x2
 2:
     LOAD_GPRS x1

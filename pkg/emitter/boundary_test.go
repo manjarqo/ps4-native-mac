@@ -232,3 +232,26 @@ func TestGuestStateBoundary(t *testing.T) {
 		})
 	}
 }
+
+// BenchmarkShimCall reports the cost of a guest call of a shim that does nothing, with the
+// default MXCSR, with flush-to-zero (TLOU threads run with 0x9fc0) and with round down plus
+// flush-to-zero (the only case in which the bridge writes FPCR, twice per call).
+func BenchmarkShimCall(b *testing.B) {
+	t := &testing.T{}
+	bin := buildBoundaryHarness(t)
+	for _, mx := range []string{"0x1f80", "0x9fc0", "0xbfc0"} {
+		b.Run("mxcsr="+mx, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				out, err := exec.Command(bin, "bench-shim", mx).CombinedOutput()
+				if err != nil {
+					b.Fatalf("%v\n%s", err, out)
+				}
+				var ns float64
+				if _, err := fmt.Sscanf(string(out[strings.Index(string(out), ": ")+2:]), "%f", &ns); err != nil {
+					b.Fatalf("%v\n%s", err, out)
+				}
+				b.ReportMetric(ns, "ns/shim")
+			}
+		})
+	}
+}

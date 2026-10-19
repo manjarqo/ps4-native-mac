@@ -8,6 +8,7 @@
 
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <mach/mach_time.h>
 
 // Guest data layout (guest.s has the same addresses).
 #define D 0x1000000ULL
@@ -76,6 +77,8 @@ void guest_spin(void);
 #define SPIN_HANDLE (D + 0x608)
 void guest_crash(void);
 void guest_helper_loop(void);
+void guest_shim_bench(void);
+#define ADDR_SHIM_BENCH 0x401300ULL
 void guest_uc_check(void);
 void guest_exc_fiber_main(void);
 void guest_exc_fiber_a(void);
@@ -362,7 +365,7 @@ void shim_test_fpcr(GuestContext *ctx) {
   SHIM_RETURN();
 }
 
-// Guest code starts with the FPCR of ctx->mxcsr, a shim runs with the default FPCR, the guest
+// Guest code starts with the FPCR of ctx->mxcsr, a shim runs with round to nearest, the guest
 // gets its own back, and the host gets its own back from recomp_enter_guest.
 static void test_fpcr(void) {
   g_proc->mxcsr = 0x5f80; // round up
@@ -370,7 +373,7 @@ static void test_fpcr(void) {
   const uint64_t host_after = read_fpcr();
   const uint64_t *r = gmem64(RES_FPCR_ADDR);
   expect("guest FPCR at entry (MXCSR 0x5f80)", r[0], FPCR_RP);
-  expect("FPCR in the shim", g_shim_fpcr, 0);
+  expect("FPCR in the shim (round to nearest, the guest's FZ)", g_shim_fpcr, FPCR_FZ);
   expect("guest FPCR after the shim", r[1], FPCR_RM | FPCR_FZ);
   expect("host FPCR after recomp_enter_guest", host_after, 0);
   expect("ctx->mxcsr after LDMXCSR", g_proc->mxcsr, 0xbf80);
@@ -593,6 +596,7 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_SPIN, (recomp_fn_t)guest_spin);
   recomp_register_fn(ADDR_CRASH, (recomp_fn_t)guest_crash);
   recomp_register_fn(ADDR_HELPER_LOOP, (recomp_fn_t)guest_helper_loop);
+  recomp_register_fn(ADDR_SHIM_BENCH, (recomp_fn_t)guest_shim_bench);
   recomp_register_fn(ADDR_UC_CHECK, (recomp_fn_t)guest_uc_check);
   recomp_register_fn(ADDR_EXC_FIBER_MAIN, (recomp_fn_t)guest_exc_fiber_main);
   recomp_register_fn(ADDR_EXC_FIBER_A, (recomp_fn_t)guest_exc_fiber_a);
@@ -623,6 +627,15 @@ int main(int argc, char **argv) {
     test_rip();
   } else if (strcmp(c, "profile") == 0) {
     test_profile();
+  } else if (strcmp(c, "bench-shim") == 0) {
+    // bench-shim <mxcsr>: ns per guest call of a shim that does nothing, guest MXCSR <mxcsr>.
+    g_proc->mxcsr = argc > 2 ? (uint32_t)strtoul(argv[2], NULL, 0) : 0x1f80;
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    const uint64_t t0 = mach_absolute_time();
+    recomp_call_guest(g_proc, ADDR_SHIM_BENCH);
+    const double ns = (double)(mach_absolute_time() - t0) * tb.numer / tb.denom;
+    printf("bench-shim mxcsr 0x%x: %.2f ns per shim call\n", g_proc->mxcsr, ns / 1e7);
   } else if (strcmp(c, "signal-in-helper") == 0) {
     test_signal_in_helper();
   } else if (strcmp(c, "exception-fiber") == 0) {
