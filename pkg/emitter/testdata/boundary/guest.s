@@ -203,3 +203,60 @@ GUEST_FN _guest_xmm
 GUEST_FN _guest_xmm_callback
     fadd s0, s0, s0
     GUEST_RET
+
+// ---- recomp_enter_guest is called from C: it must keep the AAPCS64 callee-saved d8-d15,
+// which guest code overwrites (they are the low halves of xmm8-15).
+
+GUEST_FN _guest_clobber_fp
+    movi v8.16b, #0xff
+    movi v9.16b, #0xff
+    movi v10.16b, #0xff
+    movi v11.16b, #0xff
+    movi v12.16b, #0xff
+    movi v13.16b, #0xff
+    movi v14.16b, #0xff
+    movi v15.16b, #0xff
+    GUEST_RET
+
+// Host code. uint64_t host_enter_guest_d8_d15(GuestContext *ctx, uint64_t fn): calls
+// recomp_enter_guest(ctx, fn) with d8-d15 = 8.0 .. 15.0; returns the mask of those changed.
+.text
+.p2align 2
+.globl _host_enter_guest_d8_d15
+_host_enter_guest_d8_d15:
+    stp  x29, x30, [sp, #-80]!
+    mov  x29, sp
+    stp  d8, d9, [sp, #16]
+    stp  d10, d11, [sp, #32]
+    stp  d12, d13, [sp, #48]
+    stp  d14, d15, [sp, #64]
+    fmov d8, #8.0
+    fmov d9, #9.0
+    fmov d10, #10.0
+    fmov d11, #11.0
+    fmov d12, #12.0
+    fmov d13, #13.0
+    fmov d14, #14.0
+    fmov d15, #15.0
+    bl   _recomp_enter_guest
+    mov  x0, #0
+.macro CHECK_D n, val
+    fmov d16, #\val
+    fcmp d\n, d16
+    cset x1, ne
+    orr  x0, x0, x1, lsl #\n
+.endm
+    CHECK_D 8, 8.0
+    CHECK_D 9, 9.0
+    CHECK_D 10, 10.0
+    CHECK_D 11, 11.0
+    CHECK_D 12, 12.0
+    CHECK_D 13, 13.0
+    CHECK_D 14, 14.0
+    CHECK_D 15, 15.0
+    ldp  d8, d9, [sp, #16]
+    ldp  d10, d11, [sp, #32]
+    ldp  d12, d13, [sp, #48]
+    ldp  d14, d15, [sp, #64]
+    ldp  x29, x30, [sp], #80
+    ret

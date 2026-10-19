@@ -63,7 +63,8 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 // keeps that slot pointing at the context that runs on the guest thread: the thread's own
 // GuestContext, or the fiber's while a fiber runs (ps4_fiber.c).
 //
-// Host -> guest, recomp_enter_guest(ctx, fn): saves the host callee-saved x19-x30, loads the
+// Host -> guest, recomp_enter_guest(ctx, fn): saves the host callee-saved x19-x30 and d8-d15
+// (guest code overwrites them: they are the low halves of xmm8-15), loads the
 // 16 GPRs, FS base, memory base and xmm0-7 from ctx, calls fn, and on return stores the 16
 // GPRs and xmm0-7 back to ctx (a callback's vector arguments and result).
 //
@@ -88,15 +89,20 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 // void recomp_enter_guest(GuestContext *ctx, uint64_t target_fn)
 // x0 = ctx, x1 = target_fn
 .globl _recomp_enter_guest
+// Frame: [sp] x29, x30; [sp+16] x19-x28; [sp+96] d8-d15; [sp+160] ctx.
 _recomp_enter_guest:
-    stp  x29, x30, [sp, #-112]!
+    stp  x29, x30, [sp, #-176]!
     mov  x29, sp
     stp  x19, x20, [sp, #16]
     stp  x21, x22, [sp, #32]
     stp  x23, x24, [sp, #48]
     stp  x25, x26, [sp, #64]
     stp  x27, x28, [sp, #80]
-    str  x0,       [sp, #96]
+    stp  d8,  d9,  [sp, #96]
+    stp  d10, d11, [sp, #112]
+    stp  d12, d13, [sp, #128]
+    stp  d14, d15, [sp, #144]
+    str  x0,       [sp, #160]
 
     LOAD_GPRS x0
     LOAD_XMM0_7 x0
@@ -105,7 +111,7 @@ _recomp_enter_guest:
 
     blr  x1
 
-    ldr  x0, [sp, #96]
+    ldr  x0, [sp, #160]
     SAVE_GPRS x0
     SAVE_XMM0_7 x0
 
@@ -114,7 +120,11 @@ _recomp_enter_guest:
     ldp  x23, x24, [sp, #48]
     ldp  x25, x26, [sp, #64]
     ldp  x27, x28, [sp, #80]
-    ldp  x29, x30, [sp], #112
+    ldp  d8,  d9,  [sp, #96]
+    ldp  d10, d11, [sp, #112]
+    ldp  d12, d13, [sp, #128]
+    ldp  d14, d15, [sp, #144]
+    ldp  x29, x30, [sp], #176
     ret
 
 // _recomp_call_shim: calls a host C shim from guest code (see the contract above).

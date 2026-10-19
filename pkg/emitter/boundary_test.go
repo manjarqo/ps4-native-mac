@@ -95,6 +95,7 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"exception-handler-in-shim", "exception", nil},
 		{"shim-sets-gprs", "gprs", nil},
 		{"xmm-arguments-and-results", "xmm", nil},
+		{"enter-guest-keeps-d8-d15", "callee-saved-fp", nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

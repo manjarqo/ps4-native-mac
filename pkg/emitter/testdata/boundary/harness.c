@@ -53,6 +53,8 @@ void guest_exc_handler(void);
 void guest_gprs(void);
 void guest_xmm(void);
 void guest_xmm_callback(void);
+void guest_clobber_fp(void);
+uint64_t host_enter_guest_d8_d15(GuestContext *ctx, uint64_t fn);
 
 static GuestContext *g_proc;
 static int g_failures;
@@ -278,6 +280,14 @@ static void test_xmm(void) {
   for (int i = 1; i < 8; i++) expect_xmm("after the shim", i, &after[i], kXmmByte[i]);
 }
 
+// C code that keeps doubles in d8-d15 across a guest call keeps them.
+static void test_callee_saved_fp(void) {
+  g_proc->rsp -= 8; // the return address recomp_call_guest pushes
+  *gmem64(g_proc->rsp) = 0;
+  const uint64_t changed = host_enter_guest_d8_d15(g_proc, (uint64_t)(uintptr_t)guest_clobber_fp);
+  if (changed) fail("recomp_enter_guest changed callee-saved d8-d15 (mask 0x%llx of bits 8-15)", (unsigned long long)changed);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -306,6 +316,8 @@ int main(int argc, char **argv) {
     test_gprs();
   } else if (strcmp(c, "xmm") == 0) {
     test_xmm();
+  } else if (strcmp(c, "callee-saved-fp") == 0) {
+    test_callee_saved_fp();
   } else {
     fprintf(stderr, "unknown case %s\n", c);
     return 2;
