@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <errno.h>
 
 #define MAX_GNM_OWNERS    256
@@ -2264,7 +2265,23 @@ void shim_sceGnmGetShaderProgramBaseAddress(GuestContext *ctx) {
     SHIM_RETURN();
 }
 
+// The guest thread that submits command buffers feeds the GPU; if the scheduler
+// starves it the GPU idles. Raise it once, like the encoder thread.
+// PS4_GNM_CP_QOS=0 disables this.
+static void gnm_raise_submit_thread_qos(void) {
+    static __thread int done;
+    if (done) return;
+    done = 1;
+    const char *e = getenv("PS4_GNM_CP_QOS");
+    if (e && e[0] == '0') return;
+    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) != 0) return;
+    char name[64] = {0};
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+    printf("[gnm] submit thread '%s' raised to USER_INTERACTIVE\n", name[0] ? name : "unnamed");
+}
+
 void shim_sceGnmSubmitCommandBuffers(GuestContext *ctx) {
+    gnm_raise_submit_thread_qos();
     uint32_t count = (uint32_t)ctx->rdi;
     const uint64_t *dcb_gpu_addrs = (const uint64_t *)recomp_guest_to_host(ctx, ctx->rsi);
     const uint32_t *dcb_sizes_in_bytes = (const uint32_t *)recomp_guest_to_host(ctx, ctx->rdx);
@@ -2275,6 +2292,7 @@ void shim_sceGnmSubmitCommandBuffers(GuestContext *ctx) {
 }
 
 void shim_sceGnmSubmitCommandBuffersForWorkload(GuestContext *ctx) {
+    gnm_raise_submit_thread_qos();
     uint32_t workload = (uint32_t)ctx->rdi;
     uint32_t count = (uint32_t)ctx->rsi;
     const uint64_t *dcb_gpu_addrs = (const uint64_t *)recomp_guest_to_host(ctx, ctx->rdx);
@@ -2286,6 +2304,7 @@ void shim_sceGnmSubmitCommandBuffersForWorkload(GuestContext *ctx) {
 }
 
 void shim_sceGnmSubmitAndFlipCommandBuffers(GuestContext *ctx) {
+    gnm_raise_submit_thread_qos();
     uint32_t count = (uint32_t)ctx->rdi;
     const uint64_t *dcb_gpu_addrs = (const uint64_t *)recomp_guest_to_host(ctx, ctx->rsi);
     const uint32_t *dcb_sizes_in_bytes = (const uint32_t *)recomp_guest_to_host(ctx, ctx->rdx);
@@ -2305,6 +2324,7 @@ void shim_sceGnmSubmitAndFlipCommandBuffers(GuestContext *ctx) {
 }
 
 void shim_sceGnmSubmitAndFlipCommandBuffersForWorkload(GuestContext *ctx) {
+    gnm_raise_submit_thread_qos();
     uint32_t workload = (uint32_t)ctx->rdi;
     uint32_t count = (uint32_t)ctx->rsi;
     const uint64_t *dcb_gpu_addrs = (const uint64_t *)recomp_guest_to_host(ctx, ctx->rdx);

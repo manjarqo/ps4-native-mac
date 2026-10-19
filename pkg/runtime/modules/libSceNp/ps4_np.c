@@ -1,11 +1,35 @@
 #include "ps4_np.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdatomic.h>
 
 // Guest pointer arguments are guest addresses; translate them to host pointers.
 #define NP_GPTR(ctx, a) ((a) ? (void *)((ctx)->mem_base + (a)) : NULL)
 
-#define NP_LOG(fmt, ...) printf("[libSceNp] " fmt "\n", ##__VA_ARGS__)
+// The game polls several NP stubs every frame, and a printf to a redirected
+// stdout can block a job the frame waits on. Each call site prints its first
+// call in full; later calls are only counted, with a summary line at every
+// 1000th call. PS4_NP_LOG_ALL=1 prints every call.
+static int np_log_all(void) {
+    static _Atomic int cached = -1;
+    int v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("PS4_NP_LOG_ALL");
+        v = (e && e[0] == '1') ? 1 : 0;
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+#define NP_LOG(fmt, ...) ({ \
+    static _Atomic unsigned np_log_calls_; \
+    unsigned np_log_n_ = atomic_fetch_add_explicit(&np_log_calls_, 1, memory_order_relaxed) + 1; \
+    if (np_log_n_ == 1 || np_log_all()) \
+        printf("[libSceNp] " fmt "\n", ##__VA_ARGS__); \
+    else if (np_log_n_ % 1000 == 0) \
+        printf("[libSceNp] %s:%d: %u calls\n", __func__, __LINE__, np_log_n_); \
+})
 
 #define NP_REQUEST_OFFSET 0x20000000
 #define NP_AUTH_REQUEST_OFFSET 0x10000000

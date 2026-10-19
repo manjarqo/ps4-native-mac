@@ -104,6 +104,17 @@ static int metal_screen_init_main(int width, int height, const char *title) {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
+        // Opt out of App Nap and timer coalescing for the life of the process;
+        // the game's frame deadlines are far shorter than the coalescing slack.
+        // PS4_NO_LATENCY_ACTIVITY=1 disables this.
+        static id g_latencyActivity;
+        const char *noAct = getenv("PS4_NO_LATENCY_ACTIVITY");
+        if (!g_latencyActivity && !(noAct && noAct[0] == '1')) {
+            g_latencyActivity = [[NSProcessInfo processInfo]
+                beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
+                                  reason:@"game"];
+        }
+
         if (!g_screenDelegate) {
             g_screenDelegate = [[PS4ScreenDelegate alloc] init];
         }
