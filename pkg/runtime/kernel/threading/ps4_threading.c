@@ -154,6 +154,41 @@ static void recomp_thread_epilogue(RecompThread *t, GuestContext *ctx) {
   }
 }
 
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+// PS4_GUEST_WORKER_QOS=<default|utility|initiated|interactive>: QoS class of the game's job
+// workers (guest threads named "NdJobWorkerThread*"), set when the thread starts. Unset means
+// "initiated": above other apps' default-class work, which otherwise takes the cores from the
+// workers while a frame waits for a job, and below the CP, encoder and audio threads
+// (USER_INTERACTIVE). "default" leaves the class the thread got at creation (QOS_CLASS_DEFAULT).
+// Idle workers spin instead of sleeping, so "interactive" puts six spinning threads next to the
+// CP and encoder threads; it exists for experiments only.
+static void guest_worker_apply_qos(const char *name) {
+  static const char kPrefix[] = "NdJobWorkerThread";
+  if (strncmp(name, kPrefix, sizeof kPrefix - 1) != 0) return;
+  const char *e = getenv("PS4_GUEST_WORKER_QOS");
+  if (!e || !e[0]) e = "initiated";
+  if (strcmp(e, "default") == 0) return;
+  qos_class_t cls;
+  if (strcmp(e, "utility") == 0) cls = QOS_CLASS_UTILITY;
+  else if (strcmp(e, "initiated") == 0) cls = QOS_CLASS_USER_INITIATED;
+  else if (strcmp(e, "interactive") == 0) cls = QOS_CLASS_USER_INTERACTIVE;
+  else {
+    fprintf(stderr, "[ps4-thread] PS4_GUEST_WORKER_QOS='%s' unknown (default|utility|initiated|interactive); unchanged\n", e);
+    return;
+  }
+  qos_class_t before = QOS_CLASS_UNSPECIFIED;
+  int rel = 0;
+  pthread_get_qos_class_np(pthread_self(), &before, &rel);
+  int err = pthread_set_qos_class_self_np(cls, 0);
+  if (err != 0) {
+    fprintf(stderr, "[ps4-thread] '%s': setting QoS %s failed: error %d\n", name, e, err);
+    return;
+  }
+  fprintf(stderr, "[ps4-thread] '%s': QoS 0x%x -> %s (0x%x)\n", name, (unsigned)before, e, (unsigned)cls);
+}
+#endif
+
 static void *recomp_host_thread_runner(void *arg) {
   RecompThread *t = (RecompThread *)arg;
   GuestContext *ctx = t->ctx;
@@ -163,6 +198,7 @@ static void *recomp_host_thread_runner(void *arg) {
   if (t->name[0] != '\0') {
 #if defined(__APPLE__)
     pthread_setname_np(t->name);
+    guest_worker_apply_qos(t->name);
 #elif defined(__linux__)
     pthread_setname_np(t->host_thread, t->name);
 #endif
