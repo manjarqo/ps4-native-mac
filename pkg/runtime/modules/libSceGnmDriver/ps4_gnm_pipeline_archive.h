@@ -20,8 +20,14 @@ namespace ps4gnm_pso_archive {
 // processes that no longer run are removed. Returns false (archive disabled) only when Metal
 // cannot create an archive or the index cannot be written, or with PS4_GNM_NO_PSO_ARCHIVE=1
 // (only the value "1").
+// Only one process changes the directory: Open takes <dir>/pipelines.lock (flock, held until the
+// process ends). If another process holds it, the archive opens lookup only: the files its index
+// lists are attached and their keys known, but nothing is added, saved, evicted, rewritten or
+// cleaned up (returns false only if the index is missing or not for this OS/GPU).
 bool Open(id<MTLDevice> dev, const std::string& dir, uint64_t budget_bytes);
 bool Enabled();
+// True if Open found the directory owned by another process.
+bool LookupOnly();
 // Makes pipeline creation look in the archive first (descriptor.binaryArchives).
 void Attach(MTLRenderPipelineDescriptor* d);
 void Attach(MTLComputePipelineDescriptor* d);

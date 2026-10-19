@@ -6,13 +6,19 @@
 // PS4_GNM_PSO_ARCHIVE_MAX_FILES) must delete the oldest files and their keys and keep the newest
 // one served from the archive, evicted checks that the rewritten index kept exactly that, and
 // budgetstop (1 byte budget) must stop accepting pipelines once a file passes the budget.
+// hold opens the archive (owning it) and sleeps; lookup, run meanwhile on the same directory after
+// write, must open lookup only, find the archived pipelines, and adding and saving must change no
+// file in the directory.
 #import <Metal/Metal.h>
 #include "ps4_gnm_pipeline_archive.h"
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <map>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <vector>
 
 // The nonce (one per test-suite run, passed by the driver) is baked into the shader code so that
 // pipeline caches left by earlier runs cannot satisfy this run.
@@ -37,6 +43,30 @@ static int ArchiveFiles(const std::string& dir) {
     return n;
 }
 
+// Name -> size, modification time and contents of every file in dir.
+static std::map<std::string, std::string> Snapshot(const std::string& dir) {
+    std::map<std::string, std::string> m;
+    if (DIR* d = opendir(dir.c_str())) {
+        while (dirent* de = readdir(d)) {
+            if (de->d_name[0] == '.') continue;
+            const std::string p = dir + "/" + de->d_name;
+            struct stat st;
+            if (stat(p.c_str(), &st) != 0) continue;
+            std::string v = std::to_string((long long)st.st_size) + ":" + std::to_string((long long)st.st_mtimespec.tv_sec) +
+                            "." + std::to_string((long long)st.st_mtimespec.tv_nsec) + ":";
+            if (FILE* f = fopen(p.c_str(), "rb")) {
+                std::vector<char> buf(1 << 16);
+                size_t n;
+                while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) v.append(buf.data(), n);
+                fclose(f);
+            }
+            m[de->d_name] = v;
+        }
+        closedir(d);
+    }
+    return m;
+}
+
 static int Fail(const char* what) {
     printf("pso_archive_test: FAIL (%s)\n", what);
     return 1;
@@ -44,7 +74,7 @@ static int Fail(const char* what) {
 
 int main(int argc, char** argv) {
     if (argc != 4)
-        return Fail("usage: pso_archive_test <write|read|append|read2|budget|corrupt|stale|add<k>|evict|evicted|budgetstop> <dir> <nonce>");
+        return Fail("usage: pso_archive_test <write|read|append|read2|budget|corrupt|stale|add<k>|evict|evicted|budgetstop|hold|lookup> <dir> <nonce>");
     const std::string mode = argv[1], dir = argv[2], nonce = argv[3];
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -97,7 +127,16 @@ int main(int argc, char** argv) {
             return d;
         };
         const uint64_t budget = mode == "budget" || mode == "budgetstop" ? 1 : (64ull << 20);
+        const std::map<std::string, std::string> before = Snapshot(dir);
         if (!ps4gnm_pso_archive::Open(dev, dir, budget)) return Fail("open");
+        if (ps4gnm_pso_archive::LookupOnly() != (mode == "lookup")) return Fail("wrong lookup-only state");
+        if (mode == "hold") {
+            // the driver waits for this line, runs lookup, then kills this process
+            printf("pso_archive_test: holding %s\n", dir.c_str());
+            fflush(stdout);
+            sleep(120);
+            return Fail("hold: not killed");
+        }
         if (mode.size() == 4 && mode.compare(0, 3, "add") == 0 && isdigit((unsigned char)mode[3])) {
             const int k = mode[3] - '0';
             MTLRenderPipelineDescriptor* d = numbered(k);
@@ -121,6 +160,24 @@ int main(int argc, char** argv) {
             for (int k = 0; k < 6; ++k)
                 if ((stat((dir + "/pipelines-" + std::to_string(k) + ".metalar").c_str(), &st) == 0) != (k >= 3))
                     return Fail("evict: wrong files kept");
+        } else if (mode == "lookup") {
+            if (Snapshot(dir) != before) return Fail("lookup: Open changed the directory");
+            if (!ps4gnm_pso_archive::Contains(1) || !ps4gnm_pso_archive::Contains(2)) return Fail("lookup: keys not loaded");
+            ps4gnm_pso_archive::Attach(rd);
+            // only the file of the write session; no archive for additions
+            if (rd.binaryArchives.count != 1) return Fail("lookup: wrong archives attached");
+            if (![dev newRenderPipelineStateWithDescriptor:rd options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                reflection:nil error:&e])
+                return Fail("lookup: archived pipeline not served from the archive");
+            ps4gnm_pso_archive::Attach(rd3);
+            if (![dev newRenderPipelineStateWithDescriptor:rd3 error:&e]) return Fail("lookup: render build");
+            ps4gnm_pso_archive::Add(3, rd3);
+            ps4gnm_pso_archive::Add(4, cd);
+            if (ps4gnm_pso_archive::Contains(3) || ps4gnm_pso_archive::Contains(4)) return Fail("lookup: pipeline accepted");
+            ps4gnm_pso_archive::StartPeriodicSave(0.05);
+            if (!ps4gnm_pso_archive::SaveNow(30)) return Fail("lookup: save");
+            usleep(200 * 1000);
+            if (Snapshot(dir) != before) return Fail("lookup: adding or saving changed the directory");
         } else if (mode == "budgetstop") {
             ps4gnm_pso_archive::Attach(rd);
             if (![dev newRenderPipelineStateWithDescriptor:rd error:&e]) return Fail("budgetstop: render build");

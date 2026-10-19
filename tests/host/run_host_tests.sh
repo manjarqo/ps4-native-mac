@@ -44,6 +44,17 @@ NONCE=$(( $(date +%s) % 100000 * 10 + RANDOM % 10 ))
 "$T/pso_archive_test" budget "$A" $NONCE
 "$T/pso_archive_test" write "$A" $NONCE
 "$T/pso_archive_test" corrupt "$A" $NONCE
+# Two processes on one directory: hold owns it, lookup (meanwhile) must change nothing; once
+# hold is gone, read owns it again.
+L="$T/shared"; mkdir -p "$L"
+"$T/pso_archive_test" write "$L" $NONCE
+"$T/pso_archive_test" hold "$L" $NONCE > "$T/hold.txt" &
+HOLD=$!
+for n in $(seq 300); do grep -q holding "$T/hold.txt" && break; sleep 0.1; done
+grep -q holding "$T/hold.txt" || { echo "pso_archive_test: hold did not start"; kill $HOLD; exit 1; }
+"$T/pso_archive_test" lookup "$L" $NONCE || { kill $HOLD; exit 1; }
+kill $HOLD; wait $HOLD 2>/dev/null || true
+"$T/pso_archive_test" read "$L" $NONCE
 # eviction: 6 one-pipeline files, then a cap of 4 files
 E="$T/evict"; mkdir -p "$E"
 for k in 0 1 2 3 4 5; do "$T/pso_archive_test" add$k "$E" $NONCE; done

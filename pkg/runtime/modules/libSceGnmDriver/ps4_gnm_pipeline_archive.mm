@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <map>
 #include <mutex>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -34,6 +35,8 @@ struct ArchiveState {
     id<MTLDevice> dev = nil;
     std::atomic<bool> enabled{false};           // Open succeeded (lookups and saves work)
     std::atomic<bool> adding{false};            // new pipelines are accepted (false once over budget)
+    bool lookup_only = false;                   // another process owns the directory; set by Open
+    int lock_fd = -1;                           // <dir>/pipelines.lock, held for the life of the process
     id<MTLBinaryArchive> archive = nil;         // additions since the last save (written to `path`); q only
     NSArray<id<MTLBinaryArchive>>* list = nil; // all archives (files read and written, then `archive`); mu
     std::string dir, path, index_path;          // path: q only
@@ -342,13 +345,71 @@ NSArray<id<MTLBinaryArchive>>* List() {
 }
 } // namespace
 
+namespace {
+// Takes <dir>/pipelines.lock (flock, never released: the fd stays open until the process ends,
+// and the kernel drops the lock with it, also after a crash). Returns false if another process
+// holds it or the lock cannot be taken at all.
+bool TakeDirLock(const std::string& dir) {
+    const std::string p = dir + "/pipelines.lock";
+    const int fd = open(p.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "[gnm-pso-archive] cannot open %s (errno %d)\n", p.c_str(), errno);
+        return false;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno != EWOULDBLOCK)
+            fprintf(stderr, "[gnm-pso-archive] cannot lock %s (errno %d)\n", p.c_str(), errno);
+        close(fd);
+        return false;
+    }
+    A.lock_fd = fd;
+    return true;
+}
+
+// Another process owns the directory: attach the files its index lists and know their keys, but
+// change nothing (no temp cleanup, eviction, index rewrite, additions or saves). The owner may
+// rewrite or append to the index meanwhile: the rename is atomic and LoadIndex ignores a partial
+// trailing record. A file the owner deletes before it is opened here is skipped.
+bool OpenLookupOnly(id<MTLDevice> dev, const std::string& dir) {
+    fprintf(stderr, "[gnm-pso-archive] another process owns the archive: lookup only\n");
+    std::map<int, std::vector<uint64_t>> records;
+    if (!LoadIndex(CurrentHeader(dev), records)) {
+        fprintf(stderr, "[gnm-pso-archive] %s is missing, corrupt or not for this OS/GPU: no archive this session\n",
+                A.index_path.c_str());
+        return false;
+    }
+    NSMutableArray<id<MTLBinaryArchive>>* list = [NSMutableArray array];
+    size_t files = 0;
+    for (int n : ListFiles(dir)) {
+        NSError* e = nil;
+        id<MTLBinaryArchive> a = NewArchive(dev, [NSURL fileURLWithPath:@(FilePath(n).c_str())], &e);
+        if (!a) continue;
+        [list addObject:a];
+        ++files;
+        if (auto it = records.find(n); it != records.end()) A.keys.insert(it->second.begin(), it->second.end());
+    }
+    A.dev = dev;
+    A.list = list;
+    A.lookup_only = true;
+    A.enabled = true;
+    A.adding = false;
+    fprintf(stderr, "[gnm-pso-archive] %s: %zu pipelines in %zu files (lookup only)\n", dir.c_str(), A.keys.size(),
+            files);
+    return true;
+}
+} // namespace
+
 bool Open(id<MTLDevice> dev, const std::string& dir, uint64_t budget_bytes) {
     const char* off = getenv("PS4_GNM_NO_PSO_ARCHIVE");
     if (off && strcmp(off, "1") == 0) return false;
     A.dir = dir;
     A.index_path = dir + "/pipelines_archived.bin";
     A.budget = budget_bytes;
-    A.q = dispatch_queue_create("ps4.gnm.pso_archive", DISPATCH_QUEUE_SERIAL);
+    // Two processes may share the directory (the owner's game and a benchmark): only the one
+    // holding the lock changes files; the other only looks pipelines up.
+    if (!TakeDirLock(dir)) return OpenLookupOnly(dev, dir);
+    A.q = dispatch_queue_create("ps4.gnm.pso_archive",
+                                dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
     RemoveStaleTemps(dir);
     const IndexHeader cur = CurrentHeader(dev);
     std::map<int, std::vector<uint64_t>> records;
@@ -430,6 +491,10 @@ bool Enabled() {
     return A.enabled;
 }
 
+bool LookupOnly() {
+    return A.lookup_only;
+}
+
 void Attach(MTLRenderPipelineDescriptor* d) {
     if (NSArray<id<MTLBinaryArchive>>* l = List()) d.binaryArchives = l;
 }
@@ -459,17 +524,21 @@ bool SaveNow(double timeout_s) {
     if (!A.q) return true;
     __block bool ok = false;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
-    dispatch_async(A.q, ^{
-        ok = SaveOnQueue(SaveKind::Now);
-        dispatch_semaphore_signal(done);
-    });
+    // The queue runs at utility QoS; the quit save has a short budget, so its block (and the
+    // queued additions ahead of it, through QoS override) runs at user-initiated QoS.
+    dispatch_block_t b = dispatch_block_create_with_qos_class(DISPATCH_BLOCK_ENFORCE_QOS_CLASS, QOS_CLASS_USER_INITIATED,
+                                                              0, ^{
+                                                                  ok = SaveOnQueue(SaveKind::Now);
+                                                                  dispatch_semaphore_signal(done);
+                                                              });
+    dispatch_async(A.q, b);
     if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout_s * NSEC_PER_SEC))) != 0)
         return false;
     return ok;
 }
 
 void StartPeriodicSave(double period_s) {
-    if (!A.enabled || A.timer) return;
+    if (!A.enabled || A.lookup_only || A.timer) return;
     A.timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, A.q);
     const uint64_t ns = (uint64_t)(period_s * NSEC_PER_SEC);
     dispatch_source_set_timer(A.timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)ns), ns, NSEC_PER_SEC);
