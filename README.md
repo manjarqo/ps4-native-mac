@@ -7,11 +7,11 @@ A macOS Apple Silicon ahead-of-time (AOT) recompiler that translates PlayStation
 
 ## Features
 
-- **AOT C Compiler**: Recovers functions, CFG, and jump tables, translating AMD64 instructions into partitioned C for parallel Apple Clang compilation.
+- **Native ARM64 Assembly AOT Compiler**: Recovers functions, CFG, and jump tables, translating AMD64 instructions directly into native ARM64 assembly (`.s`) chunks for fast, parallel Apple Clang assembler compilation without intermediate C translation overhead.
 - **Native Metal Graphics & GNM Driver**: Direct Apple Metal PM4 Command Processor, hardware context tracking, tessellation ring buffers, zero-copy UMA buffer mapping, and SPIRV-Cross shader translation to MSL with hardware VSync via `CAMetalLayer`.
-- **Orbis & POSIX Subsystems**: Shims for memory (UMA), threads, sync, events, networking (`libSceNet`/BSD sockets), and VFS path virtualization (`/app0`).
+- **Orbis & POSIX Subsystems**: Shims for memory (UMA), multi-threading (pthreads / Orbis threads), synchronization primitives, events, networking (`libSceNet`/BSD sockets), and VFS path virtualization (`/app0`).
 - **Media & Hardware**: Low-latency PCM audio (`AudioToolbox`), DualSense/DS4 support (`GameController.framework`), and Cocoa modal dialogs.
-- **Tooling & Bundling**: Static PRX module linking, and automatic macOS `.app` bundle generation.
+- **Tooling & Bundling**: Companion PRX module analysis, static linking, and automatic macOS `.app` bundle generation.
 
 ---
 
@@ -103,11 +103,31 @@ Recompile the extracted Orbis binary and package it into a native standalone app
 ./ps4-recomp path/to/extracted_game/eboot.bin --app-dir /path/to/extracted_game --copy-resources -o output_dir -c
 ```
 
+### 3. CLI Options
+
+| Flag                    | Description                                                          | Default       |
+| ----------------------- | -------------------------------------------------------------------- | ------------- |
+| `-o`, `-out <dir>`      | Output directory for generated code and binaries                     | `"build"`     |
+| `-e`, `-elf <file>`     | Path to input PS4 ELF binary                                         | —             |
+| `-c`, `-compile`        | Compile emitted assembly to native ARM64 binary with Clang           | `true`        |
+| `-j`, `-jobs <num>`     | Number of parallel Clang assembler workers                           | `NumCPU`      |
+| `-O`, `-opt <level>`    | Clang optimization level (`0`, `1`, `2`, `3`, `s`, `z`)              | `"2"`         |
+| `-r`, `-run`            | Run the compiled binary after successful recompilation               | `false`       |
+| `-t`, `-timeout <sec>`  | Watchdog timeout in seconds when running binary (`0` = no timeout)   | `0`           |
+| `-a`, `-all-symbols`    | Recompile all symbols in symbol table even if unreachable            | `false`       |
+| `-k`, `-chunk-size <n>` | Number of functions per emitted ARM64 assembly chunk file            | `250`         |
+| `-v`, `-verbose`        | Enable verbose output and detailed timing breakdown                  | `false`       |
+| `--app-dir <dir>`       | Host directory mapping to `/app0` for game assets                    | Auto-detected |
+| `--copy-resources`      | Copy all game assets/resources into macOS `.app` bundle `Resources/` | `false`       |
+| `--asan`                | Compile runtime with AddressSanitizer and LeakSanitizer              | `false`       |
+
 ---
 
 ## Commercial Game Milestones
 
-### Hollow Knight: Silksong (Unity 6)
+### Hollow Knight: Silksong (Unity 6 / Il2Cpp)
+
+Silksong boots into the native Unity 6 engine runtime on Apple Silicon, initializes the Boehm GC subsystem with registered host/guest stack boundaries, establishes the Metal display layer (`CAMetalLayer`), and launches over 30 concurrent engine and audio worker threads (`FMOD stream thread`, `Job.Worker`, `AsyncReadManager`):
 
 ```text
 [ps4-recomp] Initializing runtime...
@@ -116,42 +136,41 @@ Recompile the extracted Orbis binary and package it into a native standalone app
 [ps4-mem] SceLibcMallocReplace at 0x20000f8: size=0x78 init=0x14db270 malloc=0x14dba10
 [ps4-recomp] Initializing custom memory allocator via SceLibcParam at 0x14db270...
 [ps4-mem] sceKernelAllocateDirectMemory: start=0x0 end=0x800000000 len=268435456 (256.00 MB) align=2097152 type=0
-[ps4-mem] sceKernelMapDirectMemory: in=0x0 len=268435456 (256.00 MB) prot=0x33 flags=0x0 phys=0x0 align=2097152
-[ps4-vm] recomp_vm_alloc_named_aligned (direct_mem): size=268435456 (256.00 MB) align=2097152 flags=0x0
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0x8400000
 [ps4-mem] sceKernelMapDirectMemory SUCCESS: out=0x8400000
-[ps4-mem] sceKernelSetVirtualRangeName: addr=0x8400000 len=268435456 name='dlmalloc_extra'
 [ps4-recomp] Initializing libc malloc subsystem via _malloc_init at 0x2ca7a00...
 [ps4-kernel] _sceKernelRtldSetApplicationHeapAPI: table at 0x2da4178
-[ps4-kernel] heap_malloc=0x14dba10, heap_free=0x14db9b0
-[ps4-vm] recomp_vm_alloc_named_aligned (heap_trace_info): size=4096 (0.00 MB) align=4096 flags=0x0
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0x82f0000
-[ps4-mem] sceKernelAllocateDirectMemory: start=0x0 end=0x800000000 len=268435456 (256.00 MB) align=2097152 type=0
-[ps4-mem] sceKernelMapDirectMemory: in=0x0 len=268435456 (256.00 MB) prot=0x33 flags=0x0 phys=0x10000000 align=2097152
-[ps4-vm] recomp_vm_alloc_named_aligned (direct_mem): size=268435456 (256.00 MB) align=2097152 flags=0x0
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0x18400000
-[ps4-mem] sceKernelMapDirectMemory SUCCESS: out=0x18400000
-[ps4-mem] sceKernelSetVirtualRangeName: addr=0x18400000 len=268435456 name='dlmalloc_extra'
 [ps4-recomp] Executing _start (0x13550)...
-........
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0xd5740000
-[ps4-mem] sceKernelReserveVirtualRange SUCCESS: out=0xd5740000
-[ps4-mem] sceKernelReserveVirtualRange: in=0x298c0000 len=1048576 (1.00 MB) flags=0x10 align=0
-[ps4-vm] recomp_vm_alloc_fixed (reserved): desired=0x298c0000 size=1048576 (1.00 MB)
-[ps4-mem] sceKernelReserveVirtualRange SUCCESS: out=0x298c0000
-[ps4-mem] sceKernelCheckedReleaseDirectMemory: phys=0x0 len=1048576
-[ps4-unwind] GetModuleInfoForUnwind: addr=0x2d36ed1 -> mod=libc.prx, hdr=0x0, frame=0x0 (size=0x0)
-[ps4-unwind] GetModuleInfoForUnwind: addr=0x2d37054 -> mod=libc.prx, hdr=0x0, frame=0x0 (size=0x0)
-[ps4-unwind] GetModuleInfoForUnwind: addr=0x2d368a5 -> mod=libc.prx, hdr=0x0, frame=0x0 (size=0x0)
-Terminating due to uncaught exception 195a3440 of type Il2CppExceptionWrapper
-
-FATAL: Unresolved indirect jump/call to 0x0 (return addr=0x2d35b16)
-Registers:
-  RAX=0x0000000000000000 RBX=0x00000000195a3440 RCX=0x00000000195a3440 RDX=0x0000000000000000
-  RSI=0x0000000000000001 RDI=0x0000000000000000 RBP=0x00000007ffffa2d0 RSP=0x00000007ffffa2c8
-  R8 =0x00000000184001f8 R9 =0x00000000184001f8 R10=0x0000000018400000 R11=0x000000000000001c
-  R12=0x00000000082d0468 R13=0x00000000195a3440 R14=0x0000000000000000 R15=0x00000000075b0000
-Guest call stack heuristic (RSP=0x7ffffa2c8):
+...
+[ps4-mem] sceKernelMapDirectMemory SUCCESS: out=0xd0ca0000
+[ps4-gnm-metal] Native Apple Metal GNM Command Processor initialized (Apple M1)
+[videoout] Presenting frame 4294967296 (buffer 0, 1920x1080)
+[videoout] sceVideoOutSubmitFlip: handle=1 buf=0 flipQueueReg=1 (num=2)
+[videoout] sceVideoOutGetFlipStatus: handle=1 num=2 currentBuf=0
+[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=200704 (0.19 MB) align=4096 flags=0x0
+[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0xd4731000
+[ps4-thread] Thread created: id=1041, name='UnityGfxDeviceWorker', entry=0xb2d420, arg=0x2891d0b0
+[ps4-thread] Thread started: id=1041, name='UnityGfxDeviceWorker', entry=0xb2d420, arg=0x2891d0b0
+...
+[ps4-sys] open: '/app0/Media/Resources/unity default resources' (resolved='/Volumes/Samsung T7/Hollow Knight Silksong/game/Media/Resources/unity default resources', flags=0x0) -> fd=10
+[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=331776 (0.32 MB) align=4096 flags=0x0
+[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0xd4800000
+[ps4-thread] Thread created: id=1042, name='FMOD mixer thread', entry=0x19aef40, arg=0xd0157848
+[ps4-thread] Thread started: id=1042, name='FMOD mixer thread', entry=0x19aef40, arg=0xd0157848
+[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=86016 (0.08 MB) align=4096 flags=0x0
+[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0xd4762000
+[ps4-thread] Thread created: id=1043, name='FMOD AudioOut thread', entry=0x19aef40, arg=0xd01576f0
+[ps4-thread] Thread started: id=1043, name='FMOD AudioOut thread', entry=0x19aef40, arg=0xd01576f0
+[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=200704 (0.19 MB) align=4096 flags=0x0
+[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0xd4851000
+[ps4-thread] Thread created: id=1044, name='FMOD stream thread', entry=0x19aef40, arg=0xd0151338
+[ps4-thread] Thread started: id=1044, name='FMOD stream thread', entry=0x19aef40, arg=0xd0151338
+[gnm] sceGnmSubmitDone called (total=2)
+Forcing submitDone to avoid TRC R4089 breach
+[gnm] sceGnmSubmitDone called (total=3)
+Forcing submitDone to avoid TRC R4089 breach
+[gnm] sceGnmSubmitDone called (total=4)
+Forcing submitDone to avoid TRC R4089 breach
+^C
 ```
 
 ### Hogwarts Legacy (Unreal Engine 4)
@@ -204,8 +223,8 @@ Failed to allocate virtual address space. (Original Type: CPU, Type: CPU, Size: 
     ├── analyzer/        # Instruction coverage & CFG analyzer
     ├── disasm/          # Disassembly & jump tables
     ├── elfloader/       # ELF64 / PRX loader & relocations
-    ├── lifter/          # AMD64 to C lifter (ALU, SIMD, AVX, FPU)
-    ├── emitter/         # Partitioned C emitter & Clang driver
+    ├── lifter/          # AMD64 to ARM64 assembly lifter (ALU, SIMD, AVX, FPU, string ops)
+    ├── emitter/         # Partitioned ARM64 assembly emitter & Clang driver
     └── runtime/         # macOS host runtime & Orbis/POSIX kernel ABI
         ├── core/        # Guest context & register state
         └── modules/     # libSce (VideoOut, AudioOut, Net, Pad, etc.)

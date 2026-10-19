@@ -177,7 +177,7 @@ func TestPRXDynsymBindsMemcpyShim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := NewCEmitter(loaded, nil, nil)
+	e := NewAsmEmitter(loaded, nil, nil)
 	wantNID := elfloader.CalculateNID("memcpy")
 	var memcpyAddr uint64
 	for _, sym := range loaded.DynSymbols {

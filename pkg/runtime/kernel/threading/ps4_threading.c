@@ -47,7 +47,7 @@ static void register_thread(RecompThread *t) {
 }
 
 RecompThread *recomp_find_thread(uint64_t handle) {
-  if (handle == 0) return NULL;
+  if (handle == 0) return g_current_thread;
   pthread_mutex_lock(&g_threads_mutex);
   RecompThread *curr = g_threads;
   while (curr) {
@@ -88,6 +88,13 @@ static inline RecompThread *find_thread(uint64_t handle) {
   return recomp_find_thread(handle);
 }
 
+const char *recomp_get_current_thread_name(void) {
+  if (g_current_thread && g_current_thread->name[0]) {
+    return g_current_thread->name;
+  }
+  return "main";
+}
+
 static void unregister_thread(RecompThread *t) {
   pthread_mutex_lock(&g_threads_mutex);
   RecompThread **curr = &g_threads;
@@ -107,6 +114,12 @@ void recomp_init_main_thread(GuestContext *ctx) {
   g_main_thread_obj.host_thread = pthread_self();
   g_main_thread_obj.thread_id = ctx->thread_id ? ctx->thread_id : 1000;
   g_main_thread_obj.ctx = ctx;
+  g_main_thread_obj.stack_base = ctx->stack_base;
+  g_main_thread_obj.stack_size = ctx->stack_alloc_size;
+  strncpy(g_main_thread_obj.name, "main", sizeof(g_main_thread_obj.name) - 1);
+  if (ctx->fs_base && ctx->mem_base) {
+    *(uint64_t *)(ctx->mem_base + ctx->fs_base + 0x10ULL) = (uint64_t)&g_main_thread_obj;
+  }
   g_current_thread = &g_main_thread_obj;
   register_thread(&g_main_thread_obj);
 }
@@ -257,11 +270,17 @@ void shim_pthread_create(GuestContext *ctx) {
   child_ctx->thread_id = t->thread_id;
 
   t->ctx = child_ctx;
+  t->stack_base = child_ctx->stack_base;
+  t->stack_size = stack_size;
   t->start_routine = start_routine;
   t->arg = arg;
   t->finished = false;
   t->joined = false;
   t->detached = false;
+
+  if (child_ctx->fs_base && ctx->mem_base) {
+    *(uint64_t *)(ctx->mem_base + child_ctx->fs_base + 0x10ULL) = (uint64_t)t;
+  }
 
   register_thread(t);
 
@@ -668,6 +687,8 @@ void shim_scePthreadCreate(GuestContext *ctx) {
   child_ctx->thread_id = t->thread_id;
 
   t->ctx = child_ctx;
+  t->stack_base = child_ctx->stack_base;
+  t->stack_size = stack_size;
   t->start_routine = start_routine;
   t->arg = arg;
   t->finished = false;
@@ -679,6 +700,10 @@ void shim_scePthreadCreate(GuestContext *ctx) {
       strncpy(t->name, name, sizeof(t->name) - 1);
       t->name[sizeof(t->name) - 1] = '\0';
     }
+  }
+
+  if (child_ctx->fs_base && ctx->mem_base) {
+    *(uint64_t *)(ctx->mem_base + child_ctx->fs_base + 0x10ULL) = (uint64_t)t;
   }
 
   register_thread(t);
@@ -875,15 +900,77 @@ void shim_scePthreadAttrGetdetachstate(GuestContext *ctx) {
 }
 
 void shim_scePthreadAttrGet(GuestContext *ctx) {
+  uint64_t thread_handle = ctx->rdi;
   uint64_t attr_addr = ctx->rsi;
   RecompPthreadAttr *pattr = get_pthread_attr(ctx, attr_addr);
-  if (pattr) {
-    pattr->sched_policy = 1;
-    pattr->sched_inherit = 0;
-    pattr->prio = 700;
-    pattr->stacksize_attr = 2 * 1024 * 1024;
-    pattr->cpuset = 0x7f;
+  if (!pattr) {
+    if (attr_addr && ctx->mem_base) {
+      pattr = (RecompPthreadAttr *)calloc(1, sizeof(RecompPthreadAttr));
+      *(uint64_t *)(ctx->mem_base + attr_addr) = (uint64_t)pattr;
+    }
   }
+  if (!pattr) {
+    ctx->rax = 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+    SHIM_RETURN();
+  }
+
+  RecompThread *t = thread_handle ? find_thread(thread_handle) : g_current_thread;
+  if (!t) {
+    t = g_current_thread;
+  }
+
+  pattr->sched_policy = 1;
+  pattr->sched_inherit = 0;
+  pattr->prio = 700;
+  pattr->cpuset = 0x7f;
+
+  if (t) {
+    pattr->stackaddr_attr = t->stack_base ? t->stack_base : (t->ctx ? t->ctx->stack_base : 0);
+    pattr->stacksize_attr = t->stack_size ? t->stack_size : (t->ctx ? t->ctx->stack_alloc_size : 2 * 1024 * 1024);
+    if (t->detached) {
+      pattr->flags |= 1;
+    }
+  } else {
+    pattr->stackaddr_attr = 0;
+    pattr->stacksize_attr = 2 * 1024 * 1024;
+  }
+
+  fprintf(stderr, "[ps4-thread] scePthreadAttrGet: thread=0x%llx -> stackaddr=0x%llx, stacksize=%llu\n",
+          (unsigned long long)thread_handle, (unsigned long long)pattr->stackaddr_attr, (unsigned long long)pattr->stacksize_attr);
+
+  ctx->rax = 0;
+  SHIM_RETURN();
+}
+
+void shim_sceKernelIsStack(GuestContext *ctx) {
+  uint64_t addr = ctx->rdi;
+  uint64_t start_ptr = ctx->rsi;
+  uint64_t end_ptr = ctx->rdx;
+
+  uint64_t stack_start = 0;
+  uint64_t stack_end = 0;
+
+  pthread_mutex_lock(&g_threads_mutex);
+  RecompThread *curr = g_threads;
+  while (curr) {
+    uint64_t sbase = curr->stack_base;
+    uint64_t ssize = curr->stack_size;
+    if (sbase && ssize && addr >= sbase && addr < (sbase + ssize)) {
+      stack_start = sbase;
+      stack_end = sbase + ssize;
+      break;
+    }
+    curr = curr->next;
+  }
+  pthread_mutex_unlock(&g_threads_mutex);
+
+  if (start_ptr && ctx->mem_base) {
+    *(uint64_t *)(ctx->mem_base + start_ptr) = stack_start;
+  }
+  if (end_ptr && ctx->mem_base) {
+    *(uint64_t *)(ctx->mem_base + end_ptr) = stack_end;
+  }
+
   ctx->rax = 0;
   SHIM_RETURN();
 }

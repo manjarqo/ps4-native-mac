@@ -234,6 +234,22 @@ const RecompModuleUnwindInfo *recomp_module_find_by_addr(uint64_t addr) {
     return NULL;
 }
 
+const RecompModuleUnwindInfo *recomp_module_find_by_handle(int32_t handle) {
+    pthread_mutex_lock(&g_sysmodule_mutex);
+    if (handle == 1 && g_unwind_modules_count > 0) {
+        const RecompModuleUnwindInfo *res = &g_unwind_modules[0];
+        pthread_mutex_unlock(&g_sysmodule_mutex);
+        return res;
+    }
+    if (handle > 1 && handle <= g_unwind_modules_count) {
+        const RecompModuleUnwindInfo *res = &g_unwind_modules[handle - 1];
+        pthread_mutex_unlock(&g_sysmodule_mutex);
+        return res;
+    }
+    pthread_mutex_unlock(&g_sysmodule_mutex);
+    return NULL;
+}
+
 void recomp_module_start(GuestContext *ctx, int32_t handle) {
     if (!ctx || handle <= 0) {
         return;

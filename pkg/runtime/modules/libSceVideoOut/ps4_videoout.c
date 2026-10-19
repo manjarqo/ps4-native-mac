@@ -24,9 +24,9 @@ typedef struct {
     OrbisVideoOutBufferAttribute attr;
     int bufferCount;
     uint64_t buffers[MAX_FRAME_BUFFERS];
-    OrbisKernelEqueue flipQueue;
-    void *flipQueueUdata;
-    int flipQueueRegistered;
+    OrbisKernelEqueue flipQueues[MAX_EQUEUES_PER_PORT];
+    void *flipQueueUdatas[MAX_EQUEUES_PER_PORT];
+    int flipQueueCount;
     int32_t flipRate;
     OrbisVideoOutFlipStatus flipStatus;
     pthread_mutex_t mutex;
@@ -83,9 +83,13 @@ static void *vblank_thread_func(void *arg) {
 
             pthread_cond_broadcast(&vh->vblankCond);
 
+            uint64_t vblank_time_12b = vh->vblankStatus.tsc & 0xfffULL;
+            uint64_t vblank_counter_4b = (uint64_t)(vh->vblankStatus.count & 0xfULL);
+            uint64_t vblank_event_data = vblank_time_12b | (vblank_counter_4b << 12) | ((uint64_t)vh->vblankStatus.count << 16);
+
             for (int q = 0; q < vh->vblankQueueCount; q++) {
                 if (vh->vblankQueues[q] > 0) {
-                    ps4_equeue_post_event(vh->vblankQueues[q], 0x7 /* Vblank */, ORBIS_KERNEL_EVFILT_VIDEO_OUT, (int64_t)(vh->vblankStatus.count << 16), vh->vblankUdatas[q]);
+                    ps4_equeue_post_event(vh->vblankQueues[q], 0x7 /* Vblank */, ORBIS_KERNEL_EVFILT_VIDEO_OUT, (int64_t)vblank_event_data, vh->vblankUdatas[q]);
                 }
             }
             pthread_mutex_unlock(&vh->mutex);
@@ -123,9 +127,9 @@ int32_t sceVideoOutOpen(int32_t userId, int32_t busType, int32_t index, const vo
     vh->handle = g_next_video_handle++;
     vh->in_use = 1;
     vh->bufferCount = 0;
-    vh->flipQueue = 0;
-    vh->flipQueueUdata = NULL;
-    vh->flipQueueRegistered = 0;
+    vh->flipQueueCount = 0;
+    memset(vh->flipQueues, 0, sizeof(vh->flipQueues));
+    memset(vh->flipQueueUdatas, 0, sizeof(vh->flipQueueUdatas));
     vh->flipRate = 0;
     vh->vblankQueueCount = 0;
     memset(&vh->attr, 0, sizeof(vh->attr));
@@ -252,9 +256,19 @@ int32_t sceVideoOutAddFlipEvent(OrbisKernelEqueue eq, int32_t handle, void *flip
     }
 
     pthread_mutex_lock(&vh->mutex);
-    vh->flipQueue = eq;
-    vh->flipQueueUdata = flipArg;
-    vh->flipQueueRegistered = 1;
+    int found = 0;
+    for (int i = 0; i < vh->flipQueueCount; i++) {
+        if (vh->flipQueues[i] == eq) {
+            vh->flipQueueUdatas[i] = flipArg;
+            found = 1;
+            break;
+        }
+    }
+    if (!found && vh->flipQueueCount < MAX_EQUEUES_PER_PORT) {
+        vh->flipQueues[vh->flipQueueCount] = eq;
+        vh->flipQueueUdatas[vh->flipQueueCount] = flipArg;
+        vh->flipQueueCount++;
+    }
     pthread_mutex_unlock(&vh->mutex);
 
     pthread_mutex_unlock(&g_video_table_mutex);
@@ -282,9 +296,17 @@ static void finish_flip(const PendingFlip *pf) {
         vh->flipStatus.currentBuffer = pf->bufferIndex;
         if (vh->flipStatus.numFlipPending > 0) vh->flipStatus.numFlipPending--;
         if (vh->flipStatus.numGpuFlipPending > 0) vh->flipStatus.numGpuFlipPending--;
-        if (vh->flipQueueRegistered) {
-            ps4_equeue_post_event(vh->flipQueue, 0x6, ORBIS_KERNEL_EVFILT_VIDEO_OUT,
-                                  (pf->flipArg << 16) | ((uint64_t)pf->handle & 0xffff), vh->flipQueueUdata);
+        vh->flipStatus.ptime = get_time_usec();
+        vh->flipStatus.stime = get_fake_tsc();
+        // Event data: low 12 bits of the timestamp, 4-bit flip counter, flip argument above.
+        uint64_t time_12b = vh->flipStatus.stime & 0xfffULL;
+        uint64_t counter_4b = (uint64_t)(vh->flipStatus.num & 0xfULL);
+        uint64_t event_data = time_12b | (counter_4b << 12) | ((uint64_t)pf->flipArg << 16);
+        for (int q = 0; q < vh->flipQueueCount; q++) {
+            if (vh->flipQueues[q] > 0) {
+                ps4_equeue_post_event(vh->flipQueues[q], 0x6 /* Flip */, ORBIS_KERNEL_EVFILT_VIDEO_OUT,
+                                      (int64_t)event_data, vh->flipQueueUdatas[q]);
+            }
         }
         pthread_mutex_unlock(&vh->mutex);
     }
@@ -306,12 +328,13 @@ int32_t sceVideoOutSubmitFlip(GuestContext *ctx, int32_t handle, int32_t bufferI
         return -EINVAL;
     }
     pthread_mutex_lock(&vh->mutex);
-    if (bufferIndex < 0 || bufferIndex >= vh->bufferCount) {
+    // bufferIndex -1 is a flip without a display buffer (blank frame): it only completes the flip.
+    if (bufferIndex != -1 && (bufferIndex < 0 || bufferIndex >= vh->bufferCount)) {
         pthread_mutex_unlock(&vh->mutex);
         pthread_mutex_unlock(&g_video_table_mutex);
         return -EINVAL;
     }
-    const uint64_t guest_buf_vaddr = vh->buffers[bufferIndex];
+    const uint64_t guest_buf_vaddr = bufferIndex >= 0 ? vh->buffers[bufferIndex] : 0;
     const OrbisVideoOutBufferAttribute attr = vh->attr;
     vh->flipStatus.numFlipPending++;
     vh->flipStatus.numGpuFlipPending++;
@@ -378,6 +401,8 @@ int32_t sceVideoOutGetFlipStatus(int32_t handle, OrbisVideoOutFlipStatus *status
 
     pthread_mutex_lock(&vh->mutex);
     *status = vh->flipStatus;
+    fprintf(stderr, "[videoout] sceVideoOutGetFlipStatus: handle=%d num=%llu currentBuf=%d\n",
+            handle, (unsigned long long)vh->flipStatus.num, vh->flipStatus.currentBuffer);
     pthread_mutex_unlock(&vh->mutex);
 
     pthread_mutex_unlock(&g_video_table_mutex);
@@ -489,8 +514,17 @@ int32_t sceVideoOutGetResolutionStatus(int32_t handle, OrbisVideoOutResolutionSt
 }
 
 int32_t sceVideoOutIsFlipPending(int32_t handle) {
-    (void)handle;
-    return 0;
+    pthread_mutex_lock(&g_video_table_mutex);
+    VideoOutHandle *vh = find_video_handle_locked(handle);
+    if (!vh) {
+        pthread_mutex_unlock(&g_video_table_mutex);
+        return 0;
+    }
+    pthread_mutex_lock(&vh->mutex);
+    int32_t pending = vh->flipStatus.numFlipPending;
+    pthread_mutex_unlock(&vh->mutex);
+    pthread_mutex_unlock(&g_video_table_mutex);
+    return pending;
 }
 
 int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t setIndex) {
@@ -530,9 +564,15 @@ int32_t sceVideoOutDeleteFlipEvent(OrbisKernelEqueue eq, int32_t handle) {
     }
 
     pthread_mutex_lock(&vh->mutex);
-    if (vh->flipQueue == eq) {
-        vh->flipQueueRegistered = 0;
-        vh->flipQueue = 0;
+    for (int i = 0; i < vh->flipQueueCount; i++) {
+        if (vh->flipQueues[i] == eq) {
+            for (int j = i; j < vh->flipQueueCount - 1; j++) {
+                vh->flipQueues[j] = vh->flipQueues[j + 1];
+                vh->flipQueueUdatas[j] = vh->flipQueueUdatas[j + 1];
+            }
+            vh->flipQueueCount--;
+            break;
+        }
     }
     pthread_mutex_unlock(&vh->mutex);
 
@@ -689,12 +729,26 @@ int32_t sceVideoOutGetDeviceCapabilityInfo(int32_t handle, SceVideoOutDeviceCapa
 
 int32_t sceVideoOutGetEventCount(const OrbisKernelEvent *ev) {
     if (!ev || ev->filter != ORBIS_KERNEL_EVFILT_VIDEO_OUT) return -EINVAL;
-    return (int32_t)(ev->data & 0xffff);
+    return (int32_t)((ev->data >> 12) & 0xf);
 }
 
 int32_t sceVideoOutGetEventId(const OrbisKernelEvent *ev) {
-    if (!ev) return -EINVAL;
-    return (int32_t)ev->ident;
+    if (!ev || ev->filter != ORBIS_KERNEL_EVFILT_VIDEO_OUT) return -EINVAL;
+    switch ((int32_t)ev->ident) {
+    case 0x6: // OrbisVideoOutInternalEventId::Flip
+        return 0; // SCE_VIDEO_OUT_EVENT_FLIP
+    case 0x7: // OrbisVideoOutInternalEventId::Vblank
+    case 0x57: // SysVblank
+        return 1; // SCE_VIDEO_OUT_EVENT_VBLANK
+    case 0x53: // PreVblankStart
+        return 2;
+    case 0x51: // SetMode
+        return 8;
+    case 0x54: // Position
+        return 12;
+    default:
+        return -EINVAL;
+    }
 }
 
 void shim_sceVideoOutAddVblankEvent(GuestContext *ctx) {

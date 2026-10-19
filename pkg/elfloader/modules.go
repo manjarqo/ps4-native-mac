@@ -429,6 +429,13 @@ func MergeImages(dst, src *LoadedELF) error {
 	dst.DataRanges = mergeRanges(append(dst.DataRanges, src.DataRanges...))
 	dst.Relocations = append(dst.Relocations, src.Relocations...)
 
+	if dst.TLSVaddr == 0 && src.TLSVaddr != 0 {
+		dst.TLSVaddr = src.TLSVaddr
+		dst.TLSFilesz = src.TLSFilesz
+		dst.TLSMemsz = src.TLSMemsz
+		dst.TLSAlign = src.TLSAlign
+	}
+
 	canaryTarget := dst.CanaryAddr
 	if canaryTarget == 0 {
 		canaryTarget = src.CanaryAddr

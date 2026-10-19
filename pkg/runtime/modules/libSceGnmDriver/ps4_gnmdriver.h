@@ -147,8 +147,8 @@ int32_t sceGnmSubmitCommandBuffersForWorkload(GuestContext *ctx, uint32_t worklo
 int32_t sceGnmSubmitAndFlipCommandBuffers(GuestContext *ctx, uint32_t count, const uint64_t *dcb_gpu_addrs, const uint32_t *dcb_sizes_in_bytes, const uint64_t *ccb_gpu_addrs, const uint32_t *ccb_sizes_in_bytes, uint32_t vo_handle, uint32_t buf_idx, uint32_t flip_mode, int64_t flip_arg);
 int32_t sceGnmSubmitAndFlipCommandBuffersForWorkload(GuestContext *ctx, uint32_t workload, uint32_t count, const uint64_t *dcb_gpu_addrs, const uint32_t *dcb_sizes_in_bytes, const uint64_t *ccb_gpu_addrs, const uint32_t *ccb_sizes_in_bytes, uint32_t vo_handle, uint32_t buf_idx, uint32_t flip_mode, int64_t flip_arg);
 int32_t sceGnmSubmitDone(void);
-int32_t sceGnmRequestFlipAndSubmitDone(void);
-int32_t sceGnmRequestFlipAndSubmitDoneForWorkload(void);
+int32_t sceGnmRequestFlipAndSubmitDone(GuestContext *ctx, uint64_t gpu_addr, uint32_t gpu_addr_size_in_bytes, uint32_t vo_handle, uint32_t buf_idx, uint32_t flip_mode, int64_t flip_arg);
+int32_t sceGnmRequestFlipAndSubmitDoneForWorkload(GuestContext *ctx, uint64_t workload, uint64_t gpu_addr, uint32_t gpu_addr_size_in_bytes, uint32_t vo_handle, uint32_t buf_idx, uint32_t flip_mode, int64_t flip_arg);
 
 // Markers
 int32_t sceGnmInsertDingDongMarker(uint32_t *cmdbuf, uint32_t size);

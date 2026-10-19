@@ -13,7 +13,9 @@ extern "C" {
 GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image, size_t image_size, const char *prog_name);
 GuestContext *recomp_init_runtime_file(const char *image_filename, size_t requested_mem_sz, const char *prog_name);
 void recomp_init_process_param(GuestContext *ctx, uint64_t proc_param_addr);
+void recomp_init_tls(GuestContext *ctx, uint64_t tls_vaddr, uint64_t tls_filesz, uint64_t tls_memsz, uint64_t tls_align);
 void recomp_setup_entry_args(GuestContext *ctx, int argc, char **argv, uint64_t entry_addr);
+void recomp_dispatch_external(GuestContext *ctx, uint64_t target);
 void recomp_free_runtime(GuestContext *ctx);
 GuestContext *recomp_create_thread_context(GuestContext *parent, uint64_t stack_size);
 uint64_t recomp_vm_alloc(GuestContext *ctx, size_t size);
@@ -36,9 +38,12 @@ void recomp_register_unresolved(uint64_t addr, const char *nid, const char *sym_
 const RecompUnresolvedSym *recomp_lookup_unresolved(uint64_t addr);
 void recomp_unimplemented_shim(GuestContext *ctx, const char *shim_name);
 void shim_unresolved_stub(GuestContext *ctx);
+void recomp_unsupported_instruction(uint64_t rip, uint64_t fn_entry, const char *inst_str);
 
-// Main thread initialization
+// Main thread and TLS context helpers
 void recomp_init_main_thread(GuestContext *ctx);
+GuestContext *recomp_get_current_ctx(void);
+void recomp_set_current_ctx(GuestContext *ctx);
 
 // Subsystem teardown and lifecycle
 void recomp_free_thread_context(GuestContext *ctx);
