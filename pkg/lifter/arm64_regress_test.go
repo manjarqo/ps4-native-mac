@@ -371,3 +371,16 @@ func TestRegressX87Stores(t *testing.T) {
 	requireInOrder(t, "fistp word", liftBlock(t, "df18")[0], "fcvtzs x17, d31", "and w1, w1, #0x8000")
 	requireInOrder(t, "fistp dword", liftBlock(t, "db18")[0], "fcvtzs x17, d31", "and w1, w1, #0x80000000")
 }
+
+// FCMOVcc ST(0), ST(i) took i from the first operand (always ST(0), a no-op) and used fixed ARM
+// conditions instead of the tracked carry sense.
+func TestRegressFcmov(t *testing.T) {
+	l := liftBlock(t, "dbd2")[0] // fcmovnbe st0, st2
+	requireInOrder(t, "fcmovnbe st0, st2", l, "add w17, w17, #2", "ldr d1, [x5, w17, uxtw #3]", "fcsel d0, d1, d0, hi")
+
+	l = liftBlock(t, "4801d8", "dbd2")[1] // add rax, rbx; fcmovnbe st0, st2: C = CF after ADD
+	requireInOrder(t, "fcmovnbe after add", l, "cfinv", "fcsel d0, d1, d0, hi")
+
+	l = liftBlock(t, "4801d8", "dac1")[1] // add rax, rbx; fcmovb st0, st1: CF = 1 is C = 1 after ADD
+	requireInOrder(t, "fcmovb after add", l, "add w17, w17, #1", "fcsel d0, d1, d0, cs")
+}

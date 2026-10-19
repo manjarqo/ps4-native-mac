@@ -397,29 +397,20 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 	// Conditional moves: FCMOVB, FCMOVE, FCMOVBE, FCMOVU, FCMOVNB, FCMOVNE, FCMOVNBE, FCMOVNU
 	case x86asm.FCMOVB, x86asm.FCMOVE, x86asm.FCMOVBE, x86asm.FCMOVU,
 		x86asm.FCMOVNB, x86asm.FCMOVNE, x86asm.FCMOVNBE, x86asm.FCMOVNU:
+		// FCMOVcc ST(0), ST(i): the source is the second operand.
 		idx := 1
-		if reg, ok := args[0].(x86asm.Reg); ok && reg >= x86asm.F0 && reg <= x86asm.F7 {
-			idx = int(reg - x86asm.F0)
+		if len(args) > 1 {
+			if reg, ok := args[1].(x86asm.Reg); ok && reg >= x86asm.F0 && reg <= x86asm.F7 {
+				idx = int(reg - x86asm.F0)
+			}
 		}
-		cond := "eq"
-		switch op {
-		case x86asm.FCMOVB:
-			cond = "cc" // carry clear -> CF=1
-		case x86asm.FCMOVNB:
-			cond = "cs" // carry set -> CF=0
-		case x86asm.FCMOVE:
-			cond = "eq"
-		case x86asm.FCMOVNE:
-			cond = "ne"
-		case x86asm.FCMOVBE:
-			cond = "ls"
-		case x86asm.FCMOVNBE:
-			cond = "hi"
-		case x86asm.FCMOVU:
-			cond = "vs"
-		case x86asm.FCMOVNU:
-			cond = "vc"
-		}
+		// x86 condition encoding (see x86CondIndex): B, AE, E, NE, BE, A, P, NP.
+		cc := map[x86asm.Op]int{
+			x86asm.FCMOVB: 2, x86asm.FCMOVNB: 3, x86asm.FCMOVE: 4, x86asm.FCMOVNE: 5,
+			x86asm.FCMOVBE: 6, x86asm.FCMOVNBE: 7, x86asm.FCMOVU: 10, x86asm.FCMOVNU: 11,
+		}[op]
+		pre, cond := l.condFor(cc)
+		lines = append(lines, pre...)
 		lines = append(lines, loadFpuSt("d0", 0)...)
 		lines = append(lines, loadFpuSt("d1", idx)...)
 		lines = append(lines, fmt.Sprintf("    fcsel d0, d1, d0, %s", cond))
