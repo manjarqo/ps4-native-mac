@@ -6,6 +6,41 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 
+/* x87 state around a test (AT&T syntax). dt_x87_load(st, k): FNINIT, k x FINCSTP, then push
+   st[6] .. st[0], so ST(i) = st[i] and TOP = (k - 7) & 7. dt_x87_save(fx): FXSAVE into the
+   16-byte aligned 512-byte area, then FNINIT. The C code between them and the test stub uses no
+   x87 instructions. */
+__asm__(".text\n"
+        ".p2align 4\n_dt_x87_load:\n"
+        "  fninit\n"
+        "1:\n  testl %esi, %esi\n  jz 2f\n  fincstp\n  decl %esi\n  jmp 1b\n"
+        "2:\n  fldl 48(%rdi)\n  fldl 40(%rdi)\n  fldl 32(%rdi)\n  fldl 24(%rdi)\n"
+        "  fldl 16(%rdi)\n  fldl 8(%rdi)\n  fldl 0(%rdi)\n  ret\n"
+        ".p2align 4\n_dt_x87_save:\n  fxsave (%rdi)\n  fninit\n  ret\n");
+void dt_x87_load(const double *st, unsigned k);
+void dt_x87_save(void *fx);
+
+/* Unpacks an FXSAVE image into DtState: ST(i) as doubles where the tag says valid. */
+static void dt_x87_unpack(const uint8_t *fx, DtState *st) {
+    uint16_t fcw, fsw;
+    memcpy(&fcw, fx, 2);
+    memcpy(&fsw, fx + 2, 2);
+    unsigned top = (fsw >> 11) & 7, ftw = fx[4];
+    st->fcw = fcw;
+    st->fsw = fsw;
+    st->ftop = top;
+    st->ftag = 0;
+    for (int i = 0; i < 8; i++) {
+        st->st[i] = 0;
+        if (ftw >> ((top + i) & 7) & 1) {
+            long double v;
+            memcpy(&v, fx + 32 + 16 * i, 10);
+            st->st[i] = (double)v;
+            st->ftag |= 1u << i;
+        }
+    }
+}
+
 extern const uint64_t nt_count;
 extern void (*const nt_table[])(DtState *);
 extern const uint64_t nt_regsets[][17];
@@ -40,8 +75,12 @@ int main(int argc, char **argv) {
             memset(scr, 0, DT_SCRATCH_SIZE);
             dt_make_state(&res.st, scr, t, k, special, nt_regsets[t]);
             sig_hit = 0;
+            static uint8_t fx[512] __attribute__((aligned(16)));
             if (sigsetjmp(jb, 1) == 0) {
+                dt_x87_load(res.st.st, (res.st.ftop + 7) & 7);
                 nt_table[t](&res.st);
+                dt_x87_save(fx);
+                dt_x87_unpack(fx, &res.st);
             } else {
                 res.status = sig_hit == SIGILL ? 1 : 2;
             }

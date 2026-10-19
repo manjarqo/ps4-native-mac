@@ -115,6 +115,10 @@ const (
 	// modeDeadCO: CF and OF are dead after the instruction (disasm sets CarryDead and
 	// OverflowDead); CF and OF are not compared.
 	modeDeadCO
+	// modeCrossBlock: the instruction ends a block whose successor reads the flags: the lifter
+	// emits its block-end code (EndBlock with CF live) and the flags are read back as the next
+	// block would, from the block-boundary carry sense (C = !CF).
+	modeCrossBlock
 	// modeFpCmp: the input flags are those of an FP compare (ZF/PF/CF in {000, 001, 100, 111},
 	// OF = SF = AF = 0) and NZCV holds them the way the lifter's COMIS lowering leaves them
 	// (Z = ZF, C = !CF, V = PF, N = 0). The lifter models PF only there, so the PF readers
@@ -131,12 +135,19 @@ const (
 	// random rounding mode, FZ, DAZ and exception flags). A random value would have reserved
 	// bits set, which x86 rejects with #GP and Rosetta 2 silently masks.
 	regsetMxcsr = 1 << 61
+	// regsetShiftCL: a shift or rotate by CL; trials 0 and 1 run with CL = 0 and CL = 1.
+	regsetShiftCL = 1 << 60
+	// regsetFcw: the memory operand holds a valid x87 control word (for FLDCW).
+	regsetFcw = 1 << 59
+	// regsetPopf: [stackTop] holds a valid RFLAGS image for POPFQ (arithmetic flags random,
+	// IF and bit 1 set, TF/DF/AC clear).
+	regsetPopf = 1 << 58
 )
 
 // readsPF reports whether the instruction's result depends on PF.
 func readsPF(op x86asm.Op) bool {
 	switch op {
-	case x86asm.SETP, x86asm.SETNP, x86asm.CMOVP, x86asm.CMOVNP:
+	case x86asm.SETP, x86asm.SETNP, x86asm.CMOVP, x86asm.CMOVNP, x86asm.FCMOVU, x86asm.FCMOVNU:
 		return true
 	}
 	return false
@@ -154,28 +165,74 @@ type test struct {
 	flags   string // flag rule passed to compare.py
 	vregs   string // vector registers named by the instruction (comma-separated indexes)
 	vdest   string // vector register the instruction writes ("-" if none)
+	clShift bool   // shift or rotate by CL (CL = 0 and 1 are forced in two trials)
+	stackOp bool   // PUSHFQ/POPFQ: runs on a stack in the compared memory window (RSP = stackTop)
 }
 
-func skipOp(op x86asm.Op) bool {
+// stackTop is RSP for PUSHFQ/POPFQ tests: PUSHFQ writes [stackTop-8, stackTop) and POPFQ reads
+// [stackTop, stackTop+8), both inside the compared memory window.
+const stackTop = memTarget + 64
+
+// skipClass returns the filtered class of an opcode the harness does not test, or "". Every
+// filtered listing site is counted per class in skipped.txt.
+func skipClass(inst x86asm.Inst) string {
+	op := inst.Op
 	s := op.String()
 	switch op {
-	case x86asm.CALL, x86asm.RET, x86asm.JMP, x86asm.PUSH, x86asm.POP, x86asm.PUSHFQ, x86asm.POPFQ,
-		x86asm.INT, x86asm.UD2, x86asm.HLT, x86asm.CPUID, x86asm.RDTSC, x86asm.RDTSCP, x86asm.XGETBV,
-		x86asm.SYSCALL, x86asm.LEAVE, x86asm.ENTER, x86asm.PAUSE, x86asm.FWAIT, x86asm.FXSAVE, x86asm.FXRSTOR, x86asm.XSAVE,
-		x86asm.XRSTOR, x86asm.LFENCE, x86asm.MFENCE, x86asm.SFENCE, x86asm.EMMS, x86asm.VZEROUPPER,
-		x86asm.VZEROALL, x86asm.DIV, x86asm.IDIV, x86asm.RDRAND:
-		return true
-	}
-	switch op {
+	case x86asm.CALL, x86asm.RET, x86asm.JMP:
+		return "control flow: CALL/RET/JMP/Jcc/JrCXZ/LOOP"
+	case x86asm.PUSH, x86asm.POP, x86asm.LEAVE, x86asm.ENTER:
+		return "stack: PUSH/POP/LEAVE/ENTER (the native stub keeps its frame in RSP)"
+	case x86asm.DIV, x86asm.IDIV:
+		return "DIV/IDIV (random operands fault: #DE)"
+	case x86asm.VZEROUPPER, x86asm.VZEROALL:
+		return "VZEROUPPER/VZEROALL"
+	case x86asm.FXSAVE, x86asm.FXRSTOR, x86asm.FXSAVE64, x86asm.FXRSTOR64, x86asm.XSAVE, x86asm.XRSTOR,
+		x86asm.XSAVE64, x86asm.XRSTOR64:
+		return "FXSAVE/FXRSTOR/XSAVE/XRSTOR"
+	case x86asm.EMMS:
+		return "MMX (EMMS)"
+	case x86asm.INT, x86asm.UD2, x86asm.HLT, x86asm.CPUID, x86asm.RDTSC, x86asm.RDTSCP, x86asm.XGETBV,
+		x86asm.SYSCALL, x86asm.RDRAND, x86asm.PAUSE:
+		return "system and timing: INT/UD2/HLT/CPUID/RDTSC(P)/XGETBV/SYSCALL/RDRAND/PAUSE"
+	case x86asm.LFENCE, x86asm.MFENCE, x86asm.SFENCE:
+		return "fences and prefetches"
 	case x86asm.MOVSB, x86asm.MOVSW, x86asm.MOVSD, x86asm.MOVSQ, x86asm.STOSB, x86asm.STOSW, x86asm.STOSD,
 		x86asm.STOSQ, x86asm.LODSB, x86asm.LODSW, x86asm.LODSD, x86asm.LODSQ, x86asm.SCASB, x86asm.SCASW,
 		x86asm.SCASD, x86asm.SCASQ, x86asm.CMPSB, x86asm.CMPSW, x86asm.CMPSD, x86asm.CMPSQ, x86asm.INSB,
 		x86asm.INSW, x86asm.INSD, x86asm.OUTSB, x86asm.OUTSW, x86asm.OUTSD, x86asm.XLATB:
-		return true
+		return "string instructions (Task 6)"
+	case x86asm.FNSTENV, x86asm.FLDENV, x86asm.FNSAVE, x86asm.FRSTOR:
+		return "x87 environment: tag word, FIP/FDP and exception flags are not modeled (Task 5)"
+	case x86asm.FBLD, x86asm.FBSTP:
+		return "x87 m80 and BCD forms (Task 5)"
 	}
-	if strings.HasPrefix(s, "J") || strings.HasPrefix(s, "LOOP") || strings.HasPrefix(s, "PREFETCH") ||
-		strings.HasPrefix(s, "F") { // x87 (FXSAVE/FXRSTOR are listed above)
-		return true
+	if strings.HasPrefix(s, "J") || strings.HasPrefix(s, "LOOP") {
+		return "control flow: CALL/RET/JMP/Jcc/JrCXZ/LOOP"
+	}
+	if strings.HasPrefix(s, "PREFETCH") {
+		return "fences and prefetches"
+	}
+	if strings.HasPrefix(s, "F") && (inst.MemBytes == 10 || inst.MemBytes == 0) {
+		for _, a := range inst.Args {
+			if _, ok := a.(x86asm.Mem); ok { // x86asm reports m80 operands with MemBytes 0
+				return "x87 m80 and BCD forms (Task 5)"
+			}
+		}
+	}
+	return ""
+}
+
+// shiftByCL reports shifts and rotates whose count is CL.
+func shiftByCL(inst x86asm.Inst) bool {
+	switch inst.Op {
+	case x86asm.SHL, x86asm.SHR, x86asm.SAR, x86asm.ROL, x86asm.ROR, x86asm.RCL, x86asm.RCR,
+		x86asm.SHLD, x86asm.SHRD:
+		for _, a := range inst.Args[1:] {
+			if a == x86asm.CL {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -187,7 +244,9 @@ func readsFlags(inst x86asm.Inst) bool {
 	op := inst.Op
 	switch op {
 	case x86asm.ADC, x86asm.SBB, x86asm.RCL, x86asm.RCR, x86asm.CMC, x86asm.LAHF, x86asm.PUSHFQ,
-		x86asm.INC, x86asm.DEC, x86asm.SAHF:
+		x86asm.INC, x86asm.DEC, x86asm.SAHF,
+		x86asm.FCMOVB, x86asm.FCMOVNB, x86asm.FCMOVE, x86asm.FCMOVNE, x86asm.FCMOVBE, x86asm.FCMOVNBE,
+		x86asm.FCMOVU, x86asm.FCMOVNU:
 		return true
 	case x86asm.SHL, x86asm.SHR, x86asm.SAR, x86asm.ROL, x86asm.ROR, x86asm.SHLD, x86asm.SHRD:
 		// A count of 0 keeps the flags.
@@ -212,7 +271,8 @@ func flagRule(inst x86asm.Inst) string {
 	op := inst.Op
 	switch op {
 	case x86asm.COMISS, x86asm.UCOMISS, x86asm.COMISD, x86asm.UCOMISD,
-		x86asm.VCOMISS, x86asm.VUCOMISS, x86asm.VCOMISD, x86asm.VUCOMISD:
+		x86asm.VCOMISS, x86asm.VUCOMISS, x86asm.VCOMISD, x86asm.VUCOMISD,
+		x86asm.FCOMI, x86asm.FCOMIP, x86asm.FUCOMI, x86asm.FUCOMIP:
 		// OF (= 0) is not compared: after an FP compare the lifter keeps PF in ARM V, the
 		// register that holds OF everywhere else, so JO/SETO there read PF (model limit).
 		return "CZSP"
@@ -365,7 +425,7 @@ func regArgsOK(inst x86asm.Inst) bool {
 				return false
 			}
 			cl := regClass(r)
-			if r == x86asm.RIP || strings.HasPrefix(cl, "other") || cl == "st" || cl == "mm" {
+			if r == x86asm.RIP || strings.HasPrefix(cl, "other") || cl == "mm" {
 				return false
 			}
 		}
@@ -374,7 +434,15 @@ func regArgsOK(inst x86asm.Inst) bool {
 }
 
 type skipInfo struct {
-	count   int
+	count   int      // distinct signatures
+	sites   int      // listing sites of those signatures
+	keys    []string // the signatures
+	example string
+}
+
+type classInfo struct {
+	sites   int
+	ops     map[string]int
 	example string
 }
 
@@ -416,10 +484,15 @@ func main() {
 			}
 		}
 		dead := mode == modeDeadCO
-		lines, err := l.LiftInstructionToBuf(disasm.Instruction{Address: addr, Inst: inst, SkipFlags: mode == modeNoFlags,
-			CarryDead: dead, OverflowDead: dead}, addr+uint64(inst.Len), fn, nil)
+		dInst := disasm.Instruction{Address: addr, Inst: inst, SkipFlags: mode == modeNoFlags,
+			CarryDead: dead, OverflowDead: dead}
+		lines, err := l.LiftInstructionToBuf(dInst, addr+uint64(inst.Len), fn, nil)
 		if err != nil {
 			return nil, nil, err
+		}
+		if mode == modeCrossBlock {
+			lines = append(lines, l.EndBlock(dInst)...)
+			l.ResetFlags()
 		}
 		var readout []string
 		for k, op := range readoutOps {
@@ -437,7 +510,7 @@ func main() {
 	seen := map[string]bool{}
 	perOp := map[x86asm.Op]int{}
 	skipped := map[string]*skipInfo{}
-	noteSkip := func(reason string, inst x86asm.Inst, addr uint64) {
+	noteSkip := func(reason string, inst x86asm.Inst, addr uint64, sigKey string) {
 		key := inst.Op.String() + "\t" + reason
 		s := skipped[key]
 		if s == nil {
@@ -445,11 +518,13 @@ func main() {
 			skipped[key] = s
 		}
 		s.count++
+		s.keys = append(s.keys, sigKey)
 	}
 	var tests []*test
 	add := func(in x86asm.Inst, b []byte, addr uint64, key string, setRegs map[int]uint64) {
 		base := test{addr: addr, bytes: b, text: safeText(in, addr), sig: key, setRegs: setRegs,
-			flags: flagRule(in), vregs: vectorRegs(in), vdest: vectorDest(in)}
+			flags: flagRule(in), vregs: vectorRegs(in), vdest: vectorDest(in), clShift: shiftByCL(in),
+			stackOp: in.Op == x86asm.PUSHFQ || in.Op == x86asm.POPFQ}
 		ln, ro, err := lift(in, addr, modeBlockStart)
 		if err != nil {
 			return
@@ -493,8 +568,25 @@ func main() {
 		}
 		variant(modeNoFlags, "noflags", "-", true)
 		variant(modeDeadCO, "dead-cf-of", "deadco:"+base.flags, true)
+		if !readsPF(in.Op) {
+			variant(modeCrossBlock, "cross-block", "", true)
+		}
 	}
 
+	// Filtered listing sites per class, and listing sites per signature (sites of the sampled
+	// signatures that are not tested are reported with the reason).
+	classes := map[string]*classInfo{}
+	filter := func(class string, inst x86asm.Inst, addr uint64) {
+		c := classes[class]
+		if c == nil {
+			c = &classInfo{ops: map[string]int{}, example: fmt.Sprintf("0x%x %s", addr, safeText(inst, addr))}
+			classes[class] = c
+		}
+		c.sites++
+		c.ops[inst.Op.String()]++
+	}
+	siteCount := map[string]int{}
+	sampledOut := 0
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 	seenAddr := map[uint64]bool{}
@@ -509,16 +601,29 @@ func main() {
 			continue
 		}
 		seenAddr[addr] = true
-		if img[addr] == 0x62 || img[addr] == 0xf0 || img[addr] == 0x64 || img[addr] == 0x65 { // EVEX, LOCK, FS, GS
-			continue
-		}
 		inst, err := x86asm.Decode(img[addr:], 64)
-		if err != nil || inst.Len == 0 || skipOp(inst.Op) {
+		if err != nil || inst.Len == 0 {
+			filter("decode error", x86asm.Inst{}, addr)
 			continue
 		}
-		// operand signature, reject RIP/RSP use
+		switch img[addr] {
+		case 0x62:
+			filter("prefix: EVEX", inst, addr)
+			continue
+		case 0xf0:
+			filter("prefix: LOCK (Task 4)", inst, addr)
+			continue
+		case 0x64, 0x65:
+			filter("prefix: FS/GS segment", inst, addr)
+			continue
+		}
+		if c := skipClass(inst); c != "" {
+			filter(c, inst, addr)
+			continue
+		}
+		// operand signature; RIP/RSP use and other untestable operands are filtered
 		var sig []string
-		bad := false
+		bad := ""
 		var mem *x86asm.Mem
 		for _, a := range inst.Args {
 			if a == nil {
@@ -526,24 +631,32 @@ func main() {
 			}
 			switch v := a.(type) {
 			case x86asm.Reg:
-				if idx, ok := gprIndex[v]; ok && idx == 4 {
-					bad = true
-				}
-				if v == x86asm.RIP {
-					bad = true
-				}
 				cl := regClass(v)
-				if strings.HasPrefix(cl, "other") || cl == "st" || cl == "mm" {
-					bad = true
+				if idx, ok := gprIndex[v]; ok && idx == 4 {
+					bad = "register operand: RSP (the native stub keeps its frame there)"
+				} else if v == x86asm.RIP {
+					bad = "register operand: RIP"
+				} else if cl == "mm" {
+					bad = "MMX register operand"
+				} else if strings.HasPrefix(cl, "other") {
+					bad = "register operand: segment/control/other"
 				}
 				sig = append(sig, cl)
 			case x86asm.Mem:
-				if v.Base == x86asm.RIP || v.Segment != 0 || v.Base == x86asm.RSP || v.Base == x86asm.ESP ||
-					(v.Base == 0 && v.Index == 0) {
-					bad = true
-				}
-				if v.Index >= x86asm.X0 && v.Index <= x86asm.Y15 { // VSIB gathers
-					bad = true
+				switch {
+				case v.Base == x86asm.RIP:
+					bad = "memory: RIP-relative"
+				case v.Segment != 0:
+					bad = "memory: segment override"
+				case v.Base == x86asm.RSP || v.Base == x86asm.ESP:
+					bad = "memory: RSP base (the native stub keeps its frame there)"
+				case v.Base == 0 && v.Index == 0 && (img[addr] == 0xc4 || img[addr] == 0xc5):
+					// x86asm reports VEX RIP-relative operands without a base register.
+					bad = "memory: RIP-relative"
+				case v.Base == 0 && v.Index == 0:
+					bad = "memory: absolute address"
+				case v.Index >= x86asm.X0 && v.Index <= x86asm.Y15:
+					bad = "memory: VSIB (gathers)"
 				}
 				vv := v
 				mem = &vv
@@ -551,12 +664,24 @@ func main() {
 			case x86asm.Imm:
 				sig = append(sig, fmt.Sprintf("i%x", uint64(v)))
 			case x86asm.Rel:
-				bad = true
+				bad = "branch target operand"
 			default:
-				bad = true
+				bad = "other operand type"
+			}
+			if bad != "" {
+				break
 			}
 		}
-		if bad || inst.Op == x86asm.LEA && mem == nil {
+		if bad != "" {
+			filter(bad, inst, addr)
+			continue
+		}
+		if mem != nil && mem.Base >= x86asm.EAX && mem.Base <= x86asm.R15L {
+			filter("memory: 32-bit address (addr32)", inst, addr)
+			continue
+		}
+		if mem != nil && mem.Base == 0 {
+			filter("memory: index without base", inst, addr)
 			continue
 		}
 		// register aliasing pattern (dest == src2 etc. exercises copy-order bugs)
@@ -579,15 +704,16 @@ func main() {
 			}
 		}
 		key := inst.Op.String() + " " + strings.Join(sig, ",") + alias
+		siteCount[key]++
 		if seen[key] || perOp[inst.Op] >= *maxPerOp {
+			sampledOut++
 			continue
 		}
 		setRegs := map[int]uint64{}
+		if inst.Op == x86asm.PUSHFQ || inst.Op == x86asm.POPFQ {
+			setRegs[4] = stackTop
+		}
 		if mem != nil {
-			// 32-bit addressing would truncate
-			if mem.Base >= x86asm.EAX && mem.Base <= x86asm.R15L {
-				continue
-			}
 			bi, hasB := gprIndex[mem.Base]
 			ii, hasI := gprIndex[mem.Index]
 			scale := uint64(mem.Scale)
@@ -606,21 +732,17 @@ func main() {
 					iv = indexValue
 					setRegs[ii] = iv
 				}
-				if hasB {
-					setRegs[bi] = memTarget - disp - iv*scale
-				} else {
-					continue
-				}
+				setRegs[bi] = memTarget - disp - iv*scale
 			}
 		}
 		lines, _, err := lift(inst, addr, modeBlockStart)
 		if err != nil {
-			noteSkip("lift error: "+err.Error(), inst, addr)
+			noteSkip("lift error: "+err.Error(), inst, addr, key)
 			continue
 		}
 		seen[key] = true
 		if ok, why := selfContained(lines); !ok {
-			noteSkip(why, inst, addr)
+			noteSkip(why, inst, addr, key)
 			continue
 		}
 		perOp[inst.Op]++
@@ -650,8 +772,18 @@ func main() {
 	writeNative(filepath.Join(*outDir, "native_tests.s"), tests)
 	writeAsm(filepath.Join(*outDir, "asm_tests.s"), tests)
 	writeList(filepath.Join(*outDir, "tests.txt"), tests)
-	writeSkipped(filepath.Join(*outDir, "skipped.txt"), skipped)
-	fmt.Printf("%d tests written to %s (%d opcode/reason pairs skipped, see skipped.txt)\n", len(tests), *outDir, len(skipped))
+	for _, sk := range skipped {
+		for _, k := range sk.keys {
+			sk.sites += siteCount[k]
+		}
+	}
+	writeSkipped(filepath.Join(*outDir, "skipped.txt"), classes, skipped, sampledOut)
+	nf := 0
+	for _, c := range classes {
+		nf += c.sites
+	}
+	fmt.Printf("%d tests written to %s (%d listing sites filtered in %d classes, %d opcode/reason pairs not "+
+		"testable after lifting; see skipped.txt)\n", len(tests), *outDir, nf, len(classes), len(skipped))
 }
 
 func writeList(path string, tests []*test) {
@@ -662,16 +794,37 @@ func writeList(path string, tests []*test) {
 	os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
-func writeSkipped(path string, skipped map[string]*skipInfo) {
+func writeSkipped(path string, classes map[string]*classInfo, skipped map[string]*skipInfo, sampledOut int) {
+	var b strings.Builder
+	b.WriteString("# Filtered listing sites (never lifted for a test), by class\n# class\tsites\topcodes (sites)\texample\n")
+	names := make([]string, 0, len(classes))
+	for k := range classes {
+		names = append(names, k)
+	}
+	sort.Slice(names, func(i, j int) bool { return classes[names[i]].sites > classes[names[j]].sites })
+	for _, k := range names {
+		c := classes[k]
+		ops := make([]string, 0, len(c.ops))
+		for op := range c.ops {
+			ops = append(ops, op)
+		}
+		sort.Slice(ops, func(i, j int) bool { return c.ops[ops[i]] > c.ops[ops[j]] })
+		var parts []string
+		for _, op := range ops {
+			parts = append(parts, fmt.Sprintf("%s %d", op, c.ops[op]))
+		}
+		fmt.Fprintf(&b, "%s\t%d\t%s\t%s\n", k, c.sites, strings.Join(parts, ", "), c.example)
+	}
+	fmt.Fprintf(&b, "\n# Sampled out (signature already tested or %s per opcode reached): %d sites\n", "max-per-op", sampledOut)
 	keys := make([]string, 0, len(skipped))
 	for k := range skipped {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	var b strings.Builder
-	b.WriteString("# opcode\treason\tdistinct signatures\texample\n")
+	b.WriteString("\n# Not testable after lifting (runtime helper call, branch out, unsupported)\n" +
+		"# opcode\treason\tdistinct signatures\tsites\texample\n")
 	for _, k := range keys {
-		fmt.Fprintf(&b, "%s\t%d\t%s\n", k, skipped[k].count, skipped[k].example)
+		fmt.Fprintf(&b, "%s\t%d\t%d\t%s\n", k, skipped[k].count, skipped[k].sites, skipped[k].example)
 	}
 	os.WriteFile(path, []byte(b.String()), 0o644)
 }
@@ -694,10 +847,14 @@ func writeNative(path string, tests []*test) {
 	b.WriteString(".intel_syntax noprefix\n.text\n")
 	b.WriteString(".globl _g_state\n.zerofill __DATA,__bss,_g_state,8,3\n")
 	b.WriteString(".zerofill __DATA,__bss,_g_saved_rsp,8,3\n.zerofill __DATA,__bss,_g_tmp,8,3\n")
+	b.WriteString(".zerofill __DATA,__bss,_g_host_mxcsr,8,3\n.zerofill __DATA,__bss,_g_test_rsp,8,3\n")
 	for i, t := range tests {
 		fmt.Fprintf(&b, "\n.globl _nt_%d\n.p2align 4\n_nt_%d:\n", i, i)
 		b.WriteString("  push rbx\n  push rbp\n  push r12\n  push r13\n  push r14\n  push r15\n")
 		b.WriteString("  mov [rip+_g_saved_rsp], rsp\n  mov [rip+_g_state], rdi\n")
+		// The host MXCSR is restored on return: a test's (V)LDMXCSR must not change how the C
+		// driver rounds while it builds the next inputs.
+		b.WriteString("  stmxcsr [rip+_g_host_mxcsr]\n")
 		for r := 0; r < 16; r++ {
 			fmt.Fprintf(&b, "  vmovdqu ymm%d, [rdi+%d]\n", r, offYmm+32*r)
 		}
@@ -709,6 +866,9 @@ func writeNative(path string, tests []*test) {
 			}
 			fmt.Fprintf(&b, "  mov %s, [rdi+%d]\n", gprNames[r], offGpr+8*r)
 		}
+		if t.stackOp {
+			fmt.Fprintf(&b, "  mov rsp, [rdi+%d]\n", offGpr+8*4)
+		}
 		fmt.Fprintf(&b, "  mov rdi, [rdi+%d]\n", offGpr+8*7)
 		b.WriteString("  .byte ")
 		for k, by := range t.bytes {
@@ -718,6 +878,9 @@ func writeNative(path string, tests []*test) {
 			fmt.Fprintf(&b, "0x%02x", by)
 		}
 		b.WriteString("\n")
+		if t.stackOp { // back to the host stack before anything else uses it (MOV keeps the flags)
+			b.WriteString("  mov [rip+_g_test_rsp], rsp\n  mov rsp, [rip+_g_saved_rsp]\n")
+		}
 		b.WriteString("  mov [rip+_g_tmp], rax\n  pushfq\n  pop rax\n")
 		b.WriteString("  push rcx\n  mov rcx, [rip+_g_state]\n")
 		fmt.Fprintf(&b, "  mov [rcx+%d], rax\n", offFlags)
@@ -731,11 +894,14 @@ func writeNative(path string, tests []*test) {
 			}
 			fmt.Fprintf(&b, "  mov [rcx+%d], %s\n", offGpr+8*r, gprNames[r])
 		}
+		if t.stackOp {
+			fmt.Fprintf(&b, "  mov rax, [rip+_g_test_rsp]\n  mov [rcx+%d], rax\n", offGpr+8*4)
+		}
 		for r := 0; r < 16; r++ {
 			fmt.Fprintf(&b, "  vmovdqu [rcx+%d], ymm%d\n", offYmm+32*r, r)
 		}
 		fmt.Fprintf(&b, "  stmxcsr [rcx+%d]\n", offMxcsr)
-		b.WriteString("  mov rsp, [rip+_g_saved_rsp]\n  vzeroupper\n")
+		b.WriteString("  mov rsp, [rip+_g_saved_rsp]\n  vzeroupper\n  ldmxcsr [rip+_g_host_mxcsr]\n")
 		b.WriteString("  pop r15\n  pop r14\n  pop r13\n  pop r12\n  pop rbp\n  pop rbx\n  ret\n")
 	}
 	fmt.Fprintf(&b, "\n.data\n.globl _nt_count\n_nt_count: .quad %d\n.globl _nt_table\n.p2align 3\n_nt_table:\n", len(tests))
@@ -764,6 +930,15 @@ func writeRegsets(b *strings.Builder, tests []*test) {
 		}
 		if strings.HasPrefix(t.sig, "LDMXCSR ") || strings.HasPrefix(t.sig, "VLDMXCSR ") {
 			mask |= regsetMxcsr
+		}
+		if t.clShift {
+			mask |= regsetShiftCL
+		}
+		if strings.HasPrefix(t.sig, "FLDCW ") {
+			mask |= regsetFcw
+		}
+		if strings.HasPrefix(t.sig, "POPFQ") {
+			mask |= regsetPopf
 		}
 		fmt.Fprintf(b, "  .quad 0x%x", mask)
 		for _, v := range vals {

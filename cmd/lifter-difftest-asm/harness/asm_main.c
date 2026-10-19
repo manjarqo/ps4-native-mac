@@ -13,6 +13,10 @@
 /* GuestContext offsets the lifter hard-codes (pkg/lifter: liftMxcsr, mmxOffset, pcmpistri). */
 _Static_assert(offsetof(GuestContext, mxcsr) == 0x2e8, "mxcsr offset used by the lifter");
 _Static_assert(offsetof(GuestContext, mmx) == 0x2f0, "mmx offset used by the lifter");
+_Static_assert(offsetof(GuestContext, fpu_stack) == 0x2a0, "fpu_stack offset used by the lifter");
+_Static_assert(offsetof(GuestContext, fpu_top) == 0x2e0, "fpu_top offset used by the lifter");
+_Static_assert(offsetof(GuestContext, fpu_cw) == 0x2e4, "fpu_cw offset used by the lifter");
+_Static_assert(offsetof(GuestContext, fpu_sw) == 0x2e6, "fpu_sw offset used by the lifter");
 _Static_assert(offsetof(GuestContext, zf) == 0x99, "zf offset used by the lifter");
 _Static_assert(offsetof(GuestContext, sf) == 0x9a, "sf offset used by the lifter");
 
@@ -53,7 +57,9 @@ int main(int argc, char **argv) {
                [x28 + x27 + 0x70]. */
             memset(&ctx, 0, sizeof(ctx));
             ctx.mxcsr = res.st.mxcsr;
-            ctx.fpu_cw = 0x37f;
+            ctx.fpu_cw = res.st.fcw;
+            ctx.fpu_top = (int)res.st.ftop;
+            for (int i = 0; i < 8; i++) ctx.fpu_stack[(res.st.ftop + i) & 7] = res.st.st[i];
             GuestContext *cp = &ctx;
             memcpy(scr + (DT_FAKE_TCB - DT_SCRATCH_BASE) + 0x70, &cp, sizeof(cp));
             static volatile DtState st;
@@ -62,6 +68,14 @@ int main(int argc, char **argv) {
                 lt_table[t]((DtState *)&st, DT_FAKE_TCB);
                 memcpy(&res.st, (void *)&st, sizeof(st));
                 res.st.mxcsr = ctx.mxcsr;
+                /* x87: the lifter keeps TOP and the eight registers in the GuestContext and
+                   inserts TOP into the status word only when it is stored (FNSTSW). */
+                unsigned top = (unsigned)ctx.fpu_top & 7;
+                res.st.ftop = top;
+                for (int i = 0; i < 8; i++) res.st.st[i] = ctx.fpu_stack[(top + i) & 7];
+                res.st.fcw = ctx.fpu_cw;
+                res.st.fsw = (uint16_t)((ctx.fpu_sw & ~0x3800) | (top << 11));
+                res.st.ftag = 0xff;
             } else {
                 res.status = 2;
             }
