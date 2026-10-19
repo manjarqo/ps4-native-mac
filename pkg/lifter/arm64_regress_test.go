@@ -468,3 +468,14 @@ func TestRegressX87Math(t *testing.T) {
 	requireInOrder(t, "fxtract", l, "scvtf d29, x2", "orr x0, x0, #0x3ff0000000000000",
 		"str d29, [x5, w17, uxtw #3]", "sub w17, w17, #1", "str d28, [x5, w17, uxtw #3]")
 }
+
+// An absolute [disp32] operand (SIB byte, no base, no index) was treated like the RIP-relative
+// operands that x86asm's VEX decoder reports without a base: mov eax, [0xc] read the guest code
+// after the instruction instead of address 0xc (the NULL page).
+func TestRegressAbsoluteAddress(t *testing.T) {
+	l := liftBlock(t, "8b04250c000000")[0] // mov eax, [0xc]
+	requireInOrder(t, "mov eax, [0xc]", l, "mov x16, #0", "add x16, x16, #12", "ldr w16, [x28, x16]")
+	// VEX RIP-relative: vmovss xmm0, [rip+0x10] at 0x1000 (next instruction at 0x1008).
+	l = liftBlock(t, "c5fa100510000000")[0]
+	requireInOrder(t, "vmovss xmm0, [rip+0x10]", l, "movz x16, #0x1018...")
+}

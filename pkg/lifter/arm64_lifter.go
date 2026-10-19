@@ -429,8 +429,10 @@ func computeEffAddr(mem x86asm.Mem, nextPC uint64, targetReg string) []string {
 	var lines []string
 	disp := int64(int32(mem.Disp))
 
-	// 1. RIP-relative addressing: [rip + disp]
-	if mem.Base == x86asm.RIP || (mem.Segment == 0 && mem.Base == 0 && mem.Index == 0 && mem.Disp != 0) {
+	// 1. RIP-relative addressing: [rip + disp]. x86asm's VEX decoder leaves Base unset for
+	// RIP-relative operands; it can be told from the absolute [disp32] form (a SIB byte with no
+	// base and no index) by Scale, which only a SIB byte sets.
+	if mem.Base == x86asm.RIP || (mem.Segment == 0 && mem.Base == 0 && mem.Index == 0 && mem.Scale == 0) {
 		effAddr := uint64(int64(nextPC) + disp)
 		return loadImm64(targetReg, effAddr)
 	}

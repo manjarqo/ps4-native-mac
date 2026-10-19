@@ -653,8 +653,8 @@ func main() {
 					bad = "memory: segment override"
 				case v.Base == x86asm.RSP || v.Base == x86asm.ESP:
 					bad = "memory: RSP base (the native stub keeps its frame there)"
-				case v.Base == 0 && v.Index == 0 && (img[addr] == 0xc4 || img[addr] == 0xc5):
-					// x86asm reports VEX RIP-relative operands without a base register.
+				case v.Base == 0 && v.Index == 0 && v.Scale == 0:
+					// x86asm's VEX decoder reports RIP-relative operands without a base register.
 					bad = "memory: RIP-relative"
 				case v.Base == 0 && v.Index == 0:
 					bad = "memory: absolute address"
