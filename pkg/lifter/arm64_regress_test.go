@@ -325,3 +325,49 @@ func TestRegressNoPlatformRegister(t *testing.T) {
 		}
 	}
 }
+
+// lastWriteBefore returns the code of the last line before index end whose destination (first
+// operand) is register reg, or "".
+func lastWriteBefore(lines []string, end int, reg string) string {
+	for i := end - 1; i >= 0; i-- {
+		f := strings.Fields(strings.ReplaceAll(code(lines[i]), ",", " "))
+		if len(f) >= 2 && f[1] == reg && !strings.HasPrefix(f[0], "st") {
+			return code(lines[i])
+		}
+	}
+	return ""
+}
+
+// x87 stores to memory computed the address into x16 and then read the x87 stack, whose helpers
+// reload x16 with the GuestContext pointer: the value went to [x28 + ctx pointer].
+func TestRegressX87Stores(t *testing.T) {
+	for _, tc := range []struct{ name, hex, store string }{
+		{"fstp dword [rax]", "d918", "str s0, [x28, x16]"},
+		{"fstp qword [rax]", "dd18", "str d0, [x28, x16]"},
+		{"fst dword [rax]", "d910", "str s0, [x28, x16]"},
+		{"fistp dword [rax]", "db18", "str w17, [x28, x16]"},
+		{"fisttp qword [rax]", "dd08", "str x17, [x28, x16]"},
+		{"fist word [rax]", "df10", "strh w17, [x28, x16]"},
+		{"fistp word [rax]", "df18", "strh w17, [x28, x16]"},
+	} {
+		l := liftBlock(t, tc.hex)[0]
+		forbid(t, tc.name, l, "b _recomp_unsupported_instruction")
+		at := -1
+		for i, ln := range l {
+			if code(ln) == tc.store {
+				at = i
+			}
+		}
+		if at < 0 {
+			t.Errorf("%s: no %q in:\n%s", tc.name, tc.store, strings.Join(l, "\n"))
+			continue
+		}
+		if w := lastWriteBefore(l, at, "x16"); w != "mov x16, x19" {
+			t.Errorf("%s: the store address x16 was last written by %q, not the address computation:\n%s",
+				tc.name, w, strings.Join(l, "\n"))
+		}
+	}
+	// FIST/FISTP give the integer indefinite for NaN and out-of-range values.
+	requireInOrder(t, "fistp word", liftBlock(t, "df18")[0], "fcvtzs x17, d31", "and w1, w1, #0x8000")
+	requireInOrder(t, "fistp dword", liftBlock(t, "db18")[0], "fcvtzs x17, d31", "and w1, w1, #0x80000000")
+}

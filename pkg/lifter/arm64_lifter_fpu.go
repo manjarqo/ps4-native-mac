@@ -172,15 +172,16 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			return lines, nil
 		}
 		if mem, ok := args[0].(x86asm.Mem); ok {
-			lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
+			// Read ST(0) before computing the address: the stack helpers use x16 for the
+			// GuestContext pointer.
 			lines = append(lines, loadFpuSt("d0", 0)...)
 			if defMemSz == 8 {
+				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
 				lines = append(lines, "    str d0, [x28, x16]")
 			} else {
-				lines = append(lines,
-					"    fcvt s0, d0",
-					"    str s0, [x28, x16]",
-				)
+				lines = append(lines, "    fcvt s0, d0")
+				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
+				lines = append(lines, "    str s0, [x28, x16]")
 			}
 			if isPop {
 				lines = append(lines, emitFpuDiscard()...)
@@ -188,47 +189,28 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 			return lines, nil
 		}
 
-	case x86asm.FISTP, x86asm.FISTTP:
+	case x86asm.FIST, x86asm.FISTP, x86asm.FISTTP:
 		if mem, ok := args[0].(x86asm.Mem); ok {
-			lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
-			lines = append(lines, emitFpuPopD0()...)
-			if op == x86asm.FISTTP {
-				// Truncate towards zero
-				if defMemSz == 8 {
-					lines = append(lines,
-						"    fcvtzs x17, d0",
-						"    str x17, [x28, x16]",
-					)
-				} else if defMemSz == 2 {
-					lines = append(lines,
-						"    fcvtzs w17, d0",
-						"    strh w17, [x28, x16]",
-					)
-				} else {
-					lines = append(lines,
-						"    fcvtzs w17, d0",
-						"    str w17, [x28, x16]",
-					)
-				}
+			// Value first, address second (the stack helpers use x16), then the store.
+			if op == x86asm.FIST {
+				lines = append(lines, loadFpuSt("d0", 0)...)
 			} else {
-				// Round to nearest even
-				lines = append(lines, "    frintn d0, d0")
-				if defMemSz == 8 {
-					lines = append(lines,
-						"    fcvtzs x17, d0",
-						"    str x17, [x28, x16]",
-					)
-				} else if defMemSz == 2 {
-					lines = append(lines,
-						"    fcvtzs w17, d0",
-						"    strh w17, [x28, x16]",
-					)
-				} else {
-					lines = append(lines,
-						"    fcvtzs w17, d0",
-						"    str w17, [x28, x16]",
-					)
-				}
+				lines = append(lines, emitFpuPopD0()...)
+			}
+			trunc := op == x86asm.FISTTP
+			switch defMemSz {
+			case 8:
+				lines = append(lines, fpToIntX86("x17", "d0", trunc)...)
+				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
+				lines = append(lines, "    str x17, [x28, x16]")
+			case 2:
+				lines = append(lines, fpToInt16X86("w17", "d0", trunc)...)
+				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
+				lines = append(lines, "    strh w17, [x28, x16]")
+			default:
+				lines = append(lines, fpToIntX86("w17", "d0", trunc)...)
+				lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
+				lines = append(lines, "    str w17, [x28, x16]")
 			}
 			return lines, nil
 		}
@@ -680,4 +662,31 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 
 	lines = append(lines, l.emitUnsupported(inst, fmt.Sprintf("unsupported fpu: %v", op))...)
 	return lines, nil
+}
+
+// fpToInt16X86 converts the double in src (d<n>) to int16 in dst (w register) with x86 FIST
+// semantics: NaN and values outside [-32768, 32767] give the integer indefinite 0x8000. FISTTP
+// truncates; FIST/FISTP round by the current mode. NZCV is not touched. Scratch: x1, x2, v30,
+// v31.
+func fpToInt16X86(dst, src string, trunc bool) []string {
+	var out []string
+	if !trunc {
+		out = append(out, fmt.Sprintf("    frintx d31, %s", src))
+		src = "d31"
+	}
+	x := "x" + dst[1:]
+	out = append(out,
+		fmt.Sprintf("    fcvtzs %s, %s", x, src),
+		fmt.Sprintf("    fcmeq d30, %s, %s", src, src),
+		"    fmov x2, d30", // all ones unless NaN
+		fmt.Sprintf("    sxth x1, %s", dst),
+		fmt.Sprintf("    eor x1, x1, %s", x), // 0 iff it fits in 16 bits
+		"    clz x1, x1",
+		"    lsr x1, x1, #6",
+		"    sub x1, x1, #1", // 0 iff it fits, else all ones
+		"    orn x1, x1, x2", // ... or NaN
+		fmt.Sprintf("    bic %s, %s, w1", dst, dst),
+		"    and w1, w1, #0x8000",
+		fmt.Sprintf("    orr %s, %s, w1", dst, dst))
+	return out
 }

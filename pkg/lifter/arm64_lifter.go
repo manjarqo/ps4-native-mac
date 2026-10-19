@@ -1603,7 +1603,7 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		return l.liftPmaddwd(inst, nextPC, lines)
 
 	case x86asm.FLD, x86asm.FILD, x86asm.FLDZ, x86asm.FLD1,
-		x86asm.FST, x86asm.FSTP, x86asm.FISTP, x86asm.FISTTP,
+		x86asm.FST, x86asm.FSTP, x86asm.FIST, x86asm.FISTP, x86asm.FISTTP,
 		x86asm.FXCH, x86asm.FCHS, x86asm.FABS, x86asm.FSQRT,
 		x86asm.FADD, x86asm.FADDP, x86asm.FSUB, x86asm.FSUBP, x86asm.FSUBR, x86asm.FSUBRP,
 		x86asm.FMUL, x86asm.FMULP, x86asm.FDIV, x86asm.FDIVP, x86asm.FDIVR, x86asm.FDIVRP,
