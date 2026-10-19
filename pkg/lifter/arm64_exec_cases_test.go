@@ -353,3 +353,37 @@ func TestExecX87ComparesKeepFlags(t *testing.T) {
 	}
 	runExecCases(t, cases)
 }
+
+// VCVTPS2PH rounds by its imm8: bits 1:0 give the mode unless bit 2 selects MXCSR.RC.
+func TestExecVcvtps2phRounding(t *testing.T) {
+	vals := []float32{1 + 0x1p-11, 1 + 3*0x1p-12, -(1 + 0x1p-11), 65520, 1e-7, 2049, -2049, 65519}
+	src := make([]byte, 32)
+	for i, v := range vals {
+		binary.LittleEndian.PutUint32(src[4*i:], math.Float32bits(v))
+	}
+	var cases []execCase
+	for rc := uint32(0); rc < 4; rc++ {
+		mx := make([]byte, 4)
+		binary.LittleEndian.PutUint32(mx, 0x1f80|rc<<13)
+		for imm := 0; imm < 8; imm++ {
+			ib := fmt.Sprintf("%02x", imm)
+			cases = append(cases, execCase{
+				name: fmt.Sprintf("mxcsr.rc=%d imm=%d", rc, imm),
+				code: []string{
+					"0fae16",            // ldmxcsr [rsi]
+					"c5f8100f",          // vmovups xmm1, [rdi]
+					"c4e3791d4f20" + ib, // vcvtps2ph qword [rdi+0x20], xmm1, imm
+					"c4e3791dca" + ib,   // vcvtps2ph xmm2, xmm1, imm
+					"c5f9d65730",        // vmovq [rdi+0x30], xmm2
+					"c5fc100f",          // vmovups ymm1, [rdi]
+					"c4e37d1d4f40" + ib, // vcvtps2ph xmmword [rdi+0x40], ymm1, imm
+					"c4e37d1dcb" + ib,   // vcvtps2ph xmm3, ymm1, imm
+					"c5f8115f50",        // vmovups [rdi+0x50], xmm3
+				},
+				regs: map[x86asm.Reg]uint64{x86asm.RSI: execMemBase + 0x80, x86asm.RDI: execMemBase + 0x100},
+				mem:  map[int][]byte{0x80: mx, 0x100: src},
+			})
+		}
+	}
+	runExecCases(t, cases)
+}

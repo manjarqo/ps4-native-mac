@@ -1099,6 +1099,32 @@ func packedFpToInt32X86(d, s string, trunc bool) []string {
 		fmt.Sprintf("    bit %s.16b, v31.16b, v29.16b", d))
 }
 
+// cvtps2phRounding returns the code around the FCVTNs of VCVTPS2PH that applies its imm8
+// rounding control: bits 1:0 (nearest, down, up, toward zero) unless bit 2 selects MXCSR.RC,
+// which FPCR already holds. FPCR is only written when its mode differs; the old value stays in
+// x5. NZCV is not touched. Scratch: x5-x7.
+func cvtps2phRounding(inst disasm.Instruction) (begin, end []string) {
+	imm, ok := inst.Inst.Args[2].(x86asm.Imm)
+	if !ok || imm&4 != 0 {
+		return nil, nil
+	}
+	rm := [4]int{0, 2, 1, 3}[imm&3] // FPCR RMode: nearest, up, down, toward zero
+	begin = []string{"    mrs  x5, fpcr", "    ubfx x6, x5, #22, #2"}
+	if rm != 0 {
+		begin = append(begin, fmt.Sprintf("    eor  x6, x6, #%d", rm))
+	}
+	begin = append(begin,
+		"    cbz  x6, 1f", // already in that mode
+		fmt.Sprintf("    mov  x6, #%d", rm),
+		"    mov  x7, x5",
+		"    bfi  x7, x6, #22, #2",
+		"    msr  fpcr, x7",
+		"    mov  x6, #1",
+		"1:")
+	end = []string{"    cbz  x6, 2f", "    msr  fpcr, x5", "2:"}
+	return begin, end
+}
+
 // liftCvtdq handles conversions between float, double, int, and half-precision.
 func (l *Arm64Lifter) liftCvtdq(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	op := inst.Inst.Op
@@ -1117,17 +1143,19 @@ func (l *Arm64Lifter) liftCvtdq(inst disasm.Instruction, nextPC uint64, lines []
 			sReg, okSrc := src.(x86asm.Reg)
 			if isY, _, _, sL, sH, _, _, okS := getVectorDesc(sReg); okSrc && okS {
 				lines = append(lines, computeEffAddr(memDst, nextPC, "x16")...)
+				begin, end := cvtps2phRounding(inst)
+				lines = append(lines, begin...)
 				if isY {
 					lines = append(lines,
 						fmt.Sprintf("    fcvtn v28.4h, %s.4s", sL),
 						fmt.Sprintf("    fcvtn2 v28.8h, %s.4s", sH),
-						"    str q28, [x28, x16]",
 					)
+					lines = append(lines, end...)
+					lines = append(lines, "    str q28, [x28, x16]")
 				} else {
-					lines = append(lines,
-						fmt.Sprintf("    fcvtn v28.4h, %s.4s", sL),
-						"    str d28, [x28, x16]",
-					)
+					lines = append(lines, fmt.Sprintf("    fcvtn v28.4h, %s.4s", sL))
+					lines = append(lines, end...)
+					lines = append(lines, "    str d28, [x28, x16]")
 				}
 				return lines, nil
 			}
@@ -1258,10 +1286,14 @@ func (l *Arm64Lifter) liftCvtdq(inst disasm.Instruction, nextPC uint64, lines []
 		}
 
 	case x86asm.VCVTPS2PH:
+		begin, end := cvtps2phRounding(inst)
+		lines = append(lines, begin...)
 		lines = append(lines, fmt.Sprintf("    fcvtn %s.4h, %s.4s", dLowV, sLowV))
 		if isYmm {
 			lines = append(lines, fmt.Sprintf("    fcvtn2 %s.8h, %s.4s", dLowV, sHighV))
-		} else {
+		}
+		lines = append(lines, end...)
+		if !isYmm {
 			lines = append(lines, fmt.Sprintf("    mov %s.d[1], xzr", dLowV))
 		}
 		lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", dHighV))
