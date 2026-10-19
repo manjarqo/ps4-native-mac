@@ -13,7 +13,8 @@
 # it checks values and flags of the atomic lowerings, not atomicity (pkg/lifter TestLockFullBarrier).
 #
 # Environment: MAX_PER_OP (default 40), SPECIAL=1 adds special FP values (inf/nan/denormals),
-# STAGE_TIMEOUT (seconds per stage, default 900).
+# STAGE_TIMEOUT (seconds per stage, default 900), TSO=0 lifts without x86 memory ordering
+# (ps4-recomp -tso=false; the default lifts with it, as ps4-recomp does).
 #
 # Every stage runs under /usr/bin/time -l; the peak resident set size of each stage is written to
 # <workdir>/peak_rss.txt (MB) so runs on large eboots can be kept memory-bounded.
@@ -47,7 +48,7 @@ else
 fi
 arch -x86_64 /usr/bin/true || { echo "Rosetta 2 is not installed" >&2; exit 1; }
 (cd "$ROOT" && go build -o "$OUT/lifter-difftest-asm" ./cmd/lifter-difftest-asm)
-stage generator "$OUT/lifter-difftest-asm" -image "$IMG" -dis "$DIS" -out "$OUT" -max-per-op ${MAX_PER_OP:-40}
+stage generator "$OUT/lifter-difftest-asm" -image "$IMG" -dis "$DIS" -out "$OUT" -max-per-op ${MAX_PER_OP:-40} -tso=$([ "${TSO:-1}" = 0 ] && echo false || echo true)
 H="$HERE/harness"
 stage clang_native clang -arch x86_64 -O1 -I"$H" "$H/native_main.c" "$OUT/native_tests.s" -o "$OUT/native_dt"
 stage clang_asm clang -arch arm64 -O1 -w -I"$H" -I"$ROOT/pkg/runtime/core" "$H/asm_main.c" "$OUT/asm_tests.s" -o "$OUT/asm_dt"

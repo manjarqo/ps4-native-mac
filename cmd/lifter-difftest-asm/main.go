@@ -19,7 +19,7 @@
 // Memory operands are redirected into a scratch area mapped at the same fixed address in both
 // programs. run.sh/harness/compare.py compare the final states.
 //
-// Usage: lifter-difftest-asm -image guest_image.bin -dis listing.txt -out DIR [-max-per-op N]
+// Usage: lifter-difftest-asm -image guest_image.bin -dis listing.txt -out DIR [-max-per-op N] [-tso=false]
 package main
 
 import (
@@ -460,6 +460,7 @@ func main() {
 	disPath := flag.String("dis", "", "disassembly listing (lines 'ADDR: ...', ADDR in hex, optional 0x)")
 	outDir := flag.String("out", "difftest", "output directory")
 	maxPerOp := flag.Int("max-per-op", 40, "max distinct signatures per opcode")
+	tso := flag.Bool("tso", true, "lift with x86 memory ordering (acquire/release for non-stack memory), as ps4-recomp -tso")
 	flag.Parse()
 
 	img, err := os.ReadFile(*imgPath)
@@ -475,6 +476,7 @@ func main() {
 	defer f.Close()
 
 	l := lifter.NewArm64Lifter(nil)
+	l.SetTSO(*tso)
 	// UsesYmm: lift in the mode that keeps every YMM upper half intact (the strict superset).
 	fn := &disasm.Function{EntryAddr: 0x1000, Blocks: make(map[uint64]*disasm.BasicBlock), UsesYmm: true}
 	lift := func(inst x86asm.Inst, addr uint64, mode entryMode) ([]string, []string, error) {
