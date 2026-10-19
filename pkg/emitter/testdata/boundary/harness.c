@@ -43,6 +43,21 @@ enum { W_RAX, W_RBX, W_RCX, W_RDX, W_RSI, W_RDI, W_RBP, W_RSP, W_R8, W_R15 = W_R
 #define ADDR_XMM 0x400700ULL
 #define ADDR_XMM_CALLBACK 0x400800ULL
 #define RES_XMM_ADDR (D + 0x1000 + 0x1000)
+#define RES_FPCR_ADDR (D + 0x1000 + 0x1100)
+#define RES_FP_ADDR (D + 0x1000 + 0x1200) // M1, A1, A2, B1, M2: {FPCR, ctx->mxcsr}
+#define ADDR_FPCR 0x400900ULL
+
+// FPCR values for an MXCSR rounding mode (RMode bits 23:22) and flush to zero (bit 24).
+#define FPCR_RP (1ULL << 22)
+#define FPCR_RM (2ULL << 22)
+#define FPCR_RZ (3ULL << 22)
+#define FPCR_FZ (1ULL << 24)
+
+static uint64_t read_fpcr(void) {
+  uint64_t v;
+  __asm__ volatile("mrs %0, fpcr" : "=r"(v));
+  return v;
+}
 
 void guest_fiber_main1(void);
 void guest_fiber_main2(void);
@@ -54,6 +69,7 @@ void guest_gprs(void);
 void guest_xmm(void);
 void guest_xmm_callback(void);
 void guest_clobber_fp(void);
+void guest_fpcr(void);
 uint64_t host_enter_guest_d8_d15(GuestContext *ctx, uint64_t fn);
 
 static GuestContext *g_proc;
@@ -161,6 +177,18 @@ static void test_fiber(void) {
   expect("B argOnRun from A", *gmem64(ARGRUN_B), 0x5252);
   check_pattern("thread 2 after Run(A)", RES_M2, 0x2200, res(RES_M2_PRE)[W_RSP], fs2);
   expect("thread 2 argOnReturn", *gmem64(ARGRET2), 0x88);
+  static const char *fp_names[] = {"thread 1 after Run(A)", "A after Switch(B)", "A resumed on thread 2",
+                                   "B resumed on thread 2", "thread 2 after Run(A)"};
+  static const uint64_t fp_fpcr[] = {FPCR_RZ, FPCR_RM | FPCR_FZ, FPCR_RM | FPCR_FZ, FPCR_RP, 0};
+  static const uint64_t fp_mxcsr[] = {0x7f80, 0xbf80, 0xbf80, 0x5f80, 0x1f80};
+  for (int i = 0; i < 5; i++) {
+    char what[96];
+    const uint64_t *fp = gmem64(RES_FP_ADDR + (uint64_t)i * 16);
+    snprintf(what, sizeof what, "%s: FPCR", fp_names[i]);
+    expect(what, fp[0], fp_fpcr[i]);
+    snprintf(what, sizeof what, "%s: MXCSR (STMXCSR)", fp_names[i]);
+    expect(what, fp[1], fp_mxcsr[i]);
+  }
   expect("thread 1 TCB slot", tcb_slot(t1), (uint64_t)(uintptr_t)t1);
   expect("thread 2 TCB slot", tcb_slot(t2), (uint64_t)(uintptr_t)t2);
 }
@@ -288,6 +316,27 @@ static void test_callee_saved_fp(void) {
   if (changed) fail("recomp_enter_guest changed callee-saved d8-d15 (mask 0x%llx of bits 8-15)", (unsigned long long)changed);
 }
 
+static uint64_t g_shim_fpcr = ~0ULL;
+
+void shim_test_fpcr(GuestContext *ctx) {
+  g_shim_fpcr = read_fpcr();
+  SHIM_RETURN();
+}
+
+// Guest code starts with the FPCR of ctx->mxcsr, a shim runs with the default FPCR, the guest
+// gets its own back, and the host gets its own back from recomp_enter_guest.
+static void test_fpcr(void) {
+  g_proc->mxcsr = 0x5f80; // round up
+  recomp_call_guest(g_proc, ADDR_FPCR);
+  const uint64_t host_after = read_fpcr();
+  const uint64_t *r = gmem64(RES_FPCR_ADDR);
+  expect("guest FPCR at entry (MXCSR 0x5f80)", r[0], FPCR_RP);
+  expect("FPCR in the shim", g_shim_fpcr, 0);
+  expect("guest FPCR after the shim", r[1], FPCR_RM | FPCR_FZ);
+  expect("host FPCR after recomp_enter_guest", host_after, 0);
+  expect("ctx->mxcsr after LDMXCSR", g_proc->mxcsr, 0xbf80);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -306,6 +355,7 @@ int main(int argc, char **argv) {
   recomp_register_fn(ADDR_GPRS, (recomp_fn_t)guest_gprs);
   recomp_register_fn(ADDR_XMM, (recomp_fn_t)guest_xmm);
   recomp_register_fn(ADDR_XMM_CALLBACK, (recomp_fn_t)guest_xmm_callback);
+  recomp_register_fn(ADDR_FPCR, (recomp_fn_t)guest_fpcr);
 
   const char *c = argv[1];
   if (strcmp(c, "fiber") == 0) {
@@ -318,6 +368,8 @@ int main(int argc, char **argv) {
     test_xmm();
   } else if (strcmp(c, "callee-saved-fp") == 0) {
     test_callee_saved_fp();
+  } else if (strcmp(c, "fpcr") == 0) {
+    test_fpcr();
   } else {
     fprintf(stderr, "unknown case %s\n", c);
     return 2;

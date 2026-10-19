@@ -399,6 +399,11 @@ static void *fiber_host_main(void *arg) {
 // restores the same frame from load_sp. A new fiber's stack starts with such
 // a frame that "returns" into ps4_fiber_co_trampoline with x19 = FiberHost
 // and x20 = fiber_co_main.
+// FPCR and MXCSR need no slot in the frame: a switch happens inside a shim, and
+// host code runs with the default FPCR (the shim bridge keeps the guest FPCR in
+// its frame on the switching endpoint's host stack and restores it when that
+// endpoint resumes); MXCSR is in each endpoint's own GuestContext, the one the
+// TCB slot names while it runs.
 __attribute__((visibility("hidden"))) void ps4_fiber_ctx_switch(void **save_sp, void *load_sp);
 __attribute__((visibility("hidden"))) extern const char ps4_fiber_co_trampoline[];
 

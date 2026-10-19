@@ -34,6 +34,12 @@
 .set RES_GPRS_PRE, RES + 0xe00
 .set RES_GPRS, RES + 0xf00
 .set RES_XMM, RES + 0x1000
+.set RES_FPCR, RES + 0x1100
+.set RES_FP_M1, RES + 0x1200    // FPCR and ctx->mxcsr after each fiber hand-over (STORE_FP)
+.set RES_FP_A1, RES + 0x1210
+.set RES_FP_A2, RES + 0x1220
+.set RES_FP_B1, RES + 0x1230
+.set RES_FP_M2, RES + 0x1240
 
 .macro LI reg, val
     movz \reg, #((\val) & 0xffff)
@@ -77,6 +83,33 @@
     movz x15, #(\p + 0x0f)
 .endm
 
+// LDMXCSR as the lifter lowers it: ctx->mxcsr (through the TCB slot) and FPCR RMode/FZ.
+.macro SET_MXCSR val
+    LI   x0, \val
+    add  x17, x27, #0x70
+    ldr  x17, [x28, x17]
+    str  w0, [x17, #0x2e8]
+    mrs  x1, fpcr
+    ubfx w2, w0, #14, #1
+    bfi  x1, x2, #22, #1
+    ubfx w2, w0, #13, #1
+    bfi  x1, x2, #23, #1
+    ubfx w2, w0, #15, #1
+    bfi  x1, x2, #24, #1
+    msr  fpcr, x1
+.endm
+
+// FPCR and the ctx->mxcsr STMXCSR would read (through the TCB slot) to \addr.
+.macro STORE_FP addr
+    LI   x16, \addr
+    add  x16, x28, x16
+    mrs  x0, fpcr
+    add  x17, x27, #0x70
+    ldr  x17, [x28, x17]
+    ldr  w1, [x17, #0x2e8]
+    stp  x0, x1, [x16]
+.endm
+
 // Result block: rax rbx rcx rdx rsi rdi rbp rsp r8-r15 fs mem (18 words).
 .macro STORE_REGS addr
     LI   x16, \addr
@@ -98,12 +131,15 @@
 
 GUEST_FN _guest_fiber_main1
     SET_PATTERN 0x1100
+    SET_MXCSR 0x7f80                // round toward zero
     STORE_REGS RES_M1_PRE
     LI   x24, FIBER_A
     LI   x23, 0x5150
     LI   x22, ARGRET1
     GUEST_CALL _stub_sceFiberRun
     STORE_REGS RES_M1
+    STORE_FP RES_FP_M1
+    SET_MXCSR 0x1f80
     GUEST_RET
 
 GUEST_FN _guest_fiber_main2
@@ -114,21 +150,25 @@ GUEST_FN _guest_fiber_main2
     LI   x22, ARGRET2
     GUEST_CALL _stub_sceFiberRun
     STORE_REGS RES_M2
+    STORE_FP RES_FP_M2
     GUEST_RET
 
 GUEST_FN _guest_fiber_a
     STORE_REGS RES_A_ARGS
     SET_PATTERN 0xa000
+    SET_MXCSR 0xbf80                // round down, flush to zero
     STORE_REGS RES_A_PRE
     LI   x24, FIBER_B
     LI   x23, 0x5151
     LI   x22, ARGRUN_A
     GUEST_CALL _stub_sceFiberSwitch
     STORE_REGS RES_A1
+    STORE_FP RES_FP_A1
     LI   x24, 0x77
     LI   x23, ARGRUN_A2
     GUEST_CALL _stub_sceFiberReturnToThread
     STORE_REGS RES_A2
+    STORE_FP RES_FP_A2
     LI   x24, FIBER_B
     LI   x23, 0x5252
     LI   x22, ARGRUN_A3
@@ -138,6 +178,7 @@ GUEST_FN _guest_fiber_a
 GUEST_FN _guest_fiber_b
     STORE_REGS RES_B_ARGS
     SET_PATTERN 0xb000
+    SET_MXCSR 0x5f80                // round up
     STORE_REGS RES_B_PRE
     GUEST_CALL _stub_test_noop
     LI   x24, FIBER_A
@@ -145,6 +186,7 @@ GUEST_FN _guest_fiber_b
     LI   x22, ARGRUN_B
     GUEST_CALL _stub_sceFiberSwitch
     STORE_REGS RES_B1
+    STORE_FP RES_FP_B1
     LI   x24, 0x88
     movz x23, #0
     GUEST_CALL _stub_sceFiberReturnToThread
@@ -202,6 +244,21 @@ GUEST_FN _guest_xmm
 // float callback(float x) { return x + x; }
 GUEST_FN _guest_xmm_callback
     fadd s0, s0, s0
+    GUEST_RET
+
+// ---- FPCR: guest code runs with the FPCR its MXCSR asks for, host code with the default.
+
+GUEST_FN _guest_fpcr
+    LI   x16, RES_FPCR
+    add  x16, x28, x16
+    mrs  x0, fpcr
+    str  x0, [x16, #0]              // at entry: from ctx->mxcsr
+    SET_MXCSR 0xbf80                // round down, flush to zero
+    GUEST_CALL _stub_test_fpcr
+    LI   x16, RES_FPCR
+    add  x16, x28, x16
+    mrs  x0, fpcr
+    str  x0, [x16, #8]              // after the shim
     GUEST_RET
 
 // ---- recomp_enter_guest is called from C: it must keep the AAPCS64 callee-saved d8-d15,

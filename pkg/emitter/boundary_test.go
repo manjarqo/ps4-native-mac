@@ -20,6 +20,7 @@ var boundaryStubs = [][2]string{
 	{"_stub_test_wait_signal", "shim_test_wait_signal"},
 	{"_stub_test_set_gprs", "shim_test_set_gprs"},
 	{"_stub_test_xmm", "shim_test_xmm"},
+	{"_stub_test_fpcr", "shim_test_fpcr"},
 }
 
 // boundaryRuntimeSources are the runtime files the boundary tests run against.
@@ -96,6 +97,7 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"shim-sets-gprs", "gprs", nil},
 		{"xmm-arguments-and-results", "xmm", nil},
 		{"enter-guest-keeps-d8-d15", "callee-saved-fp", nil},
+		{"fpcr", "fpcr", nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

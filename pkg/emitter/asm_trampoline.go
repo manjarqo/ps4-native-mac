@@ -50,7 +50,7 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 // While recompiled guest code runs, the x86 state is pinned in host registers:
 //   rax x19, rbx x20, rcx x21, rdx x22, rsi x23, rdi x24, rbp x25, rsp x26, r8-r15 x8-x15,
 //   FS base x27, guest memory base x28; xmm0-15 (low 128 bits) v0-v15, the upper halves
-//   of ymm0-15 v16-v31; the flags in NZCV.
+//   of ymm0-15 v16-v31; the flags in NZCV; MXCSR.RC/FZ in FPCR (RMode, FZ).
 // x0-x7, x16 and x17 are scratch, x18 is never touched, x29 is not maintained (guest code
 // builds no frame records). Each active guest function keeps its host return address (x30)
 // in a 16-byte slot on the host stack.
@@ -64,14 +64,17 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 // GuestContext, or the fiber's while a fiber runs (ps4_fiber.c).
 //
 // Host -> guest, recomp_enter_guest(ctx, fn): saves the host callee-saved x19-x30 and d8-d15
-// (guest code overwrites them: they are the low halves of xmm8-15), loads the
-// 16 GPRs, FS base, memory base and xmm0-7 from ctx, calls fn, and on return stores the 16
-// GPRs and xmm0-7 back to ctx (a callback's vector arguments and result).
+// (guest code overwrites them: they are the low halves of xmm8-15) and the host FPCR, loads the
+// 16 GPRs, FS base, memory base and xmm0-7 from ctx, sets FPCR RMode/FZ from ctx->mxcsr,
+// calls fn, and on return stores the 16 GPRs and xmm0-7 back to ctx (a callback's vector
+// arguments and result) and restores the host FPCR.
 //
 // Guest -> host, _recomp_call_shim (x0 = shim; the shim stub branches here in place of a
 // guest function): ctx = the TCB slot. Stores the 16 GPRs and xmm0-7 to ctx, calls
 // shim(ctx), then reloads from that same ctx (kept in the bridge frame, not looked up again)
-// all 16 GPRs, xmm0-7, the FS base and the memory base. A shim reads its arguments and
+// all 16 GPRs, xmm0-7, the FS base and the memory base. Host code runs with the default
+// FPCR (0: round to nearest, no flush to zero); the bridge keeps the guest FPCR in its frame
+// and restores it on return. A shim reads its arguments and
 // returns its results through ctx (rax/rdx, xmm0/xmm1) and may set any GPR (rsp included),
 // e.g. to resume at a longjmp target. xmm8-15, the ymm upper halves (ctx->ymmh is never
 // written) and the flags are not synced: System V makes them caller-saved, so guest code
@@ -80,7 +83,8 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 // A shim that switches context (sceFiberRun/Switch/ReturnToThread) switches host stacks
 // inside the shim. The bridge frame of a call lives on the host stack of the context that
 // made the call, so when that context is resumed, its own frame finishes the call: it
-// reloads the guest registers that context stored, and the FS base from ctx->fs_base, which
+// reloads the guest registers that context stored and its FPCR, and the FS base from
+// ctx->fs_base, which
 // the fiber runtime updates when a fiber resumes on another guest thread. The runtime must
 // point the TCB slot of a guest thread at the GuestContext of the endpoint it switches to,
 // before the switch.
@@ -89,7 +93,7 @@ const trampolineAsm = `// ARM64 assembly bridge between the host C runtime and r
 // void recomp_enter_guest(GuestContext *ctx, uint64_t target_fn)
 // x0 = ctx, x1 = target_fn
 .globl _recomp_enter_guest
-// Frame: [sp] x29, x30; [sp+16] x19-x28; [sp+96] d8-d15; [sp+160] ctx.
+// Frame: [sp] x29, x30; [sp+16] x19-x28; [sp+96] d8-d15; [sp+160] ctx, host FPCR.
 _recomp_enter_guest:
     stp  x29, x30, [sp, #-176]!
     mov  x29, sp
@@ -104,6 +108,22 @@ _recomp_enter_guest:
     stp  d14, d15, [sp, #144]
     str  x0,       [sp, #160]
 
+    // Guest FPCR: the host's with RMode and FZ from ctx->mxcsr (as the lifter's LDMXCSR maps
+    // them: x86 RC bits 14:13 swapped into RMode bits 23:22, MXCSR.FZ into FPCR.FZ).
+    mrs  x2, fpcr
+    str  x2, [sp, #168]
+    ldr  w3, [x0, #0x2e8]        // mxcsr
+    and  x4, x2, #0xfffffffffe3fffff
+    ubfx w5, w3, #14, #1
+    bfi  x4, x5, #22, #1
+    ubfx w5, w3, #13, #1
+    bfi  x4, x5, #23, #1
+    ubfx w5, w3, #15, #1
+    bfi  x4, x5, #24, #1
+    cmp  x4, x2
+    b.eq 1f
+    msr  fpcr, x4
+1:
     LOAD_GPRS x0
     LOAD_XMM0_7 x0
     ldr  x27, [x0, #0x88]        // fs_base
@@ -114,7 +134,12 @@ _recomp_enter_guest:
     ldr  x0, [sp, #160]
     SAVE_GPRS x0
     SAVE_XMM0_7 x0
-
+    ldr  x2, [sp, #168]          // host FPCR
+    mrs  x3, fpcr
+    cmp  x2, x3
+    b.eq 2f
+    msr  fpcr, x2
+2:
     ldp  x19, x20, [sp, #16]
     ldp  x21, x22, [sp, #32]
     ldp  x23, x24, [sp, #48]
@@ -128,16 +153,21 @@ _recomp_enter_guest:
     ret
 
 // _recomp_call_shim: calls a host C shim from guest code (see the contract above).
-// x0 = shim. Frame: [sp] x29, x30; [sp+16] shim, ctx.
+// x0 = shim. Frame: [sp] x29, x30; [sp+16] shim, ctx; [sp+32] guest FPCR.
 .globl _recomp_call_shim
 _recomp_call_shim:
-    stp  x29, x30, [sp, #-32]!
+    stp  x29, x30, [sp, #-48]!
     mov  x29, sp
     add  x1, x27, #0x70
     ldr  x1, [x28, x1]           // ctx: the TCB slot
     stp  x0, x1, [sp, #16]
     SAVE_GPRS x1
     SAVE_XMM0_7 x1
+    mrs  x2, fpcr                // host code runs with the default FPCR
+    str  x2, [sp, #32]
+    cbz  x2, 1f
+    msr  fpcr, xzr
+1:
 
     mov  x0, x1
     ldr  x2, [sp, #16]
@@ -146,11 +176,17 @@ _recomp_call_shim:
     // The ctx this call stored into. A context switch inside the shim may have changed the
     // TCB slot, and x27 may name another guest thread's TCB by now.
     ldr  x1, [sp, #24]
+    ldr  x2, [sp, #32]           // guest FPCR of this call (the frame is the caller's)
+    mrs  x3, fpcr
+    cmp  x2, x3
+    b.eq 2f
+    msr  fpcr, x2
+2:
     LOAD_GPRS x1
     LOAD_XMM0_7 x1
     ldr  x27, [x1, #0x88]        // fs_base
     ldr  x28, [x1, #0x330]       // mem_base
-    ldp  x29, x30, [sp], #32
+    ldp  x29, x30, [sp], #48
     ret
 
 // Slow path of _recomp_indirect_call/_recomp_indirect_jump: the target is not in the
