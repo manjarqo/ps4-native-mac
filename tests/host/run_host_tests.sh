@@ -96,6 +96,13 @@ clang++ -std=c++17 -fobjc-arc -Wall -Werror -g -O1 -fsanitize=address,undefined 
   "$T/membudget.o" -framework Metal -framework Foundation -o "$T/gpu_membudget_test"
 "$T/gpu_membudget_test" > "$T/gpu_membudget.txt" || { cat "$T/gpu_membudget.txt"; exit 1; }
 tail -1 "$T/gpu_membudget.txt"
+# Texture cache eviction: the policy and the real TextureCache on Metal (lifetime of textures used
+# by command buffers in flight, re-upload after eviction, GPU-write invalidation, GPU-owned surfaces).
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 -fsanitize=address,undefined \
+  -I "$G" -I "$R/pkg/runtime/core" "$R/tests/host/tex_evict_test.mm" "$G/ps4_gnm_resources.mm" "$T/membudget.o" \
+  -framework Metal -framework Foundation -o "$T/tex_evict_test"
+"$T/tex_evict_test" > "$T/tex_evict.txt" 2>&1 || { cat "$T/tex_evict.txt"; exit 1; }
+tail -1 "$T/tex_evict.txt"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"

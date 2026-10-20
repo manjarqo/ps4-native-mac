@@ -2794,6 +2794,7 @@ struct TextureCache::Entry {
     uint32_t alias_key = 0;
     uint64_t gpu_upload_epoch = 0; // sampled: contents copied on the GPU after writes < this epoch
     uint64_t alloc_bytes = 0;      // tex.allocatedSize, as counted in MemStats
+    uint64_t last_seq = 0, last_ns = 0; // last use (SetUse values at the last lookup)
 };
 
 TextureCache::TextureCache(id<MTLDevice> device, id<MTLCommandQueue> queue, uint8_t* mem_base,
@@ -2811,11 +2812,11 @@ void TextureCache::Clear() {
         delete kv.second;
     }
     entries_.clear();
-    gpu_index_entries_ = ~size_t(0);
 }
 
 void TextureCache::TrackLocked(const Entry* e, int sign) {
     const bool sampled = e->kind == Entry::Sampled;
+    if (!sampled) ++gpu_version_;
     std::atomic<uint64_t>& count = sampled ? sampled_count_ : gpu_count_;
     std::atomic<uint64_t>& bytes = sampled ? sampled_bytes_ : gpu_bytes_;
     if (sign > 0) {
@@ -2825,6 +2826,44 @@ void TextureCache::TrackLocked(const Entry* e, int sign) {
         count.fetch_sub(1, std::memory_order_relaxed);
         bytes.fetch_sub(e->alloc_bytes, std::memory_order_relaxed);
     }
+}
+
+void TextureCache::SetUse(uint64_t seq, uint64_t now_ns) {
+    use_seq_.store(seq, std::memory_order_relaxed);
+    use_ns_.store(now_ns, std::memory_order_relaxed);
+}
+
+TextureCache::EvictResult TextureCache::EvictSampled(const ps4_texcache_policy& p, bool gpu_over, uint64_t now_ns,
+                                                     uint64_t completed_seq) {
+    EvictResult r;
+    if (!ps4_texcache_evict_due(&p, sampled_bytes_.load(std::memory_order_relaxed), gpu_over)) return r;
+    TimedLock lk(mutex_);
+    evict_items_.clear();
+    evict_its_.clear();
+    uint64_t total = 0;
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+        const Entry* e = it->second;
+        if (e->kind != Entry::Sampled) continue;
+        evict_items_.push_back({e->last_ns, e->last_seq, e->alloc_bytes, (uint64_t)evict_its_.size()});
+        evict_its_.push_back(it);
+        total += e->alloc_bytes;
+    }
+    uint64_t freed = 0;
+    const uint64_t n = ps4_texcache_select(evict_items_.data(), evict_items_.size(), total, &p, gpu_over ? 1 : 0,
+                                           now_ns, completed_seq, &freed);
+    for (uint64_t i = 0; i < n; ++i) {
+        auto it = evict_its_[evict_items_[i].id];
+        TrackLocked(it->second, -1);
+        delete it->second; // releases the texture; a command buffer still holding it keeps it alive
+        entries_.erase(it);  // other iterators of the multimap stay valid
+    }
+    r.count = n;
+    r.bytes = freed;
+    if (n) {
+        evicted_count_.fetch_add(n, std::memory_order_relaxed);
+        evicted_bytes_.fetch_add(freed, std::memory_order_relaxed);
+    }
+    return r;
 }
 
 TextureCache::MemStats TextureCache::GetMemStats() const {
@@ -3104,6 +3143,8 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
             } else if (e->dirty) {
                 UploadLocked(e);
             }
+            e->last_seq = use_seq_.load(std::memory_order_relaxed);
+            e->last_ns = use_ns_.load(std::memory_order_relaxed);
             stats.hits++;
             return e->tex;
         }
@@ -3155,6 +3196,8 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
         if (gpu_epochs && (!refresh_min_bytes || e->layout.total_size >= refresh_min_bytes)) gpu_upload(e);
         else UploadLocked(e);
     }
+    e->last_seq = use_seq_.load(std::memory_order_relaxed);
+    e->last_ns = use_ns_.load(std::memory_order_relaxed);
     e->alloc_bytes = (uint64_t)e->tex.allocatedSize;
     TrackLocked(e, +1);
     entries_.emplace(e->address, e);
@@ -3255,10 +3298,9 @@ id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture
                 TrackLocked(e, -1);
                 e->tex = t;
                 e->alloc_bytes = (uint64_t)t.allocatedSize;
-                TrackLocked(e, +1);
                 e->layers = layers;
                 e->size = (uint64_t)db.slice_bytes * layers;
-                gpu_index_entries_ = (size_t)-1; // ranges changed
+                TrackLocked(e, +1); // also marks the GPU range index stale
             }
             e->generation++;
             return e->tex;
@@ -3460,7 +3502,7 @@ void TextureCache::ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<M
 
 bool TextureCache::OverlapsGpuTexture(uint64_t addr, uint64_t size) const {
     TimedLock lk(mutex_);
-    if (gpu_index_entries_ != entries_.size()) {
+    if (gpu_index_version_ != gpu_version_) {
         gpu_ranges_.clear();
         for (const auto& kv : entries_) {
             const Entry* e = kv.second;
@@ -3470,7 +3512,7 @@ bool TextureCache::OverlapsGpuTexture(uint64_t addr, uint64_t size) const {
         gpu_max_end_.resize(gpu_ranges_.size());
         uint64_t m = 0;
         for (size_t i = 0; i < gpu_ranges_.size(); ++i) gpu_max_end_[i] = m = std::max(m, gpu_ranges_[i].second);
-        gpu_index_entries_ = entries_.size();
+        gpu_index_version_ = gpu_version_;
     }
     // ranges starting before `end`; one of them overlaps iff the largest end among them > addr
     const uint64_t end = addr + size;

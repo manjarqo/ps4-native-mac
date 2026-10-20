@@ -38,6 +38,8 @@
 #import <Metal/Metal.h>
 #endif
 
+#include "ps4_gnm_membudget.h"
+
 namespace ps4gnm {
 
 // =====================================================================================
@@ -846,6 +848,23 @@ public:
     };
     MemStats GetMemStats() const;
 
+    // Eviction of sampled textures (docs/gpu-memory-budget.md). Every lookup that returns a
+    // texture stamps its entry with the command buffer sequence number and time set here: the
+    // renderer calls SetUse at each commit with the number of the command buffer that work
+    // encoded from now on belongs to.
+    void SetUse(uint64_t seq, uint64_t now_ns);
+    // Evicts sampled textures chosen by ps4_texcache_select: only entries whose last command
+    // buffer has completed (completed_seq), least recently used first. GPU-owned surfaces are
+    // never evicted. An evicted texture still referenced by a command buffer lives until that
+    // command buffer is done; its next lookup creates and uploads it again.
+    struct EvictResult {
+        uint64_t count = 0, bytes = 0;
+    };
+    EvictResult EvictSampled(const ps4_texcache_policy& p, bool gpu_over, uint64_t now_ns, uint64_t completed_seq);
+    // Totals since start (any thread).
+    uint64_t EvictedCount() const { return evicted_count_.load(std::memory_order_relaxed); }
+    uint64_t EvictedBytes() const { return evicted_bytes_.load(std::memory_order_relaxed); }
+
 private:
     struct Entry;
     bool UploadLocked(Entry* e);
@@ -863,12 +882,20 @@ private:
     mutable std::mutex mutex_;
     std::unordered_multimap<uint64_t, Entry*> entries_; // keyed by guest address
     // Address ranges of GPU-owned entries sorted by start, with the running maximum of their
-    // ends, for OverlapsGpuTexture. Entries are only ever added (or all cleared), so the index
-    // is rebuilt whenever entries_ has grown.
+    // ends, for OverlapsGpuTexture. gpu_version_ changes whenever a GPU-owned entry is added,
+    // removed or resized (TrackLocked); the index is rebuilt when it was built for another
+    // version. (The entry count is no such signal: sampled entries are evicted.)
     mutable std::vector<std::pair<uint64_t, uint64_t>> gpu_ranges_;
     mutable std::vector<uint64_t> gpu_max_end_;
-    mutable size_t gpu_index_entries_ = ~size_t(0);
+    uint64_t gpu_version_ = 0;
+    mutable uint64_t gpu_index_version_ = ~0ull;
     std::atomic<uint64_t> sampled_count_{0}, sampled_bytes_{0}, gpu_count_{0}, gpu_bytes_{0};
+    std::atomic<uint64_t> evicted_count_{0}, evicted_bytes_{0};
+    // last use stamped on lookups (SetUse); before the first commit, command buffer 1
+    std::atomic<uint64_t> use_seq_{1}, use_ns_{0};
+    // EvictSampled scratch, kept to avoid allocations per pass
+    std::vector<ps4_texcache_item> evict_items_;
+    std::vector<std::unordered_multimap<uint64_t, Entry*>::iterator> evict_its_;
 };
 #endif
 
