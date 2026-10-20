@@ -4802,42 +4802,82 @@ void PresentFromGuestMemory(GuestContext* ctx, uint64_t addr, uint32_t width, ui
         ps4_metal_screen_present_frame(ctx->mem_base + addr, (size_t)pitch * 4, (int)width, (int)height);
 }
 
-// Display buffers that are not GPU targets are read from guest memory once the GPU work
-// written so far has finished. That wait, the CPU detile and the synchronous present run on
-// this serial queue instead of the encoder thread, so a long GPU job does not hold up command
-// encoding (and the event pump the encoder drives). Flips complete on this queue in order; while
-// such a frame is pending, the flips of GPU-presented frames are routed through it as well.
+// Display buffers that are not GPU targets are read from guest memory once the GPU work written
+// so far has finished. By default the encoder thread does that synchronously (Commit + WaitAll,
+// then detile and present). PS4_GNM_ASYNC_CPU_PRESENT=1 moves the read, the detile and the present
+// to this serial queue instead:
+// - the read waits for the frame's fence (AfterGpu), so it runs after every earlier fence action:
+//   the previous frames' flips and this frame's EOP / label writes;
+// - every flip completes on this queue, in order, while such a frame is pending (GPU-presented
+//   frames and the fallback path go through it too), so present_frame runs on one thread only;
+// - the encoder stays at most one frame ahead: before queueing the next guest-memory frame it
+//   waits for the previous one, so frame N's read is done before frame N+1's commands are
+//   encoded and later frames cannot overwrite the buffer being read (sceGnmInsertWaitFlipDone is
+//   not a real wait yet); a GPU that does not finish turns into S.hung through WaitAll's watchdog.
 dispatch_queue_t CpuPresentQueue() {
     static dispatch_queue_t q = dispatch_queue_create(
         "gnm.cpu-present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     return q;
 }
-std::atomic<int> g_cpu_present_pending{0};
+std::mutex g_cpu_present_mu;
+std::condition_variable g_cpu_present_cv;
+std::atomic<int> g_cpu_present_pending{0}; // queued or running jobs of CpuPresentQueue
 
-// Encoder thread: commits the frame's work and queues the guest-memory present behind it.
-void PresentFromGuestMemoryAsync(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
-                                 uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done) {
-    Commit();
-    id<MTLCommandBuffer> last = S.inflight.empty() ? nil : S.inflight.back(); // the queue completes in order
-    const double timeout_ms = S.gpu_timeout_ms;
-    auto done = std::make_shared<std::function<void()>>(std::move(on_done));
+bool AsyncCpuPresent() {
+    static const bool on = [] {
+        const char* v = getenv("PS4_GNM_ASYNC_CPU_PRESENT");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+// Encoder thread: waits until no guest-memory present is pending (the one-frame bound).
+void WaitCpuPresentIdle() {
+    auto idle = [] { return g_cpu_present_pending.load() == 0; };
+    const auto limit = std::chrono::milliseconds((int64_t)S.gpu_timeout_ms);
+    std::unique_lock<std::mutex> lk(g_cpu_present_mu);
+    if (g_cpu_present_cv.wait_for(lk, limit, idle)) return;
+    // the previous frame's GPU work has not finished: the watchdog decides (S.hung, fences run)
+    lk.unlock();
+    WaitAll();
+    lk.lock();
+    if (!g_cpu_present_cv.wait_for(lk, limit, idle))
+        fprintf(stderr, "[gnm-draw] CPU present: the previous frame is still being presented after the GPU watchdog\n");
+}
+
+// Encoder thread: queues fn behind everything already on CpuPresentQueue, after the GPU work
+// encoded so far (after_gpu) or right away.
+void QueueCpuPresentJob(std::function<void()> fn, bool after_gpu) {
+    WaitCpuPresentIdle();
     g_cpu_present_pending.fetch_add(1);
-    dispatch_async(CpuPresentQueue(), ^{
-        double waited = 0;
-        while (last && last.status < MTLCommandBufferStatusCompleted && waited < timeout_ms) {
-            usleep(200);
-            waited += 0.2;
-        }
-        if (last && last.status < MTLCommandBufferStatusCompleted) {
-            static std::atomic<bool> logged{false};
-            if (!logged.exchange(true))
-                fprintf(stderr, "[gnm-draw] CPU present: command buffer %s did not complete in %.0f ms; presenting "
-                                "guest memory as it is\n", last.label.UTF8String, timeout_ms);
-        }
-        PresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format);
-        if (*done) (*done)();
-        g_cpu_present_pending.fetch_sub(1);
-    });
+    auto job = std::make_shared<std::function<void()>>(std::move(fn));
+    auto dispatch = [job] {
+        dispatch_async(CpuPresentQueue(), ^{
+            (*job)();
+            {
+                std::lock_guard<std::mutex> lk(g_cpu_present_mu);
+                g_cpu_present_pending.fetch_sub(1);
+            }
+            g_cpu_present_cv.notify_all();
+        });
+    };
+    if (after_gpu) {
+        AfterGpu(std::move(dispatch)); // tagged with the open command buffer's sequence number
+        Commit();
+    } else {
+        dispatch();
+    }
+}
+
+void QueuePresentFromGuestMemory(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
+                                 uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done,
+                                 bool after_gpu) {
+    QueueCpuPresentJob(
+        [=, done = std::move(on_done)] {
+            PresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format);
+            if (done) done();
+        },
+        after_gpu);
 }
 
 bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
@@ -4848,6 +4888,11 @@ bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, 
     encq::Defer([=, f = std::move(on_done)]() mutable {
         if (!dbg_cpu_present && PresentImpl(ctx, addr, width, height, pitch, tiling_mode, pixel_format, std::move(f)))
             return;
+        if (g_cpu_present_pending.load() > 0) {
+            // earlier guest-memory presents are still queued: stay behind them, on their thread
+            QueuePresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format, done, false);
+            return;
+        }
         PresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format);
         if (done) done();
     });
@@ -4880,11 +4925,11 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
             RLog("present-miss", "display buffer 0x%llx is not a GPU target (draws %llu dispatches %llu skipped %llu)",
                  (unsigned long long)addr, (unsigned long long)S.n_draws, (unsigned long long)S.n_dispatches,
                  (unsigned long long)S.n_skipped);
-            // the frame is read from guest memory on the CPU once all GPU work has landed: on the
-            // CPU present queue when the encoder thread runs (the caller would wait here otherwise)
-            static const bool dbg_sync_cpu = getenv("PS4_GNM_SYNC_CPU_PRESENT") != nullptr;
-            if (encq::t_worker && !dbg_sync_cpu) {
-                PresentFromGuestMemoryAsync(ctx, addr, width, height, pitch, tiling_mode, pixel_format, std::move(on_done));
+            // the frame is read from guest memory on the CPU once all GPU work has landed: here
+            // (default), or on the CPU present queue with PS4_GNM_ASYNC_CPU_PRESENT=1
+            if (encq::t_worker && AsyncCpuPresent()) {
+                QueuePresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format,
+                                            std::move(on_done), true);
                 return true;
             }
             Commit();
