@@ -595,6 +595,13 @@ func TestSwitchTableCountBounds(t *testing.T) {
 		{"cmp ecx, 7; jb", dec([]byte{0x83, 0xf9, 0x07}, []byte{0x72, 0x00}), x86asm.RCX, 7},
 		{"cmp ecx, 7; ja", dec([]byte{0x83, 0xf9, 0x07}, []byte{0x77, 0x00}), x86asm.RCX, 8},
 		{"mov ebx, edx; inc edx; cmp edx, 0xe; ja", dec(movEbxEdx, []byte{0xff, 0xc2}, []byte{0x83, 0xfa, 0x0e}, []byte{0x77, 0x00}), x86asm.RBX, 0},
+		// A byte loaded from memory as the index (an interpreter's bytecode dispatch) has at most
+		// 256 entries.
+		{"movzx eax, byte [r10]", dec([]byte{0x41, 0x0f, 0xb6, 0x02}), x86asm.RAX, 256},
+		{"movzx eax, cl (a register: earlier checks of cl may bound it, left to them)", dec([]byte{0x0f, 0xb6, 0xc1}), x86asm.RAX, 0},
+		{"movzx eax, byte [r10]; test cl, cl; jne", dec([]byte{0x41, 0x0f, 0xb6, 0x02}, []byte{0x84, 0xc9}, []byte{0x75, 0x00}), x86asm.RAX, 256},
+		{"movzx eax, word [r10] (65536 entries: no bound)", dec([]byte{0x41, 0x0f, 0xb7, 0x02}), x86asm.RAX, 0},
+		{"movzx eax, byte [r10]; cmp eax, 9; ja", dec([]byte{0x41, 0x0f, 0xb6, 0x02}, []byte{0x83, 0xf8, 0x09}, []byte{0x77, 0x00}), x86asm.RAX, 10},
 	} {
 		if got := switchTableCount(tc.window, tc.idx); got != tc.want {
 			t.Errorf("%s: count %d, want %d", tc.name, got, tc.want)

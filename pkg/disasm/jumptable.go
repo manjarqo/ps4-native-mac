@@ -580,6 +580,16 @@ func switchTableCountKill(window []Instruction, idxReg x86asm.Reg) (int, bool) {
 		// 5. If this instruction modifies idxReg, we must not look past it,
 		// because any earlier CMP/AND was checking an obsolete value.
 		if modifiesReg(inst, idxReg) {
+			// A byte loaded from memory and zero-extended bounds the index by itself (the
+			// bytecode dispatch of an interpreter: movzx eax, byte [pc]; jmp [table + 4*rax]),
+			// and no earlier check can apply to it. Without this bound the table is scanned
+			// until the entries stop looking like code, which runs into the next table and
+			// yields targets in the middle of real instructions.
+			if inst.Op == x86asm.MOVZX && inst.MemBytes == 1 {
+				if _, ok := inst.Args[1].(x86asm.Mem); ok {
+					return 256, false
+				}
+			}
 			// Transparent register transfer: mov idxReg, otherReg
 			if inst.Op == x86asm.MOV || inst.Op == x86asm.MOVSXD || inst.Op == x86asm.MOVZX || inst.Op == x86asm.MOVSX {
 				if srcReg, ok := inst.Args[1].(x86asm.Reg); ok && gprFamily(srcReg) != 0 {
