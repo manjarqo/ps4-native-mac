@@ -625,6 +625,8 @@ struct GpuMem {
     std::atomic<uint64_t> refused_large{0}, refused_holes{0}, refused_written{0}, copies{0}, copy_bytes{0};
 };
 GpuMem g_mem;
+// The texture cache as seen by the sampler thread (set once the cache exists).
+std::atomic<TextureCache*> g_mem_tex{nullptr};
 
 // Window span of a guest_bufs key (base | windows << 48).
 inline void KeyWindows(uint64_t key, uint64_t* first, uint64_t* n) {
@@ -654,7 +656,7 @@ void StartGpuMemSampler(uint64_t mem_size) {
         pthread_setname_np("gnm-mem");
         ps4_gpumem_log_state log{};
         ps4_gpumem_budget_state budget{};
-        uint64_t peak_charged = 0, peak_wired = 0;
+        uint64_t peak_charged = 0, peak_wired = 0, peak_tex = 0;
         for (;;) {
             ps4_gpumem_sample s;
             @autoreleasepool {
@@ -663,6 +665,9 @@ void StartGpuMemSampler(uint64_t mem_size) {
             const uint64_t charged = ps4_gpumem_charged(&s);
             peak_charged = std::max(peak_charged, charged);
             peak_wired = std::max(peak_wired, s.wired);
+            TextureCache* tc = g_mem_tex.load(std::memory_order_acquire);
+            const TextureCache::MemStats ts = tc ? tc->GetMemStats() : TextureCache::MemStats{};
+            peak_tex = std::max(peak_tex, ts.sampled_bytes);
             char line[512];
             const int change = ps4_gpumem_budget_update(&budget, &g_mem.policy, charged);
             g_mem.charged.store(charged, std::memory_order_relaxed);
@@ -691,6 +696,13 @@ void StartGpuMemSampler(uint64_t mem_size) {
                         (unsigned long long)g_mem.refused_large.load(), (unsigned long long)g_mem.refused_holes.load(),
                         (unsigned long long)g_mem.refused_written.load(), (unsigned long long)g_mem.copies.load(),
                         (unsigned long long)(g_mem.copy_bytes.load() >> 20), budget.over ? "; OVER BUDGET" : "");
+                if (tc) {
+                    fprintf(stderr, "[gnm-mem] texture cache: sampled %llu (%llu MiB, peak %llu MiB), GPU-owned %llu "
+                                    "(%llu MiB)\n",
+                            (unsigned long long)ts.sampled_count, (unsigned long long)(ts.sampled_bytes >> 20),
+                            (unsigned long long)(peak_tex >> 20), (unsigned long long)ts.gpu_count,
+                            (unsigned long long)(ts.gpu_bytes >> 20));
+                }
             }
             usleep(1000000);
         }
@@ -3735,6 +3747,7 @@ bool Init(GuestContext* ctx) {
         S.queue = [S.dev newCommandQueueWithMaxCommandBufferCount:64];
         S.queue.label = @"gnm";
         S.tex = new TextureCache(S.dev, S.queue, proc->mem_base, proc->mem_size);
+        g_mem_tex.store(S.tex, std::memory_order_release);
         S.dummy = [S.dev newBufferWithLength:65536 options:MTLResourceStorageModeShared];
         S.gds = (uint8_t*)mmap(nullptr, 0x10000, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
         if (S.gds == MAP_FAILED) S.gds = nullptr;

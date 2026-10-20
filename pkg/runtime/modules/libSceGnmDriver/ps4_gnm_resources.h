@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -837,6 +838,14 @@ public:
     };
     Stats stats;
 
+    // Memory held by the cache's own textures (MTLResource.allocatedSize when created), by kind.
+    // Readable from any thread (e.g. the GPU memory sampler) without the cache lock.
+    struct MemStats {
+        uint64_t sampled_count = 0, sampled_bytes = 0; // detiled from guest memory (re-creatable)
+        uint64_t gpu_count = 0, gpu_bytes = 0;         // render targets, depth, storage (GPU-owned)
+    };
+    MemStats GetMemStats() const;
+
 private:
     struct Entry;
     bool UploadLocked(Entry* e);
@@ -844,6 +853,8 @@ private:
     id<MTLTexture> GetTextureImpl(const ImageDesc& img, const uint64_t* gpu_epochs, GpuUpload* up,
                                   uint64_t refresh_min_bytes = 0);
     void WaitIdleLocked();
+    // Adds (sign +1) or removes (sign -1) an entry's texture in the MemStats counters.
+    void TrackLocked(const Entry* e, int sign);
 
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
@@ -857,6 +868,7 @@ private:
     mutable std::vector<std::pair<uint64_t, uint64_t>> gpu_ranges_;
     mutable std::vector<uint64_t> gpu_max_end_;
     mutable size_t gpu_index_entries_ = ~size_t(0);
+    std::atomic<uint64_t> sampled_count_{0}, sampled_bytes_{0}, gpu_count_{0}, gpu_bytes_{0};
 };
 #endif
 
