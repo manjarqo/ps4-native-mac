@@ -8,6 +8,11 @@
 //   corrupt <dir> <nonce> one damaged entry is refused and deleted; the others still load
 //   config <dir> <nonce> other compile options: the old configuration's entries are deleted
 //   budget <dir> <nonce> over the budget at Open, the least recently used entries go first
+//   breaker <dir> <nonce> a pipeline that fails with a stored function (a real Metal failure: the
+//                        stored fragment function with a vertex function that does not feed it)
+//                        drops the entry once and the MSL-compiled function builds the pipeline;
+//                        refused loads count too; at kMaxFailuresPerSession the store is off for
+//                        the session, and a new session starts with it on again
 #import <Metal/Metal.h>
 #include "ps4_gnm_library_store.h"
 
@@ -33,7 +38,6 @@ static int Fail(const char* what) {
         if (!(c)) return Fail(what); \
     } while (0)
 
-static const char* kTag = "fastMath=0;preserveInvariance=1";
 
 // Sources shaped like the renderer's: separate libraries, every entry point named main0. The
 // nonce keeps caches of earlier runs from satisfying this one.
@@ -200,11 +204,37 @@ static int Unit() {
     bad = file;
     bad[offsetof(ls::Header, payload_hash)] ^= 1;
     CHECK(ls::Decode(bad.data(), bad.size(), ka, ls::kFragment, &p, &pn) == ls::Status::kBadHash, "damaged hash field");
-    // configurations: options and OS build select the directory
-    const std::string c0 = ls::ConfigName(kTag, "25A100");
-    CHECK(c0.size() == 16 && c0 == ls::ConfigName(kTag, "25A100"), "configuration name not deterministic");
-    CHECK(c0 != ls::ConfigName("fastMath=1;preserveInvariance=1", "25A100"), "options do not change the configuration");
-    CHECK(c0 != ls::ConfigName(kTag, "25A101"), "OS build does not change the configuration");
+    // configurations: options, OS build and GPU select the directory
+    const std::string tag = ls::OptionsTag(Options());
+    const std::string c0 = ls::ConfigName(tag.c_str(), "25A100", "Apple M1 Pro");
+    CHECK(c0.size() == 16 && c0 == ls::ConfigName(tag.c_str(), "25A100", "Apple M1 Pro"), "configuration name not deterministic");
+    CHECK(c0 != ls::ConfigName((tag + "x").c_str(), "25A100", "Apple M1 Pro"), "options do not change the configuration");
+    CHECK(c0 != ls::ConfigName(tag.c_str(), "25A101", "Apple M1 Pro"), "OS build does not change the configuration");
+    CHECK(c0 != ls::ConfigName(tag.c_str(), "25A100", "Apple M2"), "GPU does not change the configuration");
+    // the options tag follows every option that changes the code, read from the options object
+    CHECK(tag == ls::OptionsTag(Options()), "options tag not deterministic");
+    auto differs = [&](void (^change)(MTLCompileOptions*)) {
+        MTLCompileOptions* o = Options();
+        change(o);
+        return ls::OptionsTag(o) != tag;
+    };
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    CHECK(differs(^(MTLCompileOptions* o) { o.fastMathEnabled = YES; }), "fast-math not in the options tag");
+#pragma clang diagnostic pop
+    CHECK(differs(^(MTLCompileOptions* o) { o.preserveInvariance = NO; }), "preserveInvariance not in the options tag");
+    CHECK(differs(^(MTLCompileOptions* o) { o.languageVersion = MTLLanguageVersion2_4; }), "language version not in the options tag");
+    CHECK(differs(^(MTLCompileOptions* o) { o.mathMode = o.mathMode == MTLMathModeRelaxed ? MTLMathModeFast : MTLMathModeRelaxed; }), "math mode not in the options tag");
+    CHECK(differs(^(MTLCompileOptions* o) { o.mathFloatingPointFunctions = o.mathFloatingPointFunctions == MTLMathFloatingPointFunctionsFast ? MTLMathFloatingPointFunctionsPrecise : MTLMathFloatingPointFunctionsFast; }),
+          "floating-point functions not in the options tag");
+    CHECK(differs(^(MTLCompileOptions* o) { o.optimizationLevel = MTLLibraryOptimizationLevelSize; }),
+          "optimization level not in the options tag");
+    CHECK(differs(^(MTLCompileOptions* o) { o.preprocessorMacros = @{@"PS4" : @1}; }), "macros not in the options tag");
+    CHECK(differs(^(MTLCompileOptions* o) {
+              o.libraryType = MTLLibraryTypeDynamic;
+              o.installName = @"x";
+          }),
+          "library type not in the options tag");
     printf("lib_store_test unit: PASS\n");
     return 0;
 }
@@ -218,12 +248,16 @@ int main(int argc, char** argv) {
         CHECK(dev, "no Metal device");
         const std::string vsrc = VertexSource(nonce), fsrc = FragmentSource(nonce), csrc = KernelSource(nonce);
         const ls::Key kv = KeyOf(vsrc), kf = KeyOf(fsrc), kc = KeyOf(csrc);
-        const char* tag = mode == "config" ? "fastMath=1;preserveInvariance=1" : kTag;
+        MTLCompileOptions* tag = Options();
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        if (mode == "config") tag.fastMathEnabled = YES; // other options: another configuration
+#pragma clang diagnostic pop
         if (mode == "budget") {
             // three entries of about the same size; the one used least recently goes
             std::string sd;
             {
-                CHECK(ls::Open(dev, dir, kTag, 64ull << 20), "budget: open");
+                CHECK(ls::Open(dev, dir, Options(), 64ull << 20), "budget: open");
                 sd = ls::Dir();
             }
             CHECK(CountEntries(sd) == 3, "budget: expected the 3 entries of write");
@@ -241,7 +275,7 @@ int main(int argc, char** argv) {
             // only if the smallest goes; the kernel entry is the oldest, so it must be the one removed
             // as long as removing it brings the total under 3/4 of the budget
             const uint64_t budget = total - 1;
-            CHECK(ls::Open(dev, dir, kTag, budget), "budget: reopen");
+            CHECK(ls::Open(dev, dir, Options(), budget), "budget: reopen");
             const bool kept_v = stat((sd + "/" + ls::FileName(kv)).c_str(), &st) == 0;
             const bool kept_f = stat((sd + "/" + ls::FileName(kf)).c_str(), &st) == 0;
             const bool kept_c = stat((sd + "/" + ls::FileName(kc)).c_str(), &st) == 0;
@@ -326,6 +360,55 @@ int main(int argc, char** argv) {
             CHECK(stat(p.c_str(), &st) != 0 && !ls::Has(kf), "corrupt: damaged entry kept");
             CHECK(ls::Load(kv, ls::kVertex, &why), "corrupt: intact entry refused");
             printf("lib_store_test corrupt: PASS\n");
+            return 0;
+        }
+        if (mode == "breaker") {
+            CHECK(CountEntries(sd) == 3 && ls::Enabled() && ls::Failures() == 0, "breaker: expected the 3 entries of write");
+            std::string why;
+            // 1. a real pipeline failure with a stored function: the stored fragment function reads
+            //    user(locn0), which this vertex function does not write
+            id<MTLFunction> sf = ls::Load(kf, ls::kFragment, &why);
+            CHECK(sf, "breaker: stored fragment function");
+            id<MTLFunction> bad_vs = Compile(dev, "#include <metal_stdlib>\nusing namespace metal;\n"
+                                                  "struct main0_out { float4 p [[position]]; };\n"
+                                                  "vertex main0_out main0(uint v [[vertex_id]]) { main0_out o; o.p = float4(0, 0, 0, 1); return o; }\n");
+            NSError* e = nil;
+            CHECK(bad_vs && ![dev newRenderPipelineStateWithDescriptor:RenderDesc(bad_vs, sf) error:&e],
+                  "breaker: the incompatible pair built a pipeline");
+            CHECK(ls::ReportPipelineFailure(kf), "breaker: first report not taken");
+            struct stat st;
+            CHECK(stat((sd + "/" + ls::FileName(kf)).c_str(), &st) != 0 && !ls::Has(kf) && !ls::Load(kf, ls::kFragment, &why),
+                  "breaker: reported entry kept");
+            CHECK(ls::Failures() == 1 && ls::Enabled(), "breaker: one failure must count once and keep the store on");
+            CHECK(!ls::ReportPipelineFailure(kf) && ls::Failures() == 1, "breaker: a second report of the entry counted");
+            // the retry: the fragment function compiled from MSL with the stored vertex function
+            id<MTLFunction> sv = ls::Load(kv, ls::kVertex, &why);
+            CHECK(sv && [dev newRenderPipelineStateWithDescriptor:RenderDesc(sv, Compile(dev, fsrc)) error:&e],
+                  "breaker: retry with the MSL-compiled function failed");
+            // 2. a refused load counts as well
+            const std::string pc = sd + "/" + ls::FileName(kc);
+            FILE* f = fopen(pc.c_str(), "r+b");
+            CHECK(f, "breaker: open kernel entry");
+            fseek(f, -10, SEEK_END);
+            fputc(0x5a, f);
+            fputc(0xa5, f);
+            fclose(f);
+            CHECK(!ls::Load(kc, ls::kKernel, &why) && ls::Failures() == 2 && ls::Enabled(), "breaker: refused load not counted");
+            // 3. the third failure disables the store for the session
+            CHECK(ls::ReportPipelineFailure(kv) && ls::Failures() == ls::kMaxFailuresPerSession, "breaker: third failure");
+            CHECK(!ls::Enabled() && !ls::Has(kv) && !ls::Load(kv, ls::kVertex, &why), "breaker: store still on");
+            // nothing is written while off
+            id<MTLFunction> v = Compile(dev, vsrc), fr = Compile(dev, fsrc);
+            MTLRenderPipelineDescriptor* rd = RenderDesc(v, fr);
+            CHECK([dev newRenderPipelineStateWithDescriptor:rd error:&e], "breaker: render pipeline");
+            ls::StoreRender(&kv, &kf, rd);
+            CHECK(ls::Flush(60) && CountEntries(sd) == 0, "breaker: entries written while the store is off");
+            // 4. a new session starts with the store on and no failures
+            CHECK(ls::Open(dev, dir, Options(), 64ull << 20) && ls::Enabled() && ls::Failures() == 0,
+                  "breaker: new session not reset");
+            ls::StoreRender(&kv, &kf, rd);
+            CHECK(ls::Flush(60) && CountEntries(sd) == 2 && ls::Load(kv, ls::kVertex, &why), "breaker: new session cannot store");
+            printf("lib_store_test breaker: PASS\n");
             return 0;
         }
         if (mode == "config") {

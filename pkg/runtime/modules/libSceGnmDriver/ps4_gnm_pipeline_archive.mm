@@ -551,11 +551,12 @@ void StartPeriodicSave(double period_s) {
 } // namespace ps4gnm_pso_archive
 
 extern "C" void ps4_gnm_pso_archive_save_for_quit(double timeout_s) {
-    // The library store's queued entries are written first (each takes a few ms), within half
-    // of the time; then the archive.
-    if (!ps4gnm_lib_store::Flush(timeout_s / 2))
-        fprintf(stderr, "[gnm-lib-store] quit: queued entries not written in %.1f s\n", timeout_s / 2);
-    if (!ps4gnm_pso_archive::Enabled()) return;
-    if (!ps4gnm_pso_archive::SaveNow(timeout_s / 2))
-        fprintf(stderr, "[gnm-pso-archive] quit: save failed or did not finish in %.1f s\n", timeout_s / 2);
+    // The pipeline archive first (the harder cache to rebuild), then the library store's queued
+    // entries in the time that is left (a missing entry is written again in a later session).
+    const double t0 = CFAbsoluteTimeGetCurrent();
+    if (ps4gnm_pso_archive::Enabled() && !ps4gnm_pso_archive::SaveNow(timeout_s))
+        fprintf(stderr, "[gnm-pso-archive] quit: save failed or did not finish in %.1f s\n", timeout_s);
+    const double left = timeout_s - (CFAbsoluteTimeGetCurrent() - t0);
+    if (!ps4gnm_lib_store::Flush(left > 0.05 ? left : 0.05))
+        fprintf(stderr, "[gnm-lib-store] quit: queued entries not written in time\n");
 }

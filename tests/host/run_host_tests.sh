@@ -122,7 +122,8 @@ PS4_GNM_PSO_ARCHIVE_MAX_FILES=4 "$T/pso_archive_test" evict "$E" $NONCE
 B="$T/budgetstop"; mkdir -p "$B"
 "$T/pso_archive_test" budgetstop "$B" $NONCE
 # Shader library store: key and format units, then write / read (new process, no compiler) /
-# corrupt / other options, and the size budget on a second directory.
+# corrupt / other options, the size budget on a second directory, and the pipeline-failure
+# fallback with the session circuit breaker on a third.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/lib_store_test.mm" "$G/ps4_gnm_library_store.mm" \
   -framework Metal -framework Foundation -o "$T/lib_store_test"
 "$T/lib_store_test" unit
@@ -131,4 +132,7 @@ for m in write read corrupt config; do "$T/lib_store_test" $m "$LS" $NONCE; done
 LB="$T/libbudget"; mkdir -p "$LB"
 "$T/lib_store_test" write "$LB" $NONCE
 "$T/lib_store_test" budget "$LB" $NONCE
+LK="$T/libbreaker"; mkdir -p "$LK"
+"$T/lib_store_test" write "$LK" $NONCE
+"$T/lib_store_test" breaker "$LK" $NONCE
 rm -rf "$T"

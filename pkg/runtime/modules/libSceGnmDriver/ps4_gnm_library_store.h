@@ -79,15 +79,27 @@ void Encode(const Key& k, uint32_t stage, const uint8_t* payload, size_t n, std:
 Status Decode(const uint8_t* data, size_t n, const Key& want, uint32_t stage, const uint8_t** payload,
               size_t* payload_n);
 
-// Directory name of a configuration: format version, compile options tag, OS build.
-std::string ConfigName(const char* options_tag, const char* os_build);
+// Directory name of a configuration: format version, compile options tag, OS build, GPU name.
+std::string ConfigName(const char* options_tag, const char* os_build, const char* device);
+
+// Describes every MTLCompileOptions field that changes the compiled code (math mode and
+// fast-math, floating-point functions, invariance, language version, library type and install
+// name, optimization level, preprocessor macros): the compile-options part of the configuration,
+// derived from the options object itself so that a changed option can never reuse entries.
+std::string OptionsTag(MTLCompileOptions* o);
+
+// Session circuit breaker: after this many entries that loaded but failed (a refused load, or
+// a pipeline that could not be built from a stored function), the store is disabled for the
+// rest of the session (logged once) and every library comes from MSL.
+constexpr uint32_t kMaxFailuresPerSession = 3;
 
 // ---- Store (Metal) ----
 // Opens <title_dir>/mlib/<config>: deletes the directories of other configurations and leftover
 // temporary files, trims the directory to the budget (least recently used first) and indexes the
-// entries. options_tag names the MTLCompileOptions every library is compiled with; change it
-// with the options. False when disabled or the directory cannot be created.
-bool Open(id<MTLDevice> dev, const std::string& title_dir, const char* options_tag, uint64_t budget_bytes);
+// entries. options are the MTLCompileOptions every library is compiled with (OptionsTag). False
+// when disabled or the directory cannot be created.
+bool Open(id<MTLDevice> dev, const std::string& title_dir, MTLCompileOptions* options, uint64_t budget_bytes);
+// False before Open, when disabled, or once the circuit breaker tripped.
 bool Enabled();
 const std::string& Dir();
 // True if an entry for k is on disk or being written.
@@ -99,6 +111,14 @@ bool Peek(const Key& k, Key* full, uint32_t* stage);
 // the library from it; an entry that fails is deleted (it is written again by a later pipeline).
 // why (optional) gets the reason of a failure.
 id<MTLFunction> Load(const Key& k, uint32_t stage, std::string* why);
+// A pipeline could not be built with a function loaded from the entry of k: deletes the entry
+// (the caller compiles the MSL and retries) and counts a failure toward the circuit breaker.
+// Returns true the first time for k in this session, false if k was already reported (no new
+// failure is counted). Works also after the breaker tripped.
+bool ReportPipelineFailure(const Key& k);
+// Failures counted this session (refused loads and reported pipelines).
+uint32_t Failures();
+
 // Writes entries for the functions of a pipeline that has just been built, for each given key
 // without an entry (vs or ps may be null). Asynchronous; the descriptor is copied.
 void StoreRender(const Key* vs, const Key* ps, MTLRenderPipelineDescriptor* d);

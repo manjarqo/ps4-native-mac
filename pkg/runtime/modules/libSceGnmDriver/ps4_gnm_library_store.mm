@@ -70,16 +70,17 @@ bool EndsWith(const char* s, const char* suffix) {
 
 struct StoreState {
     id<MTLDevice> dev = nil;
-    bool enabled = false;
+    std::atomic<bool> enabled{false};
     std::string dir;
     uint64_t budget = 0;
     dispatch_queue_t q = nil;       // writes and use marks, in order
     std::mutex mu;                  // present, pending, touched, bytes
-    std::set<std::pair<uint64_t, uint64_t>> present, pending, touched;
+    std::set<std::pair<uint64_t, uint64_t>> present, pending, touched, reported;
     uint64_t bytes = 0;             // size of the entries on disk
     bool full = false;              // over the budget: no more writes this session
     // statistics (session)
     std::atomic<uint64_t> loads{0}, load_us{0}, load_fail{0}, writes{0}, write_us{0}, write_fail{0};
+    std::atomic<uint32_t> failures{0}; // circuit breaker (refused loads + reported pipelines)
     size_t opened = 0;
 };
 StoreState G;
@@ -175,6 +176,17 @@ void Forget(const Key& k, bool remove_file) {
     if (remove_file) unlink(PathOf(k).c_str());
     std::lock_guard<std::mutex> lk(G.mu);
     G.present.erase(Id(k));
+}
+
+// Counts one failure; at kMaxFailuresPerSession the store is disabled for the session.
+void CountFailure() {
+    if (G.failures.fetch_add(1) + 1 == kMaxFailuresPerSession) {
+        G.enabled = false;
+        fprintf(stderr,
+                "[gnm-lib-store] %u stored libraries failed this session: store disabled until the next start, "
+                "libraries come from MSL\n",
+                kMaxFailuresPerSession);
+    }
 }
 
 struct Item {
@@ -337,23 +349,57 @@ Status Decode(const uint8_t* data, size_t n, const Key& want, uint32_t stage, co
     return Status::kOk;
 }
 
-std::string ConfigName(const char* options_tag, const char* os_build) {
+std::string ConfigName(const char* options_tag, const char* os_build, const char* device) {
     uint64_t h = Fnv(&kFormatVersion, sizeof(kFormatVersion));
     h = Fnv(options_tag, strlen(options_tag) + 1, h);
     h = Fnv(os_build, strlen(os_build) + 1, h);
+    h = Fnv(device, strlen(device) + 1, h);
     char b[17];
     snprintf(b, sizeof(b), "%016llx", (unsigned long long)h);
     return b;
 }
 
-bool Open(id<MTLDevice> dev, const std::string& title_dir, const char* options_tag, uint64_t budget_bytes) {
+std::string OptionsTag(MTLCompileOptions* o) {
+    std::string t;
+    char b[96];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    snprintf(b, sizeof(b), "fastMath=%d;", (int)o.fastMathEnabled);
+#pragma clang diagnostic pop
+    t += b;
+    if (@available(macOS 15.0, *)) {
+        snprintf(b, sizeof(b), "mathMode=%ld;mathFP=%ld;", (long)o.mathMode, (long)o.mathFloatingPointFunctions);
+        t += b;
+    }
+    snprintf(b, sizeof(b), "invariance=%d;lang=%lu;libType=%ld;", (int)o.preserveInvariance, (unsigned long)o.languageVersion,
+             (long)o.libraryType);
+    t += b;
+    if (@available(macOS 13.0, *)) {
+        snprintf(b, sizeof(b), "opt=%ld;", (long)o.optimizationLevel);
+        t += b;
+    }
+    t += "install=";
+    if (o.installName) t += o.installName.UTF8String;
+    t += ";macros=";
+    NSArray* names = [o.preprocessorMacros.allKeys sortedArrayUsingSelector:@selector(compare:)];
+    for (NSString* n in names) {
+        t += n.UTF8String;
+        t += "=";
+        t += [[o.preprocessorMacros[n] description] UTF8String];
+        t += ",";
+    }
+    return t;
+}
+
+bool Open(id<MTLDevice> dev, const std::string& title_dir, MTLCompileOptions* options, uint64_t budget_bytes) {
     const char* off = getenv("PS4_GNM_NO_LIB_STORE");
     if ((off && strcmp(off, "1") == 0) || !dev || title_dir.empty()) return false;
     char os[64] = {0};
     size_t osn = sizeof(os) - 1;
     if (sysctlbyname("kern.osversion", os, &osn, nullptr, 0) != 0) os[0] = 0;
     const std::string root = title_dir + "/mlib";
-    const std::string config = ConfigName(options_tag, os);
+    const std::string tag = OptionsTag(options);
+    const std::string config = ConfigName(tag.c_str(), os, dev.name.UTF8String ? dev.name.UTF8String : "");
     G.dir = root + "/" + config;
     if (![[NSFileManager defaultManager] createDirectoryAtPath:@(G.dir.c_str())
                                    withIntermediateDirectories:YES
@@ -407,6 +453,8 @@ bool Open(id<MTLDevice> dev, const std::string& title_dir, const char* options_t
     G.q = dispatch_queue_create("ps4.gnm.lib_store",
                                 dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
     G.opened = G.present.size();
+    G.failures = 0;
+    G.reported.clear();
     G.enabled = true;
     fprintf(stderr, "[gnm-lib-store] %s: %zu libraries (%.1f MB)\n", G.dir.c_str(), G.opened, total / 1048576.0);
     return true;
@@ -459,7 +507,7 @@ id<MTLFunction> Load(const Key& k, uint32_t stage, std::string* why) {
     std::string fail;
     id<MTLFunction> fn = nil;
     if (!ReadAll(PathOf(k), &data, kMaxFileBytes)) {
-        fail = std::string("read: ") + strerror(errno);
+        fail = "unreadable, empty or over the size limit";
     } else if (Status s = Decode(data.data(), data.size(), k, stage, &payload, &payload_n); s != Status::kOk) {
         fail = StatusName(s);
     } else {
@@ -489,12 +537,30 @@ id<MTLFunction> Load(const Key& k, uint32_t stage, std::string* why) {
         G.load_fail++;
         fprintf(stderr, "[gnm-lib-store] entry %s unusable (%s): deleted\n", FileName(k).c_str(), fail.c_str());
         Forget(k, true);
+        CountFailure();
         if (why) *why = fail;
         return nil;
     }
     G.loads++;
     MarkUsed(k);
     return fn;
+}
+
+bool ReportPipelineFailure(const Key& k) {
+    if (G.dir.empty()) return false;
+    {
+        std::lock_guard<std::mutex> lk(G.mu);
+        if (!G.reported.insert(Id(k)).second) return false;
+    }
+    fprintf(stderr, "[gnm-lib-store] a pipeline could not be built from the stored library %s: deleted, compiling the MSL\n",
+            FileName(k).c_str());
+    Forget(k, true);
+    CountFailure();
+    return true;
+}
+
+uint32_t Failures() {
+    return G.failures.load();
 }
 
 void StoreRender(const Key* vs, const Key* ps, MTLRenderPipelineDescriptor* d) {
@@ -526,7 +592,7 @@ void StoreCompute(const Key& cs, MTLComputePipelineDescriptor* d) {
 }
 
 bool Flush(double timeout_s) {
-    if (!G.enabled) return true;
+    if (!G.q) return true;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     dispatch_block_t b = dispatch_block_create_with_qos_class(DISPATCH_BLOCK_ENFORCE_QOS_CLASS, QOS_CLASS_USER_INITIATED,
                                                               0, ^{
@@ -537,7 +603,7 @@ bool Flush(double timeout_s) {
 }
 
 void PrintStats() {
-    if (!G.enabled) return;
+    if (!G.q) return;
     size_t present;
     uint64_t bytes;
     {
@@ -547,10 +613,10 @@ void PrintStats() {
     }
     fprintf(stderr,
             "[gnm-lib-store] session: %llu loaded (%.0f ms), %llu unusable; %llu written (%.0f ms in the background), "
-            "%llu write failures; %zu entries (%zu at start), %.1f MB\n",
+            "%llu write failures; %zu entries (%zu at start), %.1f MB; %u failures%s\n",
             (unsigned long long)G.loads.load(), G.load_us.load() / 1000.0, (unsigned long long)G.load_fail.load(),
             (unsigned long long)G.writes.load(), G.write_us.load() / 1000.0, (unsigned long long)G.write_fail.load(),
-            present, G.opened, bytes / 1048576.0);
+            present, G.opened, bytes / 1048576.0, G.failures.load(), G.enabled ? "" : " (disabled)");
 }
 
 } // namespace ps4gnm_lib_store
