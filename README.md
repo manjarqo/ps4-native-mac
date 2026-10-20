@@ -1,260 +1,420 @@
-# PS4Recomp
+# ps4-native-mac
 
-A macOS Apple Silicon ahead-of-time (AOT) recompiler that translates PlayStation 4 (x86-64 ELF) binaries into native executables. No JIT, virtual machines, or MoltenVK required.
+ps4-native-mac is an ahead-of-time (AOT) static recompiler for Apple Silicon Macs. It translates
+PlayStation 4 x86-64 game executables (`eboot.bin` and the PRX modules shipped with the game) into
+native arm64 macOS apps. The game code is lifted once, at build time, into ARM64 assembly. It then
+runs against a high-level emulation (HLE) runtime of the Orbis OS libraries and a GNM command
+processor that renders with Metal. There is no JIT, no interpreter and no MoltenVK.
 
-![First Silksong screen](images/silk_test_01.png)
----
-
-## Features
-
-- **Native ARM64 Assembly AOT Compiler**: Recovers functions, CFG, and jump tables, translating AMD64 instructions directly into native ARM64 assembly (`.s`) chunks for fast, parallel Apple Clang assembler compilation without intermediate C translation overhead.
-- **Native Metal Graphics & GNM Driver**: Direct Apple Metal PM4 Command Processor, hardware context tracking, tessellation ring buffers, zero-copy UMA buffer mapping, and SPIRV-Cross shader translation to MSL with hardware VSync via `CAMetalLayer`.
-- **Orbis & POSIX Subsystems**: Shims for memory (UMA), multi-threading (pthreads / Orbis threads), synchronization primitives, events, networking (`libSceNet`/BSD sockets), and VFS path virtualization (`/app0`).
-- **Media & Hardware**: Low-latency PCM audio (`AudioToolbox`), DualSense/DS4 support (`GameController.framework`), and Cocoa modal dialogs.
-- **Tooling & Bundling**: Companion PRX module analysis, static linking, and automatic macOS `.app` bundle generation.
+**Based on:** forked from [PS4Recomp](https://github.com/wie-project/PS4Recomp) by its authors, and
+developed independently under the new name since 2026-10. License: GPL-2.0.
 
 ---
 
-## Quick Start
+## Status
 
-### Prerequisites
+Measured on an Apple M1 Pro (16 GB), macOS 27.0.1. Only measured numbers are listed; "TBD" means
+not measured yet.
 
-- macOS (Apple Silicon: M1 / M2 / M3 / M4)
-- Go 1.22+
-- Xcode Command Line Tools (`clang`, `clang++`)
-- FreeType 2 (`brew install freetype`)
-- Ninja (`brew install ninja`, recommended for fast parallel builds)
+| Game | Stage | fps | Resolution | Notes |
+| --- | --- | --- | --- | --- |
+| The Last of Us Remastered (CUSA00557) | Playable: boot, menus, movies, gameplay, saves | Walking (330 s scripted routes): chapter 1 courtyard 89.7 fps, spore corridor 99.6 fps, 0 frames > 100 ms. Standing: courtyard 78.5–78.9 fps, Sarah's house 113.7–114.5 fps. | 1920x1080 (base PS4 mode, `PS4_PRO=0`), MetalFX off. Pro mode: TBD | 30-minute courtyard soak: no fatal errors, no hangs, memory footprint flat at ~3.5 GB. Exit: 3/3 by closing the window, 3/3 by terminate, no crash reports. |
+| Uncharted 4: A Thief's End | In progress — boots to menu, not yet playable | Up to ~30 fps at the menu (the game sets a 30 Hz flip rate). Gameplay: an earlier development build reached a full level at 40+ fps in PS4 Pro mode without MetalFX (observed by hand, not benchmarked) | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Logos, then the first-boot options menu, held for 120–180 s with no GPU errors. The menu does not yet react to D-pad or stick input. Missing HLE (Vdecsw, Audiodec, Audio3d) and renderer fixes are on development branches, not yet in `main`. |
 
-### Prerequisites for Commercial Games
+How the TLOU numbers were taken:
 
-PS4Recomp operates **exclusively on already decrypted and extracted game folders** containing the game's executable (`eboot.bin`) and assets. It does not parse or decrypt proprietary encrypted package containers directly.
+- Walking: a scripted pad route played from copies of saves, with `PS4_PRO=0` and a separate data
+  directory, at commit 8145002. Earlier runs of the same backend gave 93.0–93.5 fps (courtyard) and
+  103.2–103.6 fps (spores). The machine's background load moves these numbers by a few fps between
+  runs.
+- Standing: an A/B against the previous C backend, 2 alternating rounds per build.
+- The frame rate is uncapped. The bench window is in the background, so vsync does not limit it.
 
-To dump and extract your legally purchased game backups on macOS, we officially recommend using the native, open-source community tool **[ps4-pkg-tools](https://github.com/xXJSONDeruloXx/ps4-pkg-tools)** (supports both CLI and GUI interfaces).
+**Upstream milestones (not verified in this fork):**
 
-### Cloning & 3rd-Party Dependencies
+- Hollow Knight: Silksong: upstream reported a boot into the Unity runtime with a Metal display.
+- Hogwarts Legacy: upstream reported a boot up to a virtual address space allocation failure.
 
-PS4Recomp relies on several 3rd-party submodules located in `3rdparty/`:
+---
 
-| Submodule                                | Purpose                                                                            | Integration / Output                                  |
-| ---------------------------------------- | ---------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| **SPIRV-Cross** (`3rdparty/spirv-cross`) | Translates SPIR-V GPU shaders to Apple Metal Shading Language (MSL)                | Pre-built static library (`libspirv-cross.a`)         |
-| **LibAtrac9** (`3rdparty/libatrac9`)     | ATRAC9 hardware/software audio decoder for PS4 AJM (`libSceAjm`)                   | Pre-built static library (`libatrac9.a`) or C sources |
-| **minimp3** (`3rdparty/minimp3`)         | Lightweight MP3 audio decoding header for sound playback                           | Header-only (`minimp3.h`), auto-included              |
-| **ffmpeg-core** (`3rdparty/ffmpeg-core`) | Multimedia decoding backend (H.264/AVC & HEVC) for video playback (`libSceAvcdec`) | Headers & libraries                                   |
+## How it works
+
+```text
+eboot.bin + sce_module/*.prx
+  -> ELF/PRX loader, relocations, NID resolution         (pkg/elfloader)
+  -> disassembly, CFG, jump tables, function discovery   (pkg/disasm, pkg/analyzer)
+  -> x86-64 -> ARM64 assembly lifter                     (pkg/lifter)
+  -> chunked .s files + small C glue, build.ninja        (pkg/emitter, pkg/cli)
+  -> clang -mcpu=apple-m1, linked with the HLE runtime   (pkg/runtime)
+  -> <name>.app bundle (guest_image.bin, sce_sys, Info.plist)
+```
+
+### Lifter (Go)
+
+- The `ps4-recomp` tool is written in Go and decodes x86-64 with `golang.org/x/arch`.
+- It discovers functions from the entry point, symbol tables, unwind info and relocations. It also
+  resolves jump tables and handles overlapping instruction streams.
+- It covers integer, BMI, SSE/AVX (128- and 256-bit), MMX, x87 and string instructions.
+- Each guest function becomes an ARM64 assembly function. Chunks are assembled in parallel through
+  ninja.
+- The game's own PRX modules (for example `libc.prx` and `libSceFios2.prx` from `sce_module/`) are
+  recompiled and linked statically. System library imports go to host shims.
+
+### ARM64 assembly backend
+
+- **Pinned guest registers.**
+  - RAX–RDI map to x19–x25 and R8–R15 to x8–x15.
+  - x26 holds the guest RSP, x27 the FS base (TLS) and x28 the guest memory base.
+  - The XMM/YMM registers map to the vector register file.
+  - Guest memory is reached as `[x28, addr]`.
+- **x86 memory ordering (TSO).**
+  - Scalar loads and stores to non-stack guest memory use LDAPR (load-acquire, RCpc) and STLR
+    (store-release).
+  - RSP- and RBP-relative accesses stay plain.
+  - Accesses that cross a 16-byte boundary take a fenced fallback.
+  - MFENCE lowers to `dmb ish`.
+  - This is on by default (`-tso`). It adds ~31% static instructions; the measured cost is under
+    1 fps.
+- **LOCK prefix.**
+  - Locked read-modify-write instructions use ARMv8.1 LSE atomics with acquire-release semantics:
+    LDADDAL, LDCLRAL, LDEORAL, LDSETAL, SWPAL, CASAL, CASPAL.
+  - Operations without an LSE form use an LDAXR/STLXR loop with DMB ISH.
+- **Other.**
+  - MXCSR rounding and FZ are kept across host calls.
+  - RDTSC is scaled to the PS4's 2.13 GHz TSC.
+  - x87 80-bit memory operands are converted to and from double.
+
+### HLE runtime (C / Objective-C)
+
+| Area | Implementation |
+| --- | --- |
+| Kernel | Guest virtual memory (direct and flexible memory, pools), VFS (`/app0`, `/download0`, `/temp0`), events/equeue, AIO, signals and exceptions, module info |
+| Threads | Orbis pthreads on host threads; mutexes with an atomic fast path; `libSceFiber` as coroutines on the calling thread (`PS4_FIBER_THREADS=1` selects one host thread per fiber) |
+| Audio | `libSceAudioOut` mixed and played through AudioToolbox; `libSceAjm` decodes ATRAC9 with libatrac9 and MP3 with minimp3 |
+| Video | `libSceVideodec` (H.264) on VideoToolbox, with display-order output for B-frame streams |
+| Saves | `libSceSaveData` mapped to host directories (see [Where saves and caches live](#where-saves-and-caches-live)) |
+| Other | Pad (GameController.framework), user/system service, NP that always reports "signed out", Cocoa dialogs, FreeType, network modules (Net, Http, Ssl) |
+
+The Uncharted 4 branches add AAC decoding (`libSceAudiodec`, AudioToolbox), `libSceVdecsw`
+(VideoToolbox) and `libSceAudio3d`. They are not in `main` yet.
+
+### Renderer: GNM on Metal
+
+- The GNM command processor (`pkg/runtime/modules/libSceGnmDriver`) parses the guest's PM4 command
+  buffers: the graphics ring, compute queues and indirect buffers.
+- It tracks Liverpool register state and records Metal command buffers on a separate encoder
+  thread.
+- Guest memory is mapped zero-copy into Metal buffers on unified memory.
+- Textures are detiled and cached. GPU writes invalidate the cached copies.
+- The frame is presented through `CAMetalLayer`, with optional MetalFX spatial upscaling.
+
+### Shaders
+
+```text
+GCN bytecode (from guest memory)
+  -> gcn-recompiler (shadPS4's shader_recompiler as a static library) -> SPIR-V
+  -> SPIRV-Cross -> Metal Shading Language
+  -> MTLLibrary / MTLRenderPipelineState
+```
+
+- Translated shaders are cached on disk per title: the GCN -> MSL results and the MSL sources.
+- Built pipelines are stored in Metal binary archives (the PSO archive) and loaded at the next
+  start, so known pipelines do not compile mid-frame.
+- New shaders compile in the background.
+
+### Third-party components
+
+| Component | Location | Use | License |
+| --- | --- | --- | --- |
+| gcn-recompiler (from [shadPS4](https://github.com/shadps4-emu/shadPS4) `32021e4`) | `3rdparty/gcn-recompiler` (in this repository) | GCN -> SPIR-V shader translation | GPL-2.0-or-later |
+| [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | `3rdparty/spirv-cross` (submodule) | SPIR-V -> MSL | Apache-2.0 |
+| [LibAtrac9](https://github.com/shadps4-emu/ext-LibAtrac9) | `3rdparty/libatrac9` (submodule) | ATRAC9 audio decoding | MIT |
+| [minimp3](https://github.com/lieff/minimp3) | `3rdparty/minimp3` (submodule) | MP3 audio decoding | CC0-1.0 |
+
+FFmpeg is not used: video decoding goes through VideoToolbox.
+
+gcn-recompiler vendors sirit and SPIRV-Headers (BSD-3 / MIT), fmt (MIT), magic_enum (MIT) and a
+Boost subset (BSL-1.0). Its README lists every change made to the shadPS4 sources.
+
+---
+
+## Running a game (until the GUI exists)
+
+All commands run from the repository root. `/path/to/CUSA00557` stands for your dumped game
+folder, which contains `eboot.bin`, `sce_module/` and `sce_sys/`.
+
+### 1. Prerequisites
+
+| Requirement | Notes |
+| --- | --- |
+| Apple Silicon Mac | Developed and measured on M1 Pro, 16 GB. Code is built with `-mcpu=apple-m1`. |
+| macOS | Tested on macOS 27.0.1. The bundle declares 12.0 as its minimum, but older versions are untested (TBD). MetalFX upscaling needs macOS 13 or later. |
+| Xcode Command Line Tools | `xcode-select --install`. gcn-recompiler needs Apple clang 17+ (C++23); tested with Apple clang 21. |
+| Go | `go.mod` requires Go 1.27.1. An older `go` with `GOTOOLCHAIN=auto` (the default) downloads it. |
+| CMake ≥ 3.20 and Ninja | `brew install cmake ninja`. Ninja also drives the parallel game build. |
+| FreeType 2 | `brew install freetype pkg-config` |
+
+### 2. Clone with the third-party sources
 
 ```bash
-# Clone repository with all submodules:
-git clone --recursive https://github.com/vladislavkalinkin/PS4Recomp.git
-cd PS4Recomp
-
-# Or if already cloned without --recursive:
+git clone --recursive <repository-url> ps4-native-mac
+cd ps4-native-mac
+# already cloned without --recursive:
 git submodule update --init --recursive
 ```
 
-### Building 3rd-Party Static Libraries & PS4Recomp
+`3rdparty/gcn-recompiler` is part of this repository (not a submodule); only its build output is
+ignored.
 
-Before compiling games, build the static libraries for the 3rd-party dependencies:
-
-#### 1. Build SPIRV-Cross
-
-```bash
-cd 3rdparty/spirv-cross
-clang++ -O3 -std=c++17 -c spirv_cross.cpp spirv_cross_parsed_ir.cpp spirv_parser.cpp spirv_glsl.cpp spirv_msl.cpp spirv_cfg.cpp spirv_cross_c.cpp
-ar rcs libspirv-cross.a *.o && rm -f *.o
-cd ../..
-```
-
-#### 2. Build LibAtrac9
+### 3. Build the third-party libraries and the recompiler
 
 ```bash
-cd 3rdparty/libatrac9
-clang -O3 -c C/src/*.c
-ar rcs libatrac9.a *.o && rm -f *.o
-cd ../..
-```
+# SPIRV-Cross -> 3rdparty/spirv-cross/libspirv-cross.a
+(cd 3rdparty/spirv-cross &&
+  clang++ -O3 -std=c++17 -c spirv_cross.cpp spirv_cross_parsed_ir.cpp spirv_parser.cpp \
+    spirv_glsl.cpp spirv_msl.cpp spirv_cfg.cpp spirv_cross_c.cpp &&
+  ar rcs libspirv-cross.a *.o && rm -f *.o)
 
-#### 3. Build ps4-recomp binary
+# LibAtrac9 -> 3rdparty/libatrac9/libatrac9.a
+(cd 3rdparty/libatrac9 && clang -O3 -c C/src/*.c && ar rcs libatrac9.a *.o && rm -f *.o)
 
-```bash
+# gcn-recompiler -> 3rdparty/gcn-recompiler/libgcn_recompiler.a (where ps4-recomp looks for it)
+cmake -S 3rdparty/gcn-recompiler -B /path/to/gcn-build -G Ninja
+ninja -C /path/to/gcn-build
+cp /path/to/gcn-build/libgcn_recompiler.a 3rdparty/gcn-recompiler/
+
+# the recompiler
 go build -o ps4-recomp ./cmd/ps4-recomp
 ```
 
----
+`ps4-recomp` finds the libraries under `3rdparty/` relative to the current directory or to its own
+location. Run it from the repository root, or keep the binary there.
 
-## Usage Guide
+### 4. Dump your own game
 
-### 1. Analyze a Binary
+The project works only on a **decrypted, extracted** game folder. It does not decrypt or unpack PKG
+files, and **no game files are provided**. Dump a game you own legally, using your own console and
+the tools of your choice. The upstream project suggests
+[ps4-pkg-tools](https://github.com/xXJSONDeruloXx/ps4-pkg-tools) for extracting your own backups.
 
-Scan CFGs, discover companion PRXs, and report instruction compatibility for the decrypted executable:
-
-```bash
-./ps4-recomp analyze path/to/extracted_game/eboot.bin
-```
-
-### 2. Recompile to macOS `.app` Bundle
-
-Recompile the extracted Orbis binary and package it into a native standalone application bundle:
+Optional check of the binary and its modules:
 
 ```bash
-# Basic compilation to native ARM64 binary
-./ps4-recomp path/to/extracted_game/eboot.bin -o output_dir -c
-
-# Full standalone package with VFS assets and resources included into macOS app bundle
-./ps4-recomp path/to/extracted_game/eboot.bin --app-dir /path/to/extracted_game --copy-resources -o output_dir -c
+./ps4-recomp analyze /path/to/CUSA00557/eboot.bin
 ```
 
-### 3. CLI Options
+### 5. Recompile the eboot into a .app
 
-| Flag                    | Description                                                          | Default       |
-| ----------------------- | -------------------------------------------------------------------- | ------------- |
-| `-o`, `-out <dir>`      | Output directory for generated code and binaries                     | `"build"`     |
-| `-e`, `-elf <file>`     | Path to input PS4 ELF binary                                         | —             |
-| `-c`, `-compile`        | Compile emitted assembly to native ARM64 binary with Clang           | `true`        |
-| `-j`, `-jobs <num>`     | Number of parallel Clang assembler workers                           | `NumCPU`      |
-| `-O`, `-opt <level>`    | Clang optimization level (`0`, `1`, `2`, `3`, `s`, `z`)              | `"2"`         |
-| `-r`, `-run`            | Run the compiled binary after successful recompilation               | `false`       |
-| `-t`, `-timeout <sec>`  | Watchdog timeout in seconds when running binary (`0` = no timeout)   | `0`           |
-| `-a`, `-all-symbols`    | Recompile all symbols in symbol table even if unreachable            | `false`       |
-| `-k`, `-chunk-size <n>` | Number of functions per emitted ARM64 assembly chunk file            | `250`         |
-| `-v`, `-verbose`        | Enable verbose output and detailed timing breakdown                  | `false`       |
-| `--app-dir <dir>`       | Host directory mapping to `/app0` for game assets                    | Auto-detected |
-| `--copy-resources`      | Copy all game assets/resources into macOS `.app` bundle `Resources/` | `false`       |
-| `--asan`                | Compile runtime with AddressSanitizer and LeakSanitizer              | `false`       |
+```bash
+./ps4-recomp /path/to/CUSA00557/eboot.bin --app-dir /path/to/CUSA00557 -o /path/to/build -c
+```
+
+The result is `/path/to/build/eboot.app`. `/path/to/build/ps4_app` is the same binary outside the
+bundle.
+
+- **Game files.** The bundle holds `guest_image.bin`, `sce_sys` and the icon. At run time the game
+  files are read from the `--app-dir` folder given at build time. To change that folder, set
+  `PS4_APP_DIR`. `--copy-resources` copies the whole game into `Contents/Resources` instead.
+- **Rebuilds.** After a runtime-only change, `ninja -C /path/to/build` relinks without lifting the
+  game again. Running the full command again regenerates and rebuilds everything.
+- **Build time.** For TLOU, generation takes ~25 s. A full build took ~85 s on the M1 Pro.
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `-o`, `-out <dir>` | Output directory | `build` |
+| `-e`, `-elf <file>` | Input ELF (instead of the positional argument) | — |
+| `-c`, `-compile` | Assemble and link with clang | `true` |
+| `-j`, `-jobs <n>` | Parallel clang jobs | number of CPUs |
+| `-O`, `-opt <level>` | Clang optimization level for the C parts | `2` |
+| `-k`, `-chunk-size <n>` | Functions per emitted assembly chunk | `250` |
+| `-a`, `-all-symbols` | Also emit unreachable symbols | `false` |
+| `-tso` | x86 memory ordering (`-tso=false` disables it, for A/B tests only) | `true` |
+| `--app-dir <dir>` | Host folder mapped to `/app0` | auto-detected |
+| `--copy-resources` | Copy the game files into the bundle | `false` |
+| `--asan` | Build the runtime with AddressSanitizer | `false` |
+| `-r`, `-run` / `-t`, `-timeout <s>` | Run after building, with an optional watchdog | `false` / `0` |
+| `-v`, `-verbose` | Verbose output and timings | `false` |
+
+### 6. Sign (ad hoc)
+
+```bash
+codesign -f -s - /path/to/build/eboot.app
+codesign -v /path/to/build/eboot.app
+```
+
+Sign again after every rebuild or after replacing the executable inside the bundle.
+
+### 7. Launch
+
+```bash
+open /path/to/build/eboot.app
+# or, to see the log:
+/path/to/build/eboot.app/Contents/MacOS/eboot > run.log 2>&1
+```
+
+Controllers that GameController.framework supports (DualShock 4, DualSense and others) act as the
+pad.
+
+#### Launch settings (hold Option)
+
+A settings window opens before the game starts:
+
+- on the first launch of a game;
+- on any later launch while **Option (⌥)** is held as the app starts.
+
+| Option | What it does | Default |
+| --- | --- | --- |
+| **Language** | The console system language reported to the game. The list shows only the languages whose speech packs are in your game data, and English if none are found. The first entry selected is the one matching your macOS language. | macOS language |
+| **PS4 Pro mode** | The game is told it runs on a PS4 Pro (`sceKernelIsNeoMode`), so it takes its Pro rendering path. The Last of Us Remastered then renders at 3200x1800, the PS4 Pro's "4K" mode, instead of 1920x1080 on a base PS4. This costs more GPU time. | On |
+| **MetalFX upscaling** | Scales the presented frame up to the window size with MetalFX spatial upscaling, for example to 3840x2160 in a full-screen window on a 4K display. It needs macOS 13 or later. Combined with PS4 Pro mode it gives 1800p → 4K; with Pro mode off it can bring 1080p up to a large window for less GPU cost. | Off |
+| **FPS counter (Metal HUD)** | An on-screen overlay. It shows fps, frame time and the longest frame, the mode (PS4 / PS4 Pro), the game's render resolution and, with MetalFX, the output resolution, for example `PS4 Pro 3200x1800 -> 3840x2160 MetalFX`. | On |
+| **Remember** | Saves the choices for this game, so the window does not open on later launches unless Option is held. Untick it to use the choices for this launch only. | On |
+
+How the settings are stored and overridden:
+
+- **Storage.** Settings are kept per game folder in
+  `~/Library/Application Support/PS4Recomp/settings/<game folder name>.cfg`. With
+  `PS4RECOMP_DATA_DIR` set, they are kept under that directory instead.
+- **Overrides.** Environment variables override the stored values: `PS4_LANG`, `PS4_PRO=0|1`,
+  `PS4_UPSCALE=off|metalfx` and `MTL_HUD_ENABLED=0|1`. `PS4_NO_DIALOGS=1` (or setting `PS4_LANG`)
+  never shows the window, which is useful for scripts and test runs. The log prints the resolved
+  values at startup (`[ps4-settings] ...`).
+- **Language and existing saves.** The language is the console language, which games use as the
+  default for a new profile. TLOU stores its text, subtitle and speech language in its save. Once a
+  save exists, change the language in the game's own Options menu.
+
+fps in PS4 Pro mode has not been measured yet (TBD); the status table above uses base PS4 mode.
+
+### 8. Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `PS4RECOMP_DATA_DIR=<dir>` | Root for saves (`<dir>/saves`), settings, `download0` and `temp0`. Use a separate directory for test runs. |
+| `PS4_SAVEDATA_DIR=<dir>` | Save root only (takes precedence over `PS4RECOMP_DATA_DIR`) |
+| `PS4_APP_DIR=<dir>` | Game folder mapped to `/app0` |
+| `PS4_PRO=0\|1` | PS4 Pro mode reported to the game (on by default). `0` is the base PS4 mode. |
+| `PS4_UPSCALE=off\|metalfx` | MetalFX spatial upscaling to the window size (off by default) |
+| `PS4_UPSCALE_FACTOR=<1..4>` | Upscale by a fixed factor instead of to the window size |
+| `PS4_LANG=<code>` | System language (`en`, `ru`, `ja`, ... or an Orbis number); skips the dialog |
+| `PS4_NO_DIALOGS=1` | Never show the settings dialog |
+| `MTL_HUD_ENABLED=0\|1` | Metal performance HUD |
+| `PS4_GNM_NO_SHADER_CACHE=1` | Disable the on-disk shader caches (MSL and GCN) |
+| `PS4_GNM_NO_GCN_CACHE=1` | Disable only the GCN -> MSL translation cache |
+| `PS4_GNM_SHADER_CACHE_MB=<n>` | Shader cache size budget |
+| `PS4_GNM_NO_PSO_ARCHIVE=1` | Disable the Metal pipeline archive |
+| `PS4_GNM_PSO_ARCHIVE_MB=<n>` | Pipeline archive budget (default 384) |
+| `PS4_SYNC_LOG=1` | Write the log synchronously (default: an asynchronous log that is flushed on abort/exit) |
+| `PS4_GNM_LOG_LONG_FRAMES=<ms>` | Log frames longer than `<ms>`, with a hitch breakdown |
+| `PS4_STALL_PROFILE=<ms>` | Sample all threads during stalls longer than `<ms>` |
+| `PS4_STALL_WATCHDOG=<ms>` | Report what threads do when no frame was presented for `<ms>` |
+| `PS4_GNM_STATS=1`, `PS4_AUDIO_LOG=1`, `PS4_NP_LOG_ALL=1` | Command processor, audio and NP logging |
+| `PS4_GNM_GPU_TIMEOUT=<ms>` | Command buffer watchdog (default 4000) |
+| `PS4_SCREENSHOT_DIR=<dir>`, `PS4_SCREENSHOT_EVERY=<frames>` | Save presented frames as PNG |
+| `PS4_RECOMP_HEADLESS=1`, `PS4_BACKGROUND_WINDOW=1`, `PS4_PAD_SCRIPT=...` | Automated test runs |
+
+Host unit tests: `tests/host/run_host_tests.sh`. The benchmark scripts behind the status table
+(walking routes, A/B runs) are not in the repository yet.
+
+### Where saves and caches live
+
+| Data | Default location |
+| --- | --- |
+| Saves | `~/Library/Application Support/PS4Recomp/saves` (or `$PS4RECOMP_DATA_DIR/saves`) |
+| Settings | `~/Library/Application Support/PS4Recomp/settings/<game folder name>.cfg` |
+| `/download0`, `/temp0` | `~/Library/Application Support/PS4Recomp/{download0,temp0}/<TITLE_ID>` |
+| Shader caches, pipeline archive | `~/Library/Caches/PS4Recomp/<game folder name>/` (not under `PS4RECOMP_DATA_DIR`) |
+
+The on-disk names still say `PS4Recomp`; they come from the code and have not been renamed.
+
+### Known issues
+
+- **Uncharted 4.** The fixes for it are not in `main`. The menu ignores D-pad and stick input. Some
+  draws are skipped (vertex shader permutation cap, RectList auto-index draws).
+- **x87.** 80-bit values are kept as doubles, which loses 11 mantissa bits.
+- **Misaligned atomics.** A LOCK operation on an operand that crosses a 16-byte boundary raises
+  SIGBUS. TLOU has none.
+- **NaN sign.** The sign of NaN results from invalid operations differs from x86 (ARM default NaN).
+- **Unresolved imports.** Any import without an implementation is bound to a stub that stops the
+  game with a log message naming the import. TLOU has 2, in `libSceGnmDriver`; it was never seen
+  calling them.
+- **Screenshot frames.** With screenshots on, the frames that capture one take ~130–150 ms.
+- **Shader cache sharing.** The cache key is the game folder's name, so two games in folders with
+  the same name share a cache.
+- **Bundle ID.** Bundles get the ID `org.ps4recomp.<executable name>`, so every `eboot.app` has the
+  same ID.
+- **macOS metadata files.** On exFAT/FAT volumes, AppleDouble `._*` files next to the PRX modules
+  produce harmless "Skipping module" messages.
 
 ---
 
-## Commercial Game Milestones
-
-### Hollow Knight: Silksong (Unity 6 / Il2Cpp)
-
-Silksong boots into the native Unity 6 engine runtime on Apple Silicon, initializes the Boehm GC subsystem with registered host/guest stack boundaries, establishes the Metal display layer (`CAMetalLayer`), and launches over 30 concurrent engine and audio worker threads (`FMOD stream thread`, `Job.Worker`, `AsyncReadManager`):
+## Project structure
 
 ```text
-[ps4-recomp] Initializing runtime...
-[ps4-recomp] Loading guest memory image (137105408 bytes), allocated dynamic address space (524288.0 MB)
-[ps4-mem] SceLibcParam at 0x2000000: size=0xa8 ver=14.1 malloc_replace=0x20000f8 new_replace=0x2000170
-[ps4-mem] SceLibcMallocReplace at 0x20000f8: size=0x78 init=0x14db270 malloc=0x14dba10
-[ps4-recomp] Initializing custom memory allocator via SceLibcParam at 0x14db270...
-[ps4-mem] sceKernelAllocateDirectMemory: start=0x0 end=0x800000000 len=268435456 (256.00 MB) align=2097152 type=0
-[ps4-mem] sceKernelMapDirectMemory SUCCESS: out=0x8400000
-[ps4-recomp] Initializing libc malloc subsystem via _malloc_init at 0x2ca7a00...
-[ps4-kernel] _sceKernelRtldSetApplicationHeapAPI: table at 0x2da4178
-[ps4-recomp] Executing _start (0x13550)...
-...
-[ps4-mem] sceKernelMapDirectMemory SUCCESS: out=0xd0ca0000
-[ps4-gnm-metal] Native Apple Metal GNM Command Processor initialized (Apple M1)
-[videoout] Presenting frame 4294967296 (buffer 0, 1920x1080)
-[videoout] sceVideoOutSubmitFlip: handle=1 buf=0 flipQueueReg=1 (num=2)
-[videoout] sceVideoOutGetFlipStatus: handle=1 num=2 currentBuf=0
-[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=200704 (0.19 MB) align=4096 flags=0x0
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0xd4731000
-[ps4-thread] Thread created: id=1041, name='UnityGfxDeviceWorker', entry=0xb2d420, arg=0x2891d0b0
-[ps4-thread] Thread started: id=1041, name='UnityGfxDeviceWorker', entry=0xb2d420, arg=0x2891d0b0
-...
-[ps4-sys] open: '/app0/Media/Resources/unity default resources' (resolved='/Volumes/Samsung T7/Hollow Knight Silksong/game/Media/Resources/unity default resources', flags=0x0) -> fd=10
-[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=331776 (0.32 MB) align=4096 flags=0x0
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0xd4800000
-[ps4-thread] Thread created: id=1042, name='FMOD mixer thread', entry=0x19aef40, arg=0xd0157848
-[ps4-thread] Thread started: id=1042, name='FMOD mixer thread', entry=0x19aef40, arg=0xd0157848
-[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=86016 (0.08 MB) align=4096 flags=0x0
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0xd4762000
-[ps4-thread] Thread created: id=1043, name='FMOD AudioOut thread', entry=0x19aef40, arg=0xd01576f0
-[ps4-thread] Thread started: id=1043, name='FMOD AudioOut thread', entry=0x19aef40, arg=0xd01576f0
-[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=200704 (0.19 MB) align=4096 flags=0x0
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0xd4851000
-[ps4-thread] Thread created: id=1044, name='FMOD stream thread', entry=0x19aef40, arg=0xd0151338
-[ps4-thread] Thread started: id=1044, name='FMOD stream thread', entry=0x19aef40, arg=0xd0151338
-[gnm] sceGnmSubmitDone called (total=2)
-Forcing submitDone to avoid TRC R4089 breach
-[gnm] sceGnmSubmitDone called (total=3)
-Forcing submitDone to avoid TRC R4089 breach
-[gnm] sceGnmSubmitDone called (total=4)
-Forcing submitDone to avoid TRC R4089 breach
-^C
-```
-
-### Hogwarts Legacy (Unreal Engine 4)
-
-```text
-[ps4-recomp] Initializing runtime...
-[ps4-recomp] Loading guest memory image (312811520 bytes), allocated dynamic address space (524288.0 MB)
-[ps4-recomp] Initializing custom memory allocator via SceLibcParam at 0x4188230...
-[ps4-mem] sceKernelAllocateMainDirectMemory: len=67108864 (64.00 MB) align=65536 type=3
-[ps4-mem] sceKernelAllocateDirectMemory: start=0x0 end=0xffffffffffffffff len=67108864 (64.00 MB) align=65536 type=3
-[ps4-mem] sceKernelMapDirectMemory: in=0x4000000000 len=67108864 (64.00 MB) prot=0x32 flags=0x90 phys=0x0 align=0
-[ps4-vm] recomp_vm_alloc_fixed (direct_mem): desired=0x4000000000 size=67108864 (64.00 MB)
-[ps4-mem] sceKernelMapDirectMemory SUCCESS: out=0x4000000000
-[ps4-mem] sceKernelMemoryPoolExpand: start=0x4000000 end=0x800000000 len=34292563968 (32703.94 MB) align=0
-[ps4-mem] sceKernelAllocateDirectMemory: start=0x4000000 end=0x800000000 len=34292563968 (32703.94 MB) align=65536 type=3
-[ps4-mem] sceKernelMemoryPoolReserve: in=0x1000000000 len=8589934592 (8192.00 MB) align=0 flags=0x90
-[ps4-vm] recomp_vm_alloc_fixed (pool_reserved): desired=0x1000000000 size=8589934592 (8192.00 MB)
-[ps4-mem] sceKernelMemoryPoolReserve SUCCESS: out=0x1000000000
-[ps4-mem] sceKernelMemoryPoolReserve: in=0x2000000000 len=8589934592 (8192.00 MB) align=0 flags=0x90
-[ps4-vm] recomp_vm_alloc_fixed (pool_reserved): desired=0x2000000000 size=8589934592 (8192.00 MB)
-[ps4-mem] sceKernelMemoryPoolReserve SUCCESS: out=0x2000000000
-[ps4-mem] sceKernelMemoryPoolReserve: in=0x3000000000 len=1073741824 (1024.00 MB) align=0 flags=0x90
-[ps4-vm] recomp_vm_alloc_fixed (pool_reserved): desired=0x3000000000 size=1073741824 (1024.00 MB)
-[ps4-mem] sceKernelMemoryPoolReserve SUCCESS: out=0x3000000000
-[ps4-recomp] Executing _start (0xf9a50)...
-GoodPGO
-File root is /app0/!
-[ps4-mem] sceKernelConfiguredFlexibleMemorySize: 4294967296 (4096.00 MB)
-Used memory before allocating anything was 0.00MB
-FIOS2: built with SDK version 0x09508001
-[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=81920 (0.08 MB) align=4096 flags=0x0
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0x12a80000
-[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=147456 (0.14 MB) align=4096 flags=0x0
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0x12a94000
-[ps4-vm] recomp_vm_alloc_named_aligned (anon): size=147456 (0.14 MB) align=4096 flags=0x0
-[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0x12ab8000
-
-Failed to allocate virtual address space. (Original Type: CPU, Type: CPU, Size: 2943483904, Alignment: 65536)
-[ps4-mem] sceKernelConfiguredFlexibleMemorySize: 4294967296 (4096.00 MB)
-^C
+├── cmd/ps4-recomp/          # CLI entry point
+├── cmd/lifter-difftest-asm/ # differential tester for the lifter
+├── pkg/
+│   ├── cli/                 # build driver, ninja, .app bundling
+│   ├── analyzer/            # instruction coverage and CFG analysis
+│   ├── disasm/              # disassembly, function discovery, jump tables
+│   ├── elfloader/           # ELF64 / PRX loader and relocations
+│   ├── lifter/              # x86-64 -> ARM64 assembly lifter
+│   ├── emitter/             # chunked assembly emitter, HLE shim table, trampolines
+│   └── runtime/             # host runtime
+│       ├── core/            # guest context, logging, startup
+│       ├── kernel/          # memory, threading, sync, vfs, aio, equeue, syscalls
+│       └── modules/         # libSce* HLE modules (GnmDriver, VideoOut, AudioOut, Ajm, ...)
+├── tests/                   # host unit tests and runtime test programs
+└── 3rdparty/                # see "Third-party components"
 ```
 
 ---
 
-## Project Structure
+## Contributing
 
-```text
-├── cmd/ps4-recomp/      # CLI entry point
-└── pkg/
-    ├── analyzer/        # Instruction coverage & CFG analyzer
-    ├── disasm/          # Disassembly & jump tables
-    ├── elfloader/       # ELF64 / PRX loader & relocations
-    ├── lifter/          # AMD64 to ARM64 assembly lifter (ALU, SIMD, AVX, FPU, string ops)
-    ├── emitter/         # Partitioned ARM64 assembly emitter & Clang driver
-    └── runtime/         # macOS host runtime & Orbis/POSIX kernel ABI
-        ├── core/        # Guest context & register state
-        └── modules/     # libSce (VideoOut, AudioOut, Net, Pad, etc.)
-```
+- macOS on Apple Silicon is the target. Changes for other platforms are welcome if they do not
+  break or slow down macOS.
+- AI tools may be used for development, provided the generated code is fully verified and does not
+  break recompiled builds.
 
 ---
 
-## Contributing Guidelines
+## Credits and acknowledgements
 
-- **Multi-platform support**: macOS Apple Silicon remains the main priority. Contributions for other platforms are welcome as long as they don't break or slow down macOS support.
-- **AI Tooling**: Use of LLMs/AI for development is allowed, provided all generated code is thoroughly verified and does not break recompiled binary builds.
-
----
-
-## Credits & Acknowledgements
-
-Special thanks to the open-source PlayStation emulation and research communities:
-
-- **[OpenOrbis](https://github.com/OpenOrbis)** — Open-source PS4 toolchain and reverse engineering.
-- **[shadPS4](https://github.com/shadps4-emu/shadPS4)** — HLE module architecture and system behavior documentation.
-- **[ps4libdoc](https://github.com/idc/ps4libdoc)** — Symbol dictionaries and NID-to-name mappings.
+- The **PS4Recomp authors**: this project is a fork of their recompiler, runtime and tooling.
+- **[shadPS4](https://github.com/shadps4-emu/shadPS4)**: HLE module architecture and system behaviour
+  documentation, and the shader recompiler packaged as gcn-recompiler.
+- **[OpenOrbis](https://github.com/OpenOrbis)**: open-source PS4 toolchain and reverse engineering.
+- **[ps4libdoc](https://github.com/idc/ps4libdoc)**: symbol dictionaries and NID-to-name mappings.
+- The authors of SPIRV-Cross, LibAtrac9 and minimp3.
 
 ---
 
-## Legal Notice
+## Legal notice
 
-PS4Recomp is an independent educational and research project into ahead-of-time binary translation. It does not distribute, bundle, or contain any copyrighted PlayStation 4 system libraries, firmware files, or proprietary encryption keys. "PlayStation", "PlayStation 4", "PS4", and "Orbis OS" are registered trademarks of Sony Interactive Entertainment Inc. All commercial game titles and assets belong to their respective owners.
+- **You must own every game you use with this project.** It works only on a game you dumped yourself
+  from a copy you legally own.
+- This project does not distribute game files, PS4 system software, firmware, encryption keys or
+  recompiled game binaries. Do not share the `.app` bundles, `guest_image.bin` or other build
+  outputs; they contain the game's code.
+- ps4-native-mac is an independent project. It is not affiliated with, endorsed by or sponsored by
+  Sony Interactive Entertainment, Naughty Dog or the original PS4Recomp authors.
+- "PlayStation", "PlayStation 4", "PS4" and "Orbis OS" are trademarks of Sony Interactive
+  Entertainment Inc. All game titles and assets belong to their respective owners.
 
 ---
 
 ## License
 
-[GPL-2.0](LICENSE)
+- ps4-native-mac is licensed under the [GNU General Public License v2.0](LICENSE), as was the
+  PS4Recomp code it is based on.
+- Files changed in this fork carry their change history in git: `git log --follow <file>` shows each
+  modification, its date and its author.
+- Third-party components keep their own licenses:
+
+| Component | License |
+| --- | --- |
+| gcn-recompiler (from shadPS4) | GPL-2.0-or-later |
+| SPIRV-Cross | Apache-2.0 |
+| LibAtrac9 | MIT |
+| minimp3 | CC0-1.0 |
+| sirit / SPIRV-Headers, fmt, magic_enum, Boost subset (inside gcn-recompiler) | BSD-3 / MIT, MIT, MIT, BSL-1.0 |
