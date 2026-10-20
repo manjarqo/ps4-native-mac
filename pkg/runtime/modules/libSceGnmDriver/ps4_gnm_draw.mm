@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -54,6 +55,7 @@ extern "C" const char* ps4_vfs_get_app_root(void);
 #include "gcn_recompiler.h"
 #include "ps4_gnm_draw.h"
 #include "ps4_gnm_guest_window.h"
+#include "ps4_gnm_membudget.h"
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_shader_cache.h"
 #include "ps4_gnm_pipeline_archive.h"
@@ -579,32 +581,62 @@ struct GuestBufMru {
 };
 GuestBufMru g_guest_buf_mru[4];
 
-// PS4_GNM_LOG_GUEST_WINDOWS=1: print the guest-memory windows wrapped in Metal buffers each
-// time their total has changed by 128 MiB since the last line (grown, or shrunk by dropped
-// windows). "sum" counts every buffer's length (buffers spanning several windows overlap),
-// "distinct" the guest memory they cover. Diagnostics for memory pressure: windows are only
-// released when the kernel layer remaps their pages.
-void LogGuestWindows(const char* why) {
-    static const bool on = [] {
-        const char* e = getenv("PS4_GNM_LOG_GUEST_WINDOWS");
-        return e && e[0] == '1';
-    }();
-    if (!on || !S.ctx) return;
-    static uint64_t logged_sum;
-    uint64_t sum = 0;
-    std::vector<bool> covered(S.ctx->mem_size / kWindow + 1);
-    for (auto& kv : S.guest_bufs) {
-        const uint64_t first = (kv.first & ((1ull << 48) - 1)) / kWindow, n = kv.first >> 48;
-        sum += n * kWindow;
-        for (uint64_t w = first; w < first + n && w < covered.size(); w++) covered[w] = true;
-    }
-    uint64_t distinct = 0;
-    for (bool c : covered) distinct += c ? kWindow : 0;
-    const uint64_t step = 128ull << 20;
-    if (sum < logged_sum + step && sum + step > logged_sum) return;
-    logged_sum = sum;
-    printf("[gnm] guest windows (%s): %zu buffers, sum %llu MiB, distinct %llu MiB\n", why,
-           S.guest_bufs.size(), (unsigned long long)(sum >> 20), (unsigned long long)(distinct >> 20));
+// GPU memory telemetry (ps4_gnm_membudget.h, docs/gpu-memory-budget.md). A sampler thread
+// measures wired memory, the process footprint, MTLDevice.currentAllocatedSize and the live
+// no-copy guest buffers once a second; it runs apart from the renderer so it keeps reporting
+// while the GPU or the encoder is stuck. PS4_GNM_MEM_LOG=<seconds>: one "[gnm-mem]" line per
+// period (default 10, 0 = off) and whenever a value grew by 256 MiB.
+struct GpuMem {
+    ps4_gpumem_policy policy{};
+    ps4_gpumem_windows wins{};
+    uint64_t wired_base = 0;
+    bool on = false;
+};
+GpuMem g_mem;
+
+// Window span of a guest_bufs key (base | windows << 48).
+inline void KeyWindows(uint64_t key, uint64_t* first, uint64_t* n) {
+    *first = (key & ((1ull << 48) - 1)) / kWindow;
+    *n = key >> 48;
+}
+
+void TakeGpuMemSample(ps4_gpumem_sample* s) {
+    memset(s, 0, sizeof(*s));
+    s->t_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    s->wired = ps4_gpumem_wired_bytes();
+    s->footprint = ps4_gpumem_footprint_bytes();
+    s->device = S.dev ? (uint64_t)S.dev.currentAllocatedSize : 0;
+    ps4_gpumem_windows_read(&g_mem.wins, s);
+}
+
+void StartGpuMemSampler(uint64_t mem_size) {
+    if (!ps4_gpumem_windows_init(&g_mem.wins, mem_size, kWindow)) return;
+    ps4_gpumem_policy_init(&g_mem.policy, ps4_gpumem_mem_total(), getenv("PS4_GNM_GPU_BUDGET_PCT"),
+                           getenv("PS4_GNM_GPU_BUDGET_MB"), getenv("PS4_GNM_GPU_WINDOW_IDLE_S"));
+    g_mem.wired_base = ps4_gpumem_wired_bytes();
+    g_mem.on = true;
+    const char* lv = getenv("PS4_GNM_MEM_LOG");
+    const uint64_t period_s = lv ? strtoull(lv, nullptr, 10) : 10;
+    std::thread([period_s] {
+        pthread_setname_np("gnm-mem");
+        ps4_gpumem_log_state log{};
+        uint64_t peak_charged = 0, peak_wired = 0;
+        for (;;) {
+            ps4_gpumem_sample s;
+            @autoreleasepool {
+                TakeGpuMemSample(&s);
+            }
+            peak_charged = std::max(peak_charged, ps4_gpumem_charged(&s));
+            peak_wired = std::max(peak_wired, s.wired);
+            if (period_s && ps4_gpumem_log_due(&log, &s, period_s * 1000000000ull, 256ull << 20)) {
+                char line[512];
+                ps4_gpumem_format(line, sizeof(line), &s, g_mem.wired_base, &g_mem.policy);
+                fprintf(stderr, "[gnm-mem] %s; peak charged %llu MiB, peak wired %llu MiB\n", line,
+                        (unsigned long long)(peak_charged >> 20), (unsigned long long)(peak_wired >> 20));
+            }
+            usleep(1000000);
+        }
+    }).detach();
 }
 
 void DropRemappedWindows() {
@@ -621,12 +653,17 @@ void DropRemappedWindows() {
         bool hit = false;
         for (auto& r : ranges)
             if (r.first < end && r.first + r.second > base) { hit = true; break; }
-        if (hit) it = S.guest_bufs.erase(it);
-        else ++it;
+        if (hit) {
+            uint64_t first, n;
+            KeyWindows(it->first, &first, &n);
+            if (g_mem.on) ps4_gpumem_windows_remove(&g_mem.wins, first, n, it->second.length);
+            it = S.guest_bufs.erase(it);
+        } else {
+            ++it;
+        }
     }
     for (auto& m : g_guest_buf_mru) m = GuestBufMru{};
     ps4_hitch_add_ns(PS4_HITCH_MTLBUF, ps4_hitch_now_ns() - mb_t0);
-    if (!ranges.empty()) LogGuestWindows("drop");
 }
 
 // `out` is a strong pointer: an (implicitly autoreleasing) plain one would retain and autorelease
@@ -666,7 +703,7 @@ bool GuestBuffer(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint
             return false;
         }
         S.guest_bufs[key] = b;
-        LogGuestWindows("grow");
+        if (g_mem.on) ps4_gpumem_windows_add(&g_mem.wins, base / kWindow, nwin, end - base);
     }
     mru.key = key;
     mru.buf = b;
@@ -3492,6 +3529,7 @@ bool Init(GuestContext* ctx) {
         // builds everything inline.
         S.async_compile = getenv("PS4_GNM_SYNC_COMPILE") == nullptr;
         if (!S.dev) return false;
+        StartGpuMemSampler(proc->mem_size);
         S.queue = [S.dev newCommandQueueWithMaxCommandBufferCount:64];
         S.queue.label = @"gnm";
         S.tex = new TextureCache(S.dev, S.queue, proc->mem_base, proc->mem_size);

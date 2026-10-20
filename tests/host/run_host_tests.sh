@@ -89,6 +89,13 @@ G="$R/pkg/runtime/modules/libSceGnmDriver"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
   -framework Foundation -o "$T/guest_window_test"
 "$T/guest_window_test"
+# GPU memory accounting and budget decisions, the hole check against real mappings, and the Metal
+# facts the accounting rests on (no-copy lengths in currentAllocatedSize, GPU use wires the range).
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$G" -c "$G/ps4_gnm_membudget.c" -o "$T/membudget.o"
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$G" "$R/tests/host/gpu_membudget_test.mm" \
+  "$T/membudget.o" -framework Metal -framework Foundation -o "$T/gpu_membudget_test"
+"$T/gpu_membudget_test" > "$T/gpu_membudget.txt" || { cat "$T/gpu_membudget.txt"; exit 1; }
+tail -1 "$T/gpu_membudget.txt"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"
