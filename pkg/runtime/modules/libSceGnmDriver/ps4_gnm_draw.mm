@@ -362,11 +362,19 @@ struct WorkRec {
     bool dispatch = false;
 };
 struct WorkLog {
-    static constexpr size_t kCap = 512; // the most recent records are kept
-    WorkRec rec[kCap];
+    // The most recent records are kept: 64, or 512 with the debug options that print whole
+    // command buffers (PS4_GNM_ENCODER_STATUS, PS4_GNM_HANG_REPORT_MS, PS4_GNM_COMMIT_EACH).
+    static constexpr size_t kAll = ~size_t(0); // Print(): every record kept
+    static size_t Capacity() {
+        static const size_t cap = getenv("PS4_GNM_ENCODER_STATUS") || getenv("PS4_GNM_HANG_REPORT_MS") ||
+                                          getenv("PS4_GNM_COMMIT_EACH") ? 512 : 64;
+        return cap;
+    }
+    std::vector<WorkRec> rec = std::vector<WorkRec>(Capacity());
     uint64_t count = 0;
-    void Add(const WorkRec& r) { rec[count++ % kCap] = r; }
+    void Add(const WorkRec& r) { rec[count++ % rec.size()] = r; }
     void Print(const char* prefix, size_t last) const {
+        const uint64_t kCap = rec.size();
         const uint64_t first = count > std::min<uint64_t>(last, kCap) ? count - std::min<uint64_t>(last, kCap) : 0;
         for (uint64_t i = first; i < count; ++i) {
             const WorkRec& r = rec[i % kCap];
@@ -856,7 +864,7 @@ void Commit() {
             fprintf(stderr, "[gnm-draw] command buffer %s failed: %s\n", done.label.UTF8String,
                     done.error.localizedDescription.UTF8String);
             if (EncoderStatusEnabled()) LogEncoderStatus(done);
-            if (log) log->Print("work", EncoderStatusEnabled() ? WorkLog::kCap : 12);
+            if (log) log->Print("work", EncoderStatusEnabled() ? WorkLog::kAll : 12);
         }
         std::lock_guard<std::mutex> lk(arena->free_mu);
         for (auto& b : *chunks)
@@ -875,7 +883,7 @@ void Commit() {
             if (cb.status >= MTLCommandBufferStatusCompleted) return;
             fprintf(stderr, "[gnm-draw] GPU hang report: command buffer %s not complete %ld ms after commit\n",
                     cb.label.UTF8String, hang_ms);
-            if (log) log->Print("pending work", WorkLog::kCap);
+            if (log) log->Print("pending work", WorkLog::kAll);
         });
     }
     // drop references to completed command buffers
@@ -911,7 +919,7 @@ void WaitAll() {
                     cb.label.UTF8String, deadline_ms);
             S.hung = true;
             auto lit = S.inflight_logs.find((__bridge void*)cb);
-            if (lit != S.inflight_logs.end() && lit->second) lit->second->Print("hung work", WorkLog::kCap);
+            if (lit != S.inflight_logs.end() && lit->second) lit->second->Print("hung work", WorkLog::kAll);
         }
     }
     S.inflight.clear();
