@@ -39,6 +39,24 @@ for n in 1 2; do
   "$T/fiber_lookup_test" 60
   PS4_FIBER_THREADS=1 "$T/fiber_lookup_test" 60
 done
+# Uncharted 4 boot-path HLE: kernel memory (BatchMap/Mtypeprotect against the real VM extents),
+# sem_timedwait, Rtc, and the state/formatting libraries. All runtime directories are on the path.
+RT=()
+while IFS= read -r d; do RT+=(-I "$d"); done < <(find "$R/pkg/runtime" -type d)
+M="$R/pkg/runtime/modules"
+clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/kernel_batchmap_test.c" "$R/pkg/runtime/core/recomp_runtime.c" \
+  "$R/pkg/runtime/kernel/memory/ps4_direct_mem.c" -o "$T/kernel_batchmap_test"
+"$T/kernel_batchmap_test" | grep -v '^\[ps4'
+clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/sem_timedwait_test.c" "$R/pkg/runtime/kernel/sync/ps4_semaphore.c" \
+  -o "$T/sem_timedwait_test"
+"$T/sem_timedwait_test"
+clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/rtc_test.c" "$M/libSceRtc/ps4_rtc.c" "$M/libSceRtc/ps4_rtc_extras.c" \
+  -o "$T/rtc_test"
+"$T/rtc_test"
+clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/boot_hle_test.c" "$M/libSceNp/ps4_np.c" "$M/libSceNp/ps4_np_party.c" \
+  "$M/libSceNp/ps4_np_extras.c" "$M/libSceNpProfileDialog/ps4_np_profile_dialog.c" "$M/libSceNet/ps4_net.c" \
+  "$M/libSceNetCtl/ps4_netctl.c" "$M/libSceHttp/ps4_http.c" "$M/libSceNoopStubs/ps4_noop_stubs.c" -o "$T/boot_hle_test"
+"$T/boot_hle_test" 2>/dev/null
 G="$R/pkg/runtime/modules/libSceGnmDriver"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
