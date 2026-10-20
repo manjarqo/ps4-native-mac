@@ -492,10 +492,13 @@ static uint64_t g_exception_handlers[64] = {0};
 static pthread_mutex_t g_exception_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_sigusr1_installed = false;
 
+// The handler table is indexed by the Orbis signal number; the host SIGUSR1 handler looks its
+// entry up by the host number, which is the same (30 on FreeBSD and macOS).
+_Static_assert(SIGUSR1 == 30, "host SIGUSR1 is Orbis signal 30");
+
 static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     (void)si;
-    (void)ucontext_raw;
-    if (sig != 30) return;
+    if (sig != SIGUSR1) return;
 
     uint64_t handler = __atomic_load_n(&g_exception_handlers[sig], __ATOMIC_ACQUIRE);
     if (!handler) return;
