@@ -962,13 +962,31 @@ func (d *Disassembler) disasmBranchFollowing(entryAddr uint64) (*Function, []uin
 	}
 	slices.Sort(sortedAddrs)
 
-	// Build basic blocks
+	// A branch into the middle of an instruction gives two overlapping instruction streams, and
+	// in address order an instruction of one stream can sit between an instruction of the other
+	// and its successor. Blocks must not run on across such a seam: the instruction after the
+	// seam starts a block, and so does the address the instruction before it falls through to.
+	for i := 0; i+1 < len(sortedAddrs); i++ {
+		in := instAtAddr[sortedAddrs[i]]
+		end := in.Address + uint64(in.Inst.Len)
+		if sortedAddrs[i+1] == end {
+			continue
+		}
+		leaders[sortedAddrs[i+1]] = true
+		if _, ok := instAtAddr[end]; ok {
+			leaders[end] = true
+		}
+	}
+
+	// Build basic blocks. A block ends where its last instruction ends (the fall-through
+	// address), which is not always where the next block in address order starts.
 	var currentBlock *BasicBlock
 	for _, addr := range sortedAddrs {
 		inst := instAtAddr[addr]
 		if leaders[addr] || currentBlock == nil {
 			if currentBlock != nil && len(currentBlock.Insts) > 0 {
-				currentBlock.EndAddr = addr
+				lastInst := currentBlock.Insts[len(currentBlock.Insts)-1]
+				currentBlock.EndAddr = lastInst.Address + uint64(lastInst.Inst.Len)
 				fn.Blocks[currentBlock.StartAddr] = currentBlock
 			}
 			currentBlock = &BasicBlock{

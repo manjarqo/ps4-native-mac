@@ -233,6 +233,33 @@ func (l *Arm64Lifter) EndBlock(last disasm.Instruction) []string {
 	return l.normalizeCarry()
 }
 
+// FallThrough returns the branch that continues a block at the fall-through address of its
+// last instruction when the code emitted next does not start there (next is the start of the
+// block emitted after this one, hasNext false at the end of the function). Blocks are emitted
+// in address order, and a branch into the middle of an instruction gives overlapping
+// instruction streams (see disasm.disasmBranchFollowing), so the block after this one in
+// address order can belong to the other stream. Returns nil when the next emitted block is
+// the successor, or when the last instruction never falls through. Call it after EndBlock:
+// the target starts in the block-boundary carry sense.
+func (l *Arm64Lifter) FallThrough(fn *disasm.Function, last disasm.Instruction, next uint64, hasNext bool) []string {
+	switch last.Inst.Op {
+	case x86asm.JMP, x86asm.RET, x86asm.LRET, x86asm.UD2:
+		return nil
+	}
+	target := last.Address + uint64(last.Inst.Len)
+	if hasNext && next == target {
+		return nil
+	}
+	if fn != nil && fn.Blocks[target] != nil {
+		return []string{fmt.Sprintf("    b L_fn_0x%x_loc_0x%x", fn.EntryAddr, target)}
+	}
+	if l.IsKnownFunc(target) {
+		return []string{"    ldr x30, [sp], #16", fmt.Sprintf("    b _fn_0x%x", target)}
+	}
+	lines := loadImm64("x0", target)
+	return append(lines, "    ldr x30, [sp], #16", "    b _recomp_indirect_jump")
+}
+
 // carryCond returns the ARM condition that is true when x86 CF == want, in the current sense.
 func (l *Arm64Lifter) carryCond(want bool) string {
 	if (l.cpol == carrySub) == want {

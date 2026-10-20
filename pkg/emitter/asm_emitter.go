@@ -384,7 +384,7 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 		fmt.Fprintf(w, ".globl _fn_0x%x\n_fn_0x%x:\n", addr, addr)
 		fmt.Fprintf(w, "    str x30, [sp, #-16]!\n")
 
-		for _, blockAddr := range fn.BlockOrder {
+		for bi, blockAddr := range fn.BlockOrder {
 			block := fn.Blocks[blockAddr]
 			if block == nil {
 				continue
@@ -409,6 +409,20 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 			// A block that falls through hands the next one CF in the block-boundary sense.
 			if n := len(block.Insts); n > 0 {
 				for _, line := range e.lifter.EndBlock(block.Insts[n-1]) {
+					w.WriteString(line)
+					w.WriteByte('\n')
+				}
+				// The next emitted block is not always the fall-through successor
+				// (overlapping instruction streams): branch to it then.
+				var next uint64
+				hasNext := false
+				for _, a := range fn.BlockOrder[bi+1:] {
+					if fn.Blocks[a] != nil {
+						next, hasNext = a, true
+						break
+					}
+				}
+				for _, line := range e.lifter.FallThrough(fn, block.Insts[n-1], next, hasNext) {
 					w.WriteString(line)
 					w.WriteByte('\n')
 				}
