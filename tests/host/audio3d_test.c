@@ -368,6 +368,14 @@ static void test_pacing(void) {
   CHECK_EQ(ps4_audio3d_audioout_outputs(&bad, 1, 0), PS4_AUDIO3D_ERROR_INVALID_PORT);
   CHECK_EQ(ps4_audio3d_audioout_outputs(&mis, 1, 0), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
   CHECK_EQ(ps4_audio3d_audioout_outputs(NULL, 1, 0), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
+  // The same handle repeated in one call counts once per entry: three grains for a depth-2
+  // queue are refused as a whole, and nothing is queued.
+  Ps4Audio3dAudioOutParam rep3[3] = {op, op, op};
+  CHECK_EQ(ps4_audio3d_audioout_outputs(rep3, 3, 0), PS4_AUDIO3D_ERROR_NOT_READY);
+  Ps4Audio3dAudioOutParam rep2[2] = {op, op};
+  CHECK_EQ(ps4_audio3d_audioout_outputs(rep2, 2, 0), 0);
+  CHECK_EQ(ps4_audio3d_audioout_outputs(&op, 1, 0), PS4_AUDIO3D_ERROR_NOT_READY);
+  CHECK_EQ(ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC), 0);
   CHECK_EQ(ps4_audio3d_audioout_outputs(&op, 1, 0), 0);
   CHECK_EQ(ps4_audio3d_audioout_outputs(&op, 1, 0), 0);
   CHECK_EQ(ps4_audio3d_audioout_outputs(&op, 1, 0), PS4_AUDIO3D_ERROR_NOT_READY);

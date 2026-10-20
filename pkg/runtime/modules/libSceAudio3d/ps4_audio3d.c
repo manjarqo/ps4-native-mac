@@ -929,8 +929,11 @@ int32_t ps4_audio3d_audioout_outputs(const Ps4Audio3dAudioOutParam *params, uint
     } else if (params[i].ptr &&
                ((base + (uintptr_t)params[i].ptr) & (a->is_float ? 3u : 1u)) != 0) {
       r = PS4_AUDIO3D_ERROR_INVALID_PARAMETER; // samples must be naturally aligned
-    } else if (a->pend_count >= p->queue_depth) {
-      r = PS4_AUDIO3D_ERROR_NOT_READY;
+    } else {
+      // Entries earlier in this call for the same handle also take a pending slot.
+      uint32_t adds = 1;
+      for (uint32_t j = 0; j < i; j++) adds += params[j].handle == params[i].handle;
+      if ((uint64_t)a->pend_count + adds > p->queue_depth) r = PS4_AUDIO3D_ERROR_NOT_READY;
     }
   }
   for (uint32_t i = 0; i < num && r == 0; i++) {
