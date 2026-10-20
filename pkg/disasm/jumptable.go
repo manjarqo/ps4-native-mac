@@ -26,7 +26,11 @@ type ResolvedJumpTable struct {
 	TableAddr uint64
 	BaseAddr  uint64
 	Count     int
-	Targets   []uint64
+	// Cap bounds the scan of a table whose length is not proven (Count <= 0): the scan still
+	// stops at the first entry that does not look like a target of the function, but reads
+	// no more than Cap entries (see byteIndexCap). 0 = no cap besides maxJumpTableEntries.
+	Cap     int
+	Targets []uint64
 }
 
 // picSwitch describes a recovered x86-64 PIC switch jump table.
@@ -222,6 +226,7 @@ func matchJumpTable(
 					Format:    TableFormatAbs64,
 					TableAddr: tableAddr,
 					Count:     count,
+					Cap:       byteIndexCap(window[:n-1], mem.Index),
 				}, true
 			}
 		}
@@ -252,6 +257,7 @@ func matchJumpTable(
 							Format:    TableFormatAbs64,
 							TableAddr: tableAddr,
 							Count:     count,
+							Cap:       byteIndexCap(window[:i], mem.Index),
 						}, true
 					}
 				}
@@ -378,6 +384,7 @@ func matchJumpTable(
 		TableAddr: tableAddr,
 		BaseAddr:  baseAddr,
 		Count:     count,
+		Cap:       byteIndexCap(window[:loadIdx], idxReg),
 	}, true
 }
 
@@ -580,16 +587,6 @@ func switchTableCountKill(window []Instruction, idxReg x86asm.Reg) (int, bool) {
 		// 5. If this instruction modifies idxReg, we must not look past it,
 		// because any earlier CMP/AND was checking an obsolete value.
 		if modifiesReg(inst, idxReg) {
-			// A byte loaded from memory and zero-extended bounds the index by itself (the
-			// bytecode dispatch of an interpreter: movzx eax, byte [pc]; jmp [table + 4*rax]),
-			// and no earlier check can apply to it. Without this bound the table is scanned
-			// until the entries stop looking like code, which runs into the next table and
-			// yields targets in the middle of real instructions.
-			if inst.Op == x86asm.MOVZX && inst.MemBytes == 1 {
-				if _, ok := inst.Args[1].(x86asm.Mem); ok {
-					return 256, false
-				}
-			}
 			// Transparent register transfer: mov idxReg, otherReg
 			if inst.Op == x86asm.MOV || inst.Op == x86asm.MOVSXD || inst.Op == x86asm.MOVZX || inst.Op == x86asm.MOVSX {
 				if srcReg, ok := inst.Args[1].(x86asm.Reg); ok && gprFamily(srcReg) != 0 {
@@ -604,6 +601,35 @@ func switchTableCountKill(window []Instruction, idxReg x86asm.Reg) (int, bool) {
 	return 0, i >= 0
 }
 
+// byteIndexCap returns 256 when the index register of a jump table was last written by a
+// zero-extended byte load from memory (an interpreter's bytecode dispatch: movzx eax, byte
+// [pc]; movsxd rax, [rcx+4*rax]; add rax, rcx; jmp rax), which has no bounds check. That only
+// caps the scan of the table: such a table can be shorter than 256 entries, and the entries
+// after it belong to other data. Without the cap the scan runs on into the next table, whose
+// entries read relative to this table's base can look like code addresses in the middle of
+// real instructions. Register copies are followed; 0 when the index has another source.
+func byteIndexCap(window []Instruction, idxReg x86asm.Reg) int {
+	for i := len(window) - 1; i >= 0; i-- {
+		inst := window[i].Inst
+		if !modifiesReg(inst, idxReg) {
+			continue
+		}
+		if inst.Op == x86asm.MOVZX && inst.MemBytes == 1 {
+			if _, ok := inst.Args[1].(x86asm.Mem); ok {
+				return 256
+			}
+		}
+		if inst.Op == x86asm.MOV || inst.Op == x86asm.MOVSXD || inst.Op == x86asm.MOVZX || inst.Op == x86asm.MOVSX {
+			if src, ok := inst.Args[1].(x86asm.Reg); ok && gprFamily(src) != 0 {
+				idxReg = src
+				continue
+			}
+		}
+		return 0
+	}
+	return 0
+}
+
 // readResolvedTargets reads all target addresses from the recovered jump table.
 func (d *Disassembler) readResolvedTargets(sw ResolvedJumpTable, fnStart, fnEnd uint64) []uint64 {
 	if d == nil || d.elf == nil {
@@ -615,6 +641,9 @@ func (d *Disassembler) readResolvedTargets(sw ResolvedJumpTable, fnStart, fnEnd 
 	limit := sw.Count
 	if limit <= 0 {
 		limit = maxJumpTableEntries
+		if sw.Cap > 0 {
+			limit = sw.Cap
+		}
 	}
 	if limit > maxJumpTableEntries {
 		limit = maxJumpTableEntries
