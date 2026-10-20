@@ -606,6 +606,32 @@ int recomp_module_info_by_handle(int32_t handle, RecompModuleSnapshot *out) {
     return found >= 0 ? 0 : -1;
 }
 
+int recomp_module_info_by_addr(uint64_t addr, RecompModuleSnapshot *out) {
+    RecompModuleSnapshot *mods = (RecompModuleSnapshot *)calloc(MAX_PRX_MODULES + 1, sizeof(*mods));
+    if (!mods) {
+        return -1;
+    }
+    int n = recomp_module_snapshot(mods, MAX_PRX_MODULES + 1);
+    int found = -1;
+    uint64_t best_size = UINT64_MAX;
+    for (int i = 0; i < n; i++) {
+        if (mods[i].has_range && addr >= mods[i].start_addr && addr < mods[i].end_addr &&
+            mods[i].end_addr - mods[i].start_addr < best_size) {
+            found = i;
+            best_size = mods[i].end_addr - mods[i].start_addr;
+        }
+    }
+    // Address 0 names the main module (as recomp_module_find_by_addr has it).
+    if (found < 0 && addr == 0 && n > 0 && mods[0].has_range) {
+        found = 0;
+    }
+    if (found >= 0) {
+        *out = mods[found];
+    }
+    free(mods);
+    return found >= 0 ? 0 : -1;
+}
+
 uint32_t recomp_module_snapshot_segments(const RecompModuleSnapshot *m, RecompModuleSegment out[4]) {
     memset(out, 0, 4 * sizeof(*out));
     if (m->num_segments > 0) {

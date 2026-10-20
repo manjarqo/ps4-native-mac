@@ -84,6 +84,9 @@ int recomp_module_snapshot(RecompModuleSnapshot *out, int max);
 // GetModuleInfoInternal: the main executable is handle 0 (handle 1 also names it unless a PRX
 // owns that handle); a PRX has the handle sceKernelLoadStartModule returned. 0 on success.
 int recomp_module_info_by_handle(int32_t handle, RecompModuleSnapshot *out);
+// The module whose address range contains addr (the innermost one), with the handle of the
+// scheme above. 0 on success, -1 if no module contains addr.
+int recomp_module_info_by_addr(uint64_t addr, RecompModuleSnapshot *out);
 // Fills out[4] with the segments of m (registered ones, else text + data from its range);
 // returns their number.
 uint32_t recomp_module_snapshot_segments(const RecompModuleSnapshot *m, RecompModuleSegment out[4]);
