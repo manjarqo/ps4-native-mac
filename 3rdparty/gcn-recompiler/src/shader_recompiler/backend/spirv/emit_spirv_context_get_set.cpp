@@ -70,9 +70,13 @@ Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
         index = ctx.OpIAdd(ctx.U32[1], index, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
-    const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
-    const Id result{ctx.OpLoad(ctx.U32[1], ptr)};
-    return result;
+    // PS4Recomp: s_buffer_load past num_records reads 0 on GCN, like the vector buffer loads
+    // (EmitLoadBufferB32xN). Without the check a Metal shader reads whatever follows the buffer:
+    // Uncharted 4's tiled lighting takes its per-tile light count this way, and a count read
+    // past the end of the count array made its loop run for seconds (GPU watchdog).
+    const Id size = buffer.Size(PointerSize::B32);
+    const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, ctx.ClampIndex(index, size))};
+    return ctx.ZeroIfOutOfBounds(ctx.U32[1], ctx.u32_zero_value, ctx.OpLoad(ctx.U32[1], ptr), index, size);
 }
 
 Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {

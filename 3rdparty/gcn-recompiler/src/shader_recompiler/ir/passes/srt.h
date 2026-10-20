@@ -33,6 +33,10 @@ enum class SrtOp : u32 {
     Imm,      // value: push value
     Add, Sub, Mul, Shl, Shr, And, Or, Xor, Not, UMin, UMax,
     BfeU, // pop count, offset, base: push (base >> offset) & ((1 << count) - 1)
+    // PS4Recomp: dst: flat[dst] = low dword of cur, flat[dst + 1] = bits 32..43 (V# dwords
+    // 0-1 with stride 0). The pointer becomes the base of a guest buffer for reads whose
+    // offset only the shader knows.
+    StorePtr,
 };
 
 // Guest memory reader: copy `size` bytes at guest address `addr` into `dst`.

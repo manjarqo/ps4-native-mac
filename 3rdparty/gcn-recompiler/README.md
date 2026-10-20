@@ -32,6 +32,14 @@ Vendored externals, each under its own license:
   its place, the pass now emits a portable bytecode (`Shader::SrtOp`), which
   `Shader::RunSrtProgram()` interprets through a guest-memory reader callback. The IR analysis
   is unchanged.
+- `ir/passes/flatten_extended_userdata_pass.cpp`, `ir/passes/srt.h`: an `s_load` through an SRT
+  pointer at an offset only the shader knows (a loop counter: a Phi or ReadFirstLane in the
+  offset) cannot be flattened. shadPS4 reads it through direct memory access, which the Metal
+  profile does not have; here the walker stores the pointer (`SrtOp::StorePtr`) and the read
+  becomes a `ReadConstBuffer` of a 1 MiB guest buffer based at that pointer.
+- `backend/spirv/emit_spirv_context_get_set.cpp` (`EmitReadConstBuffer`): `s_buffer_load` past
+  the V#'s `num_records` reads 0, as on GCN (bounds from `push_data.buf_sizes`, like the vector
+  buffer loads).
 - `info.h`, `frontend/fetch_shader.cpp`: shadPS4 dereferences guest GPU addresses directly. In
   this library those reads go through `compat/guest_memory.h`, using a per-thread reader that
   the C API installs.

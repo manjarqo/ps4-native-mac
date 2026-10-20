@@ -5,6 +5,12 @@
 // "SRT walker" (plus its SIGSEGV patching handler and Zydis disassembly dump) was replaced by
 // a portable bytecode program (Shader::SrtOp, see srt.h) that is interpreted on the host by
 // Shader::RunSrtProgram(). The IR analysis part of the pass is unchanged.
+//
+// PS4Recomp also handles reads the walker cannot flatten because their offset is only known
+// in the shader (an s_load whose offset register is a loop counter, i.e. a Phi; shadPS4 reads
+// those through direct memory access, which the Metal profile does not have): the walker
+// stores the pointer they read through, and they become reads of a guest buffer whose V# has
+// that pointer as its base.
 
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
@@ -71,6 +77,12 @@ struct PassInfo {
 
     // Bumped during codegen to assign offsets to readconsts
     u16 dst_off_dw;
+
+    // Readconsts with an offset the walker cannot compute -> flatbuf dword holding the 64-bit
+    // pointer they read through (stored by SrtOp::StorePtr)
+    std::unordered_map<IR::Inst*, u16> dynamic_reads;
+    // A pointer was read at such an offset (logged once per shader)
+    bool lost_pointer_logged = false;
 
     PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
         auto it = pointer_uses.find(inst);
@@ -201,7 +213,10 @@ static bool ComputeOffset(SrtEmitter& c, PassInfo& pass_info, const IR::Value& o
         c.Op(SrtOp::BfeU);
         return true;
     default:
-        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
+        // PS4Recomp: not an error by itself. A plain read with such an offset is done by the
+        // shader (LowerDynamicReadConst); a pointer read that way loses the reads through it
+        // (logged once per shader by VisitPointer).
+        LOG_DEBUG(Render_Recompiler, "Unexpected instruction for offset computation, {}",
                   magic_enum::enum_name(inst->GetOpcode()));
         return false;
     }
@@ -268,6 +283,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     // First copy all the src data from this tree level
     // That way, all data that was contiguous in the guest SRT is also contiguous in the
     // flattened buffer.
+    u16 ptr_slot = 0; // flatbuf copy of this level's pointer, for reads with a shader offset
     for (auto [src_off_dw, use] : *use_list) {
         if (src_off_dw.IsImmediate()) {
             c.Op(SrtOp::CopyImm, src_off_dw.U32(), pass_info.dst_off_dw);
@@ -275,7 +291,21 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
             const size_t mark = c.code.size();
             if (!ComputeOffset(c, pass_info, src_off_dw)) {
                 c.code.resize(mark);
-                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+                if (ptr_slot == 0) {
+                    ptr_slot = pass_info.dst_off_dw;
+                    pass_info.dst_off_dw += 2;
+                    c.Op(SrtOp::StorePtr, ptr_slot);
+                }
+                pass_info.dynamic_reads.emplace(use, ptr_slot);
+                if (pass_info.GetUsesAsPointer(use) && !pass_info.lost_pointer_logged) {
+                    // The pointer value itself is read correctly (a guest buffer read), but the
+                    // reads through it cannot be flattened without direct memory access: they
+                    // keep flatbuf offset 0 and read user data dword 0.
+                    pass_info.lost_pointer_logged = true;
+                    LOG_ERROR(Render_Recompiler,
+                              "SRT pointer read at an offset only the shader knows: the reads "
+                              "through it are not flattened (they read user data dword 0)");
+                }
                 continue;
             }
             c.Op(SrtOp::CopyDyn, pass_info.dst_off_dw);
@@ -381,6 +411,48 @@ void SimplifyReadConstAddressAdd(IR::Inst& inst) {
             user->SetArg(1, ir.IAdd(offset, dw_add_offset));
         }
     }
+}
+
+// Bytes readable through the buffer of a dynamic read, from the pointer it reads through.
+// The shader's offsets are unknown; tables indexed this way (light lists, per-tile arrays)
+// are far smaller.
+constexpr u32 DynamicReadBufferBytes = 1u << 20;
+
+// A raw V# for a guest buffer whose base address is in flatbuf[ptr_slot..+1] (stride
+// 0, so num_records is a byte count). dword3: dst_sel XYZW, NUM_FORMAT_FLOAT,
+// DATA_FORMAT_32, type 0 (buffer).
+static BufferResource DynamicReadBuffer(u16 ptr_slot) {
+    BufferResource res{};
+    res.sharp_fetch.summary = SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad;
+    res.sharp_fetch.offsets = {};
+    res.sharp_fetch.immediates = {};
+    res.sharp_fetch.offsets[0] = ptr_slot;
+    res.sharp_fetch.offsets[1] = static_cast<SharpLocation>(ptr_slot + 1);
+    res.sharp_fetch.immediates[2] = DynamicReadBufferBytes;
+    res.sharp_fetch.immediates[3] = 0x00027FACu;
+    res.sharp_fetch.load_mask = 0b0011;
+    res.used_types = IR::Type::U32;
+    res.buffer_type = BufferType::Guest;
+    return res;
+}
+
+// ReadConst(pointer, dword offset) whose offset only the shader knows -> ReadConstBuffer of
+// the guest buffer based at that pointer (same dword index).
+static void LowerDynamicReadConst(Info& info, IR::Inst& readconst, u16 ptr_slot,
+                                  std::unordered_map<u16, u32>& buffers) {
+    auto it = buffers.find(ptr_slot);
+    if (it == buffers.end()) {
+        if (info.buffers.size() >= NUM_BUFFERS) {
+            LOG_ERROR(Render_Recompiler, "No buffer slot left for a dynamic SRT read");
+            return;
+        }
+        info.buffers.push_back(DynamicReadBuffer(ptr_slot));
+        it = buffers.emplace(ptr_slot, static_cast<u32>(info.buffers.size() - 1)).first;
+    }
+    IR::IREmitter ir{*readconst.GetParent(), IR::Block::InstructionList::s_iterator_to(readconst)};
+    const IR::U32 value =
+        ir.ReadConstBuffer(ir.Imm32(it->second), IR::U32{readconst.Arg(1)}, IR::BufferInstInfo{});
+    readconst.ReplaceUsesWith(value);
 }
 
 } // Anonymous namespace
@@ -491,9 +563,16 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
     GenerateSrtProgram(program.info, pass_info);
 
     // Assign offsets to duplicate readconsts
+    std::unordered_map<u16, u32> dynamic_buffers; // pointer slot -> buffer resource index
     for (IR::Inst* readconst : all_readconsts) {
         ASSERT(pass_info.vn_to_inst.contains(pass_info.gvn_table.GetValueNumber(readconst)));
         IR::Inst* original = pass_info.DeduplicateInstruction(readconst);
+        const auto dyn = pass_info.dynamic_reads.find(original);
+        if (dyn != pass_info.dynamic_reads.end() &&
+            readconst->GetOpcode() == IR::Opcode::ReadConst) {
+            LowerDynamicReadConst(program.info, *readconst, dyn->second, dynamic_buffers);
+            continue;
+        }
         SetFlatbufOffset(readconst, GetFlatbufOffset(original));
     }
 
@@ -589,6 +668,13 @@ bool RunSrtProgram(std::span<const u32> program, const u32* user_data, u32* flat
         case SrtOp::Not:
             push(~pop());
             break;
+        case SrtOp::StorePtr: {
+            const u32 dst = program[pc++];
+            // V# dwords 0-1: base address bits 0..43; the stride field above them stays 0
+            flat_dst[dst] = static_cast<u32>(cur);
+            flat_dst[dst + 1] = static_cast<u32>(cur >> 32) & 0xFFFu;
+            break;
+        }
         case SrtOp::BfeU: {
             const u32 count = pop();
             const u32 offset = pop();
