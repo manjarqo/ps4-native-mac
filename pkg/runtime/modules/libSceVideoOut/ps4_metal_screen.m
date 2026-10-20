@@ -758,9 +758,13 @@ static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long sho
             td.storageMode = MTLStorageModeShared;
             shot = [g_device newTextureWithDescriptor:td];
         }
-        // the drawable was taken before the frame's size was known: a resize needs a new one
-        if (drawable && (drawable.texture.width != dw || drawable.texture.height != dh)) drawable = nil;
-        if (!drawable) drawable = next_drawable_timed();
+        // The drawable was taken before the frame's size was known: a resize needs a new one. A nil
+        // drawable (window minimized or closed; nextDrawable already waited its 1 s) is not asked
+        // for again: this frame is not shown.
+        if (drawable && (drawable.texture.width != dw || drawable.texture.height != dh)) {
+            drawable = nil;
+            drawable = next_drawable_timed();
+        }
         NSUInteger ox = 0, oy = 0;
         const float gamma = current_gamma();
         id<MTLRenderPipelineState> gamma_pso = fabsf(gamma - 1.0f) > 0.001f ? gamma_pipeline() : nil;
@@ -937,6 +941,10 @@ static void *presenter_main(void *arg) {
             // Get the drawable first and only then let the renderer have a slot (a credit):
             // while the display is behind, the renderer waits at the same point where it waited
             // in nextDrawable before, so the thread adds no frames of latency. Mailbox never waits.
+            // The drawable stays held while no frame comes: it is what backs the credit (giving it
+            // back would let the renderer run ahead of the display again). That leaves 2 of the 3
+            // drawables to the CPU present paths while the GPU path is idle, which is enough: the
+            // display keeps releasing them.
             id<CAMetalDrawable> drawable = next_drawable_timed();
             if (g_pr.mode != PS4_PRESENT_MAILBOX) ps4_pq_grant(&g_pr.q);
             const int s = ps4_pq_take(&g_pr.q);

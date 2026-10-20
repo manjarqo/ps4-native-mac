@@ -81,7 +81,7 @@ void ps4_pq_init(ps4_present_queue *q, int n, bool mailbox);
 int ps4_pq_try_acquire_locked(ps4_present_queue *q, int *superseded);
 // Producer: RENDERING -> QUEUED. Returns false for a slot it does not own.
 bool ps4_pq_submit_locked(ps4_present_queue *q, int slot, bool keep);
-// Producer: RENDERING -> FREE (the frame was abandoned).
+// Producer: RENDERING -> FREE (the frame was abandoned); FIFO returns the drawable credit.
 bool ps4_pq_cancel_locked(ps4_present_queue *q, int slot);
 // Presenter: the oldest QUEUED slot -> PRESENTING; -1 when none.
 int ps4_pq_try_take_locked(ps4_present_queue *q);

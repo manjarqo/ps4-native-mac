@@ -1134,7 +1134,10 @@ func packageAppBundle(cfg *Config, appName, compiledBin string) (string, error) 
 	// A failure is reported but does not fail the build: the unsigned-bundle state of older
 	// builds still runs.
 	if err := signAppBundle(bundleDir); err != nil {
-		fmt.Printf("             Warning: %v\n", err)
+		// a seal of an earlier build no longer matches: drop it, so the bundle is plainly
+		// linker-signed instead of carrying an invalid signature
+		_ = os.RemoveAll(filepath.Join(contentsDir, "_CodeSignature"))
+		fmt.Printf("             Warning: %v; the bundle is unsigned (Game Mode keys are not bound)\n", err)
 	}
 
 	return bundleDir, nil

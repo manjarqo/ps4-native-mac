@@ -133,6 +133,32 @@ static void fifo_test(void) {
     CHECK(q.superseded == 0);
 }
 
+// A frame abandoned after its slot was taken (e.g. the slot texture could not be allocated) must
+// give the drawable credit back: otherwise nothing is ever queued, the presenter waits in take for
+// good and every later acquire times out.
+static void cancel_credit_test(void) {
+    ps4_present_queue q;
+    ps4_pq_init(&q, 3, false);
+    int sup;
+    double waited;
+    ps4_pq_grant(&q);
+    const int s = ps4_pq_acquire(&q, 1.0, &sup, &waited);
+    CHECK(s >= 0 && q.credits == 0);
+    CHECK(ps4_pq_cancel(&q, s));
+    CHECK(q.credits == 1);
+    const int s2 = ps4_pq_acquire(&q, 0.2, &sup, &waited);
+    CHECK(s2 >= 0 && waited < 0.1);
+    if (s2 >= 0) {
+        CHECK(ps4_pq_submit(&q, s2, false));
+        CHECK(ps4_pq_take(&q) == s2);
+    }
+    // mailbox has no credits to return
+    ps4_present_queue m;
+    ps4_pq_init(&m, 3, true);
+    const int t = ps4_pq_acquire(&m, 0, &sup, &waited);
+    CHECK(t >= 0 && ps4_pq_cancel(&m, t) && m.credits == 0);
+}
+
 static void mailbox_test(void) {
     ps4_present_queue q;
     ps4_pq_init(&q, 3, true);
@@ -264,6 +290,7 @@ int main(void) {
     cadence_test();
     fifo_test();
     mailbox_test();
+    cancel_credit_test();
     thread_test();
     timeout_test();
     if (g_fail) return 1;

@@ -63,6 +63,9 @@ Code: `pkg/runtime/modules/libSceVideoOut/ps4_metal_screen.m` (presenter), `ps4_
   - `sceGnmInsertWaitFlipDone` is still not a real GPU wait (it needs guest-visible per-buffer labels
     that the CP polls). The one-frame bound is what keeps a later frame from overwriting the buffer being
     read.
+  - A GPU-presented frame after a guest-memory frame waits for it, so images are shown in order.
+  - CP-thread writes (DMA_DATA, WRITE_DATA) are not ordered against the read. That is one reason the
+    path stays opt-in.
 - `present_frame` and `present_texture` first drain the presenter queue: up to 1 s, and not at all after
   a timeout, until the presenter is idle again.
 

@@ -4811,9 +4811,12 @@ void PresentFromGuestMemory(GuestContext* ctx, uint64_t addr, uint32_t width, ui
 // - every flip completes on this queue, in order, while such a frame is pending (GPU-presented
 //   frames and the fallback path go through it too), so present_frame runs on one thread only;
 // - the encoder stays at most one frame ahead: before queueing the next guest-memory frame it
-//   waits for the previous one, so frame N's read is done before frame N+1's commands are
-//   encoded and later frames cannot overwrite the buffer being read (sceGnmInsertWaitFlipDone is
-//   not a real wait yet); a GPU that does not finish turns into S.hung through WaitAll's watchdog.
+//   waits for the previous one, so frame N's read is done before frame N+1's present is queued and
+//   N+2's work (which reuses buffer N with two buffers) is encoded after the read
+//   (sceGnmInsertWaitFlipDone is not a real wait yet); a GPU that does not finish turns into
+//   S.hung through WaitAll's watchdog. A GPU-presented frame after a guest-memory one waits for
+//   it too, so the images are shown in order. Writes the CP thread executes itself
+//   (DMA_DATA / WRITE_DATA) are not ordered against the read: one reason this stays opt-in.
 dispatch_queue_t CpuPresentQueue() {
     static dispatch_queue_t q = dispatch_queue_create(
         "gnm.cpu-present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
@@ -4961,6 +4964,8 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
         // work: the CPU does not wait for the GPU, so the next frame's command processing
         // overlaps this frame's GPU execution and the presenter's wait for a drawable.
         const double tp0 = CFAbsoluteTimeGetCurrent();
+        // PS4_GNM_ASYNC_CPU_PRESENT only: a guest-memory frame before this one is shown first
+        if (g_cpu_present_pending.load() > 0) WaitCpuPresentIdle();
         id<MTLTexture> dst = (__bridge id<MTLTexture>)ps4_metal_screen_acquire_frame((int)width, (int)height);
         if (!dst) { // no slot: the presenter copies this texture if it can, or drops the frame
             if (!S.present_tex || S.present_tex.width != width || S.present_tex.height != height) {

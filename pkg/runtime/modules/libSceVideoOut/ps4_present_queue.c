@@ -84,6 +84,8 @@ bool ps4_pq_submit_locked(ps4_present_queue *q, int slot, bool keep) {
 bool ps4_pq_cancel_locked(ps4_present_queue *q, int slot) {
     if (slot < 0 || slot >= q->n || q->state[slot] != PS4_PQ_RENDERING) return false;
     q->state[slot] = PS4_PQ_FREE;
+    // the presenter still holds the drawable granted for this frame: the next frame may use it
+    if (!q->mailbox && q->credits < 1) q->credits++;
     return true;
 }
 
