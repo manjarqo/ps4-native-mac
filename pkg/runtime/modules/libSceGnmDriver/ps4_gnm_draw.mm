@@ -339,6 +339,10 @@ struct Shader {
         Shader* capture = nullptr;
         Shader* expand = nullptr;
         uint32_t vertex_stride = 0, capture_slot = 0, params_slot = 0;
+        // Metal libraries still compiling (their fn is set before the count drops), and whether
+        // one failed.
+        std::atomic<int> compiling{2};
+        std::atomic<bool> failed{false};
     };
     RectList* rect = nullptr;
     bool rect_failed = false;
@@ -1461,12 +1465,25 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
 
 
 // The RectList vertex shaders of `vs` (gcn_shader_rectlist_msl), made once per shader on the CP
-// thread. Their Metal libraries are compiled here, synchronously: RectList draws are few (UI,
-// full-screen passes) and their shaders small. Returns nullptr (logged once per shader) if the
-// shader cannot be expanded.
-Shader::RectList* RectListShaders(Shader* vs) {
-    if (vs->rect || vs->rect_failed) return vs->rect;
-    const double t0 = CFAbsoluteTimeGetCurrent();
+// thread. Their Metal libraries compile in the background like any new shader's (a synchronous
+// compile stalls the CP thread for tens of ms); draws are skipped until both are ready.
+// Returns nullptr (logged once per shader) if the shader cannot be expanded, and sets *pending
+// while the libraries compile.
+Shader::RectList* RectListShaders(Shader* vs, bool* pending) {
+    *pending = false;
+    if (vs->rect_failed) return nullptr;
+    if (Shader::RectList* r = vs->rect) {
+        if (r->compiling.load(std::memory_order_acquire) > 0) {
+            *pending = true;
+            return nullptr;
+        }
+        if (r->failed.load(std::memory_order_relaxed)) {
+            RLog("rect-fail", "VS 0x%llx: Metal rejected its RectList shaders", (unsigned long long)vs->code_addr);
+            vs->rect_failed = true;
+            return nullptr;
+        }
+        return r;
+    }
     gcn_rectlist_msl m{};
     char err[512] = {0};
     if (gcn_shader_rectlist_msl(vs->sh, &S.msl, &m, err, sizeof(err)) != GCN_OK) {
@@ -1474,7 +1491,12 @@ Shader::RectList* RectListShaders(Shader* vs) {
         vs->rect_failed = true;
         return nullptr;
     }
-    auto make = [&](const char* src, bool expand) -> Shader* {
+    auto* r = new Shader::RectList();
+    r->vertex_stride = m.vertex_stride;
+    r->capture_slot = m.capture_buffer;
+    r->params_slot = m.params_buffer;
+    const uint64_t code_addr = vs->code_addr;
+    auto start = [&](const char* src, bool expand) -> Shader* {
         // the same edits as FinishShader: no optnone helpers; an invariant rasterized position
         std::string msl = src;
         const std::string tag = "[[clang::optnone]] ";
@@ -1486,42 +1508,35 @@ Shader::RectList* RectListShaders(Shader* vs) {
         }
         Shader* s = new Shader();
         s->hw = GCN_HW_VS;
-        s->code_addr = vs->code_addr;
+        s->code_addr = code_addr;
         s->uid = S.next_uid++;
         s->msl_hash = Fnv(msl.data(), msl.size());
+        s->pending = true;
         DumpMsl(s, msl.c_str());
         MTLCompileOptions* opt = [MTLCompileOptions new];
         opt.fastMathEnabled = NO;
         if (@available(macOS 11.0, *)) opt.preserveInvariance = YES;
-        NSError* e = nil;
-        id<MTLLibrary> lib = [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()] options:opt error:&e];
-        if (lib) s->fn = [lib newFunctionWithName:@"main0"];
-        if (!s->fn) {
-            RLog("rect-fail", "VS 0x%llx: Metal rejected its RectList %s shader: %s", (unsigned long long)vs->code_addr,
-                 expand ? "expansion" : "capture", e ? e.localizedDescription.UTF8String : "no main0");
-            delete s;
-            return nullptr;
-        }
+        [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()]
+                            options:opt
+                  completionHandler:^(id<MTLLibrary> lib, NSError* e) {
+                      s->fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
+                      if (!s->fn) {
+                          fprintf(stderr, "[gnm-draw] VS 0x%llx: Metal rejected its RectList %s shader: %s\n",
+                                  (unsigned long long)code_addr, expand ? "expansion" : "capture",
+                                  e ? e.localizedDescription.UTF8String : "no main0");
+                          r->failed.store(true, std::memory_order_relaxed);
+                      }
+                      s->pending = false;
+                      r->compiling.fetch_sub(1, std::memory_order_release);
+                  }];
         return s;
     };
-    Shader* cap = make(m.capture_msl, false);
-    Shader* exp = cap ? make(m.expand_msl, true) : nullptr;
-    auto* r = new Shader::RectList();
-    r->vertex_stride = m.vertex_stride;
-    r->capture_slot = m.capture_buffer;
-    r->params_slot = m.params_buffer;
+    r->capture = start(m.capture_msl, false);
+    r->expand = start(m.expand_msl, true);
     gcn_rectlist_msl_free(&m);
-    g_hitch.mtl_ms += (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
-    if (!exp) {
-        delete cap;
-        delete r;
-        vs->rect_failed = true;
-        return nullptr;
-    }
-    r->capture = cap;
-    r->expand = exp;
     vs->rect = r;
-    return r;
+    *pending = true;
+    return nullptr;
 }
 
 // =====================================================================================
@@ -4158,10 +4173,18 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
                 regs[0xA102] != 0 || (args.indexed && !args.max_index))
                 return false;
         }
-        if (rs.raster.prim == PrimitiveType::RectList && !indirect && !RectListShaders(vs)) {
-            RLog("rect-skip", "%s skipped: VS 0x%llx has no RectList variant", args.name, (unsigned long long)vs_addr);
-            S.n_skipped++;
-            return true;
+        if (rs.raster.prim == PrimitiveType::RectList && !indirect) {
+            bool pending = false;
+            if (!RectListShaders(vs, &pending)) {
+                S.n_skipped++;
+                if (pending) {
+                    g_hitch.pending_draws++;
+                } else {
+                    RLog("rect-skip", "%s skipped: VS 0x%llx has no RectList variant", args.name,
+                         (unsigned long long)vs_addr);
+                }
+                return true;
+            }
         }
         Shader* ps = nullptr;
         if (ps_addr) {
