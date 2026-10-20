@@ -84,11 +84,38 @@ AD="$R/pkg/runtime/modules/libSceAudiodec"
 clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/runtime/core" -I "$AD" \
   "$R/tests/host/audiodec_test.c" "$AD/ps4_audiodec.c" -framework AudioToolbox -o "$T/audiodec_test"
 "$T/audiodec_test" "$R/tests/host/data/audiodec_chirp_ffmpeg.aac" 2> "$T/audiodec.txt" || { cat "$T/audiodec.txt"; exit 1; }
+# Presenter statistics: display intervals from presented times, drops, drawable waits, bursts.
+VO="$R/pkg/runtime/modules/libSceVideoOut"
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/tests/host/present_stats_test.c" \
+  "$VO/ps4_present_stats.c" -o "$T/present_stats_test"
+"$T/present_stats_test"
+# Presenter frame queue (FIFO / mailbox slots, blocking and timeouts) and the vsync pacing policy.
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/tests/host/present_queue_test.c" \
+  "$VO/ps4_present_queue.c" -o "$T/present_queue_test"
+"$T/present_queue_test"
 G="$R/pkg/runtime/modules/libSceGnmDriver"
+# PM4 INDIRECT_BUFFER chaining: chained chunks run to the end, calls return, deep calls stop.
+clang++ -std=c++17 -Wall -Werror -g -fsanitize=address,undefined -I "$G" "$R/tests/host/gnm_ib_chain_test.cc" \
+  -o "$T/gnm_ib_chain_test"
+"$T/gnm_ib_chain_test"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
   -framework Foundation -o "$T/guest_window_test"
 "$T/guest_window_test"
+# Shader translator (3rdparty/gcn-recompiler) scalar reads on Metal: SRT reads at offsets only the
+# shader knows, s_buffer_load past num_records, and a compute shader dumped from Uncharted 4.
+GR="$R/3rdparty/gcn-recompiler"
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_scalar_reads_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gcn_scalar_reads_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+"$T/gcn_scalar_reads_test" "$R/tests/host/data"
+# GPU memory accounting and budget decisions, the hole check against real mappings, and the Metal
+# facts the accounting rests on (no-copy lengths in currentAllocatedSize, GPU use wires the range).
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$G" -c "$G/ps4_gnm_membudget.c" -o "$T/membudget.o"
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$G" "$R/tests/host/gpu_membudget_test.mm" \
+  "$T/membudget.o" -framework Metal -framework Foundation -o "$T/gpu_membudget_test"
+"$T/gpu_membudget_test" > "$T/gpu_membudget.txt" || { cat "$T/gpu_membudget.txt"; exit 1; }
+tail -1 "$T/gpu_membudget.txt"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   "$G/ps4_gnm_library_store.mm" -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"

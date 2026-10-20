@@ -240,7 +240,9 @@ int32_t sceVideoOutSetFlipRate(int32_t handle, int32_t fliprate) {
     }
 
     pthread_mutex_lock(&vh->mutex);
+    if (vh->flipRate != fliprate) fprintf(stderr, "[videoout] SetFlipRate(handle=%d, rate=%d)\n", handle, fliprate);
     vh->flipRate = fliprate;
+    ps4_metal_screen_set_guest_flip_rate(fliprate);
     pthread_mutex_unlock(&vh->mutex);
 
     pthread_mutex_unlock(&g_video_table_mutex);
@@ -319,7 +321,10 @@ static void complete_flip(void *arg) {
 }
 
 int32_t sceVideoOutSubmitFlip(GuestContext *ctx, int32_t handle, int32_t bufferIndex, uint32_t flipMode, int64_t flipArg) {
-    (void)flipMode;
+    static uint32_t s_last_mode = ~0u;
+    if (__atomic_exchange_n(&s_last_mode, flipMode, __ATOMIC_RELAXED) != flipMode)
+        fprintf(stderr, "[videoout] SubmitFlip flip mode %u\n", flipMode);
+    ps4_metal_screen_set_guest_flip_mode((int)flipMode);
     __atomic_fetch_add(&g_ps4_videoout_flip_count, 1, __ATOMIC_RELAXED);
     pthread_mutex_lock(&g_video_table_mutex);
     VideoOutHandle *vh = find_video_handle_locked(handle);

@@ -1,5 +1,9 @@
 tools/
+!/3rdparty/gcn-recompiler/tools/
 *.DS_Store
 .DS_Store
 /ps4-recomp
 /ps4recomp
+
+# gcn-recompiler build output (built locally, see README)
+3rdparty/gcn-recompiler/libgcn_recompiler.a

@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,6 +56,7 @@
 #include "gcn_recompiler.h"
 #include "ps4_gnm_draw.h"
 #include "ps4_gnm_guest_window.h"
+#include "ps4_gnm_membudget.h"
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_shader_cache.h"
 #include "ps4_gnm_pipeline_archive.h"
@@ -63,6 +65,7 @@
 #include "ps4_metal_screen.h"
 #include "ps4_hitch.h"
 
+extern "C" void* ps4_metal_screen_acquire_frame(int width, int height);
 extern "C" int ps4_metal_screen_encode_present(void* command_buffer, void* texture);
 extern "C" uint64_t ps4_gnm_take_cp_ns(void);
 extern "C" void ps4_gnm_print_sync_stats(void);
@@ -373,11 +376,19 @@ struct WorkRec {
     bool dispatch = false;
 };
 struct WorkLog {
-    static constexpr size_t kCap = 64; // the most recent records are kept
-    WorkRec rec[kCap];
+    // The most recent records are kept: 64, or 512 with the debug options that print whole
+    // command buffers (PS4_GNM_ENCODER_STATUS, PS4_GNM_HANG_REPORT_MS, PS4_GNM_COMMIT_EACH).
+    static constexpr size_t kAll = ~size_t(0); // Print(): every record kept
+    static size_t Capacity() {
+        static const size_t cap = getenv("PS4_GNM_ENCODER_STATUS") || getenv("PS4_GNM_HANG_REPORT_MS") ||
+                                          getenv("PS4_GNM_COMMIT_EACH") ? 512 : 64;
+        return cap;
+    }
+    std::vector<WorkRec> rec = std::vector<WorkRec>(Capacity());
     uint64_t count = 0;
-    void Add(const WorkRec& r) { rec[count++ % kCap] = r; }
+    void Add(const WorkRec& r) { rec[count++ % rec.size()] = r; }
     void Print(const char* prefix, size_t last) const {
+        const uint64_t kCap = rec.size();
         const uint64_t first = count > std::min<uint64_t>(last, kCap) ? count - std::min<uint64_t>(last, kCap) : 0;
         for (uint64_t i = first; i < count; ++i) {
             const WorkRec& r = rec[i % kCap];
@@ -395,6 +406,12 @@ struct WorkLog {
 
 // Guest memory written by GPU work; epochs order the writes against GPU texture uploads.
 using GpuWrite = TextureCache::WriteRange;
+
+// A no-copy MTLBuffer over guest windows and the time it was last bound (g_mem.tick).
+struct GuestWin {
+    id<MTLBuffer> buf = nil;
+    uint64_t last_use = 0;
+};
 
 struct State {
     bool init_tried = false;
@@ -508,7 +525,7 @@ struct State {
     std::vector<std::shared_ptr<ps4gnm_kernels::Job>> kernels_open;
     std::unordered_map<uint64_t, id<MTLDepthStencilState>> ds_states;
     std::unordered_map<uint64_t, id<MTLSamplerState>> samplers;
-    std::unordered_map<uint64_t, id<MTLBuffer>> guest_bufs;
+    std::unordered_map<uint64_t, GuestWin> guest_bufs; // key: window base | windows << 48
     std::unordered_map<uint64_t, MetaState> meta; // cmask / htile address -> state
     uint64_t next_uid = 1;
     // textures with mip chains whose levels were rendered as separate render targets
@@ -671,36 +688,139 @@ std::atomic<bool> g_remap_pending{false};
 // The windows looked up last: most draws hit the same few.
 struct GuestBufMru {
     uint64_t key = ~0ull;
-    id<MTLBuffer> buf = nil;
+    GuestWin* win = nullptr; // into S.guest_bufs (the MRU is reset whenever entries are erased)
 };
 GuestBufMru g_guest_buf_mru[4];
 
-// PS4_GNM_LOG_GUEST_WINDOWS=1: print the guest-memory windows wrapped in Metal buffers each
-// time their total has changed by 128 MiB since the last line (grown, or shrunk by dropped
-// windows). "sum" counts every buffer's length (buffers spanning several windows overlap),
-// "distinct" the guest memory they cover. Diagnostics for memory pressure: windows are only
-// released when the kernel layer remaps their pages.
-void LogGuestWindows(const char* why) {
-    static const bool on = [] {
-        const char* e = getenv("PS4_GNM_LOG_GUEST_WINDOWS");
-        return e && e[0] == '1';
-    }();
-    if (!on || !S.ctx) return;
-    static uint64_t logged_sum;
-    uint64_t sum = 0;
-    std::vector<bool> covered(S.ctx->mem_size / kWindow + 1);
-    for (auto& kv : S.guest_bufs) {
-        const uint64_t first = (kv.first & ((1ull << 48) - 1)) / kWindow, n = kv.first >> 48;
-        sum += n * kWindow;
-        for (uint64_t w = first; w < first + n && w < covered.size(); w++) covered[w] = true;
+// GPU memory telemetry and budget (ps4_gnm_membudget.h, docs/gpu-memory-budget.md). A sampler
+// thread measures wired memory, the process footprint, MTLDevice.currentAllocatedSize and the
+// live no-copy guest buffers once a second and keeps the budget state; it runs apart from the
+// renderer so it keeps reporting while the GPU or the encoder is stuck. PS4_GNM_MEM_LOG=<seconds>:
+// one "[gnm-mem]" line per period (default 10, 0 = off) and whenever a value grew by 256 MiB.
+// The encoder thread releases idle windows (and, over budget, every window not bound in the last
+// 250 ms plus the transient staging caches) in SweepGuestWindows.
+struct GpuMem {
+    ps4_gpumem_policy policy{};
+    ps4_gpumem_windows wins{};
+    uint64_t wired_base = 0;
+    bool on = false;
+    std::atomic<bool> over{false};          // charged > budget (with hysteresis), set by the sampler
+    std::atomic<uint64_t> charged{0};       // latest charged total, set by the sampler
+    uint64_t tick = 0;                      // encoder thread: time of the current Commit
+    uint64_t last_sweep = 0, last_refused_clear = 0; // encoder thread
+    ps4_gpumem_purge_state purge{};         // encoder thread
+    // Released buffers stay alive while a command buffer in flight references them, so their
+    // accounting is removed only once every command buffer up to `seq` has completed.
+    struct Pending {
+        uint64_t key, length, seq;
+    };
+    std::deque<Pending> pending;            // encoder thread, in seq order
+    // Window spans refused at creation (key -> ps4_gpumem_admit), so later binds neither walk the
+    // VM regions again nor retry; cleared on remaps and every policy.idle_ns.
+    std::unordered_map<uint64_t, uint8_t> refused;
+    // Read-only copies made in the open command buffer (they live in its upload chunks), keyed by
+    // the exact guest range: one copy per range and command buffer.
+    struct Copy {
+        uint64_t addr, size;
+        id<MTLBuffer> buf;
+        uint64_t off;
+    };
+    std::unordered_map<uint64_t, Copy> copies_open;
+    std::atomic<uint64_t> released{0}, released_bytes{0}, purges{0}, large{0};
+    std::atomic<uint64_t> refused_large{0}, refused_holes{0}, refused_written{0}, copies{0}, copy_bytes{0};
+};
+GpuMem g_mem;
+
+// Window span of a guest_bufs key (base | windows << 48).
+inline void KeyWindows(uint64_t key, uint64_t* first, uint64_t* n) {
+    *first = (key & ((1ull << 48) - 1)) / kWindow;
+    *n = key >> 48;
+}
+
+void TakeGpuMemSample(ps4_gpumem_sample* s) {
+    memset(s, 0, sizeof(*s));
+    s->t_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    s->wired = ps4_gpumem_wired_bytes();
+    s->footprint = ps4_gpumem_footprint_bytes();
+    s->device = S.dev ? (uint64_t)S.dev.currentAllocatedSize : 0;
+    ps4_gpumem_windows_read(&g_mem.wins, s);
+}
+
+void StartGpuMemSampler(uint64_t mem_size) {
+    // the policy is needed by GuestBuffer even if the accounting below cannot start
+    ps4_gpumem_policy_init(&g_mem.policy, ps4_gpumem_mem_total(), getenv("PS4_GNM_GPU_BUDGET_PCT"),
+                           getenv("PS4_GNM_GPU_BUDGET_MB"), getenv("PS4_GNM_GPU_WINDOW_IDLE_S"));
+    if (!ps4_gpumem_windows_init(&g_mem.wins, mem_size, kWindow)) return;
+    g_mem.wired_base = ps4_gpumem_wired_bytes();
+    g_mem.on = true;
+    const char* lv = getenv("PS4_GNM_MEM_LOG");
+    const uint64_t period_s = lv ? strtoull(lv, nullptr, 10) : 10;
+    std::thread([period_s] {
+        pthread_setname_np("gnm-mem");
+        ps4_gpumem_log_state log{};
+        ps4_gpumem_budget_state budget{};
+        uint64_t peak_charged = 0, peak_wired = 0;
+        for (;;) {
+            ps4_gpumem_sample s;
+            @autoreleasepool {
+                TakeGpuMemSample(&s);
+            }
+            const uint64_t charged = ps4_gpumem_charged(&s);
+            peak_charged = std::max(peak_charged, charged);
+            peak_wired = std::max(peak_wired, s.wired);
+            char line[512];
+            const int change = ps4_gpumem_budget_update(&budget, &g_mem.policy, charged);
+            g_mem.charged.store(charged, std::memory_order_relaxed);
+            g_mem.over.store(budget.over != 0, std::memory_order_release);
+            if (change) {
+                ps4_gpumem_format(line, sizeof(line), &s, g_mem.wired_base, &g_mem.policy);
+                if (change > 0 && budget.times_over == 1)
+                    fprintf(stderr, "[gnm-mem] WARNING: over the GPU memory budget (%llu%% of RAM): releasing "
+                                    "guest windows not in use and purging staging caches; %s\n",
+                            (unsigned long long)(g_mem.policy.budget * 100 / std::max<uint64_t>(1, g_mem.policy.mem_total)),
+                            line);
+                else if (change > 0)
+                    RLog("gpumem-over", "[gnm-mem] over the GPU memory budget again (%llu times): %s",
+                         (unsigned long long)budget.times_over, line);
+                else
+                    RLog("gpumem-under", "[gnm-mem] back under the GPU memory budget: %s", line);
+            }
+            if (period_s && ps4_gpumem_log_due(&log, &s, period_s * 1000000000ull, 256ull << 20)) {
+                ps4_gpumem_format(line, sizeof(line), &s, g_mem.wired_base, &g_mem.policy);
+                fprintf(stderr, "[gnm-mem] %s; peak charged %llu MiB, peak wired %llu MiB; released %llu windows "
+                                "(%llu MiB), purges %llu, large %llu, refused %llu too large / %llu with holes / %llu "
+                                "written, copies %llu (%llu MiB)%s\n",
+                        line, (unsigned long long)(peak_charged >> 20), (unsigned long long)(peak_wired >> 20),
+                        (unsigned long long)g_mem.released.load(), (unsigned long long)(g_mem.released_bytes.load() >> 20),
+                        (unsigned long long)g_mem.purges.load(), (unsigned long long)g_mem.large.load(),
+                        (unsigned long long)g_mem.refused_large.load(), (unsigned long long)g_mem.refused_holes.load(),
+                        (unsigned long long)g_mem.refused_written.load(), (unsigned long long)g_mem.copies.load(),
+                        (unsigned long long)(g_mem.copy_bytes.load() >> 20), budget.over ? "; OVER BUDGET" : "");
+            }
+            usleep(1000000);
+        }
+    }).detach();
+}
+
+uint64_t CompletedSeq();
+
+// Drops a window from guest_bufs; its accounting goes when the GPU can no longer use it.
+std::unordered_map<uint64_t, GuestWin>::iterator ReleaseWindow(std::unordered_map<uint64_t, GuestWin>::iterator it) {
+    if (g_mem.on) g_mem.pending.push_back({it->first, (uint64_t)it->second.buf.length, S.committed_seq + 1});
+    return S.guest_bufs.erase(it);
+}
+
+// Removes the accounting of released windows whose command buffers have all completed.
+void RetirePendingWindows() {
+    if (g_mem.pending.empty()) return;
+    const uint64_t done = CompletedSeq();
+    while (!g_mem.pending.empty() && g_mem.pending.front().seq <= done) {
+        const GpuMem::Pending& p = g_mem.pending.front();
+        uint64_t first, n;
+        KeyWindows(p.key, &first, &n);
+        ps4_gpumem_windows_remove(&g_mem.wins, first, n, p.length);
+        g_mem.pending.pop_front();
     }
-    uint64_t distinct = 0;
-    for (bool c : covered) distinct += c ? kWindow : 0;
-    const uint64_t step = 128ull << 20;
-    if (sum < logged_sum + step && sum + step > logged_sum) return;
-    logged_sum = sum;
-    printf("[gnm] guest windows (%s): %zu buffers, sum %llu MiB, distinct %llu MiB\n", why,
-           S.guest_bufs.size(), (unsigned long long)(sum >> 20), (unsigned long long)(distinct >> 20));
 }
 
 void DropRemappedWindows() {
@@ -717,56 +837,182 @@ void DropRemappedWindows() {
         bool hit = false;
         for (auto& r : ranges)
             if (r.first < end && r.first + r.second > base) { hit = true; break; }
-        if (hit) it = S.guest_bufs.erase(it);
+        if (hit) it = ReleaseWindow(it);
         else ++it;
     }
+    if (!ranges.empty()) g_mem.refused.clear(); // the new mapping may have no holes
     for (auto& m : g_guest_buf_mru) m = GuestBufMru{};
     ps4_hitch_add_ns(PS4_HITCH_MTLBUF, ps4_hitch_now_ns() - mb_t0);
-    if (!ranges.empty()) LogGuestWindows("drop");
+}
+
+// Lazy residency and the budget (encoder thread, from Commit): releases windows not bound for
+// policy.idle_ns, and while over budget every window not bound for policy.press_ns plus the
+// transient staging caches (with a back-off once purging stops helping). A released buffer still
+// referenced by a command buffer in flight lives (and stays wired) until that command buffer
+// completes; the next use re-creates it.
+void SweepGuestWindows() {
+    g_mem.copies_open.clear(); // their upload chunks are recycled once this command buffer is done
+    if (!g_mem.on) return;
+    RetirePendingWindows();
+    const bool over = g_mem.over.load(std::memory_order_acquire);
+    const uint64_t now = g_mem.tick;
+    // once a second; over budget at every commit until a sweep has run in this state
+    static bool swept_over = false;
+    if (now - g_mem.last_sweep < 1000000000ull && !(over && !swept_over)) return;
+    g_mem.last_sweep = now;
+    swept_over = over;
+    if (g_mem.policy.idle_ns && now - g_mem.last_refused_clear >= g_mem.policy.idle_ns) {
+        g_mem.refused.clear();
+        g_mem.last_refused_clear = now;
+    }
+    uint64_t n_rel = 0, bytes = 0;
+    for (auto it = S.guest_bufs.begin(); it != S.guest_bufs.end();) {
+        if (ps4_gpumem_should_release(&g_mem.policy, now, it->second.last_use, over)) {
+            bytes += it->second.buf.length;
+            it = ReleaseWindow(it);
+            n_rel++;
+        } else {
+            ++it;
+        }
+    }
+    if (n_rel) {
+        for (auto& m : g_guest_buf_mru) m = GuestBufMru{};
+        g_mem.released.fetch_add(n_rel, std::memory_order_relaxed);
+        g_mem.released_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        RLog("gpumem-release", "[gnm-mem] released %llu guest window buffers (%llu MiB)%s", (unsigned long long)n_rel,
+             (unsigned long long)(bytes >> 20), over ? " (over budget)" : " (idle)");
+    }
+    if (ps4_gpumem_purge_due(&g_mem.purge, over, g_mem.charged.load(std::memory_order_relaxed))) {
+        // staging caches are re-created on demand
+        S.detile_staging.clear();
+        S.detile_maps.clear();
+        std::lock_guard<std::mutex> lk(S.arena.free_mu);
+        S.arena.free_list.clear();
+        g_mem.purges.fetch_add(1, std::memory_order_relaxed);
+    } else if (over && g_mem.purge.futile == 10) {
+        RLog("gpumem-futile", "[gnm-mem] purging does not lower the charged total (%llu MiB): the memory over "
+                              "budget is the device's own (textures); purges paused",
+             (unsigned long long)(g_mem.charged.load() >> 20));
+    }
+}
+
+// How a binding uses guest memory. A GPU-written binding must be the guest memory itself: a copy
+// would drop its writes.
+enum class GuestAccess { Read, Write };
+
+// Read-only stand-in for a range no no-copy buffer may cover (one with unmapped or unreadable
+// pages): a copy of its readable bytes in upload memory, holes as zero, made once per range and
+// command buffer (guest writes after the first bind in that command buffer are not seen, as with
+// any snapshot). 256 zero bytes follow it, since shader bounds round the size up to the V# end
+// (debug bounds modes PS4_GNM_BOUNDS=raw/off can still read past that). The caller decides
+// (ps4_gpumem_refused_copy) which ranges may be copied.
+bool GuestCopy(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint64_t* offset) {
+    const uint64_t ck = addr ^ (size * 0x9E3779B97F4A7C15ull);
+    auto cit = g_mem.copies_open.find(ck);
+    if (cit != g_mem.copies_open.end() && cit->second.addr == addr && cit->second.size == size) {
+        *out = cit->second.buf;
+        *offset = cit->second.off;
+        return true;
+    }
+    void* ptr = nullptr;
+    size_t off = 0;
+    id<MTLBuffer> b = nil;
+    if (!S.arena.Alloc(S.dev, size + 256, 256, &b, &off, &ptr)) return false;
+    memset(ptr, 0, size + 256);
+    struct Ctx {
+        uint8_t* dst;
+        const uint8_t* src;
+    } c = {(uint8_t*)ptr, S.ctx->mem_base + addr};
+    ps4_gpumem_for_each_readable(c.src, size, [](void* p, uint64_t o, uint64_t n) {
+        Ctx* x = (Ctx*)p;
+        memcpy(x->dst + o, x->src + o, n);
+    }, &c);
+    g_mem.copies.fetch_add(1, std::memory_order_relaxed);
+    g_mem.copy_bytes.fetch_add(size, std::memory_order_relaxed);
+    g_mem.copies_open[ck] = {addr, size, b, off};
+    *out = b;
+    *offset = off;
+    return true;
+}
+
+// A guest range whose window span got no no-copy buffer (adm: why). Reads of ranges with holes
+// get a copy; GPU-written ranges and spans over policy.nocopy_max are not bound (false), as
+// before the budget existed.
+bool RefusedGuestBuffer(uint64_t addr, uint64_t size, uint64_t base, uint64_t end, enum ps4_gpumem_admit adm,
+                        GuestAccess access, __strong id<MTLBuffer>* out, uint64_t* offset) {
+    const bool holes = adm == PS4_GPUMEM_REFUSE_HOLES;
+    const bool copied =
+        ps4_gpumem_refused_copy(adm, access == GuestAccess::Write, size) && GuestCopy(addr, size, out, offset);
+    if (holes && access == GuestAccess::Write) g_mem.refused_written.fetch_add(1, std::memory_order_relaxed);
+    RLog(!holes ? "guestbuf-big" : access == GuestAccess::Write ? "guestbuf-holes-written" : "guestbuf-holes",
+         "[gnm-mem] no no-copy buffer over guest 0x%llx+0x%llx (for 0x%llx+0x%llx): %s; %s",
+         (unsigned long long)base, (unsigned long long)(end - base), (unsigned long long)addr,
+         (unsigned long long)size, holes ? "range has holes" : "larger than 2 GiB",
+         copied ? "bound a read-only copy"
+         : !holes ? "not bound"
+         : access == GuestAccess::Write ? "not bound (GPU-written: a copy would drop the writes)"
+                                        : "not bound (over 64 MiB)");
+    return copied;
 }
 
 // `out` is a strong pointer: an (implicitly autoreleasing) plain one would retain and autorelease
-// the buffer on every call.
-bool GuestBuffer(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint64_t* offset) {
+// the buffer on every call. `access`: whether the GPU writes the range (a written range is only
+// ever bound in place).
+bool GuestBuffer(uint64_t addr, uint64_t size, GuestAccess access, __strong id<MTLBuffer>* out, uint64_t* offset) {
     GuestContext* ctx = S.ctx;
     if (g_remap_pending.load(std::memory_order_acquire)) DropRemappedWindows();
     if (!ctx) return false;
     uint64_t base, end, nwin;
     if (!ps4_gnm_guest_window_range(addr, size, ctx->mem_size, &base, &end, &nwin)) return false;
-    if (end - base > (2ull << 30)) {
-        RLog("guestbuf-big", "guest buffer range 0x%llx+0x%llx too large", (unsigned long long)addr,
-             (unsigned long long)size);
-        return false;
-    }
     const uint64_t key = base | (nwin << 48);
     GuestBufMru& mru = g_guest_buf_mru[(base / kWindow + nwin) & 3];
     if (mru.key == key) {
-        *out = mru.buf;
+        mru.win->last_use = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        *out = mru.win->buf;
         *offset = addr - base;
         return true;
     }
     auto it = S.guest_bufs.find(key);
-    id<MTLBuffer> b = nil;
-    if (it != S.guest_bufs.end()) {
-        b = it->second;
-    } else {
+    if (it == S.guest_bufs.end()) {
+        auto rit = g_mem.refused.find(key);
+        if (rit != g_mem.refused.end())
+            return RefusedGuestBuffer(addr, size, base, end, (enum ps4_gpumem_admit)rit->second, access, out, offset);
         const uint64_t mb_t0 = ps4_hitch_now_ns();
-        b = [S.dev newBufferWithBytesNoCopy:ctx->mem_base + base
-                                     length:end - base
-                                    options:MTLResourceStorageModeShared
-                                deallocator:nil];
+        // size first: a too large span is refused without walking its VM regions
+        enum ps4_gpumem_admit adm = ps4_gpumem_admit_nocopy(&g_mem.policy, end - base, 0);
+        if (adm != PS4_GPUMEM_REFUSE_TOO_LARGE)
+            adm = ps4_gpumem_admit_nocopy(&g_mem.policy, end - base,
+                                          ps4_gpumem_range_has_holes(ctx->mem_base + base, end - base));
+        if (adm == PS4_GPUMEM_REFUSE_TOO_LARGE || adm == PS4_GPUMEM_REFUSE_HOLES) {
+            ps4_hitch_add_ns(PS4_HITCH_MTLBUF, ps4_hitch_now_ns() - mb_t0);
+            (adm == PS4_GPUMEM_REFUSE_TOO_LARGE ? g_mem.refused_large : g_mem.refused_holes)
+                .fetch_add(1, std::memory_order_relaxed);
+            g_mem.refused[key] = (uint8_t)adm;
+            return RefusedGuestBuffer(addr, size, base, end, adm, access, out, offset);
+        }
+        if (adm == PS4_GPUMEM_ADMIT_LARGE) {
+            g_mem.large.fetch_add(1, std::memory_order_relaxed);
+            RLog("guestbuf-large", "[gnm-mem] no-copy buffer over guest 0x%llx+0x%llx is larger than 1 GiB: it pins "
+                                   "(and wires) all of it while bound",
+                 (unsigned long long)base, (unsigned long long)(end - base));
+        }
+        id<MTLBuffer> b = [S.dev newBufferWithBytesNoCopy:ctx->mem_base + base
+                                                   length:end - base
+                                                  options:MTLResourceStorageModeShared
+                                              deallocator:nil];
         ps4_hitch_add_ns(PS4_HITCH_MTLBUF, ps4_hitch_now_ns() - mb_t0);
         if (!b) {
             RLog("guestbuf", "newBufferWithBytesNoCopy failed for 0x%llx+0x%llx",
                  (unsigned long long)base, (unsigned long long)(end - base));
             return false;
         }
-        S.guest_bufs[key] = b;
-        LogGuestWindows("grow");
+        it = S.guest_bufs.emplace(key, GuestWin{b, 0}).first;
+        if (g_mem.on) ps4_gpumem_windows_add(&g_mem.wins, base / kWindow, nwin, end - base);
     }
+    it->second.last_use = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     mru.key = key;
-    mru.buf = b;
-    *out = b;
+    mru.win = &it->second;
+    *out = it->second.buf;
     *offset = addr - base;
     return true;
 }
@@ -841,9 +1087,38 @@ void EndEncoders() {
 
 std::atomic<bool> g_cmd_open{false}; // S.cmd != nil, readable from the CP thread
 
+// PS4_GNM_ENCODER_STATUS=1 (debug): command buffers report per-encoder execution status, and
+// every encoder is labelled with the index of its first work record, so a failed command buffer
+// names the encoder that faulted (see LogEncoderStatus). Costs GPU time; off by default.
+bool EncoderStatusEnabled() {
+    static const bool on = getenv("PS4_GNM_ENCODER_STATUS") != nullptr;
+    return on;
+}
+
+NSString* WorkLabel(const char* kind) {
+    const uint64_t first = S.cmd_log ? S.cmd_log->count : 0;
+    return [NSString stringWithFormat:@"%s from work[%llu]", kind, (unsigned long long)first];
+}
+
+void LogEncoderStatus(id<MTLCommandBuffer> done) {
+    NSArray* infos = done.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+    for (id<MTLCommandBufferEncoderInfo> info in infos) {
+        const MTLCommandEncoderErrorState st = info.errorState;
+        if (st != MTLCommandEncoderErrorStateFaulted && st != MTLCommandEncoderErrorStateAffected) continue;
+        fprintf(stderr, "[gnm-draw]   encoder '%s': %s\n", (info.label ?: @"unlabelled").UTF8String,
+                st == MTLCommandEncoderErrorStateFaulted ? "FAULTED" : "affected");
+    }
+}
+
 void EnsureCmd() {
     if (!S.cmd) {
-        S.cmd = [S.queue commandBuffer];
+        if (EncoderStatusEnabled()) {
+            MTLCommandBufferDescriptor* d = [MTLCommandBufferDescriptor new];
+            d.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            S.cmd = [S.queue commandBufferWithDescriptor:d];
+        } else {
+            S.cmd = [S.queue commandBuffer];
+        }
         g_cmd_open.store(true, std::memory_order_release);
         S.cmd.label = [NSString stringWithFormat:@"gnm-%llu", (unsigned long long)S.n_cmdbufs++];
         S.cmd_log = std::make_shared<WorkLog>();
@@ -877,6 +1152,8 @@ void RunFences(uint64_t upto) {
 
 void Commit() {
     EndEncoders();
+    g_mem.tick = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    SweepGuestWindows();
     if (S.upload_cmd) {
         // texture copies used by the work of S.cmd: same queue, committed first
         [S.upload_cmd commit];
@@ -922,7 +1199,8 @@ void Commit() {
         if (done.status == MTLCommandBufferStatusError) {
             fprintf(stderr, "[gnm-draw] command buffer %s failed: %s\n", done.label.UTF8String,
                     done.error.localizedDescription.UTF8String);
-            if (log) log->Print("work", 12);
+            if (EncoderStatusEnabled()) LogEncoderStatus(done);
+            if (log) log->Print("work", EncoderStatusEnabled() ? WorkLog::kAll : 12);
         }
         std::lock_guard<std::mutex> lk(arena->free_mu);
         for (auto& b : *chunks)
@@ -931,6 +1209,19 @@ void Commit() {
     }];
     [cb commit];
     S.n_commits++;
+    // PS4_GNM_HANG_REPORT_MS=<ms> (debug): name the work of a command buffer that has not
+    // completed that long after its commit. A shader that never ends shows no error until
+    // something else needs the GPU (then macOS kills it as "Impacting Interactivity").
+    static const long hang_ms = getenv("PS4_GNM_HANG_REPORT_MS") ? atol(getenv("PS4_GNM_HANG_REPORT_MS")) : 0;
+    if (hang_ms > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, hang_ms * NSEC_PER_MSEC),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (cb.status >= MTLCommandBufferStatusCompleted) return;
+            fprintf(stderr, "[gnm-draw] GPU hang report: command buffer %s not complete %ld ms after commit\n",
+                    cb.label.UTF8String, hang_ms);
+            if (log) log->Print("pending work", WorkLog::kAll);
+        });
+    }
     // drop references to completed command buffers
     if (S.inflight.size() >= 8) {
         size_t n = 0;
@@ -964,7 +1255,7 @@ void WaitAll() {
                     cb.label.UTF8String, deadline_ms);
             S.hung = true;
             auto lit = S.inflight_logs.find((__bridge void*)cb);
-            if (lit != S.inflight_logs.end() && lit->second) lit->second->Print("hung work", WorkLog::kCap);
+            if (lit != S.inflight_logs.end() && lit->second) lit->second->Print("hung work", WorkLog::kAll);
         }
     }
     S.inflight.clear();
@@ -1610,7 +1901,15 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
         }
     }
 
-    if (allow_async && S.async_compile) {
+    // A further permutation of a program is translated here, for this draw. Translated on the
+    // worker, Uncharted 4's UI vertex shader got permutations that did not fit the draws that
+    // asked for them (buffer stride 12 for a stride 32 draw): one new permutation per draw up to
+    // the cap of 48, then its draws were skipped (~60 per frame at the first-boot menu). A
+    // translation specializes on sharps read through the draw's pointer chains, in memory the
+    // game rewrites per draw, so read later they likely belong to another draw (a copy of the
+    // existing permutation's SRT reads did not cover them). New programs, the bulk of a new
+    // area, still go to the worker.
+    if (allow_async && S.async_compile && vec.empty()) {
         // Translate GCN -> MSL on a worker thread (1-2 ms per shader, but new areas bring
         // hundreds at once); draws using it are skipped until the result is applied.
         S.gcn_pending.insert(pend_key);
@@ -2015,7 +2314,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                      (unsigned long long)s->code_addr, i, (unsigned long long)base);
                 base &= ~3ull;
             }
-            if (!GuestBuffer(base, bd.size_bytes, &mb, &off)) {
+            if (!GuestBuffer(base, bd.size_bytes, bb.is_written ? GuestAccess::Write : GuestAccess::Read, &mb, &off)) {
                 RLog("buf-range", "shader 0x%llx: buffer %u out of range (0x%llx+0x%x)",
                      (unsigned long long)s->code_addr, i, (unsigned long long)base, bd.size_bytes);
                 mb = S.dummy;
@@ -2664,7 +2963,7 @@ bool EncodeGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up, id
     const uint64_t avail = std::min<uint64_t>(layout.total_size, S.ctx->mem_size - img.address);
     id<MTLBuffer> gbuf = nil;
     uint64_t goff = 0;
-    if (!GuestBuffer(img.address, avail, &gbuf, &goff)) return false;
+    if (!GuestBuffer(img.address, avail, GuestAccess::Read, &gbuf, &goff)) return false;
     const bool tiled = sd.tile_mode != TileMode::DisplayLinearAligned && sd.tile_mode != TileMode::DisplayLinearGeneral;
     const uint32_t bpe = sd.bpp / 8;
     id<MTLTexture> tex = up.tex;
@@ -3188,6 +3487,7 @@ id<MTLRenderCommandEncoder> BeginPass(const PassKey& key, const ClearReq& clr, i
     }
     S.renc = [S.cmd renderCommandEncoderWithDescriptor:rp];
     g_rstate.Reset(S.renc);
+    if (EncoderStatusEnabled()) S.renc.label = WorkLabel("render");
     static const bool labels = getenv("PS4_GNM_LABELS") != nullptr;
     if (labels) {
         // profiling aid: name passes after their targets (shown by Metal System Trace)
@@ -3222,6 +3522,7 @@ id<MTLComputeCommandEncoder> ComputeEncoder() {
         static const bool serial = getenv("PS4_GNM_SERIAL_COMPUTE") != nullptr;
         S.cenc = serial ? [S.cmd computeCommandEncoder]
                         : [S.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        if (EncoderStatusEnabled()) S.cenc.label = WorkLabel("compute");
         g_cstate.Reset(S.cenc);
         S.n_cencs++;
     }
@@ -3821,6 +4122,7 @@ bool Init(GuestContext* ctx) {
             S.kernels = std::make_unique<ps4gnm_kernels::Compiler>(S.dev, CompileOptions,
                                                                    n > 0 && n <= 64 ? (unsigned)n : 4u);
         }
+        StartGpuMemSampler(proc->mem_size);
         S.queue = [S.dev newCommandQueueWithMaxCommandBufferCount:64];
         S.queue.label = @"gnm";
         S.tex = new TextureCache(S.dev, S.queue, proc->mem_base, proc->mem_size);
@@ -4016,7 +4318,7 @@ bool GpuDmaImpl(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, 
         if (dst + n > 0x10000) return false;
         db = S.gds_buf;
         doff = dst;
-    } else if (!GuestBuffer(dst, n, &db, &doff)) {
+    } else if (!GuestBuffer(dst, n, GuestAccess::Write, &db, &doff)) {
         return false;
     }
     if (src_fill) {
@@ -4032,7 +4334,7 @@ bool GpuDmaImpl(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, 
         if (src + n > 0x10000) return false;
         sb = S.gds_buf;
         soff = src;
-    } else if (!GuestBuffer(src, n, &sb, &soff)) {
+    } else if (!GuestBuffer(src, n, GuestAccess::Read, &sb, &soff)) {
         return false;
     }
     EndEncoders();
@@ -4441,7 +4743,15 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
     return true;
 }
 
+// PS4_GNM_COMMIT_EACH=1 (debug): one command buffer per draw or dispatch, so a failing or
+// hanging command buffer (PS4_GNM_HANG_REPORT_MS, PS4_GNM_ENCODER_STATUS) names one shader.
+void CommitEachForDebug() {
+    static const bool each = getenv("PS4_GNM_COMMIT_EACH") != nullptr;
+    if (each && S.cmd) Commit();
+}
+
 void DrawEncode(DrawRec& r) {
+    CommitEachForDebug();
     if (S.hung) return;
     DrainAsyncPsos();
     const DrawArgs& args = r.args;
@@ -4609,7 +4919,7 @@ void DrawEncode(DrawRec& r) {
             id<MTLBuffer> mb = S.dummy;
             uint64_t off = 0;
             if (bd.address && bd.size) {
-                if (!GuestBuffer(bd.address & ~3ull, bd.size + 4, &mb, &off)) {
+                if (!GuestBuffer(bd.address & ~3ull, bd.size + 4, GuestAccess::Read, &mb, &off)) {
                     mb = S.dummy;
                     off = 0;
                 }
@@ -4681,10 +4991,10 @@ void DrawEncode(DrawRec& r) {
         if (indirect) {
             const uint64_t isz = args.index_type == 1 ? 4 : 2;
             if (rs.raster.needs_emulation ||
-                !GuestBuffer(args.indirect_addr, indexed ? 20 : 16, &arg_buf, &arg_off) || (arg_off & 3))
+                !GuestBuffer(args.indirect_addr, indexed ? 20 : 16, GuestAccess::Read, &arg_buf, &arg_off) || (arg_off & 3))
                 { S.n_skipped++; return; }
             if (indexed &&
-                (!args.index_base || !GuestBuffer(args.index_base, (uint64_t)args.max_index * isz, &ib, &ib_off) ||
+                (!args.index_base || !GuestBuffer(args.index_base, (uint64_t)args.max_index * isz, GuestAccess::Read, &ib, &ib_off) ||
                  (ib_off & 3)))
                 { S.n_skipped++; return; }
         } else if (rs.raster.needs_emulation) {
@@ -4707,7 +5017,7 @@ void DrawEncode(DrawRec& r) {
             const uint64_t isz = args.index_type == 1 ? 4 : 2;
             const uint64_t addr = args.index_base + (uint64_t)args.index_offset * isz;
             const uint64_t bytes = (uint64_t)args.count * isz;
-            if (!args.index_base || !GuestBuffer(addr, bytes, &ib, &ib_off)) {
+            if (!args.index_base || !GuestBuffer(addr, bytes, GuestAccess::Read, &ib, &ib_off)) {
                 RLog("ib", "%s: index buffer 0x%llx unavailable", args.name, (unsigned long long)addr);
                 S.n_skipped++;
                 return;
@@ -4965,6 +5275,7 @@ void WaitKernelCompiles() {
 }
 
 void DispatchEncode(DispatchRec& r) {
+    CommitEachForDebug();
     if (S.hung) return;
     const RegSnap& regs = r.regs;
     const gcn_runtime_info& rt = r.rt;
@@ -5151,7 +5462,7 @@ void DispatchEncode(DispatchRec& r) {
         if (indirect_addr) {
             id<MTLBuffer> ab;
             uint64_t off;
-            if (!GuestBuffer(indirect_addr, 12, &ab, &off)) return;
+            if (!GuestBuffer(indirect_addr, 12, GuestAccess::Read, &ab, &off)) return;
             [enc dispatchThreadgroupsWithIndirectBuffer:ab indirectBufferOffset:off threadsPerThreadgroup:tg];
         } else {
             [enc dispatchThreadgroups:MTLSizeMake(dim_x, dim_y, dim_z) threadsPerThreadgroup:tg];
@@ -5185,12 +5496,93 @@ extern "C" int ps4_gnm_read_display_cpu(GuestContext* ctx, uint64_t addr, uint32
 
 void PresentFromGuestMemory(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
                             uint32_t tiling_mode, uint32_t pixel_format) {
-    static std::vector<uint8_t> buf;
+    thread_local std::vector<uint8_t> buf; // the encoder and the CPU present queue both come here
     buf.resize((size_t)width * height * 4);
     if (ps4_gnm_read_display_cpu(ctx, addr, width, height, pitch, tiling_mode, pixel_format, buf.data()))
         ps4_metal_screen_present_frame(buf.data(), (size_t)width * 4, (int)width, (int)height);
     else
         ps4_metal_screen_present_frame(ctx->mem_base + addr, (size_t)pitch * 4, (int)width, (int)height);
+}
+
+// Display buffers that are not GPU targets are read from guest memory once the GPU work written
+// so far has finished. By default the encoder thread does that synchronously (Commit + WaitAll,
+// then detile and present). PS4_GNM_ASYNC_CPU_PRESENT=1 moves the read, the detile and the present
+// to this serial queue instead:
+// - the read waits for the frame's fence (AfterGpu), so it runs after every earlier fence action:
+//   the previous frames' flips and this frame's EOP / label writes;
+// - every flip completes on this queue, in order, while such a frame is pending (GPU-presented
+//   frames and the fallback path go through it too), so present_frame runs on one thread only;
+// - the encoder stays at most one frame ahead: before queueing the next guest-memory frame it
+//   waits for the previous one, so frame N's read is done before frame N+1's present is queued and
+//   N+2's work (which reuses buffer N with two buffers) is encoded after the read
+//   (sceGnmInsertWaitFlipDone is not a real wait yet); a GPU that does not finish turns into
+//   S.hung through WaitAll's watchdog. A GPU-presented frame after a guest-memory one waits for
+//   it too, so the images are shown in order. Writes the CP thread executes itself
+//   (DMA_DATA / WRITE_DATA) are not ordered against the read: one reason this stays opt-in.
+dispatch_queue_t CpuPresentQueue() {
+    static dispatch_queue_t q = dispatch_queue_create(
+        "gnm.cpu-present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    return q;
+}
+std::mutex g_cpu_present_mu;
+std::condition_variable g_cpu_present_cv;
+std::atomic<int> g_cpu_present_pending{0}; // queued or running jobs of CpuPresentQueue
+
+bool AsyncCpuPresent() {
+    static const bool on = [] {
+        const char* v = getenv("PS4_GNM_ASYNC_CPU_PRESENT");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+// Encoder thread: waits until no guest-memory present is pending (the one-frame bound).
+void WaitCpuPresentIdle() {
+    auto idle = [] { return g_cpu_present_pending.load() == 0; };
+    const auto limit = std::chrono::milliseconds((int64_t)S.gpu_timeout_ms);
+    std::unique_lock<std::mutex> lk(g_cpu_present_mu);
+    if (g_cpu_present_cv.wait_for(lk, limit, idle)) return;
+    // the previous frame's GPU work has not finished: the watchdog decides (S.hung, fences run)
+    lk.unlock();
+    WaitAll();
+    lk.lock();
+    if (!g_cpu_present_cv.wait_for(lk, limit, idle))
+        fprintf(stderr, "[gnm-draw] CPU present: the previous frame is still being presented after the GPU watchdog\n");
+}
+
+// Encoder thread: queues fn behind everything already on CpuPresentQueue, after the GPU work
+// encoded so far (after_gpu) or right away.
+void QueueCpuPresentJob(std::function<void()> fn, bool after_gpu) {
+    WaitCpuPresentIdle();
+    g_cpu_present_pending.fetch_add(1);
+    auto job = std::make_shared<std::function<void()>>(std::move(fn));
+    auto dispatch = [job] {
+        dispatch_async(CpuPresentQueue(), ^{
+            (*job)();
+            {
+                std::lock_guard<std::mutex> lk(g_cpu_present_mu);
+                g_cpu_present_pending.fetch_sub(1);
+            }
+            g_cpu_present_cv.notify_all();
+        });
+    };
+    if (after_gpu) {
+        AfterGpu(std::move(dispatch)); // tagged with the open command buffer's sequence number
+        Commit();
+    } else {
+        dispatch();
+    }
+}
+
+void QueuePresentFromGuestMemory(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
+                                 uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done,
+                                 bool after_gpu) {
+    QueueCpuPresentJob(
+        [=, done = std::move(on_done)] {
+            PresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format);
+            if (done) done();
+        },
+        after_gpu);
 }
 
 bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
@@ -5201,6 +5593,11 @@ bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, 
     encq::Defer([=, f = std::move(on_done)]() mutable {
         if (!dbg_cpu_present && PresentImpl(ctx, addr, width, height, pitch, tiling_mode, pixel_format, std::move(f)))
             return;
+        if (g_cpu_present_pending.load() > 0) {
+            // earlier guest-memory presents are still queued: stay behind them, on their thread
+            QueuePresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format, done, false);
+            return;
+        }
         PresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format);
         if (done) done();
     });
@@ -5233,7 +5630,13 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
             RLog("present-miss", "display buffer 0x%llx is not a GPU target (draws %llu dispatches %llu skipped %llu)",
                  (unsigned long long)addr, (unsigned long long)S.n_draws, (unsigned long long)S.n_dispatches,
                  (unsigned long long)S.n_skipped);
-            // the caller reads guest memory on the CPU: let all GPU work land first
+            // the frame is read from guest memory on the CPU once all GPU work has landed: here
+            // (default), or on the CPU present queue with PS4_GNM_ASYNC_CPU_PRESENT=1
+            if (encq::t_worker && AsyncCpuPresent()) {
+                QueuePresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format,
+                                            std::move(on_done), true);
+                return true;
+            }
             Commit();
             WaitAll();
             return false;
@@ -5258,22 +5661,30 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
         } else if (lin != f || src.textureType != MTLTextureType2D)
             view = [src newTextureViewWithPixelFormat:lin textureType:MTLTextureType2D
                                                levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
-        if (!S.present_tex || S.present_tex.width != width || S.present_tex.height != height) {
-            MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                          width:width
-                                                                                         height:height
-                                                                                      mipmapped:NO];
-            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            td.storageMode = MTLStorageModePrivate;
-            S.present_tex = [S.dev newTextureWithDescriptor:td];
+        // Convert into a present slot of the window's presenter (it waits here while every slot
+        // is queued or on screen: back-pressure from the display) and queue it behind the frame's
+        // work: the CPU does not wait for the GPU, so the next frame's command processing
+        // overlaps this frame's GPU execution and the presenter's wait for a drawable.
+        const double tp0 = CFAbsoluteTimeGetCurrent();
+        // PS4_GNM_ASYNC_CPU_PRESENT only: a guest-memory frame before this one is shown first
+        if (g_cpu_present_pending.load() > 0) WaitCpuPresentIdle();
+        id<MTLTexture> dst = (__bridge id<MTLTexture>)ps4_metal_screen_acquire_frame((int)width, (int)height);
+        if (!dst) { // no slot: the presenter copies this texture if it can, or drops the frame
+            if (!S.present_tex || S.present_tex.width != width || S.present_tex.height != height) {
+                MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                              width:width
+                                                                                             height:height
+                                                                                          mipmapped:NO];
+                td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                td.storageMode = MTLStorageModePrivate;
+                S.present_tex = [S.dev newTextureWithDescriptor:td];
+            }
+            dst = S.present_tex;
         }
-        // Convert into the presentation texture and hand it to the window in the same command
-        // buffer as the frame: the CPU does not wait for the GPU (the queue orders the work),
-        // so the next frame's command processing overlaps this frame's GPU execution.
         EndEncoders();
         EnsureCmd();
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture = S.present_tex;
+        rp.colorAttachments[0].texture = dst;
         rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> e = [S.cmd renderCommandEncoderWithDescriptor:rp];
@@ -5282,11 +5693,18 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
         [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [e endEncoding];
         LogWork("present");
-        const double tp0 = CFAbsoluteTimeGetCurrent();
-        if (ps4_metal_screen_encode_present((__bridge void*)S.cmd, (__bridge void*)S.present_tex) != 0)
+        if (ps4_metal_screen_encode_present((__bridge void*)S.cmd, (__bridge void*)dst) != 0)
             RLog("present-screen", "the Metal screen could not take the frame");
-        S.screen_ms += (CFAbsoluteTimeGetCurrent() - tp0) * 1000.0; // includes waiting for a drawable
-        if (on_done) AfterGpu(std::move(on_done));
+        S.screen_ms += (CFAbsoluteTimeGetCurrent() - tp0) * 1000.0; // includes waiting for a present slot
+        if (on_done) {
+            if (g_cpu_present_pending.load() > 0) {
+                // keep flips in order behind the guest-memory presents still queued
+                auto f = std::make_shared<std::function<void()>>(std::move(on_done));
+                AfterGpu([f] { dispatch_async(CpuPresentQueue(), ^{ (*f)(); }); });
+            } else {
+                AfterGpu(std::move(on_done));
+            }
+        }
         Commit();
         static const bool writeback_all = getenv("PS4_GNM_WRITEBACK_ALL") != nullptr;
         if (writeback_all) { // experiment: make every GPU surface CPU-visible
