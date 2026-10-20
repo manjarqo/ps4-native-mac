@@ -267,6 +267,18 @@ static void test_contract(void) {
   Ps4Audio3dAttribute one = attr(PS4_AUDIO3D_ATTR_PCM, &pcm, 0x18);
   CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 1, &two, 0), 0);
   CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 1, &one, 0), PS4_AUDIO3D_ERROR_NOT_READY);
+  // PCM longer than the whole queue (queue_depth * granularity) is rejected outright; the grain
+  // count must not wrap for lengths near UINT32_MAX.
+  Ps4Audio3dPcm pcm_huge = pcm, pcm_long = pcm;
+  pcm_huge.num_samples = 0xFFFFFFFFu;
+  pcm_long.num_samples = 2 * 256 + 1;
+  Ps4Audio3dAttribute huge = attr(PS4_AUDIO3D_ATTR_PCM, &pcm_huge, 0x18);
+  Ps4Audio3dAttribute lng = attr(PS4_AUDIO3D_ATTR_PCM, &pcm_long, 0x18);
+  Ps4Audio3dAttribute reset_only = attr(PS4_AUDIO3D_ATTR_RESET_STATE, NULL, 0);
+  Ps4Audio3dAttribute reset_huge[2] = {reset_only, huge};
+  CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 2, reset_huge, 0), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
+  Ps4Audio3dAttribute reset_long[2] = {reset_only, lng};
+  CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 2, reset_long, 0), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
   // RESET_STATE in the same call drops the queue first, so PCM fits again.
   Ps4Audio3dAttribute reset_pcm[2] = {one, attr(PS4_AUDIO3D_ATTR_RESET_STATE, NULL, 0)};
   CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 2, reset_pcm, 0), 0);

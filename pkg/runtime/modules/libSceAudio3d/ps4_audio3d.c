@@ -30,7 +30,9 @@
 //   SceAudioOutOutputParam [V] { +0 s32 handle; +8 void *ptr } (0x10)
 //
 // Object attributes [V ids and sizes from the game, I semantics]:
-//   1 PCM (0x18 struct)        mono grain(s) queued on the object
+//   1 PCM (0x18 struct)        mono grain(s) queued on the object; longer than
+//                              a grain is split, longer than queue_depth grains
+//                              INVALID_PARAMETER, no room NOT_READY
 //   2 PRIORITY (u32)           stored; every object is mixed, so unused
 //   3 POSITION (3 x float)     x right, y up, z forward [I axes]
 //   4 SPREAD (float)           angular width in radians [I unit]
@@ -666,7 +668,7 @@ int32_t ps4_audio3d_object_unreserve(uint32_t port_id, uint32_t object_id) {
 }
 
 static int32_t validate_attribute(const A3dPort *p, const Ps4Audio3dAttribute *a, uintptr_t base,
-                                  uint32_t *pcm_grains) {
+                                  uint64_t *pcm_grains) {
   const void *v = a->value ? (const void *)(base + (uintptr_t)a->value) : NULL;
   float f;
   uint32_t u;
@@ -685,7 +687,12 @@ static int32_t validate_attribute(const A3dPort *p, const Ps4Audio3dAttribute *a
     if (sb & (pcm.format == PS4_AUDIO3D_FORMAT_FLOAT ? 3u : 1u)) {
       return PS4_AUDIO3D_ERROR_INVALID_PARAMETER;
     }
-    *pcm_grains += (pcm.num_samples + p->granularity - 1) / p->granularity;
+    // More samples than the whole object queue can hold can never be accepted. 64-bit
+    // arithmetic: num_samples + granularity would wrap near UINT32_MAX.
+    if ((uint64_t)pcm.num_samples > (uint64_t)p->queue_depth * p->granularity) {
+      return PS4_AUDIO3D_ERROR_INVALID_PARAMETER;
+    }
+    *pcm_grains += ((uint64_t)pcm.num_samples + p->granularity - 1) / p->granularity;
     return 0;
   }
   case PS4_AUDIO3D_ATTR_POSITION: {
@@ -766,12 +773,12 @@ int32_t ps4_audio3d_object_set_attributes(uint32_t port_id, uint32_t object_id, 
     r = PS4_AUDIO3D_ERROR_INVALID_OBJECT;
   } else {
     bool reset = false;
-    uint32_t grains = 0;
+    uint64_t grains = 0;
     for (uint64_t i = 0; i < num && r == 0; i++) {
       r = validate_attribute(p, &attrs[i], base, &grains);
       reset |= attrs[i].attribute_id == PS4_AUDIO3D_ATTR_RESET_STATE;
     }
-    if (r == 0 && (reset ? 0 : o->pcm_count) + grains > p->queue_depth) {
+    if (r == 0 && (reset ? 0 : (uint64_t)o->pcm_count) + grains > p->queue_depth) {
       r = PS4_AUDIO3D_ERROR_NOT_READY;
     }
     if (r == 0) {
