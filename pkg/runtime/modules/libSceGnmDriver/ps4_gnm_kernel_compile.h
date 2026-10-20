@@ -19,6 +19,13 @@
  * At most `max_parallel` compiles run at once, started in the order they were asked for (the
  * order the encoder needs them); more would only slow each other and the CP and encoder threads
  * down (22 at once were measured in a TLOU loading burst).
+ *
+ * The renderer's vertex and fragment libraries go through the same queue at low priority
+ * (`kDraw`): a draw is skipped while its shader compiles, a dispatch waits. Kernels (`kDispatch`)
+ * start before any queued draw shader, and the limit holds for both together, so a loading burst
+ * of hundreds of new draw shaders no longer runs as hundreds of compiles at once (measured: the
+ * MTLCompilerService processes at 900 % CPU, load above 20, frames of 0.3–1.4 s without any work
+ * of the frame's own on the CP).
  */
 #pragma once
 
@@ -29,6 +36,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -46,18 +54,21 @@ public:
     // Blocks until the compile finished. Returns the kernel ("main0"), nil if Metal rejected the
     // MSL. *waited_ms (optional): how long this call blocked (0 if the job was done already).
     id<MTLFunction> Wait(double* waited_ms = nullptr);
-    // After Done(): Metal's error text of a failed compile ("" when it succeeded); compile time.
+    // After Done(): Metal's error text of a failed compile ("" when it succeeded); compile time;
+    // the library (nil if the MSL did not compile).
     std::string Error() const;
+    id<MTLLibrary> Library() const;
     double CompileMs() const { return compile_ms_; }
 
 private:
     friend class Compiler;
-    void Finish(id<MTLFunction> fn, const std::string& err, double ms);
+    void Finish(id<MTLLibrary> lib, id<MTLFunction> fn, const std::string& err, double ms);
     const uint64_t mh_;
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::atomic<bool> done_{false};
-    id<MTLFunction> fn_ = nil; // written once under mu_ before done_
+    id<MTLLibrary> lib_ = nil; // written once under mu_ before done_
+    id<MTLFunction> fn_ = nil;
     std::string err_;
     double compile_ms_ = 0;
 };
@@ -74,7 +85,12 @@ public:
     Compiler& operator=(const Compiler&) = delete;
     // The job of this MSL: the existing one (in flight or finished), or a new one, queued
     // behind the jobs asked for earlier. *started (optional): true if this call started it. Never blocks on a compile.
-    std::shared_ptr<Job> Start(uint64_t mh, const std::string& msl, bool* started = nullptr);
+    enum Priority { kDispatch, kDraw };
+    // Called on the compiling thread once the job is done (only for the call that started it).
+    using Done = std::function<void(const Job&)>;
+    // A kDispatch request for a job still queued as kDraw moves it ahead.
+    std::shared_ptr<Job> Start(uint64_t mh, const std::string& msl, bool* started = nullptr,
+                               Priority pri = kDispatch, Done on_done = nullptr);
     // The job of this MSL, null if none was started.
     std::shared_ptr<Job> Find(uint64_t mh) const;
     // Session counters.
@@ -87,14 +103,19 @@ public:
     double CompileMsTotal() const { return compile_us_.load(std::memory_order_relaxed) / 1000.0; }
 
 private:
-    void Run(std::shared_ptr<Job> job, std::shared_ptr<std::string> msl);
+    struct Queued {
+        std::shared_ptr<Job> job;
+        std::shared_ptr<std::string> msl;
+        Done on_done;
+    };
+    void Run(Queued q);
     void StartQueued(); // with mu_ held
     id<MTLDevice> dev_;
     MTLCompileOptions* (*make_options_)();
     dispatch_queue_t queue_;
     mutable std::mutex mu_;
     std::unordered_map<uint64_t, std::shared_ptr<Job>> jobs_;
-    std::deque<std::pair<std::shared_ptr<Job>, std::shared_ptr<std::string>>> queued_; // FIFO
+    std::deque<Queued> queued_[2]; // FIFO per priority; kDispatch first
     const unsigned max_parallel_;
     unsigned running_ = 0;
     std::condition_variable idle_;

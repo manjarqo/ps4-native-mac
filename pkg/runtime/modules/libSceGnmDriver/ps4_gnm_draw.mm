@@ -1730,13 +1730,30 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
         waiters.push_back(s);
         if (first) {
             g_compile.lib_async++;
-            [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
-                                options:CompileOptions()
-                      completionHandler:^(id<MTLLibrary> l, NSError* e) {
-                          std::lock_guard<std::mutex> lk(S.async_mu);
-                          S.async_libs_done.push_back({mh, l, l ? nil : e.localizedDescription});
-                          S.async_shaders_ready.fetch_add(1, std::memory_order_release);
-                      }];
+            auto done = [mh](id<MTLLibrary> l, NSString* err) {
+                std::lock_guard<std::mutex> lk(S.async_mu);
+                S.async_libs_done.push_back({mh, l, l ? nil : err});
+                S.async_shaders_ready.fetch_add(1, std::memory_order_release);
+            };
+            if (S.kernels) {
+                // the shared compile queue: bounded, behind the kernels dispatches wait for
+                bool started = false;
+                auto job = S.kernels->Start(mh, msl_str, &started, ps4gnm_kernels::Compiler::kDraw,
+                                            [done](const ps4gnm_kernels::Job& j) {
+                                                id<MTLLibrary> l = j.Library();
+                                                done(l, l ? nil : @(j.Error().c_str()));
+                                            });
+                // compiled before in this session (a failed library is not cached in S.libs):
+                // the waiters take that result (the job of an MSL is never in flight here,
+                // libs_pending holds its waiters until it is done)
+                if (!started && job->Done()) done(job->Library(), job->Library() ? nil : @(job->Error().c_str()));
+            } else {
+                [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
+                                    options:CompileOptions()
+                          completionHandler:^(id<MTLLibrary> l, NSError* e) {
+                              done(l, l ? nil : e.localizedDescription);
+                          }];
+            }
         }
     } else if (!lib && !stored_fn && hw == GCN_HW_CS && S.kernels) {
         // A dispatch is not optional (later passes read its results), so it is not skipped

@@ -21,6 +21,9 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <unistd.h>
+#include <atomic>
+#include <mutex>
 #include <vector>
 
 namespace {
@@ -240,6 +243,40 @@ int main(int argc, char** argv) {
             for (unsigned k = 0; k < n; ++k) CHECK(js[k]->Done() && js[k]->Error().empty());
             CHECK(js[n - 1]->CompileMs() > 0);
             for (unsigned k = 0; k < n; ++k) CHECK(RunAndCheck(dev, q, js[k]->Wait(), 200 + k, nonce));
+        }
+        // ---- priorities: kernels start before queued draw shaders; a dispatch request moves a
+        //      queued draw-shader job ahead; the completion callback runs once with the library ----
+        {
+            ps4gnm_kernels::Compiler one(dev, Options, 1);
+            using C = ps4gnm_kernels::Compiler;
+            std::atomic<int> calls{0};
+            std::atomic<bool> lib_ok{true};
+            auto cb = [&](const ps4gnm_kernels::Job& j) {
+                calls++;
+                if (!j.Library() || !j.Done() || !j.Error().empty()) lib_ok = false;
+            };
+            std::vector<std::shared_ptr<ps4gnm_kernels::Job>> d;
+            for (unsigned k = 0; k < 4; ++k) { // draw shaders: the first runs, three queue
+                const std::string s = KernelSource(400 + k, nonce);
+                d.push_back(one.Start(HashOf(s), s, nullptr, C::kDraw, cb));
+            }
+            const std::string ks = KernelSource(500, nonce);
+            auto kern = one.Start(HashOf(ks), ks, nullptr, C::kDispatch, cb); // queued after d[3]
+            const std::string ps = KernelSource(403, nonce);
+            bool started = true;
+            auto promoted = one.Start(HashOf(ps), ps, &started, C::kDispatch); // d[3], asked by a dispatch
+            CHECK(!started && promoted == d[3]);
+            kern->Wait();
+            // the kernel ran right after the job that was running: draw shaders 1 and 2 still wait
+            CHECK(!d[1]->Done() && !d[2]->Done());
+            d[3]->Wait();
+            // then the promoted draw shader, still ahead of 1 and 2
+            CHECK(!d[1]->Done() && !d[2]->Done());
+            for (auto& j : d) j->Wait();
+            for (unsigned k = 0; k < 4; ++k) CHECK(RunAndCheck(dev, q, d[k]->Wait(), 400 + k, nonce));
+            for (int t = 0; t < 100 && calls.load() < 5; ++t) usleep(10000);
+            CHECK(calls.load() == 5); // once per started job (the promotion call passed none)
+            CHECK(lib_ok.load());
         }
         // ---- the destructor waits for compiles still queued or running ----
         {

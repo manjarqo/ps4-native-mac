@@ -28,9 +28,15 @@ std::string Job::Error() const {
     return err_;
 }
 
-void Job::Finish(id<MTLFunction> fn, const std::string& err, double ms) {
+id<MTLLibrary> Job::Library() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return lib_;
+}
+
+void Job::Finish(id<MTLLibrary> lib, id<MTLFunction> fn, const std::string& err, double ms) {
     {
         std::lock_guard<std::mutex> lk(mu_);
+        lib_ = lib;
         fn_ = fn;
         err_ = err;
         compile_ms_ = ms;
@@ -48,7 +54,7 @@ Compiler::Compiler(id<MTLDevice> dev, MTLCompileOptions* (*make_options)(), unsi
 
 Compiler::~Compiler() {
     std::unique_lock<std::mutex> lk(mu_);
-    idle_.wait(lk, [this] { return running_ == 0 && queued_.empty(); });
+    idle_.wait(lk, [this] { return running_ == 0 && queued_[0].empty() && queued_[1].empty(); });
 }
 
 std::shared_ptr<Job> Compiler::Find(uint64_t mh) const {
@@ -57,42 +63,54 @@ std::shared_ptr<Job> Compiler::Find(uint64_t mh) const {
     return it == jobs_.end() ? nullptr : it->second;
 }
 
-std::shared_ptr<Job> Compiler::Start(uint64_t mh, const std::string& msl, bool* started) {
+std::shared_ptr<Job> Compiler::Start(uint64_t mh, const std::string& msl, bool* started, Priority pri,
+                                    Done on_done) {
     std::lock_guard<std::mutex> lk(mu_);
     auto& slot = jobs_[mh];
     if (slot) {
         if (started) *started = false;
+        if (pri == kDispatch && !slot->Done()) {
+            // still queued behind draw shaders: a dispatch waits for it, move it ahead
+            auto& low = queued_[kDraw];
+            for (auto it = low.begin(); it != low.end(); ++it)
+                if (it->job == slot) {
+                    queued_[kDispatch].push_back(std::move(*it));
+                    low.erase(it);
+                    break;
+                }
+        }
         return slot;
     }
     slot = std::make_shared<Job>(mh);
     if (started) *started = true;
     started_.fetch_add(1, std::memory_order_relaxed);
     in_flight_.fetch_add(1, std::memory_order_relaxed);
-    queued_.emplace_back(slot, std::make_shared<std::string>(msl));
+    queued_[pri == kDraw ? kDraw : kDispatch].push_back({slot, std::make_shared<std::string>(msl), std::move(on_done)});
     StartQueued();
     return slot;
 }
 
 void Compiler::StartQueued() {
-    while (running_ < max_parallel_ && !queued_.empty()) {
-        std::shared_ptr<Job> job = std::move(queued_.front().first);
-        std::shared_ptr<std::string> src = std::move(queued_.front().second);
-        queued_.pop_front();
+    while (running_ < max_parallel_ && (!queued_[kDispatch].empty() || !queued_[kDraw].empty())) {
+        auto& q = queued_[kDispatch].empty() ? queued_[kDraw] : queued_[kDispatch];
+        Queued item = std::move(q.front());
+        q.pop_front();
         running_++;
         for (uint64_t p = peak_.load(std::memory_order_relaxed);
              running_ > p && !peak_.compare_exchange_weak(p, running_, std::memory_order_relaxed);) {
         }
+        auto box = std::make_shared<Queued>(std::move(item));
         dispatch_async(queue_, ^{
-            Run(job, src);
+            Run(std::move(*box));
         });
     }
 }
 
-void Compiler::Run(std::shared_ptr<Job> job, std::shared_ptr<std::string> src) {
+void Compiler::Run(Queued q) {
     @autoreleasepool {
         NSError* e = nil;
         const double t0 = CFAbsoluteTimeGetCurrent();
-        id<MTLLibrary> lib = [dev_ newLibraryWithSource:[NSString stringWithUTF8String:src->c_str()]
+        id<MTLLibrary> lib = [dev_ newLibraryWithSource:[NSString stringWithUTF8String:q.msl->c_str()]
                                                 options:make_options_()
                                                   error:&e];
         id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
@@ -104,13 +122,14 @@ void Compiler::Run(std::shared_ptr<Job> job, std::shared_ptr<std::string> src) {
         }
         compile_us_.fetch_add((uint64_t)(ms * 1000.0), std::memory_order_relaxed);
         in_flight_.fetch_sub(1, std::memory_order_relaxed);
-        job->Finish(fn, err, ms);
+        q.job->Finish(lib, fn, err, ms);
+        if (q.on_done) q.on_done(*q.job);
     }
     std::lock_guard<std::mutex> lk(mu_);
     running_--;
     StartQueued();
     // under mu_: the destructor cannot return before this call has released it
-    if (running_ == 0 && queued_.empty()) idle_.notify_all();
+    if (running_ == 0 && queued_[0].empty() && queued_[1].empty()) idle_.notify_all();
 }
 
 } // namespace ps4gnm_kernels
