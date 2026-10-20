@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps4_metal_screen.h"
+#include "ps4_present_stats.h"
 #include "recomp_runtime.h"
 
 @interface PS4ScreenDelegate : NSObject <NSWindowDelegate, NSApplicationDelegate>
@@ -209,6 +210,39 @@ static int metal_screen_init_main(int width, int height, const char *title) {
     return 0;
 }
 
+// Present statistics: drawable waits, submission spacing and the real on-screen times from the
+// drawables' presented handlers; one "[metal-screen] present:" line per window of frames.
+static ps4_present_stats g_pstats;
+static dispatch_once_t g_pstats_once;
+
+static ps4_present_stats *pstats(void) {
+    dispatch_once(&g_pstats_once, ^{
+        ps4_present_stats_init(&g_pstats);
+    });
+    return &g_pstats;
+}
+
+static void pstats_presented(id<MTLDrawable> d) {
+    ps4_present_stats *s = pstats();
+    ps4_present_stats_on_presented(s, d.presentedTime);
+    char line[512];
+    if (ps4_present_stats_report(s, line, sizeof(line))) fprintf(stderr, "[metal-screen] present: %s\n", line);
+}
+
+// -[CAMetalLayer nextDrawable] blocks while every drawable is queued for the display.
+static id<CAMetalDrawable> next_drawable_timed(void) {
+    const double t0 = CACurrentMediaTime();
+    id<CAMetalDrawable> d = [g_metalLayer nextDrawable];
+    const double t1 = CACurrentMediaTime();
+    ps4_present_stats_on_acquire(pstats(), (t1 - t0) * 1000.0);
+    if (d) {
+        [d addPresentedHandler:^(id<MTLDrawable> shown) {
+            pstats_presented(shown);
+        }];
+    }
+    return d;
+}
+
 // PS4_SCREENSHOT_DIR=<dir> [PS4_SCREENSHOT_EVERY=<frames>, default 600]: save
 // the presented image as PNG periodically (frame_<n>.png), for headless runs.
 // Returns the index of the frame being presented if it is to be saved, else -1.
@@ -302,7 +336,7 @@ int ps4_metal_screen_present_frame(const void *pixels, size_t pitch, int width, 
                                bytesPerRow:pitch > 0 ? pitch : (g_width * 4)];
         }
 
-        id<CAMetalDrawable> drawable = [g_metalLayer nextDrawable];
+        id<CAMetalDrawable> drawable = next_drawable_timed();
         if (drawable) {
             id<MTLCommandBuffer> commandBuffer = [g_commandQueue commandBuffer];
             id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
@@ -320,6 +354,7 @@ int ps4_metal_screen_present_frame(const void *pixels, size_t pitch, int width, 
             [blit endEncoding];
 
             [commandBuffer presentDrawable:drawable];
+            ps4_present_stats_on_submit(pstats(), CACurrentMediaTime());
             [commandBuffer commit];
             [commandBuffer waitUntilScheduled];
             maybe_save_screenshot(g_screenTexture);
@@ -363,7 +398,7 @@ int ps4_metal_screen_present_texture(void *texture) {
              destinationSlice:0
              destinationLevel:0
             destinationOrigin:MTLOriginMake(0, 0, 0)];
-        id<CAMetalDrawable> drawable = [g_metalLayer nextDrawable];
+        id<CAMetalDrawable> drawable = next_drawable_timed();
         if (drawable) {
             NSUInteger cw = MIN((NSUInteger)g_width, drawable.texture.width);
             NSUInteger ch = MIN((NSUInteger)g_height, drawable.texture.height);
@@ -378,7 +413,10 @@ int ps4_metal_screen_present_texture(void *texture) {
                 destinationOrigin:MTLOriginMake(0, 0, 0)];
         }
         [blit endEncoding];
-        if (drawable) [commandBuffer presentDrawable:drawable];
+        if (drawable) {
+            [commandBuffer presentDrawable:drawable];
+            ps4_present_stats_on_submit(pstats(), CACurrentMediaTime());
+        }
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
         maybe_save_screenshot(g_screenTexture);
@@ -715,7 +753,7 @@ int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
             td.storageMode = MTLStorageModeShared;
             shot = [g_device newTextureWithDescriptor:td];
         }
-        id<CAMetalDrawable> drawable = [g_metalLayer nextDrawable];
+        id<CAMetalDrawable> drawable = next_drawable_timed();
         NSUInteger ox = 0, oy = 0;
         const float gamma = current_gamma();
         id<MTLRenderPipelineState> gamma_pso = fabsf(gamma - 1.0f) > 0.001f ? gamma_pipeline() : nil;
@@ -786,7 +824,10 @@ int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
             }
             [blit endEncoding];
         }
-        if (drawable) [cb presentDrawable:drawable];
+        if (drawable) {
+            [cb presentDrawable:drawable];
+            ps4_present_stats_on_submit(pstats(), CACurrentMediaTime());
+        }
         if (shot) {
             [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
                 (void)done;

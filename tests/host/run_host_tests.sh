@@ -84,6 +84,11 @@ AD="$R/pkg/runtime/modules/libSceAudiodec"
 clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/runtime/core" -I "$AD" \
   "$R/tests/host/audiodec_test.c" "$AD/ps4_audiodec.c" -framework AudioToolbox -o "$T/audiodec_test"
 "$T/audiodec_test" "$R/tests/host/data/audiodec_chirp_ffmpeg.aac" 2> "$T/audiodec.txt" || { cat "$T/audiodec.txt"; exit 1; }
+# Presenter statistics: display intervals from presented times, drops, drawable waits, bursts.
+VO="$R/pkg/runtime/modules/libSceVideoOut"
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/tests/host/present_stats_test.c" \
+  "$VO/ps4_present_stats.c" -o "$T/present_stats_test"
+"$T/present_stats_test"
 G="$R/pkg/runtime/modules/libSceGnmDriver"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
