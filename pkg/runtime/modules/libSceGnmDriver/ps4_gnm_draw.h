@@ -73,6 +73,10 @@ void SetExtentHints(const uint32_t cb[8], uint32_t db);
 // Called once per sceGnmSubmit* (trace windows, stats).
 void OnSubmit();
 
+// End of a command stream run (CP thread): waits for compute kernels that its dispatches still
+// compile in the background (ps4_gnm_kernel_compile.h), so the CP does not run further ahead.
+void WaitKernelCompiles();
+
 // True if GPU work was encoded since the last Flush(true).
 bool HasPendingWork();
 // Guest dispatches run concurrently (as consecutive dispatches do on GCN); the command

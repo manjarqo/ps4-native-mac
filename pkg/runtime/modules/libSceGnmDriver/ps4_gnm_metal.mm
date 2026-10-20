@@ -1226,6 +1226,7 @@ static void StartGfxWatchdog() {
             if (g_gfx.active && g_gfx.suspended_at) {
                 @autoreleasepool {
                     ResumeGfxQueue();
+                    ps4draw::WaitKernelCompiles();
                 }
             }
         }
@@ -1259,6 +1260,7 @@ int32_t ps4_gnm_metal_process_compute_packets(GuestContext *ctx, const uint32_t 
         // compute work without a trailing fence still has to reach the GPU
         if (ps4draw::HasPendingWork()) ps4draw::Flush(false);
         ResumeGfxQueue();
+        ps4draw::WaitKernelCompiles();
     }
     return 0;
 }
@@ -1299,6 +1301,7 @@ int32_t ps4_gnm_metal_process_command_buffers(GuestContext *ctx, uint32_t count,
         }
         RunGfxQueue(false);
         ps4draw::OnSubmit();
+        ps4draw::WaitKernelCompiles();
     }
     return 0;
 }

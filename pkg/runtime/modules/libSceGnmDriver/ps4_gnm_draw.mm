@@ -59,6 +59,7 @@
 #include "ps4_gnm_shader_cache.h"
 #include "ps4_gnm_pipeline_archive.h"
 #include "ps4_gnm_library_store.h"
+#include "ps4_gnm_kernel_compile.h"
 #include "ps4_metal_screen.h"
 #include "ps4_hitch.h"
 
@@ -334,6 +335,9 @@ struct Shader {
     bool from_store = false;       // fn was loaded from the library store
     id<MTLFunction> fn = nil;
     bool pending = false;     // Metal library still compiling (fn not yet available)
+    // Compute kernel compiling in the background (fn stays nil): the encoder waits for it at the
+    // shader's first dispatch (ps4_gnm_kernel_compile.h)
+    std::shared_ptr<ps4gnm_kernels::Job> kjob;
     uint64_t fail_key = 0;    // permutation key recorded in shader_fail if compilation fails
     std::vector<gcn_buffer_binding> bufs;
     std::vector<gcn_image_binding> imgs;
@@ -497,6 +501,11 @@ struct State {
     bool async_compile = true;
     std::unordered_map<std::string, id<MTLRenderPipelineState>> gfx_pipes;
     std::unordered_map<uint64_t, id<MTLComputePipelineState>> cs_pipes;
+    // compute kernels compiled in the background (null: on the CP thread, PS4_GNM_SYNC_KERNELS=1)
+    std::unique_ptr<ps4gnm_kernels::Compiler> kernels;
+    // kernels of dispatches handed to the encoder in the current command stream run that were
+    // still compiling (CP thread; WaitKernelCompiles)
+    std::vector<std::shared_ptr<ps4gnm_kernels::Job>> kernels_open;
     std::unordered_map<uint64_t, id<MTLDepthStencilState>> ds_states;
     std::unordered_map<uint64_t, id<MTLSamplerState>> samplers;
     std::unordered_map<uint64_t, id<MTLBuffer>> guest_bufs;
@@ -571,6 +580,10 @@ State S;
 struct HitchStats {
     double shader_ms = 0, gcn_ms = 0, mtl_ms = 0, pso_ms = 0, upload_ms = 0, wait_ms = 0;
     double lookup_ms = 0, fn_ms = 0; // translation cache lookup; MTLFunction creation
+    // blocked on background kernel compiles: the CP at the end of a submission, the encoder at a
+    // dispatch (both may wait for the same compile at the same time)
+    double kernel_wait_ms = 0, kernel_enc_wait_ms = 0;
+    uint32_t kernel_waits = 0;
     uint32_t shaders = 0, psos = 0, uploads = 0, gpu_uploads = 0, pending_draws = 0;
 };
 HitchStats g_hitch;
@@ -591,6 +604,11 @@ struct CompileCounter {
 };
 struct CompileStats {
     CompileCounter lib_sync, lib_store, pso_sync, cpso_sync;
+    // dispatches whose kernel was still compiling when the encoder reached them (time blocked)
+    CompileCounter kernel_wait;
+    // command stream runs whose end waited for kernels still compiling (time blocked, CP thread)
+    CompileCounter kernel_cp_wait;
+    std::atomic<uint64_t> kernel_ready{0}; // first dispatches whose kernel was compiled in time
     std::atomic<uint64_t> lib_async{0}, lib_prewarmed{0}, pso_async{0}, store_fallbacks{0};
 };
 CompileStats g_compile;
@@ -610,6 +628,17 @@ void PrintCompileStats() {
                     "stored libraries replaced after a pipeline failure %llu\n",
             a, l, (unsigned long long)g_compile.lib_async.load(), (unsigned long long)g_compile.lib_prewarmed.load(), b,
             (unsigned long long)g_compile.pso_async.load(), d, (unsigned long long)g_compile.store_fallbacks.load());
+    if (S.kernels) {
+        char w[96], cw[96];
+        c(g_compile.kernel_wait, w, sizeof(w));
+        c(g_compile.kernel_cp_wait, cw, sizeof(cw));
+        fprintf(stderr, "[gnm-compile] session: compute kernels compiled in the background %llu (%.0f ms, %llu at once at most, "
+                        "%llu failed), %llu ready at their first dispatch, waited for by the encoder %s, "
+                        "by the CP at the end of a submission %s\n",
+                (unsigned long long)S.kernels->Started(), S.kernels->CompileMsTotal(),
+                (unsigned long long)S.kernels->PeakRunning(), (unsigned long long)S.kernels->Failed(),
+                (unsigned long long)g_compile.kernel_ready.load(), w, cw);
+    }
     ps4gnm_lib_store::PrintStats();
 }
 
@@ -1278,6 +1307,7 @@ std::string FinalMsl(const gcn_shader* sh, uint32_t hw) {
 // from MSL after its stored function failed in a pipeline.
 id<MTLFunction> PipelineFn(const Shader* s) {
     if (!s) return nil;
+    if (s->kjob) return s->kjob->Wait(); // DispatchEncode waited for it already
     if (s->from_store)
         if (auto it = S.fallback_fns.find(s->msl_hash); it != S.fallback_fns.end()) return it->second;
     return s->fn;
@@ -1417,6 +1447,21 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
                           S.async_shaders_ready.fetch_add(1, std::memory_order_release);
                       }];
         }
+    } else if (!lib && !stored_fn && hw == GCN_HW_CS && S.kernels) {
+        // A dispatch is not optional (later passes read its results), so it is not skipped
+        // while its kernel compiles: the compile starts here, and the encoder waits for it when
+        // it reaches the dispatch. The CP thread goes on with the command stream meanwhile, and
+        // kernels met before the encoder catches up compile in parallel.
+        s->kjob = S.kernels->Start(mh, msl_str);
+        if (s->kjob->Done() && !s->kjob->Wait()) {
+            // the same MSL failed before in this session
+            RLog("msl-fail", "Metal rejected MSL of shader 0x%llx (hw %u): %s", (unsigned long long)code_addr, hw,
+                 s->kjob->Error().c_str());
+            gcn_shader_destroy(sh);
+            delete s;
+            S.shader_fail.insert(fail_key);
+            return nullptr;
+        }
     } else if (!lib && !stored_fn) {
         NSError* e = nil;
         const double mtl_t0 = CFAbsoluteTimeGetCurrent();
@@ -1441,7 +1486,7 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
         s->fn = [lib newFunctionWithName:@"main0"];
         g_hitch.fn_ms += (CFAbsoluteTimeGetCurrent() - fn_t0) * 1000.0;
     }
-    if (!s->fn && !s->pending) {
+    if (!s->fn && !s->pending && !s->kjob) {
         RLog("msl-fail", "shader 0x%llx: no main0", (unsigned long long)code_addr);
         gcn_shader_destroy(sh);
         delete s;
@@ -3765,6 +3810,17 @@ bool Init(GuestContext* ctx) {
         // builds everything inline.
         S.async_compile = getenv("PS4_GNM_SYNC_COMPILE") == nullptr;
         if (!S.dev) return false;
+        // Compute kernels compile in the background and their dispatches wait for them on the
+        // encoder thread (ps4_gnm_kernel_compile.h); PS4_GNM_SYNC_KERNELS=1 (or
+        // PS4_GNM_SYNC_COMPILE=1) compiles them on the CP thread as before.
+        if (S.async_compile && !getenv("PS4_GNM_SYNC_KERNELS"))
+        {
+            // PS4_GNM_KERNEL_COMPILES: compiles at once (default 4)
+            const char* e = getenv("PS4_GNM_KERNEL_COMPILES");
+            const int n = e ? atoi(e) : 0;
+            S.kernels = std::make_unique<ps4gnm_kernels::Compiler>(S.dev, CompileOptions,
+                                                                   n > 0 && n <= 64 ? (unsigned)n : 4u);
+        }
         S.queue = [S.dev newCommandQueueWithMaxCommandBufferCount:64];
         S.queue.label = @"gnm";
         S.tex = new TextureCache(S.dev, S.queue, proc->mem_base, proc->mem_size);
@@ -4878,10 +4934,33 @@ void Dispatch(GuestContext* ctx, const uint32_t* regs, uint32_t dim_x, uint32_t 
         r.indirect_addr = indirect_addr;
         r.queue = queue;
         r.regs.Capture(regs);
+        if (cs->kjob && !cs->kjob->Done()) S.kernels_open.push_back(cs->kjob);
         encq::Defer([rec = rp.release()] {
             DispatchEncode(*rec);
             g_dispatch_recs.Put(rec);
         });
+    }
+}
+
+// End of a command stream run (CP thread): waits for the kernels its dispatches still compile.
+// Within the run the CP thread went on while they compiled in parallel; it does not go on into
+// the next submission, so it never gets further ahead of the encoder (and of the GPU's writes to
+// guest memory, which the CP reads for resource tables) than without background kernels.
+// Measured without this: in a TLOU loading burst the CP ran seconds ahead and met twice the
+// shader permutations.
+void WaitKernelCompiles() {
+    if (S.kernels_open.empty()) return;
+    double total = 0;
+    for (auto& j : S.kernels_open) {
+        double w = 0;
+        j->Wait(&w);
+        total += w;
+    }
+    S.kernels_open.clear();
+    if (total > 0) {
+        g_compile.kernel_cp_wait.Add(total);
+        g_hitch.kernel_wait_ms += total;
+        g_hitch.kernel_waits++;
     }
 }
 
@@ -4907,6 +4986,25 @@ void DispatchEncode(DispatchRec& r) {
             // the hint register-heavy kernels get a lower limit and the dispatch had to be skipped.
             const uint64_t wg = (uint64_t)std::max(1u, rt.cs.workgroup_size[0]) * std::max(1u, rt.cs.workgroup_size[1]) *
                                 std::max(1u, rt.cs.workgroup_size[2]);
+            if (cs->kjob) {
+                // first dispatch of a kernel compiled in the background: wait for it here, in
+                // stream order (the dispatch's results are read by the work after it)
+                double waited = 0;
+                id<MTLFunction> kfn = cs->kjob->Wait(&waited);
+                if (waited > 0) {
+                    g_compile.kernel_wait.Add(waited);
+                    g_hitch.kernel_enc_wait_ms += waited;
+                } else {
+                    g_compile.kernel_ready++;
+                }
+                if (!kfn) {
+                    RLog("msl-fail", "Metal rejected MSL of shader 0x%llx (hw %u): %s", (unsigned long long)addr,
+                         cs->hw, cs->kjob->Error().c_str());
+                    S.cs_pipes[cs->uid] = nil;
+                    S.n_skipped++;
+                    return;
+                }
+            }
             MTLComputePipelineDescriptor* cpd = [MTLComputePipelineDescriptor new];
             cpd.computeFunction = PipelineFn(cs);
             if (wg > 0 && wg <= 1024) cpd.maxTotalThreadsPerThreadgroup = (NSUInteger)wg;
@@ -5220,10 +5318,11 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                 for (int k = 0; k < PS4_HITCH_KINDS; ++k) host_ms[k] = ps4_hitch_take_ns(k) / 1e6;
                 if (dt > (long_ms > 0 && long_ms < 50.0 ? long_ms : 50.0))
                     fprintf(stderr, "[gnm-draw] hitch: frame %.1f ms; shaders %u (%.1f ms: gcn %.1f, metal %.1f, lookup %.1f, fn %.1f), pipelines %u (%.1f ms), "
-                                    "texture uploads %u (%.1f ms), gpu uploads %u, gpu waits %.1f ms, draws waiting for shaders %u; "
-                                    "io %.1f, vm %.1f, mtlbuf %.1f, texlock %.1f, shader_fs %.1f ms\n",
+                                    "texture uploads %u (%.1f ms), gpu uploads %u, gpu waits %.1f ms, draws waiting for shaders %u, "
+                                    "kernel waits %u (%.1f ms CP, %.1f ms encoder); io %.1f, vm %.1f, mtlbuf %.1f, texlock %.1f, shader_fs %.1f ms\n",
                             dt, g_hitch.shaders, g_hitch.shader_ms, g_hitch.gcn_ms, g_hitch.mtl_ms, g_hitch.lookup_ms, g_hitch.fn_ms, g_hitch.psos, g_hitch.pso_ms, g_hitch.uploads,
-                            g_hitch.upload_ms, g_hitch.gpu_uploads, g_hitch.wait_ms, g_hitch.pending_draws, host_ms[PS4_HITCH_IO], host_ms[PS4_HITCH_VM],
+                            g_hitch.upload_ms, g_hitch.gpu_uploads, g_hitch.wait_ms, g_hitch.pending_draws, g_hitch.kernel_waits,
+                            g_hitch.kernel_wait_ms, g_hitch.kernel_enc_wait_ms, host_ms[PS4_HITCH_IO], host_ms[PS4_HITCH_VM],
                             host_ms[PS4_HITCH_MTLBUF], host_ms[PS4_HITCH_TEXLOCK], host_ms[PS4_HITCH_SHADER_FS]);
             } else {
                 for (int k = 0; k < PS4_HITCH_KINDS; ++k) ps4_hitch_take_ns(k);

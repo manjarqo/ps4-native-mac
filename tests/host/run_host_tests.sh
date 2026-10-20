@@ -135,4 +135,9 @@ LB="$T/libbudget"; mkdir -p "$LB"
 LK="$T/libbreaker"; mkdir -p "$LK"
 "$T/lib_store_test" write "$LK" $NONCE
 "$T/lib_store_test" breaker "$LK" $NONCE
+# Compute kernels compiled in the background: Start does not block, compiles overlap, an
+# encoder-like thread waiting in order gets correct kernels, one job per MSL, failures stick.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/kernel_compile_test.mm" "$G/ps4_gnm_kernel_compile.mm" \
+  -framework Metal -framework Foundation -o "$T/kernel_compile_test"
+"$T/kernel_compile_test" $NONCE
 rm -rf "$T"
