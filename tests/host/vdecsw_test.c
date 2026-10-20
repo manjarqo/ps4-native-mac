@@ -867,6 +867,115 @@ static void test_delete_race(void) {
     fprintf(stderr, "delete race: 40 rounds\n");
 }
 
+// ResetDecoder on one thread while another pulls pictures (SetDecodeOutput/TrySyncDecodeOutput):
+// a reset drops queued pictures, and the output side must never touch one after that.
+typedef struct OutRacer {
+    uint64_t handle, fb_desc, oi;
+    atomic_bool stop;
+    atomic_int pictures;
+    int bad;
+} OutRacer;
+
+static void *out_racer_main(void *arg) {
+    OutRacer *r = (OutRacer *)arg;
+    GuestContext c = g;
+    while (!atomic_load(&r->stop)) {
+        int32_t rc = call_on(&c, shim_sceVdecswSetDecodeOutput, r->handle, r->fb_desc, 0, 0);
+        if (rc != 0 && rc != E_OUTPUT_BUFFER_FULL) r->bad++;
+        wr64(r->oi, 0x30);
+        rc = call_on(&c, shim_sceVdecswTrySyncDecodeOutput, r->handle, r->oi, 0, 0);
+        if (rc == 0) atomic_fetch_add(&r->pictures, 1);
+        else if (rc != E_DECODE_PENDING && rc != E_OUTPUT_BUFFER_EMPTY) r->bad++;
+    }
+    return NULL;
+}
+
+static void test_reset_race(void) {
+    Dec d;
+    create_dec(&d, 32, true);
+    OutRacer r = {.handle = d.handle, .fb_desc = galloc(0x18, 16), .oi = galloc(0x40, 16)};
+    wr64(r.fb_desc, 0x18);
+    wr64(r.fb_desc + 8, d.fbs[0]);
+    wr64(r.fb_desc + 0x10, d.fb_size);
+    pthread_t t;
+    pthread_create(&t, NULL, out_racer_main, &r);
+    for (int round = 0; round < 60; round++) {
+        for (int j = 0; j < 6; j++) {
+            set_input(&d, &S1.aus[j], j);
+            int32_t rc = call(shim_sceVdecswSetDecodeInput, d.handle, d.in, 0, 0);
+            CHECK(rc == 0 || rc == E_OUTPUT_BUFFER_FULL, "reset race: SetDecodeInput 0x%x", rc);
+            wr64(d.res, 0x18);
+            call(shim_sceVdecswTrySyncDecodeInput, d.handle, d.res, 0, 0);
+        }
+        CHECK(call(shim_sceVdecswResetDecoder, d.handle, 0, 0, 0) == 0, "reset race: ResetDecoder");
+    }
+    atomic_store(&r.stop, true);
+    pthread_join(t, NULL);
+    CHECK(r.bad == 0, "reset race: %d unexpected codes", r.bad);
+    fprintf(stderr, "reset race: 60 resets, %d pictures pulled meanwhile\n", atomic_load(&r.pictures));
+    delete_dec(&d);
+}
+
+// After a reset the decoder must not release a picture early because its POC is the old
+// sequence's last POC + 1 (S1 decode order: POC 0,4,2,1,3 then 8,6,5,...).
+static void test_reset_forgets_last_poc(void) {
+    Dec d;
+    create_dec(&d, 8, true);
+    Collected col = {0};
+    col.last_flag_at = -1;
+    int seen = 0;
+    for (int j = 0; j < 5; j++) {
+        feed(&d, &S1, S1.aus[j].data, S1.aus[j].size, j, -1, &col, 0);
+        seen |= 1 << S1.aus[j].display;
+    }
+    CHECK(seen == 0x1f, "precondition: S1 AUs 0..4 hold frames 0..4 (mask 0x%x)", seen);
+    CHECK(call(shim_sceVdecswResetDecoder, d.handle, 0, 0, 0) == 0, "ResetDecoder");
+    d.output_set = false;
+    Collected after = {0};
+    after.last_flag_at = -1;
+    int fed = 0;
+    for (int j = 5; j < S1.count && fed < 6; j++) {
+        feed(&d, &S1, S1.aus[j].data, S1.aus[j].size, j, -1, &after, 0);
+        fed++;
+        if (S1.aus[j].display == 5) break;
+    }
+    CHECK(after.count == 0, "after reset %d picture(s) left early after %d access units (stale last POC)", after.count,
+          fed);
+    finish(&d, &S1, &after, 0);
+    CHECK(after.count == fed, "after reset: %d pictures for %d access units", after.count, fed);
+    for (int k = 1; k < after.count && k < MAXN; k++)
+        CHECK(after.display[k] > after.display[k - 1], "after reset: output %d frame %d after %d", k, after.display[k],
+              after.display[k - 1]);
+    delete_dec(&d);
+}
+
+// An IDR that cannot be decoded still ends the previous sequence: held pictures come out first.
+static void test_idr_error_flush(void) {
+    Dec d;
+    create_dec(&d, 8, true);
+    Collected col = {0};
+    col.last_flag_at = -1;
+    feed(&d, &S1, S1.aus[0].data, S1.aus[0].size, 0, -1, &col, 0); // IDR, out at once
+    feed(&d, &S1, S1.aus[1].data, S1.aus[1].size, 1, -1, &col, 0); // a later frame, held
+    CHECK(col.count == 1, "precondition: %d pictures out before the bad IDR", col.count);
+    static const uint8_t bad_sps[] = {0x67, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    put_nal(&buf, &len, bad_sps, sizeof(bad_sps));
+    put_nal(&buf, &len, S2.pps, S2.pps_len);
+    const Au *k0 = &S2.aus[0];
+    size_t off = nth_start(k0, 4);
+    put(&buf, &len, k0->data + off, k0->size - off);
+    feed(&d, &S1, buf, len, 2, -1, &col, 0);
+    free(buf);
+    finish(&d, &S1, &col, 0);
+    CHECK(col.count == 3, "bad IDR: %d pictures", col.count);
+    CHECK(!col.error[0] && !col.error[1] && col.error[2], "bad IDR: error flags %d %d %d", col.error[0], col.error[1],
+          col.error[2]);
+    CHECK(col.display[1] == S1.aus[1].display, "bad IDR: the held frame came out as output %d", col.display[1]);
+    delete_dec(&d);
+}
+
 // libSceVideodec (TLOU's API) on S1: one picture per Decode/Flush, display order.
 static void test_videodec(void) {
     uint64_t cfg = galloc(0x30, 16), ri = galloc(0x40, 16), ctrl = galloc(0x18, 16);
@@ -945,6 +1054,9 @@ int main(void) {
     test_interleaved();
     test_error_pictures();
     test_delete_race();
+    test_reset_race();
+    test_reset_forgets_last_poc();
+    test_idr_error_flush();
     test_videodec();
     if (atomic_load(&failures)) {
         fprintf(stderr, "vdecsw_test: %d failure(s)\n", atomic_load(&failures));
