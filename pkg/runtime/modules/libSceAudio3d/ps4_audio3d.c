@@ -30,7 +30,9 @@
 //   SceAudioOutOutputParam [V] { +0 s32 handle; +8 void *ptr } (0x10)
 //
 // Object attributes [V ids and sizes from the game, I semantics]:
-//   1 PCM (0x18 struct)        mono grain(s) queued on the object
+//   1 PCM (0x18 struct)        mono grain(s) queued on the object; longer than
+//                              a grain is split, longer than queue_depth grains
+//                              INVALID_PARAMETER, no room NOT_READY
 //   2 PRIORITY (u32)           stored; every object is mixed, so unused
 //   3 POSITION (3 x float)     x right, y up, z forward [I axes]
 //   4 SPREAD (float)           angular width in radians [I unit]
@@ -68,6 +70,9 @@
 //   AudioOut port (type 126, FLOAT_8CH_STD, opened on first push). SYNC
 //   submits everything, each submission blocking on the AudioOut ring (device
 //   clock); ASYNC submits only what AudioOut accepts without blocking.
+//   No lock is held while blocked: PortClose / Terminate close the AudioOut
+//   ports (waking the submission), wait for it to leave, and the push returns
+//   INVALID_PORT.
 //   GetQueueLevel reports the waiting mixed grains and the free slots. In
 //   ADVANCE_NO_PUSH mode Advance submits like a SYNC push; NO_ADVANCE (the
 //   library advancing by itself) is not implemented: Advance/Push return
@@ -79,6 +84,9 @@
 //   object, NOT_READY for full queues, uninitialised library and double
 //   Initialize, NOT_SUPPORTED as above. A failing ObjectSetAttributes applies
 //   nothing (all attributes are validated first) [I].
+//   AudioOutOpen with an unknown data format is INVALID_PARAMETER; other
+//   failures of the underlying AudioOut open (e.g. PORT_FULL) pass through as
+//   AudioOut codes [I].
 //
 // Mixing: see ps4_audio3d_mix.c (pairwise constant-power 7.1 panner). The
 //   port mixes in 7.1; libSceAudioOut folds it to the stereo host device.
@@ -499,16 +507,43 @@ static void port_mix_grain(A3dPort *p) {
   p->advances++;
 }
 
-static __thread float *tl_buf;
-static __thread size_t tl_cap;
+// Per-thread copy buffer for submissions and bed conversion (grown on demand,
+// freed by the key destructor when the thread exits).
+typedef struct {
+  void *buf;
+  size_t cap;
+} A3dScratch;
+
+static pthread_key_t g_scratch_key;
+static pthread_once_t g_scratch_once = PTHREAD_ONCE_INIT;
+
+static void scratch_destroy(void *v) {
+  A3dScratch *s = (A3dScratch *)v;
+  free(s->buf);
+  free(s);
+}
+
+static void scratch_key_init(void) { pthread_key_create(&g_scratch_key, scratch_destroy); }
 
 static void *scratch(size_t bytes) {
-  if (bytes > tl_cap) {
-    free(tl_buf);
-    tl_buf = (float *)malloc(bytes);
-    tl_cap = tl_buf ? bytes : 0;
+  pthread_once(&g_scratch_once, scratch_key_init);
+  A3dScratch *s = (A3dScratch *)pthread_getspecific(g_scratch_key);
+  if (!s) {
+    s = (A3dScratch *)calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    if (pthread_setspecific(g_scratch_key, s) != 0) {
+      free(s);
+      return NULL;
+    }
   }
-  return tl_buf;
+  if (bytes > s->cap) {
+    void *n = malloc(bytes);
+    if (!n) return NULL;
+    free(s->buf);
+    s->buf = n;
+    s->cap = bytes;
+  }
+  return s->buf;
 }
 
 // Lock held on entry and exit; releases it around each blocking AudioOut
@@ -565,9 +600,11 @@ static int32_t port_submit_locked(A3dPort *p, uint32_t blocking) {
     pthread_mutex_lock(&g_lock);
     if (o < 0) r = o;
   }
+  // A port closed during the submission reports INVALID_PORT, whatever error the AudioOut
+  // submission it interrupted returned (NOT_OPENED / INVALID_PORT of the closed AudioOut port).
+  if (!p->open || p->gen != gen) r = PS4_AUDIO3D_ERROR_INVALID_PORT;
   p->pushing--;
   pthread_cond_broadcast(&g_cond);
-  if (r >= 0 && (!p->open || p->gen != gen)) r = PS4_AUDIO3D_ERROR_INVALID_PORT;
   return r < 0 ? r : 0;
 }
 
@@ -666,7 +703,7 @@ int32_t ps4_audio3d_object_unreserve(uint32_t port_id, uint32_t object_id) {
 }
 
 static int32_t validate_attribute(const A3dPort *p, const Ps4Audio3dAttribute *a, uintptr_t base,
-                                  uint32_t *pcm_grains) {
+                                  uint64_t *pcm_grains) {
   const void *v = a->value ? (const void *)(base + (uintptr_t)a->value) : NULL;
   float f;
   uint32_t u;
@@ -685,7 +722,12 @@ static int32_t validate_attribute(const A3dPort *p, const Ps4Audio3dAttribute *a
     if (sb & (pcm.format == PS4_AUDIO3D_FORMAT_FLOAT ? 3u : 1u)) {
       return PS4_AUDIO3D_ERROR_INVALID_PARAMETER;
     }
-    *pcm_grains += (pcm.num_samples + p->granularity - 1) / p->granularity;
+    // More samples than the whole object queue can hold can never be accepted. 64-bit
+    // arithmetic: num_samples + granularity would wrap near UINT32_MAX.
+    if ((uint64_t)pcm.num_samples > (uint64_t)p->queue_depth * p->granularity) {
+      return PS4_AUDIO3D_ERROR_INVALID_PARAMETER;
+    }
+    *pcm_grains += ((uint64_t)pcm.num_samples + p->granularity - 1) / p->granularity;
     return 0;
   }
   case PS4_AUDIO3D_ATTR_POSITION: {
@@ -766,12 +808,12 @@ int32_t ps4_audio3d_object_set_attributes(uint32_t port_id, uint32_t object_id, 
     r = PS4_AUDIO3D_ERROR_INVALID_OBJECT;
   } else {
     bool reset = false;
-    uint32_t grains = 0;
+    uint64_t grains = 0;
     for (uint64_t i = 0; i < num && r == 0; i++) {
       r = validate_attribute(p, &attrs[i], base, &grains);
       reset |= attrs[i].attribute_id == PS4_AUDIO3D_ATTR_RESET_STATE;
     }
-    if (r == 0 && (reset ? 0 : o->pcm_count) + grains > p->queue_depth) {
+    if (r == 0 && (reset ? 0 : (uint64_t)o->pcm_count) + grains > p->queue_depth) {
       r = PS4_AUDIO3D_ERROR_NOT_READY;
     }
     if (r == 0) {
@@ -851,7 +893,7 @@ int32_t ps4_audio3d_audioout_open(uint32_t port_id, int32_t user_id, int32_t typ
     if (slot == A3D_MAX_ASSOC) {
       r = PS4_AUDIO3D_ERROR_OUT_OF_RESOURCES;
     } else if (bytes == 0) {
-      r = PS4_AUDIO_OUT_ERROR_INVALID_FORMAT;
+      r = PS4_AUDIO3D_ERROR_INVALID_PARAMETER; // unknown AudioOut data format
     } else {
       A3dAssoc *a = &p->assoc[slot];
       uint8_t *pend = (uint8_t *)realloc(a->pending, (size_t)bytes * p->queue_depth);
@@ -922,8 +964,11 @@ int32_t ps4_audio3d_audioout_outputs(const Ps4Audio3dAudioOutParam *params, uint
     } else if (params[i].ptr &&
                ((base + (uintptr_t)params[i].ptr) & (a->is_float ? 3u : 1u)) != 0) {
       r = PS4_AUDIO3D_ERROR_INVALID_PARAMETER; // samples must be naturally aligned
-    } else if (a->pend_count >= p->queue_depth) {
-      r = PS4_AUDIO3D_ERROR_NOT_READY;
+    } else {
+      // Entries earlier in this call for the same handle also take a pending slot.
+      uint32_t adds = 1;
+      for (uint32_t j = 0; j < i; j++) adds += params[j].handle == params[i].handle;
+      if ((uint64_t)a->pend_count + adds > p->queue_depth) r = PS4_AUDIO3D_ERROR_NOT_READY;
     }
   }
   for (uint32_t i = 0; i < num && r == 0; i++) {

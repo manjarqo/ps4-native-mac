@@ -233,31 +233,63 @@ func (l *Arm64Lifter) EndBlock(last disasm.Instruction) []string {
 	return l.normalizeCarry()
 }
 
-// FallThrough returns the branch that continues a block at the fall-through address of its
-// last instruction when the code emitted next does not start there (next is the start of the
-// block emitted after this one, hasNext false at the end of the function). Blocks are emitted
-// in address order, and a branch into the middle of an instruction gives overlapping
-// instruction streams (see disasm.disasmBranchFollowing), so the block after this one in
-// address order can belong to the other stream. Returns nil when the next emitted block is
-// the successor, or when the last instruction never falls through. Call it after EndBlock:
-// the target starts in the block-boundary carry sense.
-func (l *Arm64Lifter) FallThrough(fn *disasm.Function, last disasm.Instruction, next uint64, hasNext bool) []string {
-	switch last.Inst.Op {
-	case x86asm.JMP, x86asm.RET, x86asm.LRET, x86asm.UD2:
-		return nil
+// localLabel returns the label of the block of fn that starts at target, or "" when target
+// is no block of fn.
+func localLabel(fn *disasm.Function, target uint64) string {
+	if fn == nil || fn.Blocks[target] == nil {
+		return ""
 	}
-	target := last.Address + uint64(last.Inst.Len)
-	if hasNext && next == target {
-		return nil
-	}
-	if fn != nil && fn.Blocks[target] != nil {
-		return []string{fmt.Sprintf("    b L_fn_0x%x_loc_0x%x", fn.EntryAddr, target)}
+	return fmt.Sprintf("L_fn_0x%x_loc_0x%x", fn.EntryAddr, target)
+}
+
+// branchTo returns the unconditional transfer to the direct branch target target: a branch to
+// its block when it is one of fn, a tail call when it is a known function entry, otherwise the
+// dispatcher (recomp_indirect_jump with x0 = target). The caller brings C into the
+// block-boundary sense first when CF is live at target.
+func (l *Arm64Lifter) branchTo(fn *disasm.Function, target uint64) []string {
+	if lbl := localLabel(fn, target); lbl != "" {
+		return []string{"    b " + lbl}
 	}
 	if l.IsKnownFunc(target) {
 		return []string{"    ldr x30, [sp], #16", fmt.Sprintf("    b _fn_0x%x", target)}
 	}
 	lines := loadImm64("x0", target)
 	return append(lines, "    ldr x30, [sp], #16", "    b _recomp_indirect_jump")
+}
+
+// fallsThrough reports whether control can continue after inst at the next instruction. The
+// set matches disasm.blockSuccessors: RET, LRET, UD2, HLT, JMP and INT end control flow, except
+// INT 0x41 (the Orbis debugger break), which the INT lowering below turns into a no-op.
+func fallsThrough(inst x86asm.Inst) bool {
+	switch inst.Op {
+	case x86asm.JMP, x86asm.RET, x86asm.LRET, x86asm.UD2, x86asm.HLT:
+		return false
+	case x86asm.INT:
+		imm, ok := inst.Args[0].(x86asm.Imm)
+		return ok && imm == 0x41
+	}
+	return true
+}
+
+// FallThrough returns the branch that continues a block at the fall-through address of its
+// last instruction when the code emitted next does not start there (next is the start of the
+// block emitted after this one, hasNext false at the end of the function). Blocks are emitted
+// in address order, and a branch into the middle of an instruction gives overlapping
+// instruction streams (see disasm.disasmBranchFollowing), so the block after this one in
+// address order can belong to the other stream. At the end of a function whose last decoded
+// instruction falls through (decoding stopped at a cap or a decode error), the continuation is
+// a tail jump to that address instead of a return. Returns nil when the next emitted block is
+// the successor, or when the last instruction never falls through. Call it after EndBlock:
+// the target starts in the block-boundary carry sense.
+func (l *Arm64Lifter) FallThrough(fn *disasm.Function, last disasm.Instruction, next uint64, hasNext bool) []string {
+	if !fallsThrough(last.Inst) {
+		return nil
+	}
+	target := last.Address + uint64(last.Inst.Len)
+	if hasNext && next == target {
+		return nil
+	}
+	return l.branchTo(fn, target)
 }
 
 // carryCond returns the ARM condition that is true when x86 CF == want, in the current sense.
@@ -1085,27 +1117,13 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 	case x86asm.JMP:
 		if rel, ok := args[0].(x86asm.Rel); ok {
 			target := uint64(int64(nextPC) + int64(rel))
-			if fn != nil && fn.Blocks[target] != nil {
-				if !inst.CarryDead {
-					lines = append(lines, l.normalizeCarry()...)
-				}
-				lines = append(lines, fmt.Sprintf("    b L_fn_0x%x_loc_0x%x", fn.EntryAddr, target))
-			} else {
-				// A target outside the function: a tail call to a function (flags dead, so the
-				// liveness pass marks CF dead) or, for a target that is no function entry, an
-				// unknown continuation that starts in the block-boundary sense.
-				if !inst.CarryDead {
-					lines = append(lines, l.normalizeCarry()...)
-				}
-				if l.IsKnownFunc(target) {
-					lines = append(lines, "    ldr x30, [sp], #16")
-					lines = append(lines, fmt.Sprintf("    b _fn_0x%x", target))
-				} else {
-					lines = append(lines, loadImm64("x0", target)...)
-					lines = append(lines, "    ldr x30, [sp], #16")
-					lines = append(lines, "    b _recomp_indirect_jump")
-				}
+			// A target outside the function is a tail call to a function (flags dead, so the
+			// liveness pass marks CF dead) or, for a target that is no function entry, an
+			// unknown continuation that starts in the block-boundary sense.
+			if !inst.CarryDead {
+				lines = append(lines, l.normalizeCarry()...)
 			}
+			lines = append(lines, l.branchTo(fn, target)...)
 			return lines, nil
 		}
 		// emitLocalJumpTable dispatches an indirect jump to a block of the function. The table
@@ -1915,21 +1933,14 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 			lines = append(lines, pre...)
 			if rel, ok := args[0].(x86asm.Rel); ok {
 				target := uint64(int64(nextPC) + int64(rel))
-				if fn != nil && fn.Blocks[target] != nil {
-					lines = append(lines, fmt.Sprintf("    b.%s L_fn_0x%x_loc_0x%x", cond, fn.EntryAddr, target))
+				if lbl := localLabel(fn, target); lbl != "" {
+					lines = append(lines, fmt.Sprintf("    b.%s %s", cond, lbl))
 				} else {
 					inv := invertArm64Cond(cond)
 					skipLabel := fmt.Sprintf("L_fn_0x%x_skip_%d", fn.EntryAddr, l.labelCounter)
 					l.labelCounter++
 					lines = append(lines, fmt.Sprintf("    b.%s %s", inv, skipLabel))
-					if l.IsKnownFunc(target) {
-						lines = append(lines, "    ldr x30, [sp], #16")
-						lines = append(lines, fmt.Sprintf("    b _fn_0x%x", target))
-					} else {
-						lines = append(lines, loadImm64("x0", target)...)
-						lines = append(lines, "    ldr x30, [sp], #16")
-						lines = append(lines, "    b _recomp_indirect_jump")
-					}
+					lines = append(lines, l.branchTo(fn, target)...)
 					lines = append(lines, fmt.Sprintf("%s:", skipLabel))
 				}
 				return lines, nil

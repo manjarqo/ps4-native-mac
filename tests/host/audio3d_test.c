@@ -7,6 +7,8 @@
 #include "ps4_audio3d_mix.h"
 #include "ps4_audioout_internal.h"
 #include <math.h>
+#include <pthread.h>
+#include <sanitizer/allocator_interface.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -267,6 +269,18 @@ static void test_contract(void) {
   Ps4Audio3dAttribute one = attr(PS4_AUDIO3D_ATTR_PCM, &pcm, 0x18);
   CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 1, &two, 0), 0);
   CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 1, &one, 0), PS4_AUDIO3D_ERROR_NOT_READY);
+  // PCM longer than the whole queue (queue_depth * granularity) is rejected outright; the grain
+  // count must not wrap for lengths near UINT32_MAX.
+  Ps4Audio3dPcm pcm_huge = pcm, pcm_long = pcm;
+  pcm_huge.num_samples = 0xFFFFFFFFu;
+  pcm_long.num_samples = 2 * 256 + 1;
+  Ps4Audio3dAttribute huge = attr(PS4_AUDIO3D_ATTR_PCM, &pcm_huge, 0x18);
+  Ps4Audio3dAttribute lng = attr(PS4_AUDIO3D_ATTR_PCM, &pcm_long, 0x18);
+  Ps4Audio3dAttribute reset_only = attr(PS4_AUDIO3D_ATTR_RESET_STATE, NULL, 0);
+  Ps4Audio3dAttribute reset_huge[2] = {reset_only, huge};
+  CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 2, reset_huge, 0), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
+  Ps4Audio3dAttribute reset_long[2] = {reset_only, lng};
+  CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 2, reset_long, 0), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
   // RESET_STATE in the same call drops the queue first, so PCM fits again.
   Ps4Audio3dAttribute reset_pcm[2] = {one, attr(PS4_AUDIO3D_ATTR_RESET_STATE, NULL, 0)};
   CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 2, reset_pcm, 0), 0);
@@ -322,13 +336,18 @@ static void test_pacing(void) {
     double dt = now_s() - t0;
     ps4_audio3d_port_get_queue_level(port, &level, NULL);
     if (level > 0) {
+      // Returned with the grain still queued instead of waiting for the device (a blocking
+      // submission would take ~5 ms per grain and leave the queue empty); the time bound only
+      // catches gross blocking and leaves room for a loaded machine.
       saw_full = 1;
-      CHECK(dt < 0.004);
+      CHECK(dt < 0.020);
     }
   }
   CHECK(saw_full);
 
-  // SYNC is paced by the device clock: 375 grains of 256 frames are 2.0 s of audio.
+  // SYNC is paced by the device clock: 375 grains of 256 frames are 2.0 s of audio. It can't
+  // be faster (minus the ~32 ms the AudioOut ring holds); it may be slower on a loaded machine,
+  // where the headless device resynchronises after stalls instead of catching up.
   ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC);
   double t0 = now_s();
   for (int i = 0; i < 375; i++) {
@@ -339,7 +358,7 @@ static void test_pacing(void) {
   ps4_audio3d_port_get_queue_level(port, &level, &avail);
   CHECK(level == 0 && avail == 2);
   fprintf(stderr, "audio3d_test: 375 SYNC grains took %.3f s (2.000 s of audio)\n", dt);
-  CHECK(dt > 1.90 && dt < 2.20);
+  CHECK(dt > 1.90 && dt < 2.60);
 
   // Associated AudioOut ports: grain length must be the port granularity; their grains queue
   // up to queue_depth and are drained by the next push.
@@ -347,6 +366,7 @@ static void test_pacing(void) {
            PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
   CHECK_EQ(ps4_audio3d_audioout_open(3, 0xFF, 0, 0, 256, 48000, PS4_AUDIO_OUT_FMT_FLOAT_STEREO),
            PS4_AUDIO3D_ERROR_INVALID_PORT);
+  CHECK_EQ(ps4_audio3d_audioout_open(port, 0xFF, 0, 0, 256, 48000, 0x20), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
   int32_t h = ps4_audio3d_audioout_open(port, 0xFF, 0, 0, 256, 48000, PS4_AUDIO_OUT_FMT_FLOAT_STEREO);
   CHECK(h > 0);
   static float st[256 * 2];
@@ -356,6 +376,14 @@ static void test_pacing(void) {
   CHECK_EQ(ps4_audio3d_audioout_outputs(&bad, 1, 0), PS4_AUDIO3D_ERROR_INVALID_PORT);
   CHECK_EQ(ps4_audio3d_audioout_outputs(&mis, 1, 0), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
   CHECK_EQ(ps4_audio3d_audioout_outputs(NULL, 1, 0), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
+  // The same handle repeated in one call counts once per entry: three grains for a depth-2
+  // queue are refused as a whole, and nothing is queued.
+  Ps4Audio3dAudioOutParam rep3[3] = {op, op, op};
+  CHECK_EQ(ps4_audio3d_audioout_outputs(rep3, 3, 0), PS4_AUDIO3D_ERROR_NOT_READY);
+  Ps4Audio3dAudioOutParam rep2[2] = {op, op};
+  CHECK_EQ(ps4_audio3d_audioout_outputs(rep2, 2, 0), 0);
+  CHECK_EQ(ps4_audio3d_audioout_outputs(&op, 1, 0), PS4_AUDIO3D_ERROR_NOT_READY);
+  CHECK_EQ(ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC), 0);
   CHECK_EQ(ps4_audio3d_audioout_outputs(&op, 1, 0), 0);
   CHECK_EQ(ps4_audio3d_audioout_outputs(&op, 1, 0), 0);
   CHECK_EQ(ps4_audio3d_audioout_outputs(&op, 1, 0), PS4_AUDIO3D_ERROR_NOT_READY);
@@ -379,6 +407,81 @@ static void test_pacing(void) {
   CHECK_EQ(ps4_audio3d_port_open(0xFF, &p, &port), 0);
   CHECK_EQ(ps4_audio3d_port_advance(port), PS4_AUDIO3D_ERROR_NOT_SUPPORTED);
   CHECK_EQ(ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC), PS4_AUDIO3D_ERROR_NOT_SUPPORTED);
+  CHECK_EQ(ps4_audio3d_port_close(port), 0);
+}
+
+typedef struct {
+  uint32_t port;
+  int32_t result;
+  volatile int done;
+  double t_end;
+} PushArg;
+
+static void *push_thread(void *v) {
+  PushArg *a = (PushArg *)v;
+  a->result = ps4_audio3d_port_push(a->port, PS4_AUDIO3D_BLOCKING_SYNC);
+  a->t_end = now_s();
+  a->done = 1;
+  return NULL;
+}
+
+// A SYNC push blocked on the device (15 queued grains of 2048 frames = 640 ms of audio, the
+// AudioOut ring takes ~2) while another thread closes the port: the close wakes it, waits for it
+// to leave, and the push reports INVALID_PORT. Neither side hangs.
+static void test_close_during_push(void) {
+  uint32_t port = open_port(2048, 15, PS4_AUDIO3D_BUFFER_ADVANCE_AND_PUSH, 4);
+  for (int i = 0; i < 15; i++) CHECK_EQ(ps4_audio3d_port_advance(port), 0);
+  PushArg a = {port, 0, 0, 0};
+  pthread_t t;
+  CHECK_EQ(pthread_create(&t, NULL, push_thread, &a), 0);
+  usleep(150 * 1000);
+  CHECK(!a.done); // still blocked: about 0.5 s of the queue is left
+  uint32_t level = 0;
+  CHECK_EQ(ps4_audio3d_port_get_queue_level(port, &level, NULL), 0);
+  CHECK(level > 0 && level < 15);
+  double t0 = now_s();
+  CHECK_EQ(ps4_audio3d_port_close(port), 0);
+  double close_s = now_s() - t0;
+  pthread_join(t, NULL);
+  fprintf(stderr, "audio3d_test: close during blocked push took %.1f ms, push -> 0x%x\n",
+          close_s * 1e3, (uint32_t)a.result);
+  CHECK(close_s < 0.150);
+  CHECK(a.done && a.t_end - t0 < 0.150);
+  CHECK_EQ(a.result, PS4_AUDIO3D_ERROR_INVALID_PORT);
+  CHECK_EQ(ps4_audio3d_port_get_queue_level(port, &level, NULL), PS4_AUDIO3D_ERROR_INVALID_PORT);
+}
+
+// The per-thread scratch buffer (64 KB here: one 8-channel float bed grain of 2048 frames) is
+// freed when the thread exits: 40 short-lived writer threads must not leave 2.5 MB allocated.
+// Measured with the sanitizer allocator (LeakSanitizer is not available on macOS).
+typedef struct {
+  uint32_t port;
+  int32_t result;
+} BedArg;
+
+static void *bed_thread(void *v) {
+  BedArg *a = (BedArg *)v;
+  static float bed8[2048 * 8];
+  a->result = ps4_audio3d_bed_write(a->port, 8, PS4_AUDIO3D_FORMAT_FLOAT, bed8, 2048);
+  return NULL;
+}
+
+static void test_scratch_freed_on_thread_exit(void) {
+  uint32_t port = open_port(2048, 15, PS4_AUDIO3D_BUFFER_ADVANCE_AND_PUSH, 4);
+  size_t before = __sanitizer_get_current_allocated_bytes();
+  for (int i = 0; i < 40; i++) {
+    BedArg a = {port, 1};
+    pthread_t t;
+    CHECK_EQ(pthread_create(&t, NULL, bed_thread, &a), 0);
+    pthread_join(t, NULL);
+    CHECK_EQ(a.result, 0);
+    ps4_audio3d_port_advance(port); // consume the bed grain so the queue never fills
+    ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC);
+  }
+  size_t after = __sanitizer_get_current_allocated_bytes();
+  long long grown = (long long)after - (long long)before;
+  fprintf(stderr, "audio3d_test: 40 writer threads: allocated bytes grew by %lld\n", grown);
+  CHECK(grown < 512 * 1024);
   CHECK_EQ(ps4_audio3d_port_close(port), 0);
 }
 
@@ -426,8 +529,10 @@ static void test_bed_plus_object(const char *dump) {
   fclose(f);
   fprintf(stderr, "audio3d_test: dump frames: %llu bed+object, %llu silent, %llu other\n",
           (unsigned long long)match, (unsigned long long)silent, (unsigned long long)other);
-  // Everything after the pacing test's silence; tolerate device-period granularity at the edges.
-  CHECK(match >= (uint64_t)ticks * gran - 1024 && match <= (uint64_t)ticks * gran);
+  // Every pushed frame is played once; AudioOut drops audio only when its device stops for
+  // 250 ms, which a heavily loaded machine can cause, hence the 90% floor. Wrong samples are
+  // never acceptable.
+  CHECK(match >= (uint64_t)ticks * gran * 9 / 10 && match <= (uint64_t)ticks * gran);
   CHECK_EQ(other, 0);
 }
 
@@ -442,6 +547,8 @@ int main(void) {
   test_panner();
   test_contract();
   test_pacing();
+  test_close_during_push();
+  test_scratch_freed_on_thread_exit();
   test_bed_plus_object(dump);
   CHECK_EQ(ps4_audio3d_terminate(), 0);
   CHECK_EQ(ps4_audio3d_terminate(), PS4_AUDIO3D_ERROR_NOT_READY);

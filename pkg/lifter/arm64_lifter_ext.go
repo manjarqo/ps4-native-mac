@@ -589,16 +589,10 @@ func (l *Arm64Lifter) liftLoop(inst disasm.Instruction, nextPC uint64, fn *disas
 	if !inst.CarryDead {
 		lines = append(lines, l.normalizeCarry()...)
 	}
-	local := fn != nil && fn.Blocks[target] != nil
-	localLbl := ""
-	if local {
-		localLbl = fmt.Sprintf("L_fn_0x%x_loc_0x%x", fn.EntryAddr, target)
-	}
+	localLbl := localLabel(fn, target)
+	local := localLbl != ""
 	skip := fmt.Sprintf("L_%s_skip_%x", strings.ToLower(op.String()), inst.Address)
-	far := func() {
-		lines = append(lines, loadImm64("x0", target)...)
-		lines = append(lines, "    ldr  x30, [sp], #16", "    b    _recomp_indirect_jump")
-	}
+	far := func() { lines = append(lines, l.branchTo(fn, target)...) }
 
 	switch op {
 	case x86asm.LOOP:
