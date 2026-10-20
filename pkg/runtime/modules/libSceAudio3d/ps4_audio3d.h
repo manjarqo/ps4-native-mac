@@ -84,6 +84,22 @@ typedef struct {
   uint64_t ptr; // guest pointer
 } Ps4Audio3dAudioOutParam;
 
+// Cumulative signal levels of a port since it was opened (always maintained; read by tests and
+// by the PS4_AUDIO_LOG statistics). Sums of squares are over every channel sample.
+//   objects: the panned object mix alone (PortAdvance), object_frames frames of 8 channels;
+//   bed:     the BedWrite beds alone, mixed in the same advances;
+//   mix:     the port's own output grain (objects + bed) that PortPush submits;
+//   buses:   the grains the game queued on its associated AudioOut ports
+//            (sceAudio3dAudioOutOutputs), bus_samples channel samples.
+typedef struct {
+  uint64_t advances;
+  uint64_t object_grains; // object PCM grains consumed by advances
+  uint64_t frames;        // frames mixed by advances (granularity each)
+  double object_sq, bed_sq, mix_sq;
+  uint64_t bus_grains, bus_samples;
+  double bus_sq;
+} Ps4Audio3dLevels;
+
 // Host API. Guest pointers embedded in guest structures (attribute values, PCM
 // buffers, AudioOut buffers) are translated as base + pointer; tests pass 0.
 int32_t ps4_audio3d_initialize(int64_t reserved);
@@ -108,6 +124,7 @@ int32_t ps4_audio3d_audioout_open(uint32_t port_id, int32_t user_id, int32_t typ
 int32_t ps4_audio3d_audioout_close(int32_t handle);
 int32_t ps4_audio3d_audioout_outputs(const Ps4Audio3dAudioOutParam *params, uint32_t num,
                                      uintptr_t base);
+int32_t ps4_audio3d_port_get_levels(uint32_t port_id, Ps4Audio3dLevels *out);
 
 // Guest shims
 void shim_sceAudio3dInitialize(GuestContext *ctx);

@@ -536,6 +536,120 @@ static void test_bed_plus_object(const char *dump) {
   CHECK_EQ(other, 0);
 }
 
+// Replays Uncharted 4's Audio3d calls with the exact attribute arrays of its pump
+// (brbDriverBase::Pump3D, eboot 0x15e680-0x15f23b; see audio3dmix-report.md): a port of 10
+// objects (2 passthrough + 8 ambisonic, no dynamic objects), the 8-channel speaker bus on an
+// associated MAIN AudioOut port, and per tick
+//   passthrough L/R: {GAIN, PRIORITY 0, PASSTHROUGH 1/2, PCM float 1024}
+//   ambisonic channel: {GAIN, PRIORITY 0, AMBISONICS ch, PCM}   (only if AMBISONICS is advertised)
+//   dynamic object: {POSITION, SPREAD, GAIN, PRIORITY, PASSTHROUGH 0, PCM [, RESET_STATE NULL/0]}
+//   AudioOutOutputs -> PortAdvance -> PortPush(SYNC).
+// Checks where each signal is accounted (Ps4Audio3dLevels) and that the objects are mixed with
+// the expected gains.
+static void test_u4_call_shapes(void) {
+  enum { GRAN = 1024 };
+  uint32_t port = open_port(GRAN, 2, PS4_AUDIO3D_BUFFER_ADVANCE_AND_PUSH, 10);
+  float reverb = 0.0f;
+  CHECK_EQ(ps4_audio3d_port_set_attribute(port, PS4_AUDIO3D_PORT_ATTR_LATE_REVERB_LEVEL, &reverb, 4), 0);
+  uint32_t obj[10];
+  for (int i = 0; i < 10; i++) CHECK_EQ(ps4_audio3d_object_reserve(port, &obj[i]), 0);
+  uint32_t extra;
+  CHECK_EQ(ps4_audio3d_object_reserve(port, &extra), PS4_AUDIO3D_ERROR_OUT_OF_RESOURCES);
+  int32_t main_h = ps4_audio3d_audioout_open(port, 0xFF, 0, 0, GRAN, 48000, 7);
+  CHECK(main_h > 0);
+
+  static float bus[GRAN * 8], pt_l[GRAN], pt_r[GRAN], dyn[GRAN];
+  for (int f = 0; f < GRAN; f++) {
+    bus[f * 8 + 0] = 0.2f; // the game mixes "Auto (2.0ch)" into FL / FR of the 8-channel bus
+    bus[f * 8 + 1] = -0.1f;
+  }
+  const float master = 0.891251f; // [driver+0x60], the passthrough gain U4 sends
+  const uint32_t zero = 0, left = PS4_A3D_PASSTHROUGH_LEFT, right = PS4_A3D_PASSTHROUGH_RIGHT;
+  Ps4Audio3dPcm pcm_l = {PS4_AUDIO3D_FORMAT_FLOAT, 0, (uint64_t)(uintptr_t)pt_l, GRAN, 0};
+  Ps4Audio3dPcm pcm_r = {PS4_AUDIO3D_FORMAT_FLOAT, 0, (uint64_t)(uintptr_t)pt_r, GRAN, 0};
+  Ps4Audio3dAttribute pl[4] = {attr(PS4_AUDIO3D_ATTR_GAIN, &master, 4),
+                               attr(PS4_AUDIO3D_ATTR_PRIORITY, &zero, 4),
+                               attr(PS4_AUDIO3D_ATTR_PASSTHROUGH, &left, 4),
+                               attr(PS4_AUDIO3D_ATTR_PCM, &pcm_l, 0x18)};
+  Ps4Audio3dAttribute pr[4] = {attr(PS4_AUDIO3D_ATTR_GAIN, &master, 4),
+                               attr(PS4_AUDIO3D_ATTR_PRIORITY, &zero, 4),
+                               attr(PS4_AUDIO3D_ATTR_PASSTHROUGH, &right, 4),
+                               attr(PS4_AUDIO3D_ATTR_PCM, &pcm_r, 0x18)};
+  Ps4Audio3dAudioOutParam out = {main_h, 0, (uint64_t)(uintptr_t)bus};
+  Ps4Audio3dLevels lv0, lv1, lv2, lv3;
+
+  // 1. TV output as observed in chapter 1: silent passthrough PCM, the whole mix on the bus.
+  CHECK_EQ(ps4_audio3d_port_get_levels(port, &lv0), 0);
+  for (int t = 0; t < 4; t++) {
+    CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[0], 4, pl, 0), 0);
+    CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 4, pr, 0), 0);
+    CHECK_EQ(ps4_audio3d_audioout_outputs(&out, 1, 0), 0);
+    CHECK_EQ(ps4_audio3d_port_advance(port), 0);
+    CHECK_EQ(ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC), 0);
+  }
+  CHECK_EQ(ps4_audio3d_port_get_levels(port, &lv1), 0);
+  CHECK_EQ(lv1.advances - lv0.advances, 4);
+  CHECK_EQ(lv1.object_grains - lv0.object_grains, 8);
+  CHECK_EQ(lv1.frames - lv0.frames, 4 * GRAN);
+  CHECK(lv1.object_sq - lv0.object_sq == 0.0 && lv1.mix_sq - lv0.mix_sq == 0.0);
+  CHECK_EQ(lv1.bus_grains - lv0.bus_grains, 4);
+  CHECK_EQ(lv1.bus_samples - lv0.bus_samples, 4 * GRAN * 8);
+  const double bus_want = 4.0 * GRAN * (0.2 * 0.2 + 0.1 * 0.1);
+  CHECK(fabs((lv1.bus_sq - lv0.bus_sq) - bus_want) < bus_want * 1e-6);
+
+  // 2. Non-zero passthrough PCM reaches the port mix at the master gain, L -> FL, R -> FR.
+  for (int f = 0; f < GRAN; f++) {
+    pt_l[f] = 0.5f;
+    pt_r[f] = -0.25f;
+  }
+  for (int t = 0; t < 3; t++) {
+    CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[0], 4, pl, 0), 0);
+    CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[1], 4, pr, 0), 0);
+    CHECK_EQ(ps4_audio3d_audioout_outputs(&out, 1, 0), 0);
+    CHECK_EQ(ps4_audio3d_port_advance(port), 0);
+    CHECK_EQ(ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC), 0);
+  }
+  CHECK_EQ(ps4_audio3d_port_get_levels(port, &lv2), 0);
+  const double pt_want = 3.0 * GRAN * ((0.5 * master) * (0.5 * master) + (0.25 * master) * (0.25 * master));
+  CHECK(fabs((lv2.object_sq - lv1.object_sq) - pt_want) < pt_want * 1e-6);
+  CHECK(fabs((lv2.mix_sq - lv1.mix_sq) - pt_want) < pt_want * 1e-6);
+  CHECK_EQ(lv2.bed_sq - lv1.bed_sq, 0);
+
+  // 3. The ambisonic-channel call is refused (AMBISONICS is not advertised) and queues nothing.
+  const uint32_t amb_ch = 0;
+  Ps4Audio3dAttribute amb[4] = {attr(PS4_AUDIO3D_ATTR_GAIN, &master, 4),
+                                attr(PS4_AUDIO3D_ATTR_PRIORITY, &zero, 4),
+                                attr(PS4_AUDIO3D_ATTR_AMBISONICS, &amb_ch, 4),
+                                attr(PS4_AUDIO3D_ATTR_PCM, &pcm_l, 0x18)};
+  CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[2], 4, amb, 0), PS4_AUDIO3D_ERROR_NOT_SUPPORTED);
+
+  // 4. A dynamic object in U4's layout, with the trailing RESET_STATE {7, NULL, 0} the pump adds
+  //    when its reset flag is set: 1 m straight ahead -> FC only, gain applied once.
+  for (int f = 0; f < GRAN; f++) dyn[f] = 0.4f;
+  const float pos[3] = {0.0f, 0.0f, 1.0f}, spread = 0.0f, gain = 0.5f;
+  Ps4Audio3dPcm pcm_d = {PS4_AUDIO3D_FORMAT_FLOAT, 0, (uint64_t)(uintptr_t)dyn, GRAN, 0};
+  Ps4Audio3dAttribute da[7] = {attr(PS4_AUDIO3D_ATTR_POSITION, pos, 12),
+                               attr(PS4_AUDIO3D_ATTR_SPREAD, &spread, 4),
+                               attr(PS4_AUDIO3D_ATTR_GAIN, &gain, 4),
+                               attr(PS4_AUDIO3D_ATTR_PRIORITY, &zero, 4),
+                               attr(PS4_AUDIO3D_ATTR_PASSTHROUGH, &zero, 4),
+                               attr(PS4_AUDIO3D_ATTR_PCM, &pcm_d, 0x18),
+                               attr(PS4_AUDIO3D_ATTR_RESET_STATE, NULL, 0)};
+  CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[3], 7, da, 0), 0);
+  CHECK_EQ(ps4_audio3d_port_advance(port), 0);
+  CHECK_EQ(ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC), 0);
+  CHECK_EQ(ps4_audio3d_port_get_levels(port, &lv3), 0);
+  CHECK_EQ(lv3.object_grains - lv2.object_grains, 1);
+  const double dyn_want = GRAN * (0.4 * 0.5) * (0.4 * 0.5);
+  CHECK(fabs((lv3.object_sq - lv2.object_sq) - dyn_want) < dyn_want * 1e-6);
+
+  Ps4Audio3dLevels none;
+  CHECK_EQ(ps4_audio3d_port_get_levels(port + 1, &none), PS4_AUDIO3D_ERROR_INVALID_PORT);
+  CHECK_EQ(ps4_audio3d_port_get_levels(port, NULL), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
+  CHECK_EQ(ps4_audio3d_audioout_close(main_h), 0);
+  CHECK_EQ(ps4_audio3d_port_close(port), 0);
+}
+
 int main(void) {
   char dump[] = "/tmp/audio3d_test_XXXXXX";
   int fd = mkstemp(dump);
@@ -550,6 +664,7 @@ int main(void) {
   test_close_during_push();
   test_scratch_freed_on_thread_exit();
   test_bed_plus_object(dump);
+  test_u4_call_shapes();
   CHECK_EQ(ps4_audio3d_terminate(), 0);
   CHECK_EQ(ps4_audio3d_terminate(), PS4_AUDIO3D_ERROR_NOT_READY);
   CHECK_EQ(ps4_audio3d_port_advance(0), PS4_AUDIO3D_ERROR_INVALID_PORT);

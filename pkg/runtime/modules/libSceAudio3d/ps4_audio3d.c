@@ -91,7 +91,22 @@
 // Mixing: see ps4_audio3d_mix.c (pairwise constant-power 7.1 panner). The
 //   port mixes in 7.1; libSceAudioOut folds it to the stereo host device.
 //
-// Debug: PS4_AUDIO_LOG=1 logs per-port statistics every ~2 s.
+// Uncharted 4 routing [V, eboot 0x159a31-0x15f322 and runtime traces in chapter 1]:
+//   Initialize3D(dynamic = 0 from its driver config, ambisonics = 1) opens the port with
+//   max_objects = dynamic + 8 * ambisonics + 2 = 10 and reserves 2 passthrough + 8 ambisonic
+//   objects; no dynamic (positional) object is ever reserved. The game's own mixer renders the
+//   whole speaker mix (dialogue, effects, music) into an 8-channel bus that goes through
+//   sceAudio3dAudioOutOutputs to the associated MAIN AudioOut port. Only when
+//   PortGetAttributesSupported lists AMBISONICS would that bus be sent as the 8 ambisonic
+//   objects instead. The passthrough pair always gets PCM, which stays zero in every observed
+//   mode (Television ... Stereo Headphones). So for U4 the port's object mix is silent by
+//   design and bus_rms carries the sound.
+//
+// Debug: PS4_AUDIO_LOG=1 logs per-port statistics every ~2 s: object_rms (objects alone),
+//   bed_rms (BedWrite), mix_rms (the port's own grain), bus_rms (associated AudioOut buses).
+//   PS4_AUDIO_LOG=2 adds per-object and per-bus statistics, the first 64 ObjectSetAttributes
+//   calls with every attribute decoded, reserve / unreserve calls and the first failures of
+//   Advance / Push / Outputs. ps4_audio3d_port_get_levels returns the cumulative levels.
 
 #include "ps4_audio3d.h"
 #include "ps4_audio3d_mix.h"
@@ -122,6 +137,12 @@ typedef struct {
   uint32_t output_route;
   float *pcm; // queue_depth grains of granularity mono samples
   uint32_t pcm_read, pcm_count;
+  // statistics (PS4_AUDIO_LOG=2), reset every log interval
+  uint64_t st_calls, st_fails, st_pcm_samples;
+  int32_t st_last_err;
+  uint32_t st_pcm_format, st_pcm_len;
+  double st_in_sq;
+  float st_in_peak;
 } A3dObject;
 
 typedef struct {
@@ -130,6 +151,11 @@ typedef struct {
   bool is_float;
   uint8_t *pending; // queue_depth grains
   uint32_t pend_read, pend_count;
+  uint32_t param, channels;
+  // statistics (PS4_AUDIO_LOG=2)
+  uint64_t st_grains, st_null, st_samples;
+  double st_sq;
+  float st_peak;
 } A3dAssoc;
 
 typedef struct {
@@ -149,10 +175,10 @@ typedef struct {
   A3dAssoc assoc[A3D_MAX_ASSOC];
   uint32_t pushing; // threads inside a submission with the lock released
   // statistics (PS4_AUDIO_LOG)
-  uint64_t advances, pushes, grains_out, obj_grains;
-  double out_sq;
-  float out_peak;
-  uint64_t out_frames;
+  uint64_t pushes, grains_out;
+  Ps4Audio3dLevels lv;      // cumulative, see ps4_audio3d.h
+  Ps4Audio3dLevels lv_log;  // snapshot at the last PS4_AUDIO_LOG line
+  float out_peak;           // since the last log line
   uint64_t last_log_us;
 } A3dPort;
 
@@ -162,14 +188,20 @@ static bool g_initialized;
 static uint32_t g_gen;
 static A3dPort g_ports[A3D_MAX_PORTS];
 static int g_log = -1;
+static uint32_t g_trace_left = 64; // PS4_AUDIO_LOG=2: first calls logged in full
 
-static bool a3d_log(void) {
+// PS4_AUDIO_LOG: 0 off, 1 port statistics, 2 also per-object / per-bus
+// statistics and the first ObjectSetAttributes / Outputs calls in full.
+static int a3d_log_level(void) {
   if (g_log < 0) {
     const char *e = getenv("PS4_AUDIO_LOG");
-    g_log = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    g_log = (e && *e && strcmp(e, "0") != 0) ? (atoi(e) >= 2 ? 2 : 1) : 0;
   }
-  return g_log == 1;
+  return g_log;
 }
+
+static bool a3d_log(void) { return a3d_log_level() >= 1; }
+static bool a3d_verbose(void) { return a3d_log_level() >= 2; }
 
 static uint64_t now_us(void) {
   struct timespec ts;
@@ -226,17 +258,57 @@ static void port_stats_maybe_log(uint32_t id, A3dPort *p) {
   p->last_log_us = t;
   uint32_t active = 0;
   for (uint32_t i = 0; i < p->max_objects; i++) active += p->objects[i].id != 0;
-  double rms = p->out_frames ? sqrt(p->out_sq / ((double)p->out_frames * A3D_OUT_CH)) : 0.0;
+  // Interval levels. objects / bed / mix are the port's own grain; buses are what the game sent
+  // to its associated AudioOut ports (Uncharted 4 puts its whole speaker mix there, so a zero
+  // object mix with non-zero buses is that game's normal state).
+  const Ps4Audio3dLevels *c = &p->lv, *l = &p->lv_log;
+  const double n = (double)(c->frames - l->frames) * A3D_OUT_CH;
+  const double nb = (double)(c->bus_samples - l->bus_samples);
+  const double obj = n > 0 ? sqrt((c->object_sq - l->object_sq) / n) : 0.0;
+  const double bed = n > 0 ? sqrt((c->bed_sq - l->bed_sq) / n) : 0.0;
+  const double mix = n > 0 ? sqrt((c->mix_sq - l->mix_sq) / n) : 0.0;
+  const double bus = nb > 0 ? sqrt((c->bus_sq - l->bus_sq) / nb) : 0.0;
   fprintf(stderr,
           "[Audio3d] port %u: advances=%llu pushes=%llu grains_out=%llu objects=%u "
-          "object_grains=%llu mix_rms=%.5f mix_peak=%.5f queue=%u/%u\n",
-          id, (unsigned long long)p->advances, (unsigned long long)p->pushes,
-          (unsigned long long)p->grains_out, active, (unsigned long long)p->obj_grains, rms,
-          p->out_peak, p->mix_count, p->queue_depth);
-  p->out_sq = 0.0;
+          "object_grains=%llu object_rms=%.5f bed_rms=%.5f mix_rms=%.5f mix_peak=%.5f "
+          "bus_grains=%llu bus_rms=%.5f queue=%u/%u\n",
+          id, (unsigned long long)c->advances, (unsigned long long)p->pushes,
+          (unsigned long long)p->grains_out, active,
+          (unsigned long long)(c->object_grains - l->object_grains), obj, bed, mix, p->out_peak,
+          (unsigned long long)(c->bus_grains - l->bus_grains), bus, p->mix_count, p->queue_depth);
+  p->lv_log = p->lv;
   p->out_peak = 0.0f;
-  p->out_frames = 0;
-  p->obj_grains = 0;
+  if (a3d_verbose()) {
+    for (uint32_t i = 0; i < p->max_objects; i++) {
+      A3dObject *o = &p->objects[i];
+      if (!o->id) continue;
+      double in_rms = o->st_pcm_samples ? sqrt(o->st_in_sq / (double)o->st_pcm_samples) : 0.0;
+      fprintf(stderr,
+              "[Audio3d]   object 0x%x: set_calls=%llu fails=%llu last_err=0x%x gain=%.4f "
+              "pos=(%.2f %.2f %.2f) spread=%.3f passthrough=%u priority=%u pcm_fmt=%u "
+              "pcm_len=%u pcm_samples=%llu in_rms=%.5f in_peak=%.5f queued=%u\n",
+              o->id, (unsigned long long)o->st_calls, (unsigned long long)o->st_fails,
+              (uint32_t)o->st_last_err, o->pan.gain, o->pan.pos[0], o->pan.pos[1], o->pan.pos[2],
+              o->pan.spread, o->pan.passthrough, o->priority, o->st_pcm_format, o->st_pcm_len,
+              (unsigned long long)o->st_pcm_samples, in_rms, o->st_in_peak, o->pcm_count);
+      o->st_calls = o->st_fails = o->st_pcm_samples = 0;
+      o->st_in_sq = 0.0;
+      o->st_in_peak = 0.0f;
+    }
+    for (uint32_t i = 0; i < A3D_MAX_ASSOC; i++) {
+      A3dAssoc *a = &p->assoc[i];
+      if (a->handle <= 0) continue;
+      double rms = a->st_samples ? sqrt(a->st_sq / (double)a->st_samples) : 0.0;
+      fprintf(stderr,
+              "[Audio3d]   audioout handle %d (param 0x%x, %u ch): grains=%llu null=%llu "
+              "in_rms=%.5f in_peak=%.5f\n",
+              a->handle, a->param, a->channels, (unsigned long long)a->st_grains,
+              (unsigned long long)a->st_null, rms, a->st_peak);
+      a->st_grains = a->st_null = a->st_samples = 0;
+      a->st_sq = 0.0;
+      a->st_peak = 0.0f;
+    }
+  }
 }
 
 // ---------------------------------------------------------------- library
@@ -470,17 +542,19 @@ int32_t ps4_audio3d_port_get_queue_level(uint32_t port_id, uint32_t *level, uint
 
 // ---------------------------------------------------------------- mixing
 
-// Lock held. Mixes one grain into the port queue (caller checked room).
+static double sum_sq(const float *v, size_t n) {
+  double s = 0.0;
+  for (size_t i = 0; i < n; i++) s += (double)v[i] * v[i];
+  return s;
+}
+
+// Lock held. Mixes one grain into the port queue (caller checked room): the objects first (so
+// their level can be measured alone), then the bed.
 static void port_mix_grain(A3dPort *p) {
   const uint32_t gran = p->granularity;
-  float *dst = p->mixed + ((p->mix_read + p->mix_count) % p->queue_depth) * grain_floats(p);
-  memset(dst, 0, grain_floats(p) * sizeof(float));
-  if (p->bed_count) {
-    const float *b = p->bed + p->bed_read * grain_floats(p);
-    for (size_t i = 0; i < grain_floats(p); i++) dst[i] += b[i];
-    p->bed_read = (p->bed_read + 1) % p->queue_depth;
-    p->bed_count--;
-  }
+  const size_t nf = grain_floats(p);
+  float *dst = p->mixed + ((p->mix_read + p->mix_count) % p->queue_depth) * nf;
+  memset(dst, 0, nf * sizeof(float));
   for (uint32_t s = 0; s < p->max_objects; s++) {
     A3dObject *o = &p->objects[s];
     if (!o->id || !o->pcm_count) continue;
@@ -489,22 +563,30 @@ static void port_mix_grain(A3dPort *p) {
     ps4_a3d_mix_mono(dst, A3D_OUT_CH, o->pcm + (size_t)o->pcm_read * gran, gran, g);
     o->pcm_read = (o->pcm_read + 1) % p->queue_depth;
     o->pcm_count--;
-    p->obj_grains++;
+    p->lv.object_grains++;
     if (o->unreserved && o->pcm_count == 0) {
       o->id = 0;
       p->object_count--;
     }
   }
+  p->lv.object_sq += sum_sq(dst, nf);
+  if (p->bed_count) {
+    const float *b = p->bed + p->bed_read * nf;
+    p->lv.bed_sq += sum_sq(b, nf);
+    for (size_t i = 0; i < nf; i++) dst[i] += b[i];
+    p->bed_read = (p->bed_read + 1) % p->queue_depth;
+    p->bed_count--;
+  }
+  p->lv.mix_sq += sum_sq(dst, nf);
   if (a3d_log()) {
-    for (size_t i = 0; i < grain_floats(p); i++) {
+    for (size_t i = 0; i < nf; i++) {
       float a = fabsf(dst[i]);
       if (a > p->out_peak) p->out_peak = a;
-      p->out_sq += (double)dst[i] * dst[i];
     }
-    p->out_frames += gran;
   }
+  p->lv.frames += gran;
+  p->lv.advances++;
   p->mix_count++;
-  p->advances++;
 }
 
 // Per-thread copy buffer for submissions and bed conversion (grown on demand,
@@ -772,11 +854,21 @@ static void apply_attribute(const A3dPort *p, A3dObject *o, const Ps4Audio3dAttr
     const uint8_t *src = (const uint8_t *)(base + (uintptr_t)pcm.sample_buffer);
     const uint32_t ssize = pcm.format == PS4_AUDIO3D_FORMAT_FLOAT ? 4 : 2;
     uint32_t left = pcm.num_samples;
+    o->st_pcm_format = pcm.format;
+    o->st_pcm_len = pcm.num_samples;
     while (left > 0) {
       uint32_t n = left < p->granularity ? left : p->granularity;
       float *dst = o->pcm + (size_t)((o->pcm_read + o->pcm_count) % p->queue_depth) * p->granularity;
       ps4_a3d_convert(dst, src, pcm.format, n);
       if (n < p->granularity) memset(dst + n, 0, (size_t)(p->granularity - n) * sizeof(float));
+      if (a3d_verbose()) {
+        for (uint32_t i = 0; i < n; i++) {
+          float m = fabsf(dst[i]);
+          if (m > o->st_in_peak) o->st_in_peak = m;
+          o->st_in_sq += (double)dst[i] * dst[i];
+        }
+        o->st_pcm_samples += n;
+      }
       o->pcm_count++;
       src += (size_t)n * ssize;
       left -= n;
@@ -794,6 +886,40 @@ static void apply_attribute(const A3dPort *p, A3dObject *o, const Ps4Audio3dAttr
   }
 }
 
+// PS4_AUDIO_LOG=2: one ObjectSetAttributes call with every attribute decoded.
+static void trace_set_attributes(uint32_t port_id, uint32_t object_id, uint64_t num,
+                                 const Ps4Audio3dAttribute *attrs, uintptr_t base, int32_t r,
+                                 uint64_t bad) {
+  char line[1024];
+  int n = snprintf(line, sizeof(line), "[Audio3d] ObjectSetAttributes(port %u, obj 0x%x, n %llu) -> 0x%x",
+                   port_id, object_id, (unsigned long long)num, (uint32_t)r);
+  for (uint64_t i = 0; i < num && i < 16 && n > 0 && (size_t)n < sizeof(line) - 96; i++) {
+    const Ps4Audio3dAttribute *a = &attrs[i];
+    const uint8_t *v = a->value ? (const uint8_t *)(base + (uintptr_t)a->value) : NULL;
+    n += snprintf(line + n, sizeof(line) - (size_t)n, "%s {id %u size %llu", i == bad ? " BAD" : "",
+                  a->attribute_id, (unsigned long long)a->value_size);
+    if (v && a->value_size == 4) {
+      float f;
+      uint32_t u;
+      memcpy(&f, v, 4);
+      memcpy(&u, v, 4);
+      n += snprintf(line + n, sizeof(line) - (size_t)n, " 0x%x/%g}", u, f);
+    } else if (v && a->value_size == 12) {
+      float f[3];
+      memcpy(f, v, 12);
+      n += snprintf(line + n, sizeof(line) - (size_t)n, " (%g %g %g)}", f[0], f[1], f[2]);
+    } else if (v && a->attribute_id == PS4_AUDIO3D_ATTR_PCM && a->value_size >= sizeof(Ps4Audio3dPcm)) {
+      Ps4Audio3dPcm pcm;
+      memcpy(&pcm, v, sizeof(pcm));
+      n += snprintf(line + n, sizeof(line) - (size_t)n, " fmt %u buf 0x%llx samples %u}", pcm.format,
+                    (unsigned long long)pcm.sample_buffer, pcm.num_samples);
+    } else {
+      n += snprintf(line + n, sizeof(line) - (size_t)n, " ptr 0x%llx}", (unsigned long long)a->value);
+    }
+  }
+  fprintf(stderr, "%s\n", line);
+}
+
 int32_t ps4_audio3d_object_set_attributes(uint32_t port_id, uint32_t object_id, uint64_t num,
                                           const Ps4Audio3dAttribute *attrs, uintptr_t base) {
   pthread_mutex_lock(&g_lock);
@@ -809,8 +935,10 @@ int32_t ps4_audio3d_object_set_attributes(uint32_t port_id, uint32_t object_id, 
   } else {
     bool reset = false;
     uint64_t grains = 0;
+    uint64_t bad = num;
     for (uint64_t i = 0; i < num && r == 0; i++) {
       r = validate_attribute(p, &attrs[i], base, &grains);
+      if (r != 0) bad = i;
       reset |= attrs[i].attribute_id == PS4_AUDIO3D_ATTR_RESET_STATE;
     }
     if (r == 0 && (reset ? 0 : (uint64_t)o->pcm_count) + grains > p->queue_depth) {
@@ -819,6 +947,17 @@ int32_t ps4_audio3d_object_set_attributes(uint32_t port_id, uint32_t object_id, 
     if (r == 0) {
       if (reset) object_defaults(o);
       for (uint64_t i = 0; i < num; i++) apply_attribute(p, o, &attrs[i], base);
+    }
+    if (a3d_verbose()) {
+      o->st_calls++;
+      if (r != 0) {
+        o->st_fails++;
+        o->st_last_err = r;
+      }
+      if (g_trace_left > 0 || (r != 0 && o->st_fails <= 4)) {
+        if (g_trace_left > 0) g_trace_left--;
+        trace_set_attributes(port_id, object_id, num, attrs, base, r, bad);
+      }
     }
   }
   pthread_mutex_unlock(&g_lock);
@@ -907,6 +1046,11 @@ int32_t ps4_audio3d_audioout_open(uint32_t port_id, int32_t user_id, int32_t typ
           a->bytes = bytes;
           uint32_t fmt = param & 0xFF;
           a->is_float = fmt == 3 || fmt == 4 || fmt == 5 || fmt == 7;
+          a->param = param;
+          a->channels = (fmt == 0 || fmt == 3) ? 1 : (fmt == 1 || fmt == 4) ? 2 : 8;
+          a->st_grains = a->st_null = a->st_samples = 0;
+          a->st_sq = 0.0;
+          a->st_peak = 0.0f;
           a->pend_read = 0;
           a->pend_count = 0;
         }
@@ -981,14 +1125,59 @@ int32_t ps4_audio3d_audioout_outputs(const Ps4Audio3dAudioOutParam *params, uint
       memset(dst, 0, a->bytes); // NULL submits silence for this grain
     }
     a->pend_count++;
+    // Bus level (always) and per-bus statistics (PS4_AUDIO_LOG=2).
+    const uint32_t count = a->bytes / (a->is_float ? 4u : 2u);
+    double sq = 0.0;
+    float peak = 0.0f;
+    for (uint32_t k = 0; k < count; k++) {
+      float v;
+      if (a->is_float) {
+        memcpy(&v, dst + (size_t)k * 4, 4);
+        if (!(v == v)) v = 0.0f;
+      } else {
+        int16_t s16;
+        memcpy(&s16, dst + (size_t)k * 2, 2);
+        v = (float)s16 * (1.0f / 32768.0f);
+      }
+      if (fabsf(v) > peak) peak = fabsf(v);
+      sq += (double)v * v;
+    }
+    p->lv.bus_grains++;
+    p->lv.bus_samples += count;
+    p->lv.bus_sq += sq;
+    a->st_grains++;
+    a->st_null += params[i].ptr == 0;
+    a->st_samples += count;
+    a->st_sq += sq;
+    if (peak > a->st_peak) a->st_peak = peak;
   }
   pthread_mutex_unlock(&g_lock);
   return r;
 }
 
+int32_t ps4_audio3d_port_get_levels(uint32_t port_id, Ps4Audio3dLevels *out) {
+  if (!out) return PS4_AUDIO3D_ERROR_INVALID_PARAMETER;
+  pthread_mutex_lock(&g_lock);
+  A3dPort *p = port_get(port_id);
+  if (p) *out = p->lv;
+  pthread_mutex_unlock(&g_lock);
+  return p ? 0 : PS4_AUDIO3D_ERROR_INVALID_PORT;
+}
+
 // ---------------------------------------------------------------- guest shims
 
 #define A3D_RET(ctx, v) ((ctx)->rax = (uint64_t)(int64_t)(int32_t)(v))
+
+// PS4_AUDIO_LOG=2: the first few failures of a call, and reserve / unreserve.
+static void trace_result(const char *fn, uint32_t a0, uint32_t a1, int32_t r, uint32_t *budget) {
+  if (!a3d_verbose()) return;
+  if (r >= 0 && budget) return;
+  if (budget) {
+    if (*budget == 0) return;
+    (*budget)--;
+  }
+  fprintf(stderr, "[Audio3d] %s(0x%x, 0x%x) -> 0x%x\n", fn, a0, a1, (uint32_t)r);
+}
 #define GPTR(ctx, a) ((a) ? (void *)((ctx)->mem_base + (a)) : NULL)
 
 void shim_sceAudio3dInitialize(GuestContext *ctx) {
@@ -1037,22 +1226,33 @@ void shim_sceAudio3dPortGetQueueLevel(GuestContext *ctx) {
 }
 
 void shim_sceAudio3dPortAdvance(GuestContext *ctx) {
-  A3D_RET(ctx, ps4_audio3d_port_advance((uint32_t)ctx->rdi));
+  static uint32_t budget = 8;
+  int32_t r = ps4_audio3d_port_advance((uint32_t)ctx->rdi);
+  trace_result("PortAdvance", (uint32_t)ctx->rdi, 0, r, &budget);
+  A3D_RET(ctx, r);
   SHIM_RETURN();
 }
 
 void shim_sceAudio3dPortPush(GuestContext *ctx) {
-  A3D_RET(ctx, ps4_audio3d_port_push((uint32_t)ctx->rdi, (uint32_t)ctx->rsi));
+  static uint32_t budget = 8;
+  int32_t r = ps4_audio3d_port_push((uint32_t)ctx->rdi, (uint32_t)ctx->rsi);
+  trace_result("PortPush", (uint32_t)ctx->rdi, (uint32_t)ctx->rsi, r, &budget);
+  A3D_RET(ctx, r);
   SHIM_RETURN();
 }
 
 void shim_sceAudio3dObjectReserve(GuestContext *ctx) {
-  A3D_RET(ctx, ps4_audio3d_object_reserve((uint32_t)ctx->rdi, (uint32_t *)GPTR(ctx, ctx->rsi)));
+  uint32_t *id = (uint32_t *)GPTR(ctx, ctx->rsi);
+  int32_t r = ps4_audio3d_object_reserve((uint32_t)ctx->rdi, id);
+  trace_result("ObjectReserve", (uint32_t)ctx->rdi, id ? *id : 0, r, NULL);
+  A3D_RET(ctx, r);
   SHIM_RETURN();
 }
 
 void shim_sceAudio3dObjectUnreserve(GuestContext *ctx) {
-  A3D_RET(ctx, ps4_audio3d_object_unreserve((uint32_t)ctx->rdi, (uint32_t)ctx->rsi));
+  int32_t r = ps4_audio3d_object_unreserve((uint32_t)ctx->rdi, (uint32_t)ctx->rsi);
+  trace_result("ObjectUnreserve", (uint32_t)ctx->rdi, (uint32_t)ctx->rsi, r, NULL);
+  A3D_RET(ctx, r);
   SHIM_RETURN();
 }
 
@@ -1100,7 +1300,10 @@ void shim_sceAudio3dAudioOutClose(GuestContext *ctx) {
 }
 
 void shim_sceAudio3dAudioOutOutputs(GuestContext *ctx) {
-  A3D_RET(ctx, ps4_audio3d_audioout_outputs((const Ps4Audio3dAudioOutParam *)GPTR(ctx, ctx->rdi),
-                                            (uint32_t)ctx->rsi, (uintptr_t)ctx->mem_base));
+  static uint32_t budget = 8;
+  int32_t r = ps4_audio3d_audioout_outputs((const Ps4Audio3dAudioOutParam *)GPTR(ctx, ctx->rdi),
+                                           (uint32_t)ctx->rsi, (uintptr_t)ctx->mem_base);
+  trace_result("AudioOutOutputs", (uint32_t)ctx->rsi, 0, r, &budget);
+  A3D_RET(ctx, r);
   SHIM_RETURN();
 }
