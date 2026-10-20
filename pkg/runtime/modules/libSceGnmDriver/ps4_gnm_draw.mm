@@ -1370,7 +1370,15 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
         }
     }
 
-    if (allow_async && S.async_compile) {
+    // A further permutation of a program is translated here, for this draw. Translated on the
+    // worker, Uncharted 4's UI vertex shader got permutations that did not fit the draws that
+    // asked for them (buffer stride 12 for a stride 32 draw): one new permutation per draw up to
+    // the cap of 48, then its draws were skipped (~60 per frame at the first-boot menu). A
+    // translation specializes on sharps read through the draw's pointer chains, in memory the
+    // game rewrites per draw, so read later they likely belong to another draw (a copy of the
+    // existing permutation's SRT reads did not cover them). New programs, the bulk of a new
+    // area, still go to the worker.
+    if (allow_async && S.async_compile && vec.empty()) {
         // Translate GCN -> MSL on a worker thread (1-2 ms per shader, but new areas bring
         // hundreds at once); draws using it are skipped until the result is applied.
         S.gcn_pending.insert(pend_key);
