@@ -43,7 +43,8 @@ void ps4_gpumem_policy_init(ps4_gpumem_policy *p, uint64_t mem_total, const char
         // hw.memsize unknown: no budget rather than one of 0 that would always be exceeded
         p->budget = mem_total ? mem_total / 100 * pct : UINT64_MAX;
     }
-    p->nocopy_max = 1ull << 30;
+    p->nocopy_warn = 1ull << 30;
+    p->nocopy_max = 2ull << 30;
     const uint64_t idle = idle_s ? parse_u64(idle_s) : 30;
     // "0" disables idle release; junk keeps the default
     const int idle_zero = idle_s && idle_s[0] == '0' && idle_s[1] == 0;
@@ -54,7 +55,11 @@ void ps4_gpumem_policy_init(ps4_gpumem_policy *p, uint64_t mem_total, const char
 enum ps4_gpumem_admit ps4_gpumem_admit_nocopy(const ps4_gpumem_policy *p, uint64_t length, int has_holes) {
     if (length > p->nocopy_max) return PS4_GPUMEM_REFUSE_TOO_LARGE;
     if (has_holes) return PS4_GPUMEM_REFUSE_HOLES;
-    return PS4_GPUMEM_ADMIT;
+    return length > p->nocopy_warn ? PS4_GPUMEM_ADMIT_LARGE : PS4_GPUMEM_ADMIT;
+}
+
+int ps4_gpumem_refused_copy(enum ps4_gpumem_admit adm, int written, uint64_t size) {
+    return adm == PS4_GPUMEM_REFUSE_HOLES && !written && size <= PS4_GPUMEM_COPY_MAX;
 }
 
 int ps4_gpumem_should_release(const ps4_gpumem_policy *p, uint64_t now_ns, uint64_t last_use_ns,
@@ -76,6 +81,25 @@ int ps4_gpumem_budget_update(ps4_gpumem_budget_state *st, const ps4_gpumem_polic
         return -1;
     }
     return 0;
+}
+
+int ps4_gpumem_purge_due(ps4_gpumem_purge_state *st, int over, uint64_t charged) {
+    if (!over) {
+        st->futile = 0;
+        st->have = 0;
+        return 0;
+    }
+    if (st->have) {
+        if (charged < st->last_charged) st->futile = 0;
+        else st->futile++;
+    }
+    if (st->futile >= 10) {
+        st->last_charged = charged; // a later drop (e.g. textures freed) re-enables purging
+        return 0;
+    }
+    st->have = 1;
+    st->last_charged = charged;
+    return 1;
 }
 
 int ps4_gpumem_log_due(ps4_gpumem_log_state *st, const ps4_gpumem_sample *s, uint64_t period_ns,
@@ -131,9 +155,9 @@ void ps4_gpumem_windows_read(const ps4_gpumem_windows *w, ps4_gpumem_sample *s) 
 }
 
 #if defined(__APPLE__)
-// Walks the VM regions over [p, p + len): fn gets each readable+writable (want_rw) or readable
-// piece. Returns the bytes passed to fn; *hole is set when some part is not covered.
-static uint64_t walk_regions(const void *p, uint64_t len, int want_rw, int *hole,
+// Walks the VM regions over [p, p + len): fn gets each readable piece. Returns the bytes passed
+// to fn; *hole is set when some part is unmapped or not readable.
+static uint64_t walk_regions(const void *p, uint64_t len, int *hole,
                              void (*fn)(void *ctx, uint64_t offset, uint64_t n), void *ctx) {
     const mach_vm_address_t start = (mach_vm_address_t)(uintptr_t)p, end = start + len;
     mach_vm_address_t cur = start;
@@ -153,8 +177,7 @@ static uint64_t walk_regions(const void *p, uint64_t len, int want_rw, int *hole
         }
         if (addr > cur) *hole = 1; // unmapped gap before this region
         const mach_vm_address_t a = addr, b = addr + size < end ? addr + size : end;
-        const vm_prot_t need = want_rw ? (VM_PROT_READ | VM_PROT_WRITE) : VM_PROT_READ;
-        if ((info.protection & need) == need) {
+        if (info.protection & VM_PROT_READ) {
             if (fn) fn(ctx, a - start, b - a);
             good += b - a;
         } else {
@@ -169,7 +192,7 @@ static uint64_t walk_regions(const void *p, uint64_t len, int want_rw, int *hole
 int ps4_gpumem_range_has_holes(const void *p, uint64_t len) {
 #if defined(__APPLE__)
     int hole = 0;
-    walk_regions(p, len, 1, &hole, NULL, NULL);
+    walk_regions(p, len, &hole, NULL, NULL);
     return hole;
 #else
     (void)p;
@@ -182,7 +205,7 @@ uint64_t ps4_gpumem_for_each_readable(const void *p, uint64_t len,
                                       void (*fn)(void *ctx, uint64_t offset, uint64_t n), void *ctx) {
 #if defined(__APPLE__)
     int hole = 0;
-    return walk_regions(p, len, 0, &hole, fn, ctx);
+    return walk_regions(p, len, &hole, fn, ctx);
 #else
     if (fn) fn(ctx, 0, len);
     return len;

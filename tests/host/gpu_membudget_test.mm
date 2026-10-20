@@ -1,5 +1,5 @@
 // GPU memory accounting and budget decisions (ps4_gnm_membudget.h), checked against the real
-// system: the hole check against mappings with unmapped, read-only and remapped pages and against
+// system: the hole check against mappings with unmapped, PROT_NONE, read-only and remapped pages and against
 // what newBufferWithBytesNoCopy accepts; the accounting assumptions (currentAllocatedSize counts
 // every no-copy length, GPU use wires the whole range) against Metal itself.
 #import <Metal/Metal.h>
@@ -25,7 +25,7 @@ static void test_policy(void) {
     ps4_gpumem_policy p;
     ps4_gpumem_policy_init(&p, 16 * GiB, NULL, NULL, NULL);
     check(p.budget == 16 * GiB / 100 * 40, "default budget is 40% of RAM");
-    check(p.nocopy_max == GiB, "no-copy ranges up to 1 GiB");
+    check(p.nocopy_warn == GiB && p.nocopy_max == 2 * GiB, "no-copy ranges: warning over 1 GiB, limit 2 GiB");
     check(p.idle_ns == 30000000000ull, "idle windows released after 30 s");
     ps4_gpumem_policy_init(&p, 16 * GiB, "25", NULL, NULL);
     check(p.budget == 16 * GiB / 100 * 25, "PS4_GNM_GPU_BUDGET_PCT=25");
@@ -54,10 +54,19 @@ static void test_decisions(void) {
     ps4_gpumem_policy_init(&p, 16 * GiB, NULL, NULL, NULL);
     check(ps4_gpumem_admit_nocopy(&p, 64 * MiB, 0) == PS4_GPUMEM_ADMIT, "64 MiB plain range admitted");
     check(ps4_gpumem_admit_nocopy(&p, GiB, 0) == PS4_GPUMEM_ADMIT, "exactly 1 GiB admitted");
-    check(ps4_gpumem_admit_nocopy(&p, GiB + 16384, 0) == PS4_GPUMEM_REFUSE_TOO_LARGE, "over 1 GiB refused");
+    check(ps4_gpumem_admit_nocopy(&p, GiB + 16384, 0) == PS4_GPUMEM_ADMIT_LARGE,
+          "over 1 GiB still admitted (it bound before the budget), with a warning");
+    check(ps4_gpumem_admit_nocopy(&p, 2 * GiB, 0) == PS4_GPUMEM_ADMIT_LARGE, "exactly 2 GiB admitted");
+    check(ps4_gpumem_admit_nocopy(&p, 2 * GiB + 16384, 0) == PS4_GPUMEM_REFUSE_TOO_LARGE, "over 2 GiB refused");
     check(ps4_gpumem_admit_nocopy(&p, 64 * MiB, 1) == PS4_GPUMEM_REFUSE_HOLES, "range with holes refused");
-    check(ps4_gpumem_admit_nocopy(&p, 2 * GiB, 1) == PS4_GPUMEM_REFUSE_TOO_LARGE, "size checked first");
+    check(ps4_gpumem_admit_nocopy(&p, 3 * GiB, 1) == PS4_GPUMEM_REFUSE_TOO_LARGE, "size checked first");
+    check(ps4_gpumem_admit_nocopy(&p, 3 * GiB, 0) == PS4_GPUMEM_REFUSE_TOO_LARGE,
+          "too large decided without the hole walk (has_holes 0)");
 
+    check(ps4_gpumem_refused_copy(PS4_GPUMEM_REFUSE_HOLES, 0, 64 * MiB), "read of a range with holes: copy");
+    check(!ps4_gpumem_refused_copy(PS4_GPUMEM_REFUSE_HOLES, 1, 4096), "GPU-written range with holes: never a copy");
+    check(!ps4_gpumem_refused_copy(PS4_GPUMEM_REFUSE_HOLES, 0, 64 * MiB + 1), "over 64 MiB: no copy");
+    check(!ps4_gpumem_refused_copy(PS4_GPUMEM_REFUSE_TOO_LARGE, 0, 4096), "too large span: no copy");
     const uint64_t s = 1000000000ull;
     check(!ps4_gpumem_should_release(&p, 100 * s, 80 * s, 0), "20 s idle kept under budget");
     check(ps4_gpumem_should_release(&p, 100 * s, 70 * s, 0), "30 s idle released");
@@ -83,6 +92,19 @@ static void test_decisions(void) {
     a.nocopy_sum = 2000 * MiB;
     a.nocopy_distinct = 1200 * MiB;
     check(ps4_gpumem_charged(&a) == 2200 * MiB, "charged = own allocations + distinct no-copy coverage");
+    ps4_gpumem_purge_state ps;
+    memset(&ps, 0, sizeof(ps));
+    check(!ps4_gpumem_purge_due(&ps, 0, 5 * GiB), "under budget: no purge");
+    check(ps4_gpumem_purge_due(&ps, 1, 5 * GiB), "over budget: first purge");
+    int ran = 1;
+    for (int i = 0; i < 20; ++i) ran += ps4_gpumem_purge_due(&ps, 1, 5 * GiB);
+    check(ran == 10, "flat charged total: purging stops once 10 purges in a row did not help");
+    check(ps4_gpumem_purge_due(&ps, 1, 5 * GiB - MiB), "charged total dropped: purging resumes");
+    for (int i = 0; i < 15; ++i) ps4_gpumem_purge_due(&ps, 1, 6 * GiB);
+    check(!ps4_gpumem_purge_due(&ps, 1, 6 * GiB), "paused again");
+    check(!ps4_gpumem_purge_due(&ps, 0, 3 * GiB) && ps.futile == 0, "under budget resets the back-off");
+    check(ps4_gpumem_purge_due(&ps, 1, 6 * GiB), "over again: purges at once");
+
     a.device = 100 * MiB; // sampled while a buffer was being added
     check(ps4_gpumem_charged(&a) == 1200 * MiB, "no underflow when no-copy sum exceeds the device total");
 }
@@ -175,7 +197,10 @@ static void test_holes(id<MTLDevice> dev) {
     ok = nil;
 
     check(mprotect(m + 20 * pg, pg, PROT_READ) == 0, "mprotect one page read-only");
-    check(ps4_gpumem_range_has_holes(m, len), "read-only page is a hole");
+    check(!ps4_gpumem_range_has_holes(m, len), "read-only page is not a hole");
+    id<MTLBuffer> ro = [dev newBufferWithBytesNoCopy:m length:len options:MTLResourceStorageModeShared deallocator:nil];
+    check(ro != nil, "Metal agrees: no-copy buffer over a read-only page is created");
+    ro = nil;
     check(!ps4_gpumem_range_has_holes(m, 20 * pg), "range ending before it has none");
     check(!ps4_gpumem_range_has_holes(m + 21 * pg, len - 21 * pg), "range starting after it has none");
     mprotect(m + 20 * pg, pg, PROT_READ | PROT_WRITE);

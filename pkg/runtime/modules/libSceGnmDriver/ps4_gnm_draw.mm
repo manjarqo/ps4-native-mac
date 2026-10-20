@@ -600,10 +600,29 @@ struct GpuMem {
     uint64_t wired_base = 0;
     bool on = false;
     std::atomic<bool> over{false};          // charged > budget (with hysteresis), set by the sampler
-    uint64_t tick = 0;                      // encoder thread: time of the last Commit
-    uint64_t last_sweep = 0;                // encoder thread
-    std::atomic<uint64_t> released{0}, released_bytes{0}, purges{0};
-    std::atomic<uint64_t> refused_large{0}, refused_holes{0}, copies{0}, copy_bytes{0};
+    std::atomic<uint64_t> charged{0};       // latest charged total, set by the sampler
+    uint64_t tick = 0;                      // encoder thread: time of the current Commit
+    uint64_t last_sweep = 0, last_refused_clear = 0; // encoder thread
+    ps4_gpumem_purge_state purge{};         // encoder thread
+    // Released buffers stay alive while a command buffer in flight references them, so their
+    // accounting is removed only once every command buffer up to `seq` has completed.
+    struct Pending {
+        uint64_t key, length, seq;
+    };
+    std::deque<Pending> pending;            // encoder thread, in seq order
+    // Window spans refused at creation (key -> ps4_gpumem_admit), so later binds neither walk the
+    // VM regions again nor retry; cleared on remaps and every policy.idle_ns.
+    std::unordered_map<uint64_t, uint8_t> refused;
+    // Read-only copies made in the open command buffer (they live in its upload chunks), keyed by
+    // the exact guest range: one copy per range and command buffer.
+    struct Copy {
+        uint64_t addr, size;
+        id<MTLBuffer> buf;
+        uint64_t off;
+    };
+    std::unordered_map<uint64_t, Copy> copies_open;
+    std::atomic<uint64_t> released{0}, released_bytes{0}, purges{0}, large{0};
+    std::atomic<uint64_t> refused_large{0}, refused_holes{0}, refused_written{0}, copies{0}, copy_bytes{0};
 };
 GpuMem g_mem;
 
@@ -646,6 +665,7 @@ void StartGpuMemSampler(uint64_t mem_size) {
             peak_wired = std::max(peak_wired, s.wired);
             char line[512];
             const int change = ps4_gpumem_budget_update(&budget, &g_mem.policy, charged);
+            g_mem.charged.store(charged, std::memory_order_relaxed);
             g_mem.over.store(budget.over != 0, std::memory_order_release);
             if (change) {
                 ps4_gpumem_format(line, sizeof(line), &s, g_mem.wired_base, &g_mem.policy);
@@ -663,16 +683,39 @@ void StartGpuMemSampler(uint64_t mem_size) {
             if (period_s && ps4_gpumem_log_due(&log, &s, period_s * 1000000000ull, 256ull << 20)) {
                 ps4_gpumem_format(line, sizeof(line), &s, g_mem.wired_base, &g_mem.policy);
                 fprintf(stderr, "[gnm-mem] %s; peak charged %llu MiB, peak wired %llu MiB; released %llu windows "
-                                "(%llu MiB), purges %llu, refused %llu too large / %llu with holes, copies %llu (%llu MiB)%s\n",
+                                "(%llu MiB), purges %llu, large %llu, refused %llu too large / %llu with holes / %llu "
+                                "written, copies %llu (%llu MiB)%s\n",
                         line, (unsigned long long)(peak_charged >> 20), (unsigned long long)(peak_wired >> 20),
                         (unsigned long long)g_mem.released.load(), (unsigned long long)(g_mem.released_bytes.load() >> 20),
-                        (unsigned long long)g_mem.purges.load(), (unsigned long long)g_mem.refused_large.load(),
-                        (unsigned long long)g_mem.refused_holes.load(), (unsigned long long)g_mem.copies.load(),
+                        (unsigned long long)g_mem.purges.load(), (unsigned long long)g_mem.large.load(),
+                        (unsigned long long)g_mem.refused_large.load(), (unsigned long long)g_mem.refused_holes.load(),
+                        (unsigned long long)g_mem.refused_written.load(), (unsigned long long)g_mem.copies.load(),
                         (unsigned long long)(g_mem.copy_bytes.load() >> 20), budget.over ? "; OVER BUDGET" : "");
             }
             usleep(1000000);
         }
     }).detach();
+}
+
+uint64_t CompletedSeq();
+
+// Drops a window from guest_bufs; its accounting goes when the GPU can no longer use it.
+std::unordered_map<uint64_t, GuestWin>::iterator ReleaseWindow(std::unordered_map<uint64_t, GuestWin>::iterator it) {
+    if (g_mem.on) g_mem.pending.push_back({it->first, (uint64_t)it->second.buf.length, S.committed_seq + 1});
+    return S.guest_bufs.erase(it);
+}
+
+// Removes the accounting of released windows whose command buffers have all completed.
+void RetirePendingWindows() {
+    if (g_mem.pending.empty()) return;
+    const uint64_t done = CompletedSeq();
+    while (!g_mem.pending.empty() && g_mem.pending.front().seq <= done) {
+        const GpuMem::Pending& p = g_mem.pending.front();
+        uint64_t first, n;
+        KeyWindows(p.key, &first, &n);
+        ps4_gpumem_windows_remove(&g_mem.wins, first, n, p.length);
+        g_mem.pending.pop_front();
+    }
 }
 
 void DropRemappedWindows() {
@@ -689,25 +732,23 @@ void DropRemappedWindows() {
         bool hit = false;
         for (auto& r : ranges)
             if (r.first < end && r.first + r.second > base) { hit = true; break; }
-        if (hit) {
-            uint64_t first, n;
-            KeyWindows(it->first, &first, &n);
-            if (g_mem.on) ps4_gpumem_windows_remove(&g_mem.wins, first, n, it->second.buf.length);
-            it = S.guest_bufs.erase(it);
-        } else {
-            ++it;
-        }
+        if (hit) it = ReleaseWindow(it);
+        else ++it;
     }
+    if (!ranges.empty()) g_mem.refused.clear(); // the new mapping may have no holes
     for (auto& m : g_guest_buf_mru) m = GuestBufMru{};
     ps4_hitch_add_ns(PS4_HITCH_MTLBUF, ps4_hitch_now_ns() - mb_t0);
 }
 
 // Lazy residency and the budget (encoder thread, from Commit): releases windows not bound for
 // policy.idle_ns, and while over budget every window not bound for policy.press_ns plus the
-// transient staging caches. A released buffer still referenced by a command buffer in flight
-// lives (and stays wired) until that command buffer completes; the next use re-creates it.
+// transient staging caches (with a back-off once purging stops helping). A released buffer still
+// referenced by a command buffer in flight lives (and stays wired) until that command buffer
+// completes; the next use re-creates it.
 void SweepGuestWindows() {
+    g_mem.copies_open.clear(); // their upload chunks are recycled once this command buffer is done
     if (!g_mem.on) return;
+    RetirePendingWindows();
     const bool over = g_mem.over.load(std::memory_order_acquire);
     const uint64_t now = g_mem.tick;
     // once a second; over budget at every commit until a sweep has run in this state
@@ -715,14 +756,15 @@ void SweepGuestWindows() {
     if (now - g_mem.last_sweep < 1000000000ull && !(over && !swept_over)) return;
     g_mem.last_sweep = now;
     swept_over = over;
+    if (g_mem.policy.idle_ns && now - g_mem.last_refused_clear >= g_mem.policy.idle_ns) {
+        g_mem.refused.clear();
+        g_mem.last_refused_clear = now;
+    }
     uint64_t n_rel = 0, bytes = 0;
     for (auto it = S.guest_bufs.begin(); it != S.guest_bufs.end();) {
         if (ps4_gpumem_should_release(&g_mem.policy, now, it->second.last_use, over)) {
-            uint64_t first, n;
-            KeyWindows(it->first, &first, &n);
             bytes += it->second.buf.length;
-            ps4_gpumem_windows_remove(&g_mem.wins, first, n, it->second.buf.length);
-            it = S.guest_bufs.erase(it);
+            it = ReleaseWindow(it);
             n_rel++;
         } else {
             ++it;
@@ -735,25 +777,43 @@ void SweepGuestWindows() {
         RLog("gpumem-release", "[gnm-mem] released %llu guest window buffers (%llu MiB)%s", (unsigned long long)n_rel,
              (unsigned long long)(bytes >> 20), over ? " (over budget)" : " (idle)");
     }
-    if (over) { // staging caches are re-created on demand
+    if (ps4_gpumem_purge_due(&g_mem.purge, over, g_mem.charged.load(std::memory_order_relaxed))) {
+        // staging caches are re-created on demand
         S.detile_staging.clear();
         S.detile_maps.clear();
         std::lock_guard<std::mutex> lk(S.arena.free_mu);
         S.arena.free_list.clear();
         g_mem.purges.fetch_add(1, std::memory_order_relaxed);
+    } else if (over && g_mem.purge.futile == 10) {
+        RLog("gpumem-futile", "[gnm-mem] purging does not lower the charged total (%llu MiB): the memory over "
+                              "budget is the device's own (textures); purges paused",
+             (unsigned long long)(g_mem.charged.load() >> 20));
     }
 }
 
-// Fallback for a range no no-copy buffer may cover (too large, or with unmapped / not read-write
-// pages): a copy of its readable bytes in upload memory (holes read as zero). GPU writes to the
-// copy do not reach guest memory, so it serves reads only; ranges over 64 MiB are refused.
+// How a binding uses guest memory. A GPU-written binding must be the guest memory itself: a copy
+// would drop its writes.
+enum class GuestAccess { Read, Write };
+
+// Read-only stand-in for a range no no-copy buffer may cover (one with unmapped or unreadable
+// pages): a copy of its readable bytes in upload memory, holes as zero, made once per range and
+// command buffer (guest writes after the first bind in that command buffer are not seen, as with
+// any snapshot). 256 zero bytes follow it, since shader bounds round the size up to the V# end
+// (debug bounds modes PS4_GNM_BOUNDS=raw/off can still read past that). The caller decides
+// (ps4_gpumem_refused_copy) which ranges may be copied.
 bool GuestCopy(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint64_t* offset) {
-    if (size > (64ull << 20)) return false;
+    const uint64_t ck = addr ^ (size * 0x9E3779B97F4A7C15ull);
+    auto cit = g_mem.copies_open.find(ck);
+    if (cit != g_mem.copies_open.end() && cit->second.addr == addr && cit->second.size == size) {
+        *out = cit->second.buf;
+        *offset = cit->second.off;
+        return true;
+    }
     void* ptr = nullptr;
     size_t off = 0;
     id<MTLBuffer> b = nil;
-    if (!S.arena.Alloc(S.dev, size, 256, &b, &off, &ptr)) return false;
-    memset(ptr, 0, size);
+    if (!S.arena.Alloc(S.dev, size + 256, 256, &b, &off, &ptr)) return false;
+    memset(ptr, 0, size + 256);
     struct Ctx {
         uint8_t* dst;
         const uint8_t* src;
@@ -764,14 +824,36 @@ bool GuestCopy(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint64
     }, &c);
     g_mem.copies.fetch_add(1, std::memory_order_relaxed);
     g_mem.copy_bytes.fetch_add(size, std::memory_order_relaxed);
+    g_mem.copies_open[ck] = {addr, size, b, off};
     *out = b;
     *offset = off;
     return true;
 }
 
+// A guest range whose window span got no no-copy buffer (adm: why). Reads of ranges with holes
+// get a copy; GPU-written ranges and spans over policy.nocopy_max are not bound (false), as
+// before the budget existed.
+bool RefusedGuestBuffer(uint64_t addr, uint64_t size, uint64_t base, uint64_t end, enum ps4_gpumem_admit adm,
+                        GuestAccess access, __strong id<MTLBuffer>* out, uint64_t* offset) {
+    const bool holes = adm == PS4_GPUMEM_REFUSE_HOLES;
+    const bool copied =
+        ps4_gpumem_refused_copy(adm, access == GuestAccess::Write, size) && GuestCopy(addr, size, out, offset);
+    if (holes && access == GuestAccess::Write) g_mem.refused_written.fetch_add(1, std::memory_order_relaxed);
+    RLog(!holes ? "guestbuf-big" : access == GuestAccess::Write ? "guestbuf-holes-written" : "guestbuf-holes",
+         "[gnm-mem] no no-copy buffer over guest 0x%llx+0x%llx (for 0x%llx+0x%llx): %s; %s",
+         (unsigned long long)base, (unsigned long long)(end - base), (unsigned long long)addr,
+         (unsigned long long)size, holes ? "range has holes" : "larger than 2 GiB",
+         copied ? "bound a read-only copy"
+         : !holes ? "not bound"
+         : access == GuestAccess::Write ? "not bound (GPU-written: a copy would drop the writes)"
+                                        : "not bound (over 64 MiB)");
+    return copied;
+}
+
 // `out` is a strong pointer: an (implicitly autoreleasing) plain one would retain and autorelease
-// the buffer on every call.
-bool GuestBuffer(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint64_t* offset) {
+// the buffer on every call. `access`: whether the GPU writes the range (a written range is only
+// ever bound in place).
+bool GuestBuffer(uint64_t addr, uint64_t size, GuestAccess access, __strong id<MTLBuffer>* out, uint64_t* offset) {
     GuestContext* ctx = S.ctx;
     if (g_remap_pending.load(std::memory_order_acquire)) DropRemappedWindows();
     if (!ctx) return false;
@@ -780,27 +862,34 @@ bool GuestBuffer(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint
     const uint64_t key = base | (nwin << 48);
     GuestBufMru& mru = g_guest_buf_mru[(base / kWindow + nwin) & 3];
     if (mru.key == key) {
-        mru.win->last_use = g_mem.tick;
+        mru.win->last_use = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         *out = mru.win->buf;
         *offset = addr - base;
         return true;
     }
     auto it = S.guest_bufs.find(key);
     if (it == S.guest_bufs.end()) {
+        auto rit = g_mem.refused.find(key);
+        if (rit != g_mem.refused.end())
+            return RefusedGuestBuffer(addr, size, base, end, (enum ps4_gpumem_admit)rit->second, access, out, offset);
         const uint64_t mb_t0 = ps4_hitch_now_ns();
-        const int holes = ps4_gpumem_range_has_holes(ctx->mem_base + base, end - base);
-        const enum ps4_gpumem_admit adm = ps4_gpumem_admit_nocopy(&g_mem.policy, end - base, holes);
-        if (adm != PS4_GPUMEM_ADMIT) {
+        // size first: a too large span is refused without walking its VM regions
+        enum ps4_gpumem_admit adm = ps4_gpumem_admit_nocopy(&g_mem.policy, end - base, 0);
+        if (adm != PS4_GPUMEM_REFUSE_TOO_LARGE)
+            adm = ps4_gpumem_admit_nocopy(&g_mem.policy, end - base,
+                                          ps4_gpumem_range_has_holes(ctx->mem_base + base, end - base));
+        if (adm == PS4_GPUMEM_REFUSE_TOO_LARGE || adm == PS4_GPUMEM_REFUSE_HOLES) {
             ps4_hitch_add_ns(PS4_HITCH_MTLBUF, ps4_hitch_now_ns() - mb_t0);
             (adm == PS4_GPUMEM_REFUSE_TOO_LARGE ? g_mem.refused_large : g_mem.refused_holes)
                 .fetch_add(1, std::memory_order_relaxed);
-            const bool copied = GuestCopy(addr, size, out, offset);
-            RLog(adm == PS4_GPUMEM_REFUSE_TOO_LARGE ? "guestbuf-big" : "guestbuf-holes",
-                 "[gnm-mem] no no-copy buffer over guest 0x%llx+0x%llx (for 0x%llx+0x%llx): %s; %s",
-                 (unsigned long long)base, (unsigned long long)(end - base), (unsigned long long)addr,
-                 (unsigned long long)size, adm == PS4_GPUMEM_REFUSE_TOO_LARGE ? "larger than 1 GiB" : "range has holes",
-                 copied ? "bound a read-only copy" : "not bound (over 64 MiB)");
-            return copied;
+            g_mem.refused[key] = (uint8_t)adm;
+            return RefusedGuestBuffer(addr, size, base, end, adm, access, out, offset);
+        }
+        if (adm == PS4_GPUMEM_ADMIT_LARGE) {
+            g_mem.large.fetch_add(1, std::memory_order_relaxed);
+            RLog("guestbuf-large", "[gnm-mem] no-copy buffer over guest 0x%llx+0x%llx is larger than 1 GiB: it pins "
+                                   "(and wires) all of it while bound",
+                 (unsigned long long)base, (unsigned long long)(end - base));
         }
         id<MTLBuffer> b = [S.dev newBufferWithBytesNoCopy:ctx->mem_base + base
                                                    length:end - base
@@ -815,7 +904,7 @@ bool GuestBuffer(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint
         it = S.guest_bufs.emplace(key, GuestWin{b, 0}).first;
         if (g_mem.on) ps4_gpumem_windows_add(&g_mem.wins, base / kWindow, nwin, end - base);
     }
-    it->second.last_use = g_mem.tick;
+    it->second.last_use = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     mru.key = key;
     mru.win = &it->second;
     *out = it->second.buf;
@@ -1874,7 +1963,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                      (unsigned long long)s->code_addr, i, (unsigned long long)base);
                 base &= ~3ull;
             }
-            if (!GuestBuffer(base, bd.size_bytes, &mb, &off)) {
+            if (!GuestBuffer(base, bd.size_bytes, bb.is_written ? GuestAccess::Write : GuestAccess::Read, &mb, &off)) {
                 RLog("buf-range", "shader 0x%llx: buffer %u out of range (0x%llx+0x%x)",
                      (unsigned long long)s->code_addr, i, (unsigned long long)base, bd.size_bytes);
                 mb = S.dummy;
@@ -2523,7 +2612,7 @@ bool EncodeGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up, id
     const uint64_t avail = std::min<uint64_t>(layout.total_size, S.ctx->mem_size - img.address);
     id<MTLBuffer> gbuf = nil;
     uint64_t goff = 0;
-    if (!GuestBuffer(img.address, avail, &gbuf, &goff)) return false;
+    if (!GuestBuffer(img.address, avail, GuestAccess::Read, &gbuf, &goff)) return false;
     const bool tiled = sd.tile_mode != TileMode::DisplayLinearAligned && sd.tile_mode != TileMode::DisplayLinearGeneral;
     const uint32_t bpe = sd.bpp / 8;
     id<MTLTexture> tex = up.tex;
@@ -3826,7 +3915,7 @@ bool GpuDmaImpl(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, 
         if (dst + n > 0x10000) return false;
         db = S.gds_buf;
         doff = dst;
-    } else if (!GuestBuffer(dst, n, &db, &doff)) {
+    } else if (!GuestBuffer(dst, n, GuestAccess::Write, &db, &doff)) {
         return false;
     }
     if (src_fill) {
@@ -3842,7 +3931,7 @@ bool GpuDmaImpl(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, 
         if (src + n > 0x10000) return false;
         sb = S.gds_buf;
         soff = src;
-    } else if (!GuestBuffer(src, n, &sb, &soff)) {
+    } else if (!GuestBuffer(src, n, GuestAccess::Read, &sb, &soff)) {
         return false;
     }
     EndEncoders();
@@ -4419,7 +4508,7 @@ void DrawEncode(DrawRec& r) {
             id<MTLBuffer> mb = S.dummy;
             uint64_t off = 0;
             if (bd.address && bd.size) {
-                if (!GuestBuffer(bd.address & ~3ull, bd.size + 4, &mb, &off)) {
+                if (!GuestBuffer(bd.address & ~3ull, bd.size + 4, GuestAccess::Read, &mb, &off)) {
                     mb = S.dummy;
                     off = 0;
                 }
@@ -4491,10 +4580,10 @@ void DrawEncode(DrawRec& r) {
         if (indirect) {
             const uint64_t isz = args.index_type == 1 ? 4 : 2;
             if (rs.raster.needs_emulation ||
-                !GuestBuffer(args.indirect_addr, indexed ? 20 : 16, &arg_buf, &arg_off) || (arg_off & 3))
+                !GuestBuffer(args.indirect_addr, indexed ? 20 : 16, GuestAccess::Read, &arg_buf, &arg_off) || (arg_off & 3))
                 { S.n_skipped++; return; }
             if (indexed &&
-                (!args.index_base || !GuestBuffer(args.index_base, (uint64_t)args.max_index * isz, &ib, &ib_off) ||
+                (!args.index_base || !GuestBuffer(args.index_base, (uint64_t)args.max_index * isz, GuestAccess::Read, &ib, &ib_off) ||
                  (ib_off & 3)))
                 { S.n_skipped++; return; }
         } else if (rs.raster.needs_emulation) {
@@ -4517,7 +4606,7 @@ void DrawEncode(DrawRec& r) {
             const uint64_t isz = args.index_type == 1 ? 4 : 2;
             const uint64_t addr = args.index_base + (uint64_t)args.index_offset * isz;
             const uint64_t bytes = (uint64_t)args.count * isz;
-            if (!args.index_base || !GuestBuffer(addr, bytes, &ib, &ib_off)) {
+            if (!args.index_base || !GuestBuffer(addr, bytes, GuestAccess::Read, &ib, &ib_off)) {
                 RLog("ib", "%s: index buffer 0x%llx unavailable", args.name, (unsigned long long)addr);
                 S.n_skipped++;
                 return;
@@ -4910,7 +4999,7 @@ void DispatchEncode(DispatchRec& r) {
         if (indirect_addr) {
             id<MTLBuffer> ab;
             uint64_t off;
-            if (!GuestBuffer(indirect_addr, 12, &ab, &off)) return;
+            if (!GuestBuffer(indirect_addr, 12, GuestAccess::Read, &ab, &off)) return;
             [enc dispatchThreadgroupsWithIndirectBuffer:ab indirectBufferOffset:off threadsPerThreadgroup:tg];
         } else {
             [enc dispatchThreadgroups:MTLSizeMake(dim_x, dim_y, dim_z) threadsPerThreadgroup:tg];
