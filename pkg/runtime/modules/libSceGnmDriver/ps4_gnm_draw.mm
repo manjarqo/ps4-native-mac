@@ -362,7 +362,7 @@ struct WorkRec {
     bool dispatch = false;
 };
 struct WorkLog {
-    static constexpr size_t kCap = 64; // the most recent records are kept
+    static constexpr size_t kCap = 512; // the most recent records are kept
     WorkRec rec[kCap];
     uint64_t count = 0;
     void Add(const WorkRec& r) { rec[count++ % kCap] = r; }
@@ -745,9 +745,38 @@ void EndEncoders() {
 
 std::atomic<bool> g_cmd_open{false}; // S.cmd != nil, readable from the CP thread
 
+// PS4_GNM_ENCODER_STATUS=1 (debug): command buffers report per-encoder execution status, and
+// every encoder is labelled with the index of its first work record, so a failed command buffer
+// names the encoder that faulted (see LogEncoderStatus). Costs GPU time; off by default.
+bool EncoderStatusEnabled() {
+    static const bool on = getenv("PS4_GNM_ENCODER_STATUS") != nullptr;
+    return on;
+}
+
+NSString* WorkLabel(const char* kind) {
+    const uint64_t first = S.cmd_log ? S.cmd_log->count : 0;
+    return [NSString stringWithFormat:@"%s from work[%llu]", kind, (unsigned long long)first];
+}
+
+void LogEncoderStatus(id<MTLCommandBuffer> done) {
+    NSArray* infos = done.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+    for (id<MTLCommandBufferEncoderInfo> info in infos) {
+        const MTLCommandEncoderErrorState st = info.errorState;
+        if (st != MTLCommandEncoderErrorStateFaulted && st != MTLCommandEncoderErrorStateAffected) continue;
+        fprintf(stderr, "[gnm-draw]   encoder '%s': %s\n", (info.label ?: @"unlabelled").UTF8String,
+                st == MTLCommandEncoderErrorStateFaulted ? "FAULTED" : "affected");
+    }
+}
+
 void EnsureCmd() {
     if (!S.cmd) {
-        S.cmd = [S.queue commandBuffer];
+        if (EncoderStatusEnabled()) {
+            MTLCommandBufferDescriptor* d = [MTLCommandBufferDescriptor new];
+            d.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            S.cmd = [S.queue commandBufferWithDescriptor:d];
+        } else {
+            S.cmd = [S.queue commandBuffer];
+        }
         g_cmd_open.store(true, std::memory_order_release);
         S.cmd.label = [NSString stringWithFormat:@"gnm-%llu", (unsigned long long)S.n_cmdbufs++];
         S.cmd_log = std::make_shared<WorkLog>();
@@ -826,7 +855,8 @@ void Commit() {
         if (done.status == MTLCommandBufferStatusError) {
             fprintf(stderr, "[gnm-draw] command buffer %s failed: %s\n", done.label.UTF8String,
                     done.error.localizedDescription.UTF8String);
-            if (log) log->Print("work", 12);
+            if (EncoderStatusEnabled()) LogEncoderStatus(done);
+            if (log) log->Print("work", EncoderStatusEnabled() ? WorkLog::kCap : 12);
         }
         std::lock_guard<std::mutex> lk(arena->free_mu);
         for (auto& b : *chunks)
@@ -835,6 +865,19 @@ void Commit() {
     }];
     [cb commit];
     S.n_commits++;
+    // PS4_GNM_HANG_REPORT_MS=<ms> (debug): name the work of a command buffer that has not
+    // completed that long after its commit. A shader that never ends shows no error until
+    // something else needs the GPU (then macOS kills it as "Impacting Interactivity").
+    static const long hang_ms = getenv("PS4_GNM_HANG_REPORT_MS") ? atol(getenv("PS4_GNM_HANG_REPORT_MS")) : 0;
+    if (hang_ms > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, hang_ms * NSEC_PER_MSEC),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (cb.status >= MTLCommandBufferStatusCompleted) return;
+            fprintf(stderr, "[gnm-draw] GPU hang report: command buffer %s not complete %ld ms after commit\n",
+                    cb.label.UTF8String, hang_ms);
+            if (log) log->Print("pending work", WorkLog::kCap);
+        });
+    }
     // drop references to completed command buffers
     if (S.inflight.size() >= 8) {
         size_t n = 0;
@@ -2897,6 +2940,7 @@ id<MTLRenderCommandEncoder> BeginPass(const PassKey& key, const ClearReq& clr, i
     }
     S.renc = [S.cmd renderCommandEncoderWithDescriptor:rp];
     g_rstate.Reset(S.renc);
+    if (EncoderStatusEnabled()) S.renc.label = WorkLabel("render");
     static const bool labels = getenv("PS4_GNM_LABELS") != nullptr;
     if (labels) {
         // profiling aid: name passes after their targets (shown by Metal System Trace)
@@ -2931,6 +2975,7 @@ id<MTLComputeCommandEncoder> ComputeEncoder() {
         static const bool serial = getenv("PS4_GNM_SERIAL_COMPUTE") != nullptr;
         S.cenc = serial ? [S.cmd computeCommandEncoder]
                         : [S.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        if (EncoderStatusEnabled()) S.cenc.label = WorkLabel("compute");
         g_cstate.Reset(S.cenc);
         S.n_cencs++;
     }
@@ -4100,7 +4145,15 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
     return true;
 }
 
+// PS4_GNM_COMMIT_EACH=1 (debug): one command buffer per draw or dispatch, so a failing or
+// hanging command buffer (PS4_GNM_HANG_REPORT_MS, PS4_GNM_ENCODER_STATUS) names one shader.
+void CommitEachForDebug() {
+    static const bool each = getenv("PS4_GNM_COMMIT_EACH") != nullptr;
+    if (each && S.cmd) Commit();
+}
+
 void DrawEncode(DrawRec& r) {
+    CommitEachForDebug();
     if (S.hung) return;
     DrainAsyncPsos();
     const DrawArgs& args = r.args;
@@ -4601,6 +4654,7 @@ void Dispatch(GuestContext* ctx, const uint32_t* regs, uint32_t dim_x, uint32_t 
 }
 
 void DispatchEncode(DispatchRec& r) {
+    CommitEachForDebug();
     if (S.hung) return;
     const RegSnap& regs = r.regs;
     const gcn_runtime_info& rt = r.rt;
