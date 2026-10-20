@@ -794,7 +794,7 @@ static int fill_module_info_ex(GuestContext *ctx, uint64_t addr, uint64_t info_a
     memset(info, 0, sizeof(*info));
     info->st_size = sizeof(OrbisKernelModuleInfoEx);
     snprintf(info->name, sizeof(info->name), "%s", snap.name);
-    info->id = 1;
+    info->id = snap.handle;
     info->eh_frame_hdr_addr = snap.eh_frame_hdr_addr;
     info->eh_frame_hdr_size = (uint32_t)snap.eh_frame_hdr_size;
     info->eh_frame_addr = snap.eh_frame_addr;

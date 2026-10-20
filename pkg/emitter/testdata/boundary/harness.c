@@ -677,8 +677,8 @@ static void test_module_info(void) {
   expect_seg("Internal eboot text", &xseg[0], 0x400000, 0x180000, 5);
   expect_seg("Internal eboot data", &xseg[2], 0x5c0000, 0x40000, 6);
 
-  // GetModuleInfoFromAddr (same layout as Internal): the module's own segments; an address in no
-  // module is ESRCH, as on the console.
+  // GetModuleInfoFromAddr (same layout as Internal): the id is the module's handle, the segments
+  // its own; an address in no module is ESRCH, as on the console.
   int32_t prx_handle = -1;
   for (uint64_t i = 0; i < n; i++) {
     call_shim(ctx, shim_sceKernelGetModuleInfo, (uint64_t)(int64_t)list[i], MI_INFO, 0, 0, 0, 0, 0);
@@ -687,10 +687,12 @@ static void test_module_info(void) {
   if (prx_handle <= 0) fail("GetModuleList has no libFake.prx with a PRX handle (got %d)", prx_handle);
   memset(g_proc->mem_base + MI_INFO, 0xee, 1024);
   expect("FromAddr(eboot text)", call_shim(ctx, shim_sceKernelGetModuleInfoFromAddr, 0x400100, 0, MI_INFO, 0, 0, 0, 0), 0);
+  expect("FromAddr(eboot) id", (uint64_t)(int64_t)*(const int32_t *)(ex + 8 + 256), 0);
   expect("FromAddr(eboot) segment count", *(const uint32_t *)((const uint8_t *)xseg + 4 * sizeof(MiSeg)), 3);
   expect_seg("FromAddr eboot rodata", &xseg[1], 0x580000, 0x40000, 4);
   memset(g_proc->mem_base + MI_INFO, 0xee, 1024);
   expect("FromAddr(PRX text)", call_shim(ctx, shim_sceKernelGetModuleInfoFromAddr, 0x800100, 0, MI_INFO, 0, 0, 0, 0), 0);
+  expect("FromAddr(PRX) id", (uint64_t)(int64_t)*(const int32_t *)(ex + 8 + 256), (uint64_t)(int64_t)prx_handle);
   if (strcmp((const char *)ex + 8, "libFake.prx") != 0) fail("FromAddr(PRX) name %.32s", (const char *)ex + 8);
   expect("FromAddr(PRX) segment count", *(const uint32_t *)((const uint8_t *)xseg + 4 * sizeof(MiSeg)), 1);
   expect_seg("FromAddr PRX text", &xseg[0], 0x800000, 0x10000, 5);
