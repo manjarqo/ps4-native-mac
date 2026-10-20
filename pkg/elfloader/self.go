@@ -14,9 +14,9 @@ const (
 	selfHeaderSize = 0x20
 	selfEntrySize  = 0x20
 
-	selfPropHasBlocks     = 11
-	selfPropSegmentShift  = 20
-	selfPropSegmentMask   = 0xFFFF
+	selfPropHasBlocks    = 11
+	selfPropSegmentShift = 20
+	selfPropSegmentMask  = 0xFFFF
 )
 
 // IsSELF reports whether data starts with a PS4 SELF header.

@@ -78,6 +78,32 @@ type AsmEmitter struct {
 	// unresolved describes every import slot (PLT stub and GOT slot address) that no host
 	// shim and no loaded module satisfies. Each one is bound to shim_unresolved_stub.
 	unresolved map[uint64]unresolvedImport
+	// UnresolvedFuncImports and UnresolvedDataImports count the unresolved import relocations:
+	// JUMP_SLOT ones are calls, GLOB_DAT/R_X86_64_64 ones are address loads (a data import is
+	// bound to the same stub, so reading it as data yields the stub's address).
+	UnresolvedFuncImports int
+	UnresolvedDataImports int
+	// UnresolvedDataNames lists the unresolved data imports, sorted, each as its name (the NID
+	// when the NID database does not know it) and importing library.
+	UnresolvedDataNames []string
+	// Warnings collects generation-time problems that do not stop the generation (the caller
+	// prints them in its summary).
+	Warnings []string
+}
+
+// maxModuleSegments is the number of segments a module registers with the runtime
+// (RecompModuleUnwindInfo.segments, the four of SceKernelModuleInfo).
+const maxModuleSegments = 4
+
+// registeredSegments returns the segments of module name that fit the runtime's table, with a
+// warning in e.Warnings when some do not.
+func (e *AsmEmitter) registeredSegments(name string, segs []*elfloader.Segment) []*elfloader.Segment {
+	if len(segs) <= maxModuleSegments {
+		return segs
+	}
+	e.Warnings = append(e.Warnings, fmt.Sprintf("module %s has %d segments; module info reports only the first %d",
+		name, len(segs), maxModuleSegments))
+	return segs[:maxModuleSegments]
 }
 
 // unresolvedImport is what shim_unresolved_stub reports when the guest calls a missing import.
@@ -95,8 +121,9 @@ const unresolvedStubShim = "shim_unresolved_stub"
 // (or at itself when there is no PLT) when neither a module export nor the canary applies, and
 // the emitter binds a host shim to the slots it can serve. What is left would jump to itself
 // forever, so it is routed to shim_unresolved_stub with its name instead.
-func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]string) map[uint64]unresolvedImport {
-	out := make(map[uint64]unresolvedImport)
+func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]string) (out map[uint64]unresolvedImport, funcs, data int, dataNames []string) {
+	out = make(map[uint64]unresolvedImport)
+	seenData := make(map[string]bool)
 	for _, rel := range loaded.Relocations {
 		switch rel.Type {
 		case elfloader.R_X86_64_JUMP_SLOT, elfloader.R_X86_64_GLOB_DAT, elfloader.R_X86_64_64:
@@ -117,6 +144,22 @@ func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]st
 		if canon, ok := elfloader.ResolveNID(rel.SymName); ok {
 			imp.name = canon
 		}
+		if rel.Type == elfloader.R_X86_64_JUMP_SLOT {
+			funcs++
+		} else {
+			data++
+			label := imp.name
+			if label == "" {
+				label = imp.nid
+			}
+			if imp.lib != "" {
+				label += " (" + imp.lib + ")"
+			}
+			if !seenData[label] {
+				seenData[label] = true
+				dataNames = append(dataNames, label)
+			}
+		}
 		for _, addr := range []uint64{rel.PltAddr, rel.Offset} {
 			if addr == 0 {
 				continue
@@ -129,7 +172,8 @@ func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]st
 			}
 		}
 	}
-	return out
+	slices.Sort(dataNames)
+	return out, funcs, data, dataNames
 }
 
 // NewAsmEmitter creates a new ARM64 assembly emitter.
@@ -176,7 +220,7 @@ func NewAsmEmitter(loaded *elfloader.LoadedELF, d *disasm.Disassembler, l *lifte
 		bindAddr(sym.Name, sym.Address)
 	}
 
-	unresolved := collectUnresolvedImports(loaded, shimMap)
+	unresolved, unresFuncs, unresData, unresDataNames := collectUnresolvedImports(loaded, shimMap)
 	for addr := range unresolved {
 		shimMap[addr] = unresolvedStubShim
 	}
@@ -187,6 +231,10 @@ func NewAsmEmitter(loaded *elfloader.LoadedELF, d *disasm.Disassembler, l *lifte
 		lifter:     l,
 		shimMap:    shimMap,
 		unresolved: unresolved,
+
+		UnresolvedFuncImports: unresFuncs,
+		UnresolvedDataImports: unresData,
+		UnresolvedDataNames:   unresDataNames,
 	}
 }
 
@@ -762,11 +810,8 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 		if endAddr == 0 {
 			endAddr = e.elf.MaxVAddr
 		}
-		mainSegs := ownSegments(e.elf)
+		mainSegs := e.registeredSegments(mainName, ownSegments(e.elf))
 		numSegs := len(mainSegs)
-		if numSegs > 4 {
-			numSegs = 4
-		}
 		var segsInit strings.Builder
 		for si := 0; si < numSegs; si++ {
 			s := mainSegs[si]
@@ -810,13 +855,11 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 				fmt.Fprintf(w, "    recomp_module_register_init(%q, recomp_module_init_%d, %d);\n", name, i, len(mod.Init))
 			}
 		}
-		modNumSegs := len(mod.Segments)
-		if modNumSegs > 4 {
-			modNumSegs = 4
-		}
+		modSegs := e.registeredSegments(mod.FileName, mod.Segments)
+		modNumSegs := len(modSegs)
 		var modSegsInit strings.Builder
 		for si := 0; si < modNumSegs; si++ {
-			s := mod.Segments[si]
+			s := modSegs[si]
 			prot := 0
 			if s.Flags&1 != 0 {
 				prot |= 1

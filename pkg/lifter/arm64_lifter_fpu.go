@@ -46,11 +46,11 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		var code []string
 		code = append(code, loadCtxPtr("x16")...)
 		code = append(code,
-			"    ldr  w17, [x16, #0x2e0]",     // w17 = fpu_top
-			"    sub  w17, w17, #1",           // w17 = top - 1
-			"    and  w17, w17, #7",           // w17 = (top - 1) & 7
-			"    str  w17, [x16, #0x2e0]",     // update fpu_top
-			"    add  x5, x16, #0x2a0",       // x5 = &fpu_stack[0]
+			"    ldr  w17, [x16, #0x2e0]",      // w17 = fpu_top
+			"    sub  w17, w17, #1",            // w17 = top - 1
+			"    and  w17, w17, #7",            // w17 = (top - 1) & 7
+			"    str  w17, [x16, #0x2e0]",      // update fpu_top
+			"    add  x5, x16, #0x2a0",         // x5 = &fpu_stack[0]
 			"    str  d28, [x5, w17, uxtw #3]", // fpu_stack[top] = d28
 		)
 		return code
@@ -63,12 +63,12 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		var code []string
 		code = append(code, loadCtxPtr("x16")...)
 		code = append(code,
-			"    ldr  w17, [x16, #0x2e0]",     // w17 = fpu_top
-			"    add  x5, x16, #0x2a0",       // x5 = &fpu_stack[0]
+			"    ldr  w17, [x16, #0x2e0]",      // w17 = fpu_top
+			"    add  x5, x16, #0x2a0",         // x5 = &fpu_stack[0]
 			"    ldr  d28, [x5, w17, uxtw #3]", // d28 = fpu_stack[top]
-			"    add  w17, w17, #1",           // w17 = top + 1
-			"    and  w17, w17, #7",           // w17 = (top + 1) & 7
-			"    str  w17, [x16, #0x2e0]",     // update fpu_top
+			"    add  w17, w17, #1",            // w17 = top + 1
+			"    and  w17, w17, #7",            // w17 = (top + 1) & 7
+			"    str  w17, [x16, #0x2e0]",      // update fpu_top
 		)
 		return code
 	}
@@ -78,10 +78,10 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		var code []string
 		code = append(code, loadCtxPtr("x16")...)
 		code = append(code,
-			"    ldr  w17, [x16, #0x2e0]",             // w17 = fpu_top
+			"    ldr  w17, [x16, #0x2e0]",              // w17 = fpu_top
 			fmt.Sprintf("    add  w17, w17, #%d", idx), // w17 = top + idx
-			"    and  w17, w17, #7",                   // w17 = (top + idx) & 7
-			"    add  x5, x16, #0x2a0",               // x5 = &fpu_stack[0]
+			"    and  w17, w17, #7",                    // w17 = (top + idx) & 7
+			"    add  x5, x16, #0x2a0",                 // x5 = &fpu_stack[0]
 			fmt.Sprintf("    ldr  %s, [x5, w17, uxtw #3]", targetD),
 		)
 		return code
@@ -92,10 +92,10 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		var code []string
 		code = append(code, loadCtxPtr("x16")...)
 		code = append(code,
-			"    ldr  w17, [x16, #0x2e0]",             // w17 = fpu_top
+			"    ldr  w17, [x16, #0x2e0]",              // w17 = fpu_top
 			fmt.Sprintf("    add  w17, w17, #%d", idx), // w17 = top + idx
-			"    and  w17, w17, #7",                   // w17 = (top + idx) & 7
-			"    add  x5, x16, #0x2a0",               // x5 = &fpu_stack[0]
+			"    and  w17, w17, #7",                    // w17 = (top + idx) & 7
+			"    add  x5, x16, #0x2a0",                 // x5 = &fpu_stack[0]
 			fmt.Sprintf("    str  %s, [x5, w17, uxtw #3]", srcD),
 		)
 		return code
@@ -450,10 +450,10 @@ func (l *Arm64Lifter) liftFpu(inst disasm.Instruction, nextPC uint64, lines []st
 		// Store FPU status word into AX or memory
 		lines = append(lines, loadCtxPtr("x16")...)
 		lines = append(lines,
-			"    ldrh w17, [x16, #0x2e6]",     // w17 = fpu_sw
-			"    ldr  w5, [x16, #0x2e0]",     // w5 = fpu_top
+			"    ldrh w17, [x16, #0x2e6]", // w17 = fpu_sw
+			"    ldr  w5, [x16, #0x2e0]",  // w5 = fpu_top
 			"    and  w5, w5, #7",
-			"    bic  w17, w17, #(7 << 11)",   // clear TOP bits
+			"    bic  w17, w17, #(7 << 11)",  // clear TOP bits
 			"    orr  w17, w17, w5, lsl #11", // insert TOP bits
 		)
 		if reg, ok := args[0].(x86asm.Reg); ok && reg == x86asm.AX {
@@ -688,7 +688,7 @@ func x87RoundBegin() []string {
 		"    ldrh w6, [x5, #0x2e4]",
 		"    ubfx w6, w6, #10, #2",
 		"    eor  w7, w6, w6, lsr #1",
-		"    and  w7, w7, #1",        // 1 for down and up, whose encodings swap
+		"    and  w7, w7, #1", // 1 for down and up, whose encodings swap
 		"    orr  w7, w7, w7, lsl #1",
 		"    eor  w6, w6, w7",
 		"    mrs  x5, fpcr",
@@ -727,30 +727,30 @@ func isX87M80(inst disasm.Instruction) bool {
 func x87LoadM80() []string {
 	return []string{
 		"    mrs  x7, nzcv",
-		"    ldr  x2, [x1]",           // significand
-		"    ldrh w3, [x1, #8]",       // sign and exponent
-		"    and  w4, w3, #0x7fff",    // biased exponent (bias 16383)
+		"    ldr  x2, [x1]",        // significand
+		"    ldrh w3, [x1, #8]",    // sign and exponent
+		"    and  w4, w3, #0x7fff", // biased exponent (bias 16383)
 		"    and  x3, x3, #0x8000",
-		"    lsl  x3, x3, #48",        // sign in bit 63
+		"    lsl  x3, x3, #48", // sign in bit 63
 		"    mov  w6, #0x7fff",
 		"    cmp  w4, w6",
 		"    b.eq 3f",
 		"    cbz  w4, 1f",
-		"    tbz  x2, #63, 4f",        // unnormal
+		"    tbz  x2, #63, 4f", // unnormal
 		"    b    2f",
 		"1:",
-		"    cbz  x2, 5f",             // +-0
-		"    mov  w4, #1",             // denormals and pseudo-denormals use exponent 1
+		"    cbz  x2, 5f", // +-0
+		"    mov  w4, #1", // denormals and pseudo-denormals use exponent 1
 		"2:",
 		"    clz  x6, x2",
 		"    lsl  x2, x2, x6",
-		"    mov  x0, x2",             // normalized significand, for the denormal path
-		"    sub  w4, w4, w6",         // biased exponent of 1.f after normalization
-		"    ucvtf d28, x2",           // 2^63 <= value <= 2^64: double exponent field 1086 (1087)
+		"    mov  x0, x2",     // normalized significand, for the denormal path
+		"    sub  w4, w4, w6", // biased exponent of 1.f after normalization
+		"    ucvtf d28, x2",   // 2^63 <= value <= 2^64: double exponent field 1086 (1087)
 		"    fmov x2, d28",
-		"    mov  w6, #16446",         // 16383 + 63
+		"    mov  w6, #16446", // 16383 + 63
 		"    sub  w4, w4, w6",
-		"    sxtw x4, w4",             // value = ucvtf result * 2^x4
+		"    sxtw x4, w4", // value = ucvtf result * 2^x4
 		"    add  x6, x4, #1086",
 		"    cmp  x6, #2047",
 		"    b.ge 6f",
@@ -758,31 +758,31 @@ func x87LoadM80() []string {
 		"    b.le 7f",
 		"    add  x2, x2, x4, lsl #52",
 		"    b    8f",
-		"7:",                          // denormal result: significand x0 >> s, rounded to nearest even
+		"7:", // denormal result: significand x0 >> s, rounded to nearest even
 		"    mov  x6, #-1074",
-		"    sub  x6, x6, x4",         // s = -1074 - x4 >= 12
+		"    sub  x6, x6, x4", // s = -1074 - x4 >= 12
 		"    cmp  x6, #64",
-		"    b.gt 5f",                 // below half the smallest denormal: +-0
+		"    b.gt 5f", // below half the smallest denormal: +-0
 		"    b.eq 10f",
 		"    lsr  x2, x0, x6",
 		"    neg  x4, x6",
-		"    lsl  x6, x0, x4",         // the bits shifted out, left-aligned
-		"    tbz  x6, #63, 8f",        // below half: truncate
+		"    lsl  x6, x0, x4",  // the bits shifted out, left-aligned
+		"    tbz  x6, #63, 8f", // below half: truncate
 		"    lsl  x6, x6, #1",
-		"    cbnz x6, 11f",            // above half
-		"    tbz  x2, #0, 8f",         // tie: to even
+		"    cbnz x6, 11f",    // above half
+		"    tbz  x2, #0, 8f", // tie: to even
 		"11:",
-		"    add  x2, x2, #1",         // may carry into the smallest normal: still the right bits
+		"    add  x2, x2, #1", // may carry into the smallest normal: still the right bits
 		"    b    8f",
-		"10:",                         // s = 64: half the smallest denormal or more
+		"10:", // s = 64: half the smallest denormal or more
 		"    lsl  x6, x0, #1",
 		"    cmp  x6, #0",
 		"    cset x2, ne",
 		"    b    8f",
 		"3:",
-		"    tbz  x2, #63, 4f",        // pseudo-infinity / pseudo-NaN
+		"    tbz  x2, #63, 4f", // pseudo-infinity / pseudo-NaN
 		"    lsl  x6, x2, #1",
-		"    cbz  x6, 6f",             // infinity
+		"    cbz  x6, 6f", // infinity
 		"    lsr  x6, x6, #12",
 		"    orr  x2, x6, #0x7ff8000000000000", // quiet, as the x87 delivers a signaling NaN
 		"    b    8f",
@@ -809,27 +809,27 @@ func x87StoreM80() []string {
 		"    mrs  x7, nzcv",
 		"    fmov x2, d28",
 		"    lsr  x3, x2, #63",
-		"    lsl  x3, x3, #15",        // sign in bit 15 of the exponent word
-		"    ubfx x4, x2, #52, #11",   // double exponent field
+		"    lsl  x3, x3, #15",      // sign in bit 15 of the exponent word
+		"    ubfx x4, x2, #52, #11", // double exponent field
 		"    and  x6, x2, #0xfffffffffffff",
 		"    cbz  x4, 1f",
 		"    mov  x0, #0x7ff",
 		"    cmp  x4, x0",
 		"    b.eq 2f",
-		"    mov  x0, #15360",         // 16383 - 1023
+		"    mov  x0, #15360", // 16383 - 1023
 		"    add  x4, x4, x0",
 		"    lsl  x6, x6, #11",
 		"    orr  x6, x6, #0x8000000000000000",
 		"    b    4f",
 		"1:",
-		"    cbz  x6, 4f",             // +-0
-		"    clz  x0, x6",             // denormal: normalize the fraction
+		"    cbz  x6, 4f", // +-0
+		"    clz  x0, x6", // denormal: normalize the fraction
 		"    lsl  x6, x6, x0",
-		"    mov  x4, #15372",         // 16383 - 1074 + 63
+		"    mov  x4, #15372", // 16383 - 1074 + 63
 		"    sub  x4, x4, x0",
 		"    b    4f",
 		"2:",
-		"    mov  x4, #0x7fff",        // infinity or NaN
+		"    mov  x4, #0x7fff", // infinity or NaN
 		"    cbz  x6, 3f",
 		"    orr  x6, x6, #0x0008000000000000", // NaN: quiet (x87 registers never hold an SNaN loaded from m64)
 		"3:",
@@ -987,7 +987,7 @@ func x87Remainder(nearest bool) []string {
 		"    orr  x5, x5, #0x10000000000000",
 		"2:",
 		"    and  x0, x0, #0x8000000000000000", // sign of the result (that of x)
-		"    subs x1, x2, x3",                   // exponent difference
+		"    subs x1, x2, x3",                  // exponent difference
 		"    b.lt 6f",
 		"    mov  x6, x4", // r = (mx << d) mod my, one quotient bit per step
 		"3:",

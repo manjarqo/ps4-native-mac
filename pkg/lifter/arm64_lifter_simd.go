@@ -2127,7 +2127,7 @@ func x86Recip(rsqrt bool, d, a string) []string {
 		return append(out,
 			"    frsqrte v27.4s, v24.4s",
 			"    fmul v26.4s, v27.4s, v27.4s",
-			"    frsqrts v26.4s, v26.4s, v24.4s", // (3 - a * x0^2) / 2
+			"    frsqrts v26.4s, v26.4s, v24.4s",             // (3 - a * x0^2) / 2
 			fmt.Sprintf("    fmul %s.4s, v27.4s, v26.4s", d)) // never denormal
 	}
 	out = append(out,
@@ -3956,9 +3956,9 @@ func (l *Arm64Lifter) liftPsadbw(inst disasm.Instruction, nextPC uint64, lines [
 	computeSadHalf := func(s1, s2, d string) []string {
 		return []string{
 			fmt.Sprintf("    uabd v28.16b, %s.16b, %s.16b", s1, s2), // absolute difference
-			"    uaddlp v29.8h, v28.16b",                             // sum 8-bit pairs to 16-bit
-			"    uaddlp v28.4s, v29.8h",                              // sum 16-bit pairs to 32-bit
-			"    uaddlp v29.2d, v28.4s",                              // sum 32-bit pairs to 64-bit
+			"    uaddlp v29.8h, v28.16b",                            // sum 8-bit pairs to 16-bit
+			"    uaddlp v28.4s, v29.8h",                             // sum 16-bit pairs to 32-bit
+			"    uaddlp v29.2d, v28.4s",                             // sum 32-bit pairs to 64-bit
 			fmt.Sprintf("    mov %s.16b, v29.16b", d),
 		}
 	}
@@ -4017,10 +4017,10 @@ func (l *Arm64Lifter) liftPmaddwd(inst disasm.Instruction, nextPC uint64, lines 
 
 	computePmadd := func(s1, s2, d string) []string {
 		return []string{
-			fmt.Sprintf("    smull v28.4s, %s.4h, %s.4h", s1, s2),   // low 4 words multiply
+			fmt.Sprintf("    smull v28.4s, %s.4h, %s.4h", s1, s2),  // low 4 words multiply
 			fmt.Sprintf("    smull2 v29.4s, %s.8h, %s.8h", s1, s2), // high 4 words multiply
-			"    addp v28.4s, v28.4s, v28.4s",                  // pairwise add low halves
-			"    addp v29.4s, v29.4s, v29.4s",                  // pairwise add high halves
+			"    addp v28.4s, v28.4s, v28.4s",                      // pairwise add low halves
+			"    addp v29.4s, v29.4s, v29.4s",                      // pairwise add high halves
 			fmt.Sprintf("    mov %s.d[0], v28.d[0]", d),
 			fmt.Sprintf("    mov %s.d[1], v29.d[0]", d),
 		}
@@ -4034,6 +4034,3 @@ func (l *Arm64Lifter) liftPmaddwd(inst disasm.Instruction, nextPC uint64, lines 
 	}
 	return lines, nil
 }
-
-
-

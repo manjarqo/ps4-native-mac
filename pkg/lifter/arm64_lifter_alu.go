@@ -591,6 +591,7 @@ func (l *Arm64Lifter) liftNegNot(inst disasm.Instruction, nextPC uint64, lines [
 //     (SHL: MSB(result) ^ CF, SHR: MSB(source), SAR: 0);
 //   - ROL/ROR change only CF (ROL: LSB(result), ROR: MSB(result)) and OF (ROL: MSB ^ CF,
 //     ROR: the two top bits XORed); SF/ZF are kept.
+//
 // CF and OF are inserted into C and V with RMIF; SF/ZF come from CMN of the top-aligned result.
 // A variable count keeps the current carry sense (the count may be 0); an immediate count
 // leaves carryAdd.
@@ -1744,6 +1745,7 @@ func (l *Arm64Lifter) liftPopcnt(inst disasm.Instruction, nextPC uint64, lines [
 //   - TZCNT/LZCNT: CF = (src == 0), ZF = (result == 0); the count of a zero source is the
 //     operand size. CMP src, #0 then CCMP result, #0 gives Z = (result == 0) and C = !CF.
 //   - BSF/BSR: ZF = (src == 0); a zero source leaves the destination unchanged.
+//
 // The carry sense afterwards is carrySub.
 func (l *Arm64Lifter) liftBitScan(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	op := inst.Inst.Op
@@ -2049,8 +2051,8 @@ func (l *Arm64Lifter) liftFlagsOp(inst disasm.Instruction, lines []string) ([]st
 func (l *Arm64Lifter) liftLeave(lines []string) []string {
 	// RSP is x26, RBP is x25
 	lines = append(lines,
-		"    mov x26, x25",           // mov rsp, rbp
-		"    ldr x25, [x28, x26]",    // pop rbp
+		"    mov x26, x25",        // mov rsp, rbp
+		"    ldr x25, [x28, x26]", // pop rbp
 		"    add x26, x26, #8",
 	)
 	return lines
@@ -2403,4 +2405,3 @@ func (l *Arm64Lifter) liftStr(inst disasm.Instruction, nextPC uint64, lines []st
 	}
 	return lines, nil
 }
-

@@ -492,6 +492,7 @@ func defMemSz(inst disasm.Instruction) int {
 //   - MOV with a 64-bit absolute address (moffs, opcodes A0-A3): x86asm reports it like a
 //     RIP-relative operand and the displacement does not fit the 32-bit path;
 //   - GS: the guest GS base is not kept anywhere.
+//
 // NOP and the prefetches do not access memory and are exempt.
 func unsupportedAddressing(inst x86asm.Inst) string {
 	switch inst.Op {

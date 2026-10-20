@@ -30,6 +30,16 @@ import (
 //	str  w17, [x28, x16]   ->  add x7, x28, x16; stlr w17, [x7]
 //
 // 2-, 4- and 8-byte accesses first check for a 16-byte boundary crossing (orderedAccess).
+//
+// Why LDAPR (RCpc) and not LDAR (RCsc): the two differ in one case only. An LDAR may not be
+// satisfied before an earlier STLR to another address has become visible; an LDAPR may. x86-TSO
+// allows exactly that reordering (a store followed by a load from another address may be
+// observed in the other order: the store-buffer relaxation). x86 code that needs it closed uses
+// MFENCE, lowered to dmb ish, or a locked instruction, lowered to an acquire-release atomic
+// (casal, ldaddal, swpal, ldaxr/stlxr) that no later load passes. The orderings TSO does
+// guarantee, load->load, load->store and store->store, LDAPR + STLR guarantee as well, so LDAR
+// would only add ordering x86 never promised. The spec left "LDAPR or LDAR" to measurement; it
+// was settled by this argument, and Task 9's TSO on/off A/B measured the cost of the ordering.
 
 // SetTSO turns x86 memory ordering for non-stack guest memory on (the default) or off.
 func (l *Arm64Lifter) SetTSO(on bool) {

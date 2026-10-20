@@ -1308,7 +1308,7 @@ static void stall_dump_threads(double stalled_ms) {
     // guest address of the last shim it called (guest code itself never writes rip).
     const GuestContext *run = t->ctx;
     if (t->ctx->mem_base && t->ctx->fs_base) {
-      const uint64_t slot = *(const uint64_t *)(t->ctx->mem_base + t->ctx->fs_base + 0x70ULL);
+      const uint64_t slot = *(const uint64_t *)(t->ctx->mem_base + t->ctx->fs_base + RECOMP_TCB_CTX_SLOT);
       if (slot) run = (const GuestContext *)(uintptr_t)slot;
     }
     fprintf(stderr, "[stall]   %-28s last shim 0x%llx  mxcsr 0x%x%s  host %s\n", t->name[0] ? t->name : "unnamed",

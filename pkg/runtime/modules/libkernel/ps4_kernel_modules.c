@@ -71,46 +71,22 @@ void shim_sceKernelGetModuleInfo(GuestContext *ctx) {
         ctx->rax = (uint64_t)(int64_t)KMOD_ERROR_EFAULT;
         SHIM_RETURN();
     }
-    RecompModuleSnapshot *mods = (RecompModuleSnapshot *)calloc(KMOD_MAX, sizeof(*mods));
-    if (!mods) {
-        ctx->rax = (uint64_t)(int64_t)KMOD_ERROR_ENOMEM;
-        SHIM_RETURN();
-    }
-    int n = recomp_module_snapshot(mods, KMOD_MAX);
-    const RecompModuleSnapshot *m = NULL;
-    for (int i = 0; i < n; i++) {
-        if (mods[i].handle == handle) {
-            m = &mods[i];
-            break;
-        }
-    }
-    // sceKernelGetModuleInfoFromAddr reports handle 1 for the main module.
-    if (!m && handle == 1 && n > 0) m = &mods[0];
-    if (!m) {
-        free(mods);
+    RecompModuleSnapshot snap;
+    if (recomp_module_info_by_handle(handle, &snap) != 0) {
         ctx->rax = (uint64_t)(int64_t)KMOD_ERROR_ESRCH;
         SHIM_RETURN();
     }
     KmodModuleInfo *info = (KmodModuleInfo *)(ctx->mem_base + info_g);
     memset(info, 0, sizeof(*info));
     info->st_size = sizeof(*info);
-    snprintf(info->name, sizeof(info->name), "%s", m->name);
-    if (m->has_range) {
-        uint64_t seg0 = m->seg0_addr ? m->seg0_addr : m->start_addr;
-        uint64_t seg0_size = m->seg0_size ? m->seg0_size : (m->end_addr - m->start_addr);
-        info->segments[0].address = seg0;
-        info->segments[0].size = (uint32_t)seg0_size;
-        info->segments[0].prot = 5; // R+X (text)
-        info->num_segments = 1;
-        uint64_t seg0_end = seg0 + seg0_size;
-        if (m->end_addr > seg0_end) {
-            info->segments[1].address = seg0_end;
-            info->segments[1].size = (uint32_t)(m->end_addr - seg0_end);
-            info->segments[1].prot = 3; // R+W (data)
-            info->num_segments = 2;
-        }
+    snprintf(info->name, sizeof(info->name), "%s", snap.name);
+    RecompModuleSegment segs[4];
+    info->num_segments = recomp_module_snapshot_segments(&snap, segs);
+    for (uint32_t i = 0; i < info->num_segments; i++) {
+        info->segments[i].address = segs[i].addr;
+        info->segments[i].size = (uint32_t)segs[i].size;
+        info->segments[i].prot = segs[i].prot;
     }
-    free(mods);
     ctx->rax = 0;
     SHIM_RETURN();
 }

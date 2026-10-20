@@ -395,6 +395,14 @@ func Execute(args []string) error {
 		return fmt.Errorf("failed to write HLE report: %w", err)
 	}
 	fmt.Print(hle.SyscallSummary())
+	fmt.Printf("             Unresolved imports bound to the abort stub: %d calls, %d data (GLOB_DAT/R_64)\n",
+		em.UnresolvedFuncImports, em.UnresolvedDataImports)
+	if len(em.UnresolvedDataNames) > 0 {
+		fmt.Printf("             Unresolved data imports: %s\n", strings.Join(em.UnresolvedDataNames, ", "))
+	}
+	for _, w := range em.Warnings {
+		fmt.Printf("             Warning: %s\n", w)
+	}
 	fmt.Printf("             Wrote %s\n", hlePath)
 
 	if cfg.AppDir != "" {

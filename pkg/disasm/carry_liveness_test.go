@@ -140,6 +140,8 @@ func TestCarryOverflowLiveness(t *testing.T) {
 		movRaxRb  = "4889d8"   // mov rax, rbx
 		repeCmpsb = "f3a6"     // repe cmpsb
 		cmpsb     = "a6"       // cmpsb
+		int41     = "cd41"     // int 0x41: no-op, falls through
+		int44     = "cd44"     // int 0x44: traps, no successor
 	)
 	for _, tc := range []struct {
 		name   string
@@ -207,6 +209,17 @@ func TestCarryOverflowLiveness(t *testing.T) {
 		{"CALL kills CF and OF", []testBlock{
 			{"entry", []string{addRR, "call:out", adcImm, ret}},
 		}, nil, []want{{label: "entry", idx: 0, carryDead: true, overDead: true, checkOver: true}}},
+		{"INT 0x41 at a block end falls through to a CF reader", []testBlock{
+			{"entry", []string{addRR, int41}},
+			{"next", []string{adcImm, ret}},
+		}, nil, []want{{label: "entry", idx: 0, carryDead: false}}},
+		{"INT 0x41 falling off the function: unknown successor", []testBlock{
+			{"entry", []string{addRR, int41}},
+		}, nil, []want{{label: "entry", idx: 0, carryDead: false}}},
+		{"other INT at a block end has no successor", []testBlock{
+			{"entry", []string{addRR, int44}},
+			{"next", []string{adcImm, ret}},
+		}, nil, []want{{label: "entry", idx: 0, carryDead: true}}},
 		{"falling off the function: unknown successor", []testBlock{
 			{"entry", []string{addRR, movRaxRb}},
 		}, nil, []want{{label: "entry", idx: 0, carryDead: false}}},
