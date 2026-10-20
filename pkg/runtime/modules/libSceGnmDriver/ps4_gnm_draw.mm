@@ -58,6 +58,7 @@
 #include "ps4_gnm_guest_window.h"
 #include "ps4_gnm_membudget.h"
 #include "ps4_gnm_rectlist.h"
+#include "ps4_gnm_push_data.h"
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_shader_cache.h"
 #include "ps4_gnm_pipeline_archive.h"
@@ -336,6 +337,9 @@ struct Shader {
     ps4gnm_lib_store::Key lib_key; // the MSL's key in the library store (lib_key.h1 == msl_hash)
     uint32_t lib_stage = 0;        // ps4gnm_lib_store::Stage of the function, 0: not stored
     bool from_store = false;       // fn was loaded from the library store
+    // Translated on the worker thread from the draw's guest memory read later than the draw, so
+    // its specialization may describe another draw: never the base of the permutation lookup.
+    bool from_worker = false;
     id<MTLFunction> fn = nil;
     bool pending = false;     // Metal library still compiling (fn not yet available)
     uint64_t fail_key = 0;    // permutation key recorded in shader_fail if compilation fails
@@ -1511,7 +1515,8 @@ void DrainAsyncCompiles() {
             S.shader_fail.insert(j->fail_key);
             continue;
         }
-        FinishShader(j->sh, j->hw, j->code_addr, j->key, j->fail_key, true, CFAbsoluteTimeGetCurrent());
+        if (Shader* fs = FinishShader(j->sh, j->hw, j->code_addr, j->key, j->fail_key, true, CFAbsoluteTimeGetCurrent()))
+            fs->from_worker = true;
     }
     for (auto& r : libs) {
         auto it = S.libs_pending.find(r.mh);
@@ -1793,21 +1798,29 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
     const int fi = hw == GCN_HW_VS ? 0 : hw == GCN_HW_PS ? 1 : hw == GCN_HW_CS ? 2 : -1;
     if (fi >= 0) S.flat_from[fi] = nullptr;
     if (!vec.empty()) {
-        const gcn_shader* list[64];
+        // The lookup builds the draw's specialization from list[0]: a permutation translated on
+        // this thread from the draw's own memory, not one from the worker (see from_worker).
         const uint32_t n = (uint32_t)std::min<size_t>(vec.size(), 64);
-        for (uint32_t i = 0; i < n; ++i) list[i] = vec[i]->sh;
+        uint32_t base = 0;
+        while (base + 1 < n && vec[base]->from_worker) ++base;
+        const gcn_shader* list[64];
+        uint32_t order[64];
+        order[0] = base;
+        for (uint32_t i = 0, k = 1; i < n; ++i)
+            if (i != base) order[k++] = i;
+        for (uint32_t i = 0; i < n; ++i) list[i] = vec[order[i]]->sh;
         int hit;
         if (fi >= 0) {
             // walk the pointer chains once: the flattened user data serves the check here and
             // the binding of the draw
-            BuildFlat(vec[0], ud, &S.flat_scratch[fi]);
-            S.flat_from[fi] = vec[0];
+            BuildFlat(vec[base], ud, &S.flat_scratch[fi]);
+            S.flat_from[fi] = vec[base];
             hit = gcn_shader_find_compatible_flat(list, n, ud, S.flat_scratch[fi].data(), S.flat_scratch[fi].size(),
                                                   &rt, ReadGuest, S.ctx);
         } else {
             hit = gcn_shader_find_compatible(list, n, ud, &rt, ReadGuest, S.ctx);
         }
-        if (hit >= 0) return vec[hit];
+        if (hit >= 0) return vec[order[hit]];
     }
     const uint64_t fail_key = Fnv(&rt, sizeof(rt), key * 1000003ull);
     if (S.shader_fail.count(fail_key)) return nullptr;
@@ -2287,7 +2300,9 @@ void BuildFlat(const Shader* s, const uint32_t ud[16], std::vector<uint32_t>* fl
 void StageFlat(int fi, const Shader* s, const uint32_t ud[16]) {
     const Shader* from = S.flat_from[fi];
     S.flat_from[fi] = nullptr;
-    if (from && from->info.flatbuf_size_dw == s->info.flatbuf_size_dw &&
+    // Reused only if built with the same SRT program: another permutation's program may place
+    // the flattened dwords elsewhere even with the same size.
+    if (from && gcn_shader_same_srt(from->sh, s->sh) &&
         S.flat_scratch[fi].size() == std::max<uint32_t>(s->info.flatbuf_size_dw, 16) && !ShouldTrace())
         return;
     BuildFlat(s, ud, &S.flat_scratch[fi]);
@@ -2539,8 +2554,10 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
         b.Sampler(GetSampler(ss, sb.is_depth), sb.msl_sampler);
     }
 
-    if (s->info.msl_push_constant_buffer >= 0)
-        b.Bytes(&pd, sizeof(pd), (uint32_t)s->info.msl_push_constant_buffer);
+    if (s->info.msl_push_constant_buffer >= 0) {
+        const ps4gnm_push::Padded padded(pd);
+        b.Bytes(padded.bytes, sizeof(padded.bytes), (uint32_t)s->info.msl_push_constant_buffer);
+    }
     return true;
 }
 

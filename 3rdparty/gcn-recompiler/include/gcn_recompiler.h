@@ -497,12 +497,17 @@ GCN_API int gcn_shader_find_compatible(const gcn_shader* const* list, uint32_t c
                                        gcn_read_guest_fn read, void* ctx);
 
 /* Same as gcn_shader_find_compatible() with the draw's flattened user data already built by
- * gcn_shader_build_flatbuf() for list[0] (the permutations of a program share its SRT program),
- * so the pointer chains are walked once per draw for both the check and the binding. */
+ * gcn_shader_build_flatbuf() for list[0], so the pointer chains are walked once per draw for both
+ * the check and the binding. The flattened data is only valid for permutations with list[0]'s SRT
+ * program (gcn_shader_same_srt); the others are checked against guest memory on their own. */
 GCN_API int gcn_shader_find_compatible_flat(const gcn_shader* const* list, uint32_t count,
                                             const uint32_t user_data[16], const uint32_t* flatbuf,
                                             size_t flatbuf_dw, const gcn_runtime_info* runtime,
                                             gcn_read_guest_fn read, void* ctx);
+
+/* True if a and b flatten user data the same way (same SRT walker program and flattened size),
+ * so the flattened user data built for one is valid for the other. */
+GCN_API bool gcn_shader_same_srt(const gcn_shader* a, const gcn_shader* b);
 
 /* ---- Sharp decoding (AmdGpu::Buffer / Image / Sampler) ----------------------------------- */
 typedef struct gcn_buffer_desc {

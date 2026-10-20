@@ -1043,14 +1043,28 @@ GCN_API bool gcn_shader_is_compatible(const gcn_shader* s, const uint32_t user_d
 }
 
 namespace {
-// Same resource lists (what StageSpecialization walks) as another permutation of the program.
+bool SameSrt(const Info& a, const Info& b) {
+    return a.srt_info.flattened_bufsize_dw == b.srt_info.flattened_bufsize_dw &&
+           a.srt_info.program == b.srt_info.program;
+}
+
+// Same resource lists (what StageSpecialization walks) and the same SRT program as another
+// permutation of the program, so a specialization built from b's Info and flattened user data
+// describes the draw for a too. Equal sizes alone are not enough: with another SRT program the
+// flattened dwords sit elsewhere, the specialization read from them is another draw's, and a
+// permutation that fits the draw never compares equal (a new permutation per draw, up to the
+// renderer's cap, then skipped draws).
 bool SameResourceLayout(const Info& a, const Info& b) {
     return a.sw_stage == b.sw_stage && a.buffers.size() == b.buffers.size() &&
            a.images.size() == b.images.size() && a.fmasks.size() == b.fmasks.size() &&
            a.samplers.size() == b.samplers.size() && a.flattened_ud_buf.size() == b.flattened_ud_buf.size() &&
-           a.srt_info.flattened_bufsize_dw == b.srt_info.flattened_bufsize_dw;
+           SameSrt(a, b);
 }
 } // namespace
+
+GCN_API bool gcn_shader_same_srt(const gcn_shader* a, const gcn_shader* b) {
+    return a && b && (a == b || SameSrt(a->info, b->info));
+}
 
 GCN_API int gcn_shader_find_compatible(const gcn_shader* const* list, uint32_t count,
                                        const uint32_t user_data[16], const gcn_runtime_info* runtime,
