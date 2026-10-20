@@ -120,6 +120,12 @@ clang++ -std=c++17 -fobjc-arc -Wall -Werror -g -O1 -fsanitize=address,undefined 
   "$T/membudget.o" -framework Metal -framework Foundation -o "$T/gpu_membudget_test"
 "$T/gpu_membudget_test" > "$T/gpu_membudget.txt" || { cat "$T/gpu_membudget.txt"; exit 1; }
 tail -1 "$T/gpu_membudget.txt"
+# RectList draws: a translated vertex shader drawn as rectangles (capture, barrier, expansion);
+# the colours at all 4 corners of each rectangle, with Metal API validation on.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_rectlist_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gnm_rectlist_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+MTL_DEBUG_LAYER=1 "$T/gnm_rectlist_test" 2>&1 | { grep -v "Metal API Validation Enabled" || true; }
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   "$G/ps4_gnm_library_store.mm" -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"

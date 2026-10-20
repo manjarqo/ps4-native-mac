@@ -57,6 +57,7 @@
 #include "ps4_gnm_draw.h"
 #include "ps4_gnm_guest_window.h"
 #include "ps4_gnm_membudget.h"
+#include "ps4_gnm_rectlist.h"
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_shader_cache.h"
 #include "ps4_gnm_pipeline_archive.h"
@@ -342,6 +343,19 @@ struct Shader {
     std::vector<gcn_image_binding> imgs;
     std::vector<gcn_sampler_binding> samps;
     std::vector<gcn_vertex_attrib> attrs;
+    // VS only: the two vertex shaders of RectList draws (ps4_gnm_rectlist.h), made by the first
+    // RectList draw that uses this shader. They only carry fn / uid / msl_hash / code_addr.
+    struct RectList {
+        Shader* capture = nullptr;
+        Shader* expand = nullptr;
+        uint32_t vertex_stride = 0, capture_slot = 0, params_slot = 0;
+        // Metal libraries still compiling (their fn is set before the count drops), and whether
+        // one failed.
+        std::atomic<int> compiling{2};
+        std::atomic<bool> failed{false};
+    };
+    RectList* rect = nullptr;
+    bool rect_failed = false;
 };
 
 struct PassKey {
@@ -1935,6 +1949,81 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
     return FinishShader(sh, hw, code_addr, key, fail_key, allow_async, t0);
 }
 
+
+// The RectList vertex shaders of `vs` (gcn_shader_rectlist_msl), made once per shader on the CP
+// thread. Their Metal libraries compile in the background like any new shader's (a synchronous
+// compile stalls the CP thread for tens of ms); draws are skipped until both are ready.
+// Returns nullptr (logged once per shader) if the shader cannot be expanded, and sets *pending
+// while the libraries compile.
+Shader::RectList* RectListShaders(Shader* vs, bool* pending) {
+    *pending = false;
+    if (vs->rect_failed) return nullptr;
+    if (Shader::RectList* r = vs->rect) {
+        if (r->compiling.load(std::memory_order_acquire) > 0) {
+            *pending = true;
+            return nullptr;
+        }
+        if (r->failed.load(std::memory_order_relaxed)) {
+            RLog("rect-fail", "VS 0x%llx: Metal rejected its RectList shaders", (unsigned long long)vs->code_addr);
+            vs->rect_failed = true;
+            return nullptr;
+        }
+        return r;
+    }
+    gcn_rectlist_msl m{};
+    char err[512] = {0};
+    if (gcn_shader_rectlist_msl(vs->sh, &S.msl, &m, err, sizeof(err)) != GCN_OK) {
+        RLog("rect-fail", "VS 0x%llx: no RectList variant: %s", (unsigned long long)vs->code_addr, err);
+        vs->rect_failed = true;
+        return nullptr;
+    }
+    auto* r = new Shader::RectList();
+    r->vertex_stride = m.vertex_stride;
+    r->capture_slot = m.capture_buffer;
+    r->params_slot = m.params_buffer;
+    const uint64_t code_addr = vs->code_addr;
+    auto start = [&](const char* src, bool expand) -> Shader* {
+        // the same edits as FinishShader: no optnone helpers; an invariant rasterized position
+        std::string msl = src;
+        const std::string tag = "[[clang::optnone]] ";
+        for (size_t pos; (pos = msl.find(tag)) != std::string::npos;) msl.erase(pos, tag.size());
+        if (expand) {
+            const std::string pos = "[[position]]";
+            for (size_t at = 0; (at = msl.find(pos, at)) != std::string::npos; at += 23)
+                msl.replace(at, pos.size(), "[[position, invariant]]");
+        }
+        Shader* s = new Shader();
+        s->hw = GCN_HW_VS;
+        s->code_addr = code_addr;
+        s->uid = S.next_uid++;
+        s->msl_hash = Fnv(msl.data(), msl.size());
+        s->pending = true;
+        DumpMsl(s, msl.c_str());
+        MTLCompileOptions* opt = [MTLCompileOptions new];
+        opt.fastMathEnabled = NO;
+        if (@available(macOS 11.0, *)) opt.preserveInvariance = YES;
+        [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()]
+                            options:opt
+                  completionHandler:^(id<MTLLibrary> lib, NSError* e) {
+                      s->fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
+                      if (!s->fn) {
+                          fprintf(stderr, "[gnm-draw] VS 0x%llx: Metal rejected its RectList %s shader: %s\n",
+                                  (unsigned long long)code_addr, expand ? "expansion" : "capture",
+                                  e ? e.localizedDescription.UTF8String : "no main0");
+                          r->failed.store(true, std::memory_order_relaxed);
+                      }
+                      s->pending = false;
+                      r->compiling.fetch_sub(1, std::memory_order_release);
+                  }];
+        return s;
+    };
+    r->capture = start(m.capture_msl, false);
+    r->expand = start(m.expand_msl, true);
+    gcn_rectlist_msl_free(&m);
+    vs->rect = r;
+    *pending = true;
+    return nullptr;
+}
 
 // =====================================================================================
 // Resource binding (shadPS4 Rasterizer::BindBuffers / BindTextures)
@@ -4610,6 +4699,19 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
                 regs[0xA102] != 0 || (args.indexed && !args.max_index))
                 return false;
         }
+        if (rs.raster.prim == PrimitiveType::RectList && !indirect) {
+            bool pending = false;
+            if (!RectListShaders(vs, &pending)) {
+                S.n_skipped++;
+                if (pending) {
+                    g_hitch.pending_draws++;
+                } else {
+                    RLog("rect-skip", "%s skipped: VS 0x%llx has no RectList variant", args.name,
+                         (unsigned long long)vs_addr);
+                }
+                return true;
+            }
+        }
         Shader* ps = nullptr;
         if (ps_addr) {
             gcn_runtime_info_from_regs(regs, 0x10000, GCN_HW_PS, GCN_SW_FRAGMENT, &S.profile, &ps_rt);
@@ -4884,8 +4986,27 @@ void DrawEncode(DrawRec& r) {
 
         // ---- pipeline
         const bool a2c = (regs[0xA2DC] & 1) != 0; // DB_ALPHA_TO_MASK
+        // RectList (ps4_gnm_rectlist.h): the VS's capture variant with the draw's vertex inputs
+        // and no rasterization, then the expansion VS with the PS and the draw's state.
+        const Shader::RectList* rect =
+            rs.raster.prim == PrimitiveType::RectList && !indirect ? vs->rect : nullptr;
+        id<MTLRenderPipelineState> rect_capture = nil;
+        if (rect) {
+            RenderState crs = rs;
+            crs.raster.rasterizer_discard = true;
+            rect_capture = GetGfxPipeline(rect->capture, nullptr, crs, color_fmt, write_mask, depth_fmt, samples,
+                                          vattrs, vlocs, false);
+            if (!rect_capture) {
+                S.n_skipped++;
+                g_hitch.pending_draws++;
+                return;
+            }
+        }
+        static const std::vector<VertexAttr> no_attrs;
+        static const std::vector<uint32_t> no_locs;
         id<MTLRenderPipelineState> pso =
-            GetGfxPipeline(vs, ps, rs, color_fmt, write_mask, depth_fmt, samples, vattrs, vlocs, a2c);
+            GetGfxPipeline(rect ? rect->expand : vs, ps, rs, color_fmt, write_mask, depth_fmt, samples,
+                           rect ? no_attrs : vattrs, rect ? no_locs : vlocs, a2c);
         if (!pso) {
             S.n_skipped++;
             g_hitch.pending_draws++;
@@ -4941,7 +5062,7 @@ void DrawEncode(DrawRec& r) {
                 (!args.index_base || !GuestBuffer(args.index_base, (uint64_t)args.max_index * isz, GuestAccess::Read, &ib, &ib_off) ||
                  (ib_off & 3)))
                 { S.n_skipped++; return; }
-        } else if (rs.raster.needs_emulation) {
+        } else if (rs.raster.needs_emulation && !rect) {
             if (rs.raster.prim == PrimitiveType::QuadList) {
                 size_t aoff;
                 if (!BuildQuadListIndices(args, args.count, &ib, &aoff, &draw_count)) {
@@ -4953,7 +5074,8 @@ void DrawEncode(DrawRec& r) {
                 indexed = true;
                 prim = MTLPrimitiveTypeTriangle;
             } else {
-                RLog("prim", "%s: primitive type %s not supported yet; skipped", args.name, NameOf(rs.raster.prim));
+                RLog("prim", "%s: primitive type %s not supported yet; skipped (VS 0x%llx PS 0x%llx n=%u)", args.name,
+                     NameOf(rs.raster.prim), (unsigned long long)vs_addr, (unsigned long long)ps_addr, args.count);
                 S.n_skipped++;
                 return;
             }
@@ -4973,6 +5095,46 @@ void DrawEncode(DrawRec& r) {
                 memcpy(ptr, S.ctx->mem_base + addr, bytes);
                 ib_off = aoff;
             }
+        }
+        const uint32_t inst = std::max(1u, args.num_instances);
+        ps4gnm_rect::Buffers rect_bufs{};
+        if (rect) {
+            // capture index of every vertex, and room for every captured vertex
+            const uint32_t n = args.count;
+            if (n % 3) {
+                RLog("rect-count", "%s: RectList with %u vertices (not 3 per rectangle); skipped", args.name, n);
+                S.n_skipped++;
+                return;
+            }
+            const uint8_t* src = nullptr;
+            if (indexed) {
+                const uint64_t isz = args.index_type == 1 ? 4 : 2;
+                src = S.ctx->mem_base + args.index_base + (uint64_t)args.index_offset * isz; // checked above
+            }
+            void* sp;
+            void* pp;
+            void* vp_;
+            size_t soff, poff, voff;
+            if (!S.arena.Alloc(S.dev, (size_t)n * 4, 16, &rect_bufs.slots, &soff, &sp) ||
+                !S.arena.Alloc(S.dev, 4, 16, &rect_bufs.params, &poff, &pp)) {
+                S.n_skipped++;
+                return;
+            }
+            const uint32_t per_instance = ps4gnm_rect::BuildSlots(src, args.index_type == 1, n, (uint32_t*)sp);
+            *(uint32_t*)pp = per_instance;
+            const uint64_t bytes = (uint64_t)per_instance * inst * rect->vertex_stride;
+            if (bytes > (64u << 20) ||
+                !S.arena.Alloc(S.dev, (size_t)bytes, 16, &rect_bufs.vertices, &voff, &vp_)) {
+                RLog("rect-size", "%s: RectList of %u vertices x %u instances needs %llu bytes; skipped", args.name, n,
+                     inst, (unsigned long long)bytes);
+                S.n_skipped++;
+                return;
+            }
+            rect_bufs.slots_off = soff;
+            rect_bufs.params_off = poff;
+            rect_bufs.vertices_off = voff;
+            rect_bufs.capture_slot = rect->capture_slot;
+            rect_bufs.params_slot = rect->params_slot;
         }
 
         // ---- vertex / instance offsets (shadPS4 GetDrawOffsets)
@@ -5077,13 +5239,27 @@ void DrawEncode(DrawRec& r) {
         }
         for (size_t i = 0; i < vbufs.size(); ++i) vb.Buffer(vbufs[i].first, vbufs[i].second, vattrs[i].buffer);
 
-        const uint32_t inst = std::max(1u, args.num_instances);
         if (indirect) {
             if (indexed)
                 [enc drawIndexedPrimitives:prim indexType:itype indexBuffer:ib indexBufferOffset:ib_off
                             indirectBuffer:arg_buf indirectBufferOffset:arg_off];
             else
                 [enc drawPrimitives:prim indirectBuffer:arg_buf indirectBufferOffset:arg_off];
+        } else if (rect) {
+            ps4gnm_rect::Geometry g;
+            g.count = args.count;
+            g.instances = inst;
+            g.base_instance = instance_offset;
+            g.vertex_start = vertex_offset;
+            g.base_vertex = (int32_t)vertex_offset;
+            g.index_buffer = indexed ? ib : nil;
+            g.index_offset = ib_off;
+            g.index_type = itype;
+            ps4gnm_rect::Encode(enc, rect_capture, pso, g, rect_bufs);
+            if (es) { // Encode bound these vertex buffers itself; the pipeline it leaves is pso
+                for (uint32_t k : {0u, 1u, 2u, rect_bufs.capture_slot, rect_bufs.params_slot})
+                    es->buf[(int)Stage::Vertex][k].gen = 0;
+            }
         } else if (indexed) {
             [enc drawIndexedPrimitives:prim indexCount:draw_count indexType:itype indexBuffer:ib
                      indexBufferOffset:ib_off instanceCount:inst baseVertex:(NSInteger)(int32_t)vertex_offset

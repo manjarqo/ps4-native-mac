@@ -2330,11 +2330,14 @@ void DecodeRenderState(const uint32_t* regs, RenderState* rs) {
             v.zfar = zoffset + zscale;
         }
         if (r.clip_disabled) {
-            // screen-space positions: shadPS4 patches the VS to map [0,16384) to NDC
+            // Screen-space positions: shadPS4 patches the VS to map [0,16384) to NDC with y
+            // pointing down (Vulkan's NDC). Metal's NDC y points up, so the viewport flips y back
+            // with a negative height; window coordinates, and the winding seen in them, are the
+            // guest's screen space (tests/host/gnm_rectlist_test.mm).
             v.origin_x = 0;
-            v.origin_y = 0;
+            v.origin_y = 16384;
             v.width = 16384;
-            v.height = 16384;
+            v.height = -16384;
         } else {
             const float xscale = xs_en ? xscale_raw : 1.f;
             const float xoffset = xo_en ? AsFloat(regs[vb + 1]) : 0.f;
