@@ -1100,8 +1100,9 @@ static void ProcessComputePackets(GuestContext *ctx, const uint32_t *words, uint
                 const uint32_t *ib = nullptr;
                 uint32_t ib_dw = 0;
                 // chained inside an IB: continue in the new buffer and do not return. At ring
-                // level (read_ptr set) the CP returns to the ring, so the packet is a call.
-                if (ps4gnm_ib::ChainReplacesTop(ps4gnm_ib::IsChained(payload, payload_dw), read_ptr != nullptr)) {
+                // level (depth 0, with or without a read pointer) the CP returns to the ring, so
+                // the packet is a call.
+                if (ps4gnm_ib::ComputeChainReplaces(ps4gnm_ib::IsChained(payload, payload_dw), depth)) {
                     if (!DecodeIndirectBuffer(ctx, payload, payload_dw, &ib, &ib_dw)) break;
                     words = ib;
                     dw = ib_dw;

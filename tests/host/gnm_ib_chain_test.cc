@@ -130,6 +130,11 @@ int main() {
         check(!ps4gnm_ib::ChainReplacesTop(true, true) && ps4gnm_ib::ChainReplacesTop(true, false) &&
                   !ps4gnm_ib::ChainReplacesTop(false, false),
               "ChainReplacesTop: only a chain inside an IB replaces it");
+        // ProcessComputePackets: ring level is depth 0, also for a queue without a read pointer.
+        check(!ps4gnm_ib::ComputeChainReplaces(true, 0),
+              "compute walker: a chained IB at ring level (with or without a read pointer) is a call");
+        check(ps4gnm_ib::ComputeChainReplaces(true, 1) && !ps4gnm_ib::ComputeChainReplaces(false, 1),
+              "compute walker: a chained IB inside an IB replaces it");
     }
     // Calls nested deeper than the limit are skipped (cycle guard): a buffer that calls itself.
     {

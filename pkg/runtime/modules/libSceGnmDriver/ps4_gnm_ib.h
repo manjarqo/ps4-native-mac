@@ -32,6 +32,13 @@ inline bool ChainReplacesTop(bool chain, bool top_is_ring) {
     return chain && !top_is_ring;
 }
 
+// The compute walker (ProcessComputePackets, recursive): `depth` is 0 for the ring of a queue,
+// whether or not the queue has a read pointer to publish, and > 0 inside an IB.
+// (Queues mapped with a NULL read pointer walk their ring with read_ptr == nullptr too.)
+inline bool ComputeChainReplaces(bool chain, int depth) {
+    return ChainReplacesTop(chain, depth == 0);
+}
+
 // Enters the IB [ib, ib + ib_dw) after the top frame has consumed the packet: a chained IB
 // replaces the top frame, a call pushes a new frame unless the nesting limit is reached.
 // bottom_is_ring: frames[0] is a ring (compute queue), not a submitted command buffer.
