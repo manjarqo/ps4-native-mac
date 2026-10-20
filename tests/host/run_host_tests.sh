@@ -70,6 +70,10 @@ clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/boot_hle_test.c" "$M
   "$M/libSceNetCtl/ps4_netctl.c" "$M/libSceHttp/ps4_http.c" "$M/libSceNoopStubs/ps4_noop_stubs.c" -o "$T/boot_hle_test"
 "$T/boot_hle_test" 2>/dev/null
 G="$R/pkg/runtime/modules/libSceGnmDriver"
+# PM4 INDIRECT_BUFFER chaining: chained chunks run to the end, calls return, deep calls stop.
+clang++ -std=c++17 -Wall -Werror -g -fsanitize=address,undefined -I "$G" "$R/tests/host/gnm_ib_chain_test.cc" \
+  -o "$T/gnm_ib_chain_test"
+"$T/gnm_ib_chain_test"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
   -framework Foundation -o "$T/guest_window_test"
