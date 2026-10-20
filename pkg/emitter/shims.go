@@ -583,9 +583,17 @@ var shimAliases = map[string]string{
 
 // knownDirectShims contains symbol names whose host shim is "shim_" + name.
 var knownDirectShims = []string{
+	// libkernel boot-path additions (kernel/memory/ps4_direct_mem.c, kernel/sync/ps4_semaphore.c,
+	// libkernel/ps4_kernel_sys.c)
+	"sceKernelSetFsstParam",
+	"sceKernelBatchMap",
+	"sceKernelMtypeprotect",
+	"sem_timedwait",
 	// No-op stubs (pkg/runtime/modules/libSceNoopStubs)
 	"sceCoredumpRegisterCoredumpHandler",
 	"sceCoredumpWriteUserData",
+	"sceCoredumpAttachMemoryRegionAsUserFile",
+	"sceCoredumpGetStopInfoGpu",
 	"sceKernelSync",
 	"sceRemoteplayTerminate",
 	"sceNpCommerceShowPsStoreIcon",
@@ -643,6 +651,15 @@ var knownDirectShims = []string{
 	"sceNpInGameMessageAbortHandle",
 	"sceNpInGameMessagePrepare",
 	"sceNpInGameMessageSendData",
+	// libSceNpParty (libSceNp/ps4_np_party.c)
+	"sceNpPartyInitialize",
+	"sceNpPartyTerminate",
+	"sceNpPartyRegisterHandler",
+	"sceNpPartyRegisterPrivateHandler",
+	"sceNpPartyUnregisterPrivateHandler",
+	"sceNpPartyCheckCallback",
+	"sceNpPartyGetVoiceChatPriority",
+	"sceNpPartySetVoiceChatPriority",
 	// libSceNpSignaling extras (libSceNp/ps4_np_extras.c)
 	"sceNpSignalingActivateConnection",
 	"sceNpSignalingDeleteContext",
@@ -680,6 +697,8 @@ var knownDirectShims = []string{
 	// libSceRtc extras (libSceRtc/ps4_rtc_extras.c)
 	"sceRtcFormatRFC2822",
 	"sceRtcTickAddSeconds",
+	"sceRtcSetTime_t",
+	"sceRtcFormatRFC3339LocalTime",
 	// libSceSaveData directory saves (libSceSaveData/ps4_savedata.c)
 	"sceSaveDataMount2",
 	"sceSaveDataUmount",
@@ -1223,6 +1242,7 @@ var knownDirectShims = []string{
 	"sceNpProfileDialogGetStatus",
 	"sceNpProfileDialogGetResult",
 	"sceNpProfileDialogTerminate",
+	"sceNpProfileDialogClose",
 	// libSceSigninDialog
 	"sceSigninDialogInitialize",
 	"sceSigninDialogOpen",
@@ -1397,6 +1417,7 @@ var knownDirectShims = []string{
 	"sceNetNtohll",
 	"sceNetInetPton",
 	"sceNetInetNtop",
+	"sceNetEtherNtostr",
 	"sceNetPoolCreate",
 	"sceNetPoolDestroy",
 	"sceNetResolverCreate",
@@ -1417,6 +1438,7 @@ var knownDirectShims = []string{
 	"sceNetCtlInit",
 	"sceNetCtlTerm",
 	"sceNetCtlGetState",
+	"sceNetCtlGetResult",
 	"sceNetCtlGetInfo",
 	"sceNetCtlGetNatInfo",
 	"sceNetCtlRegisterCallback",
@@ -1465,6 +1487,7 @@ var knownDirectShims = []string{
 	"sceHttpsEnableOption",
 	"sceHttpsDisableOption",
 	"sceHttpsSetSslCallback",
+	"sceHttpsLoadCert",
 	"sceHttp2Init",
 	"sceHttp2Term",
 	// libSceSsl
@@ -1576,6 +1599,7 @@ var knownDirectShims = []string{
 	"sceNpSignalingTerminate",
 	"sceNpSignalingCreateContext",
 	"sceNpSignalingCreateContextA",
+	"sceNpSignalingSetContextOption",
 	"sceNpWebApiInitialize",
 	"sceNpWebApiTerminate",
 	"sceNpWebApiCreateContext",

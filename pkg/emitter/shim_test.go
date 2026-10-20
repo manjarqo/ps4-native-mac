@@ -432,3 +432,48 @@ func TestNonLocalTransfersAreShimmed(t *testing.T) {
 		t.Errorf("found %d of longjmp, _longjmp, __cxa_throw in libc.prx", found)
 	}
 }
+
+// The 23 imports Uncharted 4's eboot needs at boot: each plain name and each NID (as the
+// loader encodes it in the relocation, "<nid>#<lib>#<module>") binds to its runtime shim.
+func TestUncharted4BootPathShims(t *testing.T) {
+	cases := []struct {
+		plain string
+		nid   string
+		shim  string
+	}{
+		{"", "R3TYO7Tdv5o", "shim_Func_4774D83BB4DDBF9A"},
+		{"", "ut57TBmRQN0", "shim_Func_BADE7B4C199140DD"},
+		{"sceKernelSetFsstParam", "VjBtg5Btl94", "shim_sceKernelSetFsstParam"},
+		{"sceKernelBatchMap", "2SKEx6bSq-4", "shim_sceKernelBatchMap"},
+		{"sceKernelMtypeprotect", "9bfdLIyuwCY", "shim_sceKernelMtypeprotect"},
+		{"sem_timedwait", "w5IHyvahg-o", "shim_sem_timedwait"},
+		{"sceHttpsLoadCert", "DK+GoXCNT04", "shim_sceHttpsLoadCert"},
+		{"sceCoredumpAttachMemoryRegionAsUserFile", "MEJ7tc7ThwM", "shim_sceCoredumpAttachMemoryRegionAsUserFile"},
+		{"sceCoredumpGetStopInfoGpu", "nsyWCTsI3MY", "shim_sceCoredumpGetStopInfoGpu"},
+		{"sceRtcSetTime_t", "bDEVVP4bTjQ", "shim_sceRtcSetTime_t"},
+		{"sceRtcFormatRFC3339LocalTime", "DwuHIlLGW8I", "shim_sceRtcFormatRFC3339LocalTime"},
+		{"sceNetEtherNtostr", "v6M4txecCuo", "shim_sceNetEtherNtostr"},
+		{"sceNetCtlGetResult", "0cBgduPRR+M", "shim_sceNetCtlGetResult"},
+		{"sceNpProfileDialogClose", "wkwjz0Xdo2A", "shim_sceNpProfileDialogClose"},
+		{"sceNpSignalingSetContextOption", "IHRDvZodPYY", "shim_sceNpSignalingSetContextOption"},
+		{"sceNpPartyInitialize", "lhYCTQmBkds", "shim_sceNpPartyInitialize"},
+		{"sceNpPartyTerminate", "oLYkibiHqRA", "shim_sceNpPartyTerminate"},
+		{"sceNpPartyRegisterHandler", "kA88gbv71ao", "shim_sceNpPartyRegisterHandler"},
+		{"sceNpPartyRegisterPrivateHandler", "zo4G5WWYpKg", "shim_sceNpPartyRegisterPrivateHandler"},
+		{"sceNpPartyUnregisterPrivateHandler", "zQ7gIvt11Pc", "shim_sceNpPartyUnregisterPrivateHandler"},
+		{"sceNpPartyCheckCallback", "3e4k2mzLkmc", "shim_sceNpPartyCheckCallback"},
+		{"sceNpPartyGetVoiceChatPriority", "-lc6XZnQXvM", "shim_sceNpPartyGetVoiceChatPriority"},
+		{"sceNpPartySetVoiceChatPriority", "nazKyHygHhY", "shim_sceNpPartySetVoiceChatPriority"},
+	}
+	for _, tc := range cases {
+		if tc.plain != "" {
+			if shim, ok := LookupShim(tc.plain); !ok || shim != tc.shim {
+				t.Errorf("LookupShim(%s)=%q, ok=%v, want %s", tc.plain, shim, ok, tc.shim)
+			}
+		}
+		encoded := tc.nid + "#A#B"
+		if shim, ok := LookupShim(encoded); !ok || shim != tc.shim {
+			t.Errorf("LookupShim(%s)=%q, ok=%v, want %s", encoded, shim, ok, tc.shim)
+		}
+	}
+}
