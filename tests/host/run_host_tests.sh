@@ -84,6 +84,15 @@ AD="$R/pkg/runtime/modules/libSceAudiodec"
 clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/runtime/core" -I "$AD" \
   "$R/tests/host/audiodec_test.c" "$AD/ps4_audiodec.c" -framework AudioToolbox -o "$T/audiodec_test"
 "$T/audiodec_test" "$R/tests/host/data/audiodec_chirp_ffmpeg.aac" 2> "$T/audiodec.txt" || { cat "$T/audiodec.txt"; exit 1; }
+# Presenter statistics: display intervals from presented times, drops, drawable waits, bursts.
+VO="$R/pkg/runtime/modules/libSceVideoOut"
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/tests/host/present_stats_test.c" \
+  "$VO/ps4_present_stats.c" -o "$T/present_stats_test"
+"$T/present_stats_test"
+# Presenter frame queue (FIFO / mailbox slots, blocking and timeouts) and the vsync pacing policy.
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/tests/host/present_queue_test.c" \
+  "$VO/ps4_present_queue.c" -o "$T/present_queue_test"
+"$T/present_queue_test"
 G="$R/pkg/runtime/modules/libSceGnmDriver"
 # PM4 INDIRECT_BUFFER chaining: chained chunks run to the end, calls return, deep calls stop.
 clang++ -std=c++17 -Wall -Werror -g -fsanitize=address,undefined -I "$G" "$R/tests/host/gnm_ib_chain_test.cc" \
