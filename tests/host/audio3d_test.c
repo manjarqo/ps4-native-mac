@@ -7,6 +7,7 @@
 #include "ps4_audio3d_mix.h"
 #include "ps4_audioout_internal.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -407,6 +408,47 @@ static void test_pacing(void) {
   CHECK_EQ(ps4_audio3d_port_close(port), 0);
 }
 
+typedef struct {
+  uint32_t port;
+  int32_t result;
+  volatile int done;
+  double t_end;
+} PushArg;
+
+static void *push_thread(void *v) {
+  PushArg *a = (PushArg *)v;
+  a->result = ps4_audio3d_port_push(a->port, PS4_AUDIO3D_BLOCKING_SYNC);
+  a->t_end = now_s();
+  a->done = 1;
+  return NULL;
+}
+
+// A SYNC push blocked on the device (15 queued grains of 2048 frames = 640 ms of audio, the
+// AudioOut ring takes ~2) while another thread closes the port: the close wakes it, waits for it
+// to leave, and the push reports INVALID_PORT. Neither side hangs.
+static void test_close_during_push(void) {
+  uint32_t port = open_port(2048, 15, PS4_AUDIO3D_BUFFER_ADVANCE_AND_PUSH, 4);
+  for (int i = 0; i < 15; i++) CHECK_EQ(ps4_audio3d_port_advance(port), 0);
+  PushArg a = {port, 0, 0, 0};
+  pthread_t t;
+  CHECK_EQ(pthread_create(&t, NULL, push_thread, &a), 0);
+  usleep(150 * 1000);
+  CHECK(!a.done); // still blocked: about 0.5 s of the queue is left
+  uint32_t level = 0;
+  CHECK_EQ(ps4_audio3d_port_get_queue_level(port, &level, NULL), 0);
+  CHECK(level > 0 && level < 15);
+  double t0 = now_s();
+  CHECK_EQ(ps4_audio3d_port_close(port), 0);
+  double close_s = now_s() - t0;
+  pthread_join(t, NULL);
+  fprintf(stderr, "audio3d_test: close during blocked push took %.1f ms, push -> 0x%x\n",
+          close_s * 1e3, (uint32_t)a.result);
+  CHECK(close_s < 0.150);
+  CHECK(a.done && a.t_end - t0 < 0.150);
+  CHECK_EQ(a.result, PS4_AUDIO3D_ERROR_INVALID_PORT);
+  CHECK_EQ(ps4_audio3d_port_get_queue_level(port, &level, NULL), PS4_AUDIO3D_ERROR_INVALID_PORT);
+}
+
 // A stereo bed (L = 0.25) and one object (0.5, gain 1, hard right) through PortAdvance /
 // PortPush, AudioOut's 7.1 -> stereo fold and the headless device: every played frame must be
 // (0.25, 0.7071 * 0.5). Constant signals make the check independent of where the device period
@@ -469,6 +511,7 @@ int main(void) {
   test_panner();
   test_contract();
   test_pacing();
+  test_close_during_push();
   test_bed_plus_object(dump);
   CHECK_EQ(ps4_audio3d_terminate(), 0);
   CHECK_EQ(ps4_audio3d_terminate(), PS4_AUDIO3D_ERROR_NOT_READY);

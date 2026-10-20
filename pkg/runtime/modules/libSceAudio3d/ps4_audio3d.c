@@ -70,6 +70,9 @@
 //   AudioOut port (type 126, FLOAT_8CH_STD, opened on first push). SYNC
 //   submits everything, each submission blocking on the AudioOut ring (device
 //   clock); ASYNC submits only what AudioOut accepts without blocking.
+//   No lock is held while blocked: PortClose / Terminate close the AudioOut
+//   ports (waking the submission), wait for it to leave, and the push returns
+//   INVALID_PORT.
 //   GetQueueLevel reports the waiting mixed grains and the free slots. In
 //   ADVANCE_NO_PUSH mode Advance submits like a SYNC push; NO_ADVANCE (the
 //   library advancing by itself) is not implemented: Advance/Push return
@@ -567,9 +570,11 @@ static int32_t port_submit_locked(A3dPort *p, uint32_t blocking) {
     pthread_mutex_lock(&g_lock);
     if (o < 0) r = o;
   }
+  // A port closed during the submission reports INVALID_PORT, whatever error the AudioOut
+  // submission it interrupted returned (NOT_OPENED / INVALID_PORT of the closed AudioOut port).
+  if (!p->open || p->gen != gen) r = PS4_AUDIO3D_ERROR_INVALID_PORT;
   p->pushing--;
   pthread_cond_broadcast(&g_cond);
-  if (r >= 0 && (!p->open || p->gen != gen)) r = PS4_AUDIO3D_ERROR_INVALID_PORT;
   return r < 0 ? r : 0;
 }
 
