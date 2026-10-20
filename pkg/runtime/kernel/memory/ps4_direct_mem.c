@@ -1119,3 +1119,133 @@ void shim_sceKernelMprotect(GuestContext *ctx) {
     SHIM_RETURN();
 }
 
+
+// ---------------------------------------------------------------------------------
+// sceKernelMtypeprotect / sceKernelBatchMap
+// ---------------------------------------------------------------------------------
+
+void ps4_gnm_notify_cpu_write(uint64_t addr, uint64_t size) __attribute__((weak));
+
+// Splits the non-free extent that strictly contains `at` into [addr, at) and [at, end), both
+// keeping the attributes. Caller holds vm_mutex.
+static void vm_split_extent_at(GuestContext *proc, uint64_t at) {
+    for (GuestVMExtent *e = proc->vm_extents; e; e = e->next) {
+        if (e->is_free || at <= e->addr || at >= e->addr + e->size) continue;
+        GuestVMExtent *tail = (GuestVMExtent *)calloc(1, sizeof(*tail));
+        if (!tail) return;
+        *tail = *e;
+        tail->addr = at;
+        tail->size = e->addr + e->size - at;
+        tail->prev = e;
+        e->size = at - e->addr;
+        e->next = tail;
+        if (tail->next) tail->next->prev = tail;
+        return;
+    }
+}
+
+// int sceKernelMtypeprotect(void *addr, size_t len, int mtype, int prot)
+//
+// Changes the protection and the memory type (cache attribute: 0 WB_ONION, 3 WC_GARLIC,
+// 10 WB_GARLIC ...) of the mapped part of [addr, addr+len). Behaviour follows shadPS4
+// (libraries/kernel/memory.cpp sceKernelMtypeprotect): the range is widened to 16 KiB pages,
+// the protection is applied, the type is recorded, GPU-visible copies are invalidated. A range
+// without any mapping fails with EINVAL. The host maps guest memory once with full rights
+// (there is no per-range host mprotect, see sceKernelMprotect), so protection and type are
+// bookkeeping that sceKernelVirtualQuery and later calls observe; extents are split at the
+// range edges so a small range inside a large mapping does not retag the whole mapping.
+int sceKernelMtypeprotect(GuestContext *ctx, const void *addr, size_t size, int mtype, int prot) {
+    if (!ctx) return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+    if (size == 0) return 0;
+
+    uint64_t vaddr = (uint64_t)addr;
+    uint64_t start = vaddr & ~0x3fffULL;
+    uint64_t span = (size + (vaddr - start) + 0x3fffULL) & ~0x3fffULL;
+    uint64_t end = start + span;
+    GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
+    if (end < start || end > proc->mem_size) return 0x80020016;
+
+    uint64_t covered = 0;
+    pthread_mutex_lock(&proc->vm_mutex);
+    for (GuestVMExtent *e = proc->vm_extents; e; e = e->next) {
+        if (!e->is_free && e->addr < end && e->addr + e->size > start) covered++;
+    }
+    if (covered) {
+        vm_split_extent_at(proc, start);
+        vm_split_extent_at(proc, end);
+        for (GuestVMExtent *e = proc->vm_extents; e; e = e->next) {
+            if (e->is_free || e->addr < start || e->addr + e->size > end) continue;
+            e->prot = prot;
+            e->mtype = mtype;
+        }
+    }
+    pthread_mutex_unlock(&proc->vm_mutex);
+    if (!covered) return 0x80020016;
+
+    if (ps4_gnm_notify_cpu_write) ps4_gnm_notify_cpu_write(start, span);
+    return 0;
+}
+
+void shim_sceKernelMtypeprotect(GuestContext *ctx) {
+    int rc = sceKernelMtypeprotect(ctx, (const void *)ctx->rdi, (size_t)ctx->rsi, (int)ctx->rdx, (int)ctx->rcx);
+    ctx->rax = (uint64_t)(int64_t)rc;
+    SHIM_RETURN();
+}
+
+// int sceKernelBatchMap(SceKernelBatchMapEntry *entries, int numEntries, int *numEntriesOut)
+//
+// Runs the entries in order until the first failure. *numEntriesOut (may be NULL) receives the
+// number of entries that completed, written on failure too; the failed entry is not counted.
+// The result is the failed entry's error, or 0. Entry layout, operation numbers and the
+// failure rules follow shadPS4 (libraries/kernel/memory.cpp sceKernelBatchMap2, SDK struct
+// SceKernelBatchMapEntry): length == 0 or an unknown operation fails with EINVAL, a NULL
+// array with a positive count too. The map operations pass MAP_FIXED (0x10), exactly like
+// sceKernelBatchMap does on the console; `start` is the requested address (0 = anywhere) and
+// receives the mapped address.
+int sceKernelBatchMap(GuestContext *ctx, OrbisKernelBatchMapEntry *entries, int numEntries, int *numEntriesOut) {
+    const int kFlagsMapFixed = 0x10;
+    int result = 0;
+    int processed = 0;
+    for (int i = 0; i < numEntries; i++) {
+        OrbisKernelBatchMapEntry *e = entries ? &entries[i] : NULL;
+        if (!e || e->length == 0 || (uint32_t)e->operation > ORBIS_KERNEL_BATCH_MAP_TYPE_PROTECT) {
+            result = 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+            break;
+        }
+        const int prot = (uint8_t)e->protection;
+        void *mapped = (void *)e->start;
+        switch (e->operation) {
+        case ORBIS_KERNEL_BATCH_MAP_DIRECT:
+            result = sceKernelMapDirectMemory(ctx, &mapped, (size_t)e->length, prot, kFlagsMapFixed,
+                                              (off_t)e->offset, 0);
+            if (result == 0) e->start = (uint64_t)mapped;
+            break;
+        case ORBIS_KERNEL_BATCH_MAP_UNMAP:
+            result = recomp_vm_free(ctx, e->start, (size_t)e->length) == 0 ? 0 : 0x80020016;
+            break;
+        case ORBIS_KERNEL_BATCH_MAP_PROTECT:
+            result = sceKernelMprotect(ctx, (const void *)e->start, (size_t)e->length, prot);
+            break;
+        case ORBIS_KERNEL_BATCH_MAP_FLEXIBLE:
+            result = sceKernelMapNamedFlexibleMemory(ctx, &mapped, (size_t)e->length, prot, kFlagsMapFixed, "anon");
+            if (result == 0) e->start = (uint64_t)mapped;
+            break;
+        case ORBIS_KERNEL_BATCH_MAP_TYPE_PROTECT:
+            result = sceKernelMtypeprotect(ctx, (const void *)e->start, (size_t)e->length, (uint8_t)e->type, prot);
+            break;
+        }
+        if (result != 0) break;
+        processed++;
+    }
+    if (numEntriesOut) *numEntriesOut = processed;
+    return result;
+}
+
+void shim_sceKernelBatchMap(GuestContext *ctx) {
+    OrbisKernelBatchMapEntry *entries =
+        ctx->rdi ? (OrbisKernelBatchMapEntry *)(ctx->mem_base + ctx->rdi) : NULL;
+    int *out = ctx->rdx ? (int *)(ctx->mem_base + ctx->rdx) : NULL;
+    int rc = sceKernelBatchMap(ctx, entries, (int)ctx->rsi, out);
+    ctx->rax = (uint64_t)(int64_t)rc;
+    SHIM_RETURN();
+}

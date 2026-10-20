@@ -1159,6 +1159,9 @@ GuestVMExtent *recomp_vm_find(GuestContext *ctx, uint64_t addr) {
 
 void ps4_direct_mem_on_unmap(GuestContext *ctx, uint64_t addr, size_t size);
 
+// Frees [addr, addr+size) from the extent that contains addr; a range that runs past that
+// extent (a mapping that was split, e.g. by sceKernelMtypeprotect, is several extents) is
+// continued extent by extent, like munmap over several mappings.
 int recomp_vm_free(GuestContext *ctx, uint64_t addr, size_t size) {
   if (!ctx || addr == 0 || size == 0)
     return -1;
@@ -1183,6 +1186,7 @@ int recomp_vm_free(GuestContext *ctx, uint64_t addr, size_t size) {
     pthread_mutex_unlock(&proc->vm_mutex);
     return 0;
   }
+  const uint64_t first_end = curr->addr + curr->size; // before any split below
 
   // Release host physical pages
   if (proc->mem_base && aligned_addr + aligned_size <= proc->mem_size) {
@@ -1194,7 +1198,9 @@ int recomp_vm_free(GuestContext *ctx, uint64_t addr, size_t size) {
   // If already free, nothing to do
   if (curr->is_free) {
     pthread_mutex_unlock(&proc->vm_mutex);
-    return 0;
+    return aligned_addr + aligned_size > first_end
+               ? recomp_vm_free(ctx, first_end, aligned_addr + aligned_size - first_end)
+               : 0;
   }
 
   // Case 1: aligned_addr is inside curr, but after curr->addr: split off the
@@ -1258,7 +1264,9 @@ int recomp_vm_free(GuestContext *ctx, uint64_t addr, size_t size) {
   }
 
   pthread_mutex_unlock(&proc->vm_mutex);
-  return 0;
+  return aligned_addr + aligned_size > first_end
+             ? recomp_vm_free(ctx, first_end, aligned_addr + aligned_size - first_end)
+             : 0;
 }
 
 GuestContext *recomp_create_thread_context(GuestContext *parent,

@@ -141,6 +141,7 @@ typedef struct GuestVMExtent {
   bool is_free;
   int prot;
   int flags;
+  int mtype; // memory type set by sceKernelMtypeprotect (0 = write-back onion)
   char name[32];
   struct GuestVMExtent *prev;
   struct GuestVMExtent *next;

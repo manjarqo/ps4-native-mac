@@ -15,7 +15,7 @@ cc_one() {
 }
 export -f cc_one
 # Third-party headers the runtime includes (the game build adds the same paths).
-for d in $(find "$R/3rdparty" \( -name libatrac9.h -o -name minimp3.h \) -exec dirname {} \;); do INC+=(-I "$d"); done
+for d in $(find -L "$R/3rdparty" \( -name libatrac9.h -o -name minimp3.h \) -exec dirname {} \;); do INC+=(-I "$d"); done
 if FT=$(pkg-config --cflags freetype2 2>/dev/null); then INC+=($FT); else INC+=(-I /opt/homebrew/opt/freetype/include/freetype2); fi
 printf '%s\n' "${INC[@]}" | paste -sd' ' - > "$T/inc.txt"
 mkdir -p "$T/objs"

@@ -1009,3 +1009,17 @@ void shim_Need_sceLibcInternal(GuestContext *ctx) {
     SHIM_RETURN();
 }
 
+
+// int sceKernelSetFsstParam(uint32_t a, uint32_t b)
+//
+// Class N (documented no-op returning 0). The function has no public documentation and no
+// shadPS4 implementation (only an aerolib name stub); its name and the values Uncharted 4
+// passes at boot (0x100, 0x40, call at 0x265f2f) point to a file-system tuning knob of the
+// console's own file system. The host serves guest files from the host file system through
+// the VFS layer, which has nothing to tune. The only use of the result is a test against zero
+// right after the call (TEST EAX, EAX / JNE at 0x265f34 to the error path), so returning 0
+// is the entire observable behaviour the caller depends on.
+void shim_sceKernelSetFsstParam(GuestContext *ctx) {
+    ctx->rax = 0;
+    SHIM_RETURN();
+}
