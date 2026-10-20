@@ -122,6 +122,64 @@ typedef struct GuestContext {
   uint64_t static_tls_size;
 } GuestContext;
 
+// The TCB slot (guest address fs_base + RECOMP_TCB_CTX_SLOT) that holds the GuestContext
+// pointer of the execution context running on the guest thread (contract at
+// recomp_enter_guest in the emitter's trampoline).
+#define RECOMP_TCB_CTX_SLOT 0x70ULL
+
+// GuestContext offsets that assembly hardcodes: the trampoline (pkg/emitter/asm_trampoline.go)
+// and the lifter's inline sequences (pkg/lifter: x87 stack and control/status words, MXCSR,
+// the flag bytes, the TCB slot). Changing the layout breaks these at build time; update the
+// assembly and pkg/emitter/context_offsets_test.go together with them.
+#ifdef __cplusplus
+#define RECOMP_CTX_OFFSET(field, off) \
+  static_assert(offsetof(GuestContext, field) == (off), "GuestContext." #field " offset is hardcoded in assembly")
+#else
+#define RECOMP_CTX_OFFSET(field, off) \
+  _Static_assert(offsetof(GuestContext, field) == (off), "GuestContext." #field " offset is hardcoded in assembly")
+#endif
+RECOMP_CTX_OFFSET(rax, 0x00);
+RECOMP_CTX_OFFSET(rcx, 0x08);
+RECOMP_CTX_OFFSET(rdx, 0x10);
+RECOMP_CTX_OFFSET(rbx, 0x18);
+RECOMP_CTX_OFFSET(rsp, 0x20);
+RECOMP_CTX_OFFSET(rbp, 0x28);
+RECOMP_CTX_OFFSET(rsi, 0x30);
+RECOMP_CTX_OFFSET(rdi, 0x38);
+RECOMP_CTX_OFFSET(r8, 0x40);
+RECOMP_CTX_OFFSET(r9, 0x48);
+RECOMP_CTX_OFFSET(r10, 0x50);
+RECOMP_CTX_OFFSET(r11, 0x58);
+RECOMP_CTX_OFFSET(r12, 0x60);
+RECOMP_CTX_OFFSET(r13, 0x68);
+RECOMP_CTX_OFFSET(r14, 0x70);
+RECOMP_CTX_OFFSET(r15, 0x78);
+RECOMP_CTX_OFFSET(rip, 0x80);
+RECOMP_CTX_OFFSET(fs_base, 0x88);
+RECOMP_CTX_OFFSET(cf, 0x98);
+RECOMP_CTX_OFFSET(zf, 0x99);
+RECOMP_CTX_OFFSET(sf, 0x9a);
+RECOMP_CTX_OFFSET(of, 0x9b);
+RECOMP_CTX_OFFSET(xmm[0], 0xa0);
+RECOMP_CTX_OFFSET(xmm[2], 0xc0);
+RECOMP_CTX_OFFSET(xmm[4], 0xe0);
+RECOMP_CTX_OFFSET(xmm[6], 0x100);
+RECOMP_CTX_OFFSET(fpu_stack, 0x2a0);
+RECOMP_CTX_OFFSET(fpu_top, 0x2e0);
+RECOMP_CTX_OFFSET(fpu_cw, 0x2e4);
+RECOMP_CTX_OFFSET(fpu_sw, 0x2e6);
+RECOMP_CTX_OFFSET(mxcsr, 0x2e8);
+RECOMP_CTX_OFFSET(mem_base, 0x330);
+#ifdef __cplusplus
+static_assert(sizeof(xmm_reg_t) == 16 && sizeof(((GuestContext *)0)->fpu_stack[0]) == 8 &&
+                  sizeof(((GuestContext *)0)->fpu_top) == 4,
+              "element sizes the assembly assumes");
+#else
+_Static_assert(sizeof(xmm_reg_t) == 16 && sizeof(((GuestContext *)0)->fpu_stack[0]) == 8 &&
+                   sizeof(((GuestContext *)0)->fpu_top) == 4,
+               "element sizes the assembly assumes");
+#endif
+
 #define SHIM_RETURN()                                                          \
   do {                                                                         \
     ctx->rsp += 8;                                                             \

@@ -355,7 +355,7 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
   ctx->fs_base = tcb_addr;
   MEM_U64(tcb_addr) = tcb_addr;
   MEM_U64(tcb_addr + 0x28ULL) = 0x595e9fbd94fda766ULL;
-  MEM_U64(tcb_addr + 0x70ULL) = (uint64_t)ctx;
+  MEM_U64(tcb_addr + RECOMP_TCB_CTX_SLOT) = (uint64_t)ctx;
   ctx->mxcsr = 0x1f80;
   ctx->fpu_cw = 0x037f;
 
@@ -1299,7 +1299,7 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   if (!t_ctx)
     return NULL;
 
-  *(uint64_t *)(parent->mem_base + tcb_base + 0x70ULL) = (uint64_t)t_ctx;
+  *(uint64_t *)(parent->mem_base + tcb_base + RECOMP_TCB_CTX_SLOT) = (uint64_t)t_ctx;
 
   t_ctx->mem_base = parent->mem_base;
   t_ctx->mem_size = parent->mem_size;

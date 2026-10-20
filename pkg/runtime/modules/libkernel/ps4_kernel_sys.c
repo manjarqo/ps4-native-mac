@@ -442,8 +442,27 @@ void shim_sceKernelIsAddressSanitizerEnabled(GuestContext *ctx) {
 typedef struct GuestGprs {
     uint64_t rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15, rip;
 } GuestGprs;
-_Static_assert(offsetof(GuestContext, rax) == 0 && offsetof(GuestContext, r15) == offsetof(GuestGprs, r15) &&
-               offsetof(GuestContext, fs_base) == sizeof(GuestGprs), "GuestGprs is the start of GuestContext");
+#define GUEST_GPRS_FIELD(f) \
+    _Static_assert(offsetof(GuestGprs, f) == offsetof(GuestContext, f), "GuestGprs." #f " matches GuestContext")
+GUEST_GPRS_FIELD(rax);
+GUEST_GPRS_FIELD(rcx);
+GUEST_GPRS_FIELD(rdx);
+GUEST_GPRS_FIELD(rbx);
+GUEST_GPRS_FIELD(rsp);
+GUEST_GPRS_FIELD(rbp);
+GUEST_GPRS_FIELD(rsi);
+GUEST_GPRS_FIELD(rdi);
+GUEST_GPRS_FIELD(r8);
+GUEST_GPRS_FIELD(r9);
+GUEST_GPRS_FIELD(r10);
+GUEST_GPRS_FIELD(r11);
+GUEST_GPRS_FIELD(r12);
+GUEST_GPRS_FIELD(r13);
+GUEST_GPRS_FIELD(r14);
+GUEST_GPRS_FIELD(r15);
+GUEST_GPRS_FIELD(rip);
+#undef GUEST_GPRS_FIELD
+_Static_assert(offsetof(GuestContext, fs_base) == sizeof(GuestGprs), "GuestGprs is the start of GuestContext");
 
 // What running guest code changes in its GuestContext: the GPRs and rip, the flags, the vector,
 // x87, MXCSR and MMX state (cf up to mmx). fs_base and gs_base in between and everything after
@@ -489,7 +508,7 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     // guest thread executes: in fiber thread mode it runs on its own host thread, so pass the
     // exception on; in coroutine mode this host thread is between endpoints (a hand-over in
     // progress) and the handler runs on ctx with the slot pointed at it.
-    uint64_t *slot = (uint64_t *)(ctx->mem_base + ctx->fs_base + 0x70ULL);
+    uint64_t *slot = (uint64_t *)(ctx->mem_base + ctx->fs_base + RECOMP_TCB_CTX_SLOT);
     const uint64_t saved_slot = *slot;
     if (saved_slot != (uint64_t)(uintptr_t)ctx && ps4_fiber_threads_mode()) {
         pthread_t target;

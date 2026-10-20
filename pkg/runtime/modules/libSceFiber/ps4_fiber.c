@@ -375,7 +375,7 @@ static void fiber_release_thread(const GuestContext *f, GuestContext *t) {
 // endpoint that runs next on thread t, before that endpoint runs.
 static void tcb_set_running(const GuestContext *t, GuestContext *running) {
   if (t->mem_base && t->fs_base)
-    *(uint64_t *)(t->mem_base + t->fs_base + 0x70ULL) = (uint64_t)(uintptr_t)running;
+    *(uint64_t *)(t->mem_base + t->fs_base + RECOMP_TCB_CTX_SLOT) = (uint64_t)(uintptr_t)running;
 }
 
 // h is finalized (it was IDLE, so no worker's current fiber): wait for lookups that may
