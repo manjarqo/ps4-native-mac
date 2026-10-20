@@ -1,4 +1,5 @@
 #include "ps4_gnm_pipeline_archive.h"
+#include "ps4_gnm_library_store.h"
 #import <Foundation/Foundation.h>
 #include <algorithm>
 #include <atomic>
@@ -550,7 +551,11 @@ void StartPeriodicSave(double period_s) {
 } // namespace ps4gnm_pso_archive
 
 extern "C" void ps4_gnm_pso_archive_save_for_quit(double timeout_s) {
+    // The library store's queued entries are written first (each takes a few ms), within half
+    // of the time; then the archive.
+    if (!ps4gnm_lib_store::Flush(timeout_s / 2))
+        fprintf(stderr, "[gnm-lib-store] quit: queued entries not written in %.1f s\n", timeout_s / 2);
     if (!ps4gnm_pso_archive::Enabled()) return;
-    if (!ps4gnm_pso_archive::SaveNow(timeout_s))
-        fprintf(stderr, "[gnm-pso-archive] quit: save failed or did not finish in %.1f s\n", timeout_s);
+    if (!ps4gnm_pso_archive::SaveNow(timeout_s / 2))
+        fprintf(stderr, "[gnm-pso-archive] quit: save failed or did not finish in %.1f s\n", timeout_s / 2);
 }
