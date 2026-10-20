@@ -8,6 +8,7 @@
 #include "ps4_audioout_internal.h"
 #include <math.h>
 #include <pthread.h>
+#include <sanitizer/allocator_interface.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -450,6 +451,40 @@ static void test_close_during_push(void) {
   CHECK_EQ(ps4_audio3d_port_get_queue_level(port, &level, NULL), PS4_AUDIO3D_ERROR_INVALID_PORT);
 }
 
+// The per-thread scratch buffer (64 KB here: one 8-channel float bed grain of 2048 frames) is
+// freed when the thread exits: 40 short-lived writer threads must not leave 2.5 MB allocated.
+// Measured with the sanitizer allocator (LeakSanitizer is not available on macOS).
+typedef struct {
+  uint32_t port;
+  int32_t result;
+} BedArg;
+
+static void *bed_thread(void *v) {
+  BedArg *a = (BedArg *)v;
+  static float bed8[2048 * 8];
+  a->result = ps4_audio3d_bed_write(a->port, 8, PS4_AUDIO3D_FORMAT_FLOAT, bed8, 2048);
+  return NULL;
+}
+
+static void test_scratch_freed_on_thread_exit(void) {
+  uint32_t port = open_port(2048, 15, PS4_AUDIO3D_BUFFER_ADVANCE_AND_PUSH, 4);
+  size_t before = __sanitizer_get_current_allocated_bytes();
+  for (int i = 0; i < 40; i++) {
+    BedArg a = {port, 1};
+    pthread_t t;
+    CHECK_EQ(pthread_create(&t, NULL, bed_thread, &a), 0);
+    pthread_join(t, NULL);
+    CHECK_EQ(a.result, 0);
+    ps4_audio3d_port_advance(port); // consume the bed grain so the queue never fills
+    ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC);
+  }
+  size_t after = __sanitizer_get_current_allocated_bytes();
+  long long grown = (long long)after - (long long)before;
+  fprintf(stderr, "audio3d_test: 40 writer threads: allocated bytes grew by %lld\n", grown);
+  CHECK(grown < 512 * 1024);
+  CHECK_EQ(ps4_audio3d_port_close(port), 0);
+}
+
 // A stereo bed (L = 0.25) and one object (0.5, gain 1, hard right) through PortAdvance /
 // PortPush, AudioOut's 7.1 -> stereo fold and the headless device: every played frame must be
 // (0.25, 0.7071 * 0.5). Constant signals make the check independent of where the device period
@@ -513,6 +548,7 @@ int main(void) {
   test_contract();
   test_pacing();
   test_close_during_push();
+  test_scratch_freed_on_thread_exit();
   test_bed_plus_object(dump);
   CHECK_EQ(ps4_audio3d_terminate(), 0);
   CHECK_EQ(ps4_audio3d_terminate(), PS4_AUDIO3D_ERROR_NOT_READY);

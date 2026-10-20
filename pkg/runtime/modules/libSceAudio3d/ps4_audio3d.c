@@ -507,16 +507,43 @@ static void port_mix_grain(A3dPort *p) {
   p->advances++;
 }
 
-static __thread float *tl_buf;
-static __thread size_t tl_cap;
+// Per-thread copy buffer for submissions and bed conversion (grown on demand,
+// freed by the key destructor when the thread exits).
+typedef struct {
+  void *buf;
+  size_t cap;
+} A3dScratch;
+
+static pthread_key_t g_scratch_key;
+static pthread_once_t g_scratch_once = PTHREAD_ONCE_INIT;
+
+static void scratch_destroy(void *v) {
+  A3dScratch *s = (A3dScratch *)v;
+  free(s->buf);
+  free(s);
+}
+
+static void scratch_key_init(void) { pthread_key_create(&g_scratch_key, scratch_destroy); }
 
 static void *scratch(size_t bytes) {
-  if (bytes > tl_cap) {
-    free(tl_buf);
-    tl_buf = (float *)malloc(bytes);
-    tl_cap = tl_buf ? bytes : 0;
+  pthread_once(&g_scratch_once, scratch_key_init);
+  A3dScratch *s = (A3dScratch *)pthread_getspecific(g_scratch_key);
+  if (!s) {
+    s = (A3dScratch *)calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    if (pthread_setspecific(g_scratch_key, s) != 0) {
+      free(s);
+      return NULL;
+    }
   }
-  return tl_buf;
+  if (bytes > s->cap) {
+    void *n = malloc(bytes);
+    if (!n) return NULL;
+    free(s->buf);
+    s->buf = n;
+    s->cap = bytes;
+  }
+  return s->buf;
 }
 
 // Lock held on entry and exit; releases it around each blocking AudioOut
