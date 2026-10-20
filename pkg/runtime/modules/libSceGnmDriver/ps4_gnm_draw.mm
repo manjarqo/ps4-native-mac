@@ -27,12 +27,14 @@
 #import <CoreGraphics/CoreGraphics.h>
 
 #include <dispatch/dispatch.h>
+#include <dirent.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -49,7 +51,6 @@
 #include <vector>
 #include <unistd.h>
 
-extern "C" const char* ps4_vfs_get_app_root(void);
 #include <set>
 
 #include "gcn_recompiler.h"
@@ -59,6 +60,7 @@ extern "C" const char* ps4_vfs_get_app_root(void);
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_shader_cache.h"
 #include "ps4_gnm_pipeline_archive.h"
+#include "ps4_gnm_library_store.h"
 #include "ps4_metal_screen.h"
 #include "ps4_hitch.h"
 
@@ -73,6 +75,8 @@ extern "C" void ps4_sync_print_stats(int frames);
 // bit 2 = trace the work of the next present ([gnm-trace] lines).
 extern "C" volatile int g_ps4_gnm_dump_request;
 volatile int g_ps4_gnm_dump_request;
+
+extern "C" void ps4_host_quit(int code) __attribute__((noreturn));
 
 namespace ps4draw {
 using namespace ps4gnm;
@@ -327,6 +331,9 @@ struct Shader {
     uint64_t code_addr = 0;
     uint64_t uid = 0;
     uint64_t msl_hash = 0;    // hash of the final MSL (stable across sessions)
+    ps4gnm_lib_store::Key lib_key; // the MSL's key in the library store (lib_key.h1 == msl_hash)
+    uint32_t lib_stage = 0;        // ps4gnm_lib_store::Stage of the function, 0: not stored
+    bool from_store = false;       // fn was loaded from the library store
     id<MTLFunction> fn = nil;
     bool pending = false;     // Metal library still compiling (fn not yet available)
     uint64_t fail_key = 0;    // permutation key recorded in shader_fail if compilation fails
@@ -450,7 +457,15 @@ struct State {
     // Asynchronous shader/pipeline compilation: Metal completion handlers push results here and
     // the submitting thread applies them (DrainAsyncCompiles) before each draw/dispatch.
     struct AsyncLib { uint64_t mh; id<MTLLibrary> lib; NSString* err; };
-    struct AsyncPso { std::string key; id<MTLRenderPipelineState> pso; NSString* err; };
+    // retry_vs/retry_ps: the pipeline failed with a function from the library store; the encoder
+    // compiles that shader's MSL and builds the pipeline again instead of keeping the failure.
+    struct AsyncPso {
+        std::string key;
+        id<MTLRenderPipelineState> pso;
+        NSString* err;
+        const Shader* retry_vs = nullptr;
+        const Shader* retry_ps = nullptr;
+    };
     std::mutex async_mu;
     std::vector<AsyncLib> async_libs_done;
     std::vector<AsyncPso> async_psos_done;
@@ -473,8 +488,22 @@ struct State {
     std::vector<std::shared_ptr<GcnJob>> async_gcn_done;
     std::unordered_set<uint64_t> gcn_pending;
     Shader pending_shader; // returned while a translation is in flight (fn == nil)
-    // Libraries compiled ahead of time from the on-disk MSL cache (filled by warm-up threads).
-    std::unordered_map<uint64_t, id<MTLLibrary>> prewarmed;
+    // Shaders made ready ahead of time by the warm-up threads, by MSL hash: functions loaded from
+    // the library store (fn) or libraries compiled from the on-disk MSL cache (lib). h2 is the
+    // second hash of the store key (0 for a compiled library, whose source hash is h1 itself).
+    struct Prewarmed {
+        uint64_t h2 = 0;
+        id<MTLLibrary> lib = nil;
+        id<MTLFunction> fn = nil;
+    };
+    std::unordered_map<uint64_t, Prewarmed> prewarmed;
+    // MSL hashes the CP thread resolved without the warm-up: the warm-up skips them (async_mu).
+    std::unordered_set<uint64_t> prewarm_taken;
+    // Functions loaded from the library store, by MSL hash (CP thread).
+    std::unordered_map<uint64_t, id<MTLFunction>> store_fns;
+    // Functions compiled from MSL for shaders whose stored function failed in a pipeline, by MSL
+    // hash (encoder thread only: pipelines are built there; see PipelineFn).
+    std::unordered_map<uint64_t, id<MTLFunction>> fallback_fns;
     // Pipelines built in earlier sessions (hashes in <cache>/pipelines.bin): Metal's own
     // pipeline cache makes rebuilding them cheap, so they are built synchronously.
     std::unordered_set<uint64_t> known_psos;
@@ -561,6 +590,44 @@ struct HitchStats {
     uint32_t shaders = 0, psos = 0, uploads = 0, gpu_uploads = 0, pending_draws = 0;
 };
 HitchStats g_hitch;
+
+// Session totals of Metal compile work by where it ran (printed with the frame-time lines):
+// synchronous work runs on the CP or encoder thread inside a frame and is what hitches.
+struct CompileCounter {
+    std::atomic<uint64_t> n{0}, us{0}, max_us{0}, over8{0};
+    void Add(double ms) {
+        const uint64_t u = (uint64_t)(ms * 1000.0);
+        n.fetch_add(1, std::memory_order_relaxed);
+        us.fetch_add(u, std::memory_order_relaxed);
+        if (u > 8000) over8.fetch_add(1, std::memory_order_relaxed);
+        for (uint64_t m = max_us.load(std::memory_order_relaxed);
+             u > m && !max_us.compare_exchange_weak(m, u, std::memory_order_relaxed);) {
+        }
+    }
+};
+struct CompileStats {
+    CompileCounter lib_sync, lib_store, pso_sync, cpso_sync;
+    std::atomic<uint64_t> lib_async{0}, lib_prewarmed{0}, pso_async{0}, store_fallbacks{0};
+};
+CompileStats g_compile;
+
+void PrintCompileStats() {
+    auto c = [](const CompileCounter& k, char* out, size_t n) {
+        snprintf(out, n, "%llu (%.0f ms, max %.1f ms, %llu over 8 ms)", (unsigned long long)k.n.load(),
+                 k.us.load() / 1000.0, k.max_us.load() / 1000.0, (unsigned long long)k.over8.load());
+    };
+    char a[96], b[96], d[96], l[96];
+    c(g_compile.lib_sync, a, sizeof(a));
+    c(g_compile.lib_store, l, sizeof(l));
+    c(g_compile.pso_sync, b, sizeof(b));
+    c(g_compile.cpso_sync, d, sizeof(d));
+    fprintf(stderr, "[gnm-compile] session: libraries in frame %s, loaded from the store in frame %s, in background %llu, "
+                    "from warm-up %llu; render pipelines in frame %s, in background %llu; compute pipelines in frame %s; "
+                    "stored libraries replaced after a pipeline failure %llu\n",
+            a, l, (unsigned long long)g_compile.lib_async.load(), (unsigned long long)g_compile.lib_prewarmed.load(), b,
+            (unsigned long long)g_compile.pso_async.load(), d, (unsigned long long)g_compile.store_fallbacks.load());
+    ps4gnm_lib_store::PrintStats();
+}
 
 bool g_trace_reads = false;
 bool ReadGuest(void* c, uint64_t addr, void* dst, uint64_t size) {
@@ -1253,13 +1320,35 @@ bool StoreMslInDiskCache(uint64_t mh, const char* msl) {
     return is_new;
 }
 
+MTLCompileOptions* CompileOptions() {
+    MTLCompileOptions* opt = [MTLCompileOptions new];
+    // Kept as before (not mathMode): the options are part of the system Metal cache's key, so a
+    // different spelling of the same options could make the player's cache miss once.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    opt.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+    opt.preserveInvariance = YES;
+    return opt;
+}
+
+uint32_t StoreStage(uint32_t hw) {
+    return hw == GCN_HW_VS ? ps4gnm_lib_store::kVertex
+           : hw == GCN_HW_PS ? ps4gnm_lib_store::kFragment
+           : hw == GCN_HW_CS ? ps4gnm_lib_store::kKernel
+                             : 0;
+}
+
+// Warm-up: background threads make the shaders of earlier sessions ready before the game asks
+// for them. Libraries in the store are loaded first (about a millisecond each), then cached MSL
+// without a store entry is compiled (hundreds of ms each when the system Metal cache misses).
+// Within each group the shaders the game met first in its history (oldest file creation time:
+// title screen and menus) come first.
 void StartShaderWarmup() {
-    const char* home = getenv("HOME");
-    if (getenv("PS4_GNM_NO_SHADER_CACHE") || !home) return;
-    const char* root = ps4_vfs_get_app_root();
-    const char* base = root ? strrchr(root, '/') : nullptr;
-    base = base && base[1] ? base + 1 : "default";
-    S.msl_cache_dir = std::string(home) + "/Library/Caches/PS4Recomp/" + base + "/msl";
+    if (getenv("PS4_GNM_NO_SHADER_CACHE")) return;
+    const std::string title_dir = ps4gnm_shader_cache::TitleDir();
+    if (title_dir.empty()) return;
+    S.msl_cache_dir = title_dir + "/msl";
     [[NSFileManager defaultManager] createDirectoryAtPath:[NSString stringWithUTF8String:S.msl_cache_dir.c_str()]
                               withIntermediateDirectories:YES attributes:nil error:nil];
     S.pso_list_path = S.msl_cache_dir + "/pipelines.bin";
@@ -1270,44 +1359,112 @@ void StartShaderWarmup() {
         while (fread(&h, sizeof(h), 1, pf) == 1) S.known_psos.insert(h);
         fclose(pf);
     }
-    NSArray<NSString*>* files =
-        [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[NSString stringWithUTF8String:S.msl_cache_dir.c_str()]
-                                                            error:nil];
-    __block std::vector<std::string> paths;
-    for (NSString* f in files)
-        if ([f hasSuffix:@".metal"]) {
-            paths.push_back(S.msl_cache_dir + "/" + f.UTF8String);
-            char* end = nullptr;
-            const uint64_t h = strtoull(f.UTF8String, &end, 16);
-            if (end != f.UTF8String) S.msl_on_disk.insert(h);
+    {
+        // PS4_GNM_LIB_STORE_MB: size budget of the library store; not a positive number -> 256
+        const char* mb = getenv("PS4_GNM_LIB_STORE_MB");
+        char* end = nullptr;
+        long long v = mb ? strtoll(mb, &end, 10) : 0;
+        if (!mb || end == mb || *end || v <= 0 || v > (1ll << 20)) v = 256;
+        // the configuration is derived from these options (ps4gnm_lib_store::OptionsTag)
+        ps4gnm_lib_store::Open(S.dev, title_dir, CompileOptions(), (uint64_t)v << 20);
+    }
+    struct Item {
+        std::string path;
+        ps4gnm_lib_store::Key key; // store entries: h1/h2 from the file name
+        bool store = false;
+        struct timespec born;
+    };
+    auto by_birth = [](const Item& a, const Item& b) {
+        return a.born.tv_sec != b.born.tv_sec ? a.born.tv_sec < b.born.tv_sec : a.born.tv_nsec < b.born.tv_nsec;
+    };
+    std::vector<Item> stored, sources;
+    std::unordered_set<uint64_t> stored_h1;
+    struct stat st;
+    if (ps4gnm_lib_store::Enabled()) {
+        const std::string& sd = ps4gnm_lib_store::Dir();
+        if (DIR* d = opendir(sd.c_str())) {
+            while (dirent* de = readdir(d)) {
+                Item it;
+                if (!ps4gnm_lib_store::ParseFileName(de->d_name, &it.key)) continue;
+                it.path = sd + "/" + de->d_name;
+                if (stat(it.path.c_str(), &st) != 0) continue;
+                it.store = true;
+                it.born = st.st_birthtimespec;
+                stored_h1.insert(it.key.h1);
+                stored.push_back(it);
+            }
+            closedir(d);
         }
-    if (paths.empty()) return;
-    fprintf(stderr, "[gnm-draw] warming up %zu cached shaders in the background\n", paths.size());
+    }
+    if (DIR* d = opendir(S.msl_cache_dir.c_str())) {
+        while (dirent* de = readdir(d)) {
+            const size_t n = strlen(de->d_name);
+            if (n != 22 || strcmp(de->d_name + 16, ".metal") != 0) continue;
+            char* end = nullptr;
+            const uint64_t h = strtoull(de->d_name, &end, 16);
+            if (end != de->d_name + 16) continue;
+            S.msl_on_disk.insert(h);
+            if (stored_h1.count(h)) continue; // loaded from the store instead
+            Item it;
+            it.path = S.msl_cache_dir + "/" + de->d_name;
+            if (stat(it.path.c_str(), &st) != 0) continue;
+            it.key.h1 = h;
+            it.born = st.st_birthtimespec;
+            sources.push_back(it);
+        }
+        closedir(d);
+    }
+    std::sort(stored.begin(), stored.end(), by_birth);
+    std::sort(sources.begin(), sources.end(), by_birth);
+    const size_t n_stored = stored.size();
+    auto items = std::make_shared<std::vector<Item>>(std::move(stored));
+    items->insert(items->end(), sources.begin(), sources.end());
+    if (items->empty()) return;
+    fprintf(stderr, "[gnm-draw] warming up %zu cached shaders in the background (%zu from the library store, %zu from MSL)\n",
+            items->size(), n_stored, items->size() - n_stored);
     id<MTLDevice> dev = S.dev;
     const NSUInteger workers = std::max<NSUInteger>(1, [[NSProcessInfo processInfo] activeProcessorCount] / 2);
     auto next = std::make_shared<std::atomic<size_t>>(0);
     auto done = std::make_shared<std::atomic<size_t>>(0);
+    auto store_done = std::make_shared<std::atomic<size_t>>(0);
     const double t0 = CFAbsoluteTimeGetCurrent();
     for (NSUInteger w = 0; w < workers; ++w) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            for (size_t i; (i = next->fetch_add(1)) < paths.size();) {
+            for (size_t i; (i = next->fetch_add(1)) < items->size();) {
+                const Item& it = (*items)[i];
                 @autoreleasepool {
-                    NSString* src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:paths[i].c_str()]
-                                                              encoding:NSUTF8StringEncoding error:nil];
-                    if (!src) continue;
-                    const char* c = src.UTF8String;
-                    const uint64_t mh = Fnv(c, strlen(c));
-                    MTLCompileOptions* opt = [MTLCompileOptions new];
-                    opt.fastMathEnabled = NO;
-                    if (@available(macOS 11.0, *)) opt.preserveInvariance = YES;
-                    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opt error:nil];
-                    if (lib) {
+                    bool skip;
+                    {
                         std::lock_guard<std::mutex> lk(S.async_mu);
-                        S.prewarmed[mh] = lib;
+                        skip = S.prewarm_taken.count(it.key.h1) != 0;
+                    }
+                    if (skip) {
+                    } else if (it.store) {
+                        ps4gnm_lib_store::Key full;
+                        uint32_t stage = 0;
+                        id<MTLFunction> fn = nil;
+                        if (ps4gnm_lib_store::Peek(it.key, &full, &stage)) fn = ps4gnm_lib_store::Load(full, stage, nullptr);
+                        if (fn) {
+                            std::lock_guard<std::mutex> lk(S.async_mu);
+                            if (!S.prewarm_taken.count(full.h1)) S.prewarmed[full.h1] = {full.h2, nil, fn};
+                        }
+                    } else {
+                        NSString* src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:it.path.c_str()]
+                                                                  encoding:NSUTF8StringEncoding error:nil];
+                        const char* c = src ? src.UTF8String : nullptr;
+                        const uint64_t mh = c ? Fnv(c, strlen(c)) : 0;
+                        id<MTLLibrary> lib = c ? [dev newLibraryWithSource:src options:CompileOptions() error:nil] : nil;
+                        if (lib) {
+                            std::lock_guard<std::mutex> lk(S.async_mu);
+                            if (!S.prewarm_taken.count(mh)) S.prewarmed[mh] = {0, lib, nil};
+                        }
                     }
                 }
-                if (done->fetch_add(1) + 1 == paths.size())
-                    fprintf(stderr, "[gnm-draw] shader warm-up finished: %zu shaders in %.1f s\n", paths.size(),
+                if (i < n_stored && store_done->fetch_add(1) + 1 == n_stored)
+                    fprintf(stderr, "[gnm-draw] shader warm-up: %zu libraries from the store ready in %.2f s\n", n_stored,
+                            CFAbsoluteTimeGetCurrent() - t0);
+                if (done->fetch_add(1) + 1 == items->size())
+                    fprintf(stderr, "[gnm-draw] shader warm-up finished: %zu shaders in %.1f s\n", items->size(),
                             CFAbsoluteTimeGetCurrent() - t0);
             }
         });
@@ -1358,6 +1515,9 @@ void DrainAsyncCompiles() {
     }
 }
 
+bool UsesStoredFn(const Shader* s);
+bool ReplaceStoredFns(const Shader* vs, const Shader* ps);
+
 void DrainAsyncPsos() {
     std::vector<State::AsyncPso> psos;
     if (S.async_psos_ready.load(std::memory_order_acquire) == 0) return;
@@ -1369,6 +1529,10 @@ void DrainAsyncPsos() {
     }
     for (auto& r : psos) {
         S.psos_pending.erase(r.key);
+        if (!r.pso && (r.retry_vs || r.retry_ps)) {
+            // built with a stored function: compile its MSL; the next draw builds the pipeline again
+            if (ReplaceStoredFns(r.retry_vs, r.retry_ps)) continue;
+        }
         if (!r.pso)
             RLog("pso-fail", "render pipeline failed: %s", r.err ? r.err.UTF8String : "unknown error");
         S.gfx_pipes[r.key] = r.pso;
@@ -1376,6 +1540,74 @@ void DrainAsyncPsos() {
 }
 
 bool StoreMslInDiskCache(uint64_t mh, const char* msl);
+
+// The MSL that is compiled for a translated shader: the recompiler's output after the renderer's
+// post-processing (its hash keys the MSL cache, the library store and the pipelines).
+std::string FinalMsl(const gcn_shader* sh, uint32_t hw) {
+    // SPIRV-Cross implements SPIR-V NoContraction with [[clang::optnone]] helper functions
+    // (spvFMul/spvFAdd/...), i.e. a real function call per float op on the GPU. Dropping the
+    // attribute lets the compiler inline them (fma contraction may change the last ulp).
+    static const bool keep_optnone = getenv("PS4_GNM_KEEP_OPTNONE") != nullptr;
+    std::string msl_str = gcn_shader_msl(sh);
+    if (!keep_optnone) {
+        const std::string tag = "[[clang::optnone]] ";
+        for (size_t pos; (pos = msl_str.find(tag)) != std::string::npos;) msl_str.erase(pos, tag.size());
+    }
+    // Vertex positions must be bit-identical between pipelines that draw the same geometry
+    // (depth pre-pass followed by a depth-EQUAL pass), like invariant/precise positions on the
+    // console: mark the position output invariant (compiled with preserveInvariance).
+    if (hw == GCN_HW_VS) {
+        const std::string pos = "[[position]]";
+        for (size_t at = 0; (at = msl_str.find(pos, at)) != std::string::npos; at += 23)
+            msl_str.replace(at, pos.size(), "[[position, invariant]]");
+    }
+    return msl_str;
+}
+
+// The function a pipeline is built with (encoder thread): the shader's own, or the one compiled
+// from MSL after its stored function failed in a pipeline.
+id<MTLFunction> PipelineFn(const Shader* s) {
+    if (!s) return nil;
+    if (s->from_store)
+        if (auto it = S.fallback_fns.find(s->msl_hash); it != S.fallback_fns.end()) return it->second;
+    return s->fn;
+}
+
+// True if the shader's pipelines are built with a function loaded from the library store.
+bool UsesStoredFn(const Shader* s) {
+    return s && s->from_store && !S.fallback_fns.count(s->msl_hash);
+}
+
+// Compiles a shader's MSL for its pipelines (encoder thread); false if it does not compile.
+bool CompileFallbackFn(const Shader* s) {
+    const std::string msl = FinalMsl(s->sh, s->hw);
+    NSError* e = nil;
+    const double t0 = CFAbsoluteTimeGetCurrent();
+    id<MTLLibrary> lib = [S.dev newLibraryWithSource:@(msl.c_str()) options:CompileOptions() error:&e];
+    g_compile.lib_sync.Add((CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+    id<MTLFunction> fn = [lib newFunctionWithName:@"main0"];
+    S.fallback_fns[s->msl_hash] = fn; // nil too: the shader is not retried again
+    g_compile.store_fallbacks++;
+    if (!fn)
+        RLog("msl-fail", "shader 0x%llx: MSL of a failed stored library does not compile: %s",
+             (unsigned long long)s->code_addr, e ? e.localizedDescription.UTF8String : "no main0");
+    return fn != nil;
+}
+
+// One pipeline failed (encoder thread). Of its shaders, those whose pipelines are built with a
+// stored function get their MSL compiled instead, and their store entries are deleted and
+// reported as one failure toward the store's session circuit breaker
+// (ps4gnm_lib_store::ReportPipelineFailure). False if no shader used a stored function (the
+// failure is not the store's) or an MSL does not compile; true: build the pipeline again.
+bool ReplaceStoredFns(const Shader* vs, const Shader* ps) {
+    const bool v = UsesStoredFn(vs), f = UsesStoredFn(ps);
+    if (!v && !f) return false;
+    ps4gnm_lib_store::ReportPipelineFailure(v ? &vs->lib_key : nullptr, f ? &ps->lib_key : nullptr);
+    bool ok = true;
+    if (v) ok = CompileFallbackFn(vs) && ok;
+    if (f) ok = CompileFallbackFn(ps) && ok;
+    return ok;
+}
 
 // Second half of shader creation: reflection, MSL post-processing and the Metal library
 // (from the cache, the warm-up set, a background compile, or synchronously).
@@ -1398,51 +1630,66 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
     for (uint32_t i = 0; i < s->info.num_vertex_attribs; ++i)
         gcn_shader_get_vertex_attrib(sh, i, &s->attrs[i]);
 
-    // SPIRV-Cross implements SPIR-V NoContraction with [[clang::optnone]] helper functions
-    // (spvFMul/spvFAdd/...), i.e. a real function call per float op on the GPU. Dropping the
-    // attribute lets the compiler inline them (fma contraction may change the last ulp).
-    static const bool keep_optnone = getenv("PS4_GNM_KEEP_OPTNONE") != nullptr;
-    std::string msl_str = gcn_shader_msl(sh);
-    if (!keep_optnone) {
-        const std::string tag = "[[clang::optnone]] ";
-        for (size_t pos; (pos = msl_str.find(tag)) != std::string::npos;) msl_str.erase(pos, tag.size());
-    }
-    // Vertex positions must be bit-identical between pipelines that draw the same geometry
-    // (depth pre-pass followed by a depth-EQUAL pass), like invariant/precise positions on the
-    // console: mark the position output invariant (compiled with preserveInvariance).
-    if (hw == GCN_HW_VS) {
-        const std::string pos = "[[position]]";
-        for (size_t at = 0; (at = msl_str.find(pos, at)) != std::string::npos; at += 23)
-            msl_str.replace(at, pos.size(), "[[position, invariant]]");
-    }
+    const std::string msl_str = FinalMsl(sh, hw);
     const char* msl = msl_str.c_str();
     DumpMsl(s, msl);
-    const uint64_t mh = Fnv(msl, strlen(msl));
+    const uint64_t mh = Fnv(msl, msl_str.size());
     s->msl_hash = mh;
+    s->lib_key = ps4gnm_lib_store::MakeKey(msl, msl_str.size());
+    s->lib_stage = StoreStage(hw);
     s->fail_key = fail_key;
+    // The function, in this order: built earlier in the session, made ready by the warm-up, loaded
+    // from the library store (about a millisecond, no compiler), compiled from the MSL.
     id<MTLLibrary> lib = nil;
-    auto lit = S.libs.find(mh);
-    if (lit != S.libs.end()) {
+    id<MTLFunction> stored_fn = nil;
+    const bool store_on = ps4gnm_lib_store::Enabled(); // false once its circuit breaker tripped
+    if (auto fit = S.store_fns.find(mh); store_on && fit != S.store_fns.end()) {
+        stored_fn = fit->second;
+    } else if (auto lit = S.libs.find(mh); lit != S.libs.end()) {
         lib = lit->second;
     } else {
         {
             std::lock_guard<std::mutex> lk(S.async_mu);
             auto pit = S.prewarmed.find(mh);
             if (pit != S.prewarmed.end()) {
-                lib = pit->second;
+                if (pit->second.fn ? store_on && pit->second.h2 == s->lib_key.h2 : pit->second.lib != nil) {
+                    lib = pit->second.lib;
+                    stored_fn = pit->second.fn;
+                    g_compile.lib_prewarmed++;
+                }
                 S.prewarmed.erase(pit);
-                char path[1200];
-                snprintf(path, sizeof(path), "%s/%016llx.metal", S.msl_cache_dir.c_str(), (unsigned long long)mh);
-                ps4gnm_shader_cache::MarkUsed(path);
             }
         }
-        if (lib) S.libs[mh] = lib;
+        if (!lib && !stored_fn && s->lib_stage && ps4gnm_lib_store::Has(s->lib_key)) {
+            const double ld_t0 = CFAbsoluteTimeGetCurrent();
+            stored_fn = ps4gnm_lib_store::Load(s->lib_key, s->lib_stage, nullptr);
+            const double ld_ms = (CFAbsoluteTimeGetCurrent() - ld_t0) * 1000.0;
+            g_hitch.mtl_ms += ld_ms;
+            g_compile.lib_store.Add(ld_ms);
+        }
+        if (stored_fn) {
+            S.store_fns[mh] = stored_fn;
+        } else if (lib) {
+            S.libs[mh] = lib;
+        }
+        {
+            std::lock_guard<std::mutex> lk(S.async_mu);
+            S.prewarm_taken.insert(mh);
+        }
+        if (lib || stored_fn) {
+            char path[1200];
+            snprintf(path, sizeof(path), "%s/%016llx.metal", S.msl_cache_dir.c_str(), (unsigned long long)mh);
+            ps4gnm_shader_cache::MarkUsed(path);
+        }
     }
     bool msl_known = false;
-    if (!lib) msl_known = !StoreMslInDiskCache(mh, msl);
+    if (!lib && !stored_fn) msl_known = !StoreMslInDiskCache(mh, msl);
     // MSL compiled in an earlier session is cheap to compile again (Metal's shader cache), so
-    // only new shaders are compiled in the background.
-    if (!lib && allow_async && S.async_compile && !msl_known) {
+    // only new shaders are compiled in the background. The same MSL already compiling in the
+    // background (another permutation or address of the program, in this session) waits for
+    // that compile instead of compiling it again inside the frame.
+    const bool compiling = !lib && !stored_fn && S.libs_pending.count(mh) != 0;
+    if (!lib && !stored_fn && allow_async && S.async_compile && (!msl_known || compiling)) {
         // Compile the Metal library in the background; draws using this shader are skipped
         // until it is ready instead of stalling the frame (a cold Metal compile can take
         // 100+ ms per shader, and new areas bring dozens at once).
@@ -1451,25 +1698,21 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
         const bool first = waiters.empty();
         waiters.push_back(s);
         if (first) {
-            MTLCompileOptions* opt = [MTLCompileOptions new];
-            opt.fastMathEnabled = NO;
-            if (@available(macOS 11.0, *)) opt.preserveInvariance = YES;
+            g_compile.lib_async++;
             [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
-                                options:opt
+                                options:CompileOptions()
                       completionHandler:^(id<MTLLibrary> l, NSError* e) {
                           std::lock_guard<std::mutex> lk(S.async_mu);
                           S.async_libs_done.push_back({mh, l, l ? nil : e.localizedDescription});
                           S.async_shaders_ready.fetch_add(1, std::memory_order_release);
                       }];
         }
-    } else if (!lib) {
+    } else if (!lib && !stored_fn) {
         NSError* e = nil;
-        MTLCompileOptions* opt = [MTLCompileOptions new];
-        opt.fastMathEnabled = NO;
-        if (@available(macOS 11.0, *)) opt.preserveInvariance = YES;
         const double mtl_t0 = CFAbsoluteTimeGetCurrent();
-        lib = [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl] options:opt error:&e];
+        lib = [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl] options:CompileOptions() error:&e];
         g_hitch.mtl_ms += (CFAbsoluteTimeGetCurrent() - mtl_t0) * 1000.0;
+        g_compile.lib_sync.Add((CFAbsoluteTimeGetCurrent() - mtl_t0) * 1000.0);
         if (!lib) {
             RLog("msl-fail", "Metal rejected MSL of shader 0x%llx (hw %u): %s",
                  (unsigned long long)code_addr, hw, e.localizedDescription.UTF8String);
@@ -1480,7 +1723,10 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
         }
         S.libs[mh] = lib;
     }
-    if (lib) {
+    if (stored_fn) {
+        s->fn = stored_fn;
+        s->from_store = true;
+    } else if (lib) {
         const double fn_t0 = CFAbsoluteTimeGetCurrent();
         s->fn = [lib newFunctionWithName:@"main0"];
         g_hitch.fn_ms += (CFAbsoluteTimeGetCurrent() - fn_t0) * 1000.0;
@@ -3344,6 +3590,15 @@ struct VertexAttr {
     uint32_t format, offset, buffer, stride, step_fn, step_rate;
 };
 
+// Puts the shader libraries of a pipeline that was just built into the library store, unless
+// they are there already (any thread).
+void StoreLibraries(const ps4gnm_lib_store::Key* vs, const ps4gnm_lib_store::Key* ps, MTLRenderPipelineDescriptor* d) {
+    if (!ps4gnm_lib_store::Enabled()) return;
+    if (vs && ps4gnm_lib_store::Has(*vs)) vs = nullptr;
+    if (ps && ps4gnm_lib_store::Has(*ps)) ps = nullptr;
+    if (vs || ps) ps4gnm_lib_store::StoreRender(vs, ps, d);
+}
+
 // Appends a pipeline hash to the list of pipelines built so far (any thread).
 void RememberPipeline(uint64_t stable) {
     static std::mutex mu;
@@ -3405,8 +3660,8 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
     const bool known = S.known_psos.count(stable) != 0;
 
     MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = vs->fn;
-    d.fragmentFunction = ps ? ps->fn : nil;
+    d.vertexFunction = PipelineFn(vs);
+    d.fragmentFunction = ps ? PipelineFn(ps) : nil;
     for (int i = 0; i < 8; ++i) {
         if (!color_fmt[i]) continue;
         MTLRenderPipelineColorAttachmentDescriptor* ca = d.colorAttachments[i];
@@ -3448,28 +3703,46 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
         // Build a new pipeline in the background; the draw is skipped until it is ready.
         if (S.psos_pending.insert(key).second) {
             const std::string k = key;
+            const ps4gnm_lib_store::Key vk = vs->lib_key, pk = ps ? ps->lib_key : ps4gnm_lib_store::Key{};
+            const bool vstore = vs->lib_stage != 0, pstore = ps && ps->lib_stage != 0;
+            const Shader* rvs = UsesStoredFn(vs) ? vs : nullptr;
+            const Shader* rps = UsesStoredFn(ps) ? ps : nullptr;
             [S.dev newRenderPipelineStateWithDescriptor:d
                                       completionHandler:^(id<MTLRenderPipelineState> ps_, NSError* err) {
                                           if (ps_) {
                                               RememberPipeline(stable);
                                               ps4gnm_pso_archive::Add(stable, d);
+                                              StoreLibraries(vstore ? &vk : nullptr, pstore ? &pk : nullptr, d);
                                           }
                                           std::lock_guard<std::mutex> lk(S.async_mu);
-                                          S.async_psos_done.push_back({k, ps_, ps_ ? nil : err.localizedDescription});
+                                          S.async_psos_done.push_back(
+                                              {k, ps_, ps_ ? nil : err.localizedDescription, ps_ ? nullptr : rvs, ps_ ? nullptr : rps});
                                           S.async_psos_ready.fetch_add(1, std::memory_order_release);
                                       }];
             g_hitch.psos++;
+            g_compile.pso_async++;
         }
         return nil;
     }
     NSError* e = nil;
     const double pso_t0 = CFAbsoluteTimeGetCurrent();
     id<MTLRenderPipelineState> p = [S.dev newRenderPipelineStateWithDescriptor:d error:&e];
+    if (!p) {
+        // built with a stored function: compile the MSL of the stored shader(s) and retry once
+        if (ReplaceStoredFns(vs, ps)) {
+            d.vertexFunction = PipelineFn(vs);
+            d.fragmentFunction = ps ? PipelineFn(ps) : nil;
+            e = nil;
+            p = [S.dev newRenderPipelineStateWithDescriptor:d error:&e];
+        }
+    }
     g_hitch.pso_ms += (CFAbsoluteTimeGetCurrent() - pso_t0) * 1000.0;
     g_hitch.psos++;
+    g_compile.pso_sync.Add((CFAbsoluteTimeGetCurrent() - pso_t0) * 1000.0);
     if (p && !known) RememberPipeline(stable);
     // known pipelines missing from the archive are added once (the next session loads them fast)
     if (p && !ps4gnm_pso_archive::Contains(stable)) ps4gnm_pso_archive::Add(stable, d);
+    if (p) StoreLibraries(vs->lib_stage ? &vs->lib_key : nullptr, ps && ps->lib_stage ? &ps->lib_key : nullptr, d);
     if (!p) {
         RLog("pso-fail", "render pipeline (VS 0x%llx PS 0x%llx) failed: %s",
              (unsigned long long)vs->code_addr, (unsigned long long)(ps ? ps->code_addr : 0),
@@ -3804,6 +4077,18 @@ bool Init(GuestContext* ctx) {
                                                 options:MTLResourceStorageModeShared deallocator:nil];
         if (!S.gds_buf) S.gds_buf = S.dummy;
         gcn_profile_default_metal(&S.profile);
+        // PS4_GNM_QUIT_AFTER_S=<s> (benchmarks): quit through the normal quit path after <s>
+        // seconds, so the caches are saved as when the player quits (a killed process loses the
+        // pipeline archive additions since its last save).
+        if (const char* q = getenv("PS4_GNM_QUIT_AFTER_S"); q && atof(q) > 0) {
+            const double secs = atof(q);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(secs * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                               fprintf(stderr, "[gnm-draw] PS4_GNM_QUIT_AFTER_S: quitting after %.0f s\n", secs);
+                               PrintCompileStats();
+                               ps4_host_quit(0);
+                           });
+        }
         StartShaderWarmup();
         if (!S.msl_cache_dir.empty()) {
             // PS4_GNM_PSO_ARCHIVE_MB: archive size budget; not a positive number -> 384
@@ -4933,17 +5218,26 @@ void DispatchEncode(DispatchRec& r) {
             const uint64_t wg = (uint64_t)std::max(1u, rt.cs.workgroup_size[0]) * std::max(1u, rt.cs.workgroup_size[1]) *
                                 std::max(1u, rt.cs.workgroup_size[2]);
             MTLComputePipelineDescriptor* cpd = [MTLComputePipelineDescriptor new];
-            cpd.computeFunction = cs->fn;
+            cpd.computeFunction = PipelineFn(cs);
             if (wg > 0 && wg <= 1024) cpd.maxTotalThreadsPerThreadgroup = (NSUInteger)wg;
             const uint64_t ck[2] = {cs->msl_hash, wg};
             const uint64_t cstable = Fnv(ck, sizeof(ck), 0x5ca1ab1e5ca1ab1eull);
             ps4gnm_pso_archive::Attach(cpd);
             const double cpso_t0 = CFAbsoluteTimeGetCurrent();
             pso = [S.dev newComputePipelineStateWithDescriptor:cpd options:MTLPipelineOptionNone reflection:nil error:&e];
+            if (!pso && ReplaceStoredFns(cs, nullptr)) {
+                // built with a stored function: retry once with the function compiled from MSL
+                cpd.computeFunction = PipelineFn(cs);
+                e = nil;
+                pso = [S.dev newComputePipelineStateWithDescriptor:cpd options:MTLPipelineOptionNone reflection:nil error:&e];
+            }
             if (pso && !ps4gnm_pso_archive::Contains(cstable)) ps4gnm_pso_archive::Add(cstable, cpd);
-            if (!pso) pso = [S.dev newComputePipelineStateWithFunction:cs->fn error:&e];
+            if (pso && cs->lib_stage == ps4gnm_lib_store::kKernel && !ps4gnm_lib_store::Has(cs->lib_key))
+                ps4gnm_lib_store::StoreCompute(cs->lib_key, cpd);
+            if (!pso) pso = [S.dev newComputePipelineStateWithFunction:PipelineFn(cs) error:&e];
             g_hitch.pso_ms += (CFAbsoluteTimeGetCurrent() - cpso_t0) * 1000.0;
             g_hitch.psos++;
+            g_compile.cpso_sync.Add((CFAbsoluteTimeGetCurrent() - cpso_t0) * 1000.0);
             if (!pso)
                 RLog("cpso-fail", "compute pipeline 0x%llx failed: %s", (unsigned long long)addr,
                      e.localizedDescription.UTF8String);
@@ -5234,7 +5528,7 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                             (unsigned long long)S.present_idx + 1);
                 double host_ms[PS4_HITCH_KINDS];
                 for (int k = 0; k < PS4_HITCH_KINDS; ++k) host_ms[k] = ps4_hitch_take_ns(k) / 1e6;
-                if (dt > 50.0)
+                if (dt > (long_ms > 0 && long_ms < 50.0 ? long_ms : 50.0))
                     fprintf(stderr, "[gnm-draw] hitch: frame %.1f ms; shaders %u (%.1f ms: gcn %.1f, metal %.1f, lookup %.1f, fn %.1f), pipelines %u (%.1f ms), "
                                     "texture uploads %u (%.1f ms), gpu uploads %u, gpu waits %.1f ms, draws waiting for shaders %u; "
                                     "io %.1f, vm %.1f, mtlbuf %.1f, texlock %.1f, shader_fs %.1f ms\n",
@@ -5260,6 +5554,7 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                                 ">33ms %zu, >50ms %zu, >100ms %zu\n",
                         v.size(), pct(0.50), pct(0.95), pct(0.99), v.back(), over33, over50, over100);
                 ps4gnm_shader_cache::PrintStats();
+                PrintCompileStats();
                 intervals.clear();
             }
         }

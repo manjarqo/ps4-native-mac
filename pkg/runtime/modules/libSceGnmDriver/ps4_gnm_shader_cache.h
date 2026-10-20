@@ -33,6 +33,11 @@ struct Key {
     gcn_runtime_info rt{};
 };
 
+// <cache root>/<title id>: the directory of every on-disk cache of this title (GCN translations,
+// MSL sources, pipeline list and archive). Empty when no root is known (no HOME and no
+// PS4RECOMP_CACHE_DIR). Logged once.
+std::string TitleDir();
+
 // Opens (and creates) the cache of this title and configuration and starts reading its entries
 // on a background thread.
 void Start(const gcn_profile& profile, const gcn_msl_options& msl);
