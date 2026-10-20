@@ -146,6 +146,14 @@ static int32_t vdec_emit(GuestContext *ctx, const H264VtFrame *f, uint64_t fb_ad
     return 0;
 }
 
+// Next decoded picture. Error pictures (access units that could not be decoded) are dropped:
+// this API has no picture for them, as before the shared core.
+static H264VtFrame *videodec_pop(H264VtDecoder *core) {
+    H264VtFrame *f;
+    while ((f = h264vt_pop(core)) != NULL && f->error) h264vt_frame_free(f);
+    return f;
+}
+
 static Vdec *vdec_from_ctrl(GuestContext *ctx, uint64_t ctrl_addr) {
     if (!ctrl_addr) return NULL;
     Vdec *d = (Vdec *)(uintptr_t)((VideodecCtrl *)(ctx->mem_base + ctrl_addr))->handle;
@@ -225,7 +233,7 @@ void shim_sceVideodecDecode(GuestContext *ctx) {
     h264vt_decode(d->core, ctx->mem_base + in->pAuData, (size_t)in->auSize, (int64_t)in->ptsData,
                   (int64_t)in->dtsData, in->attachedData, NULL);
     int32_t rc = 0;
-    H264VtFrame *f = h264vt_pop(d->core);
+    H264VtFrame *f = videodec_pop(d->core);
     if (f) {
         rc = vdec_emit(ctx, f, ctx->rdx, ctx->rcx);
         if (d->frames_out++ == 0) fprintf(stderr, "[libSceVideodec] first picture decoded\n");
@@ -247,7 +255,7 @@ void shim_sceVideodecFlush(GuestContext *ctx) {
     Vdec *d = vdec_from_ctrl(ctx, ctx->rdi);
     if (d) {
         h264vt_finish(d->core);
-        H264VtFrame *f = ctx->rsi ? h264vt_pop(d->core) : NULL;
+        H264VtFrame *f = ctx->rsi ? videodec_pop(d->core) : NULL;
         if (f) {
             rc = vdec_emit(ctx, f, ctx->rsi, ctx->rdx);
             h264vt_frame_free(f);

@@ -40,6 +40,8 @@ typedef struct H264SpsInfo {
     uint8_t level_idc;
     uint8_t constraint_set_flags; // bit n = constraint_set<n>_flag, n = 0..5
     uint8_t chroma_format_idc;
+    uint8_t pic_order_cnt_type;
+    uint8_t log2_max_pic_order_cnt_lsb; // pic_order_cnt_type 0 only
     uint32_t pic_width_in_mbs_minus1;
     uint32_t pic_height_in_map_units_minus1;
     uint8_t frame_mbs_only_flag;
@@ -72,6 +74,7 @@ typedef struct H264SpsInfo {
 
 // Which NAL units an access unit contained.
 typedef struct H264AuFlags {
+    uint8_t slice;                // a coded slice (nal_unit_type 1..5): the unit makes a picture
     uint8_t idr;                  // nal_unit_type 5
     uint8_t sps;                  // 7
     uint8_t pps;                  // 8
@@ -84,7 +87,8 @@ typedef struct H264AuFlags {
 } H264AuFlags;
 
 typedef struct H264VtFrame {
-    void *pixbuf; // CVPixelBufferRef (NV12, video range)
+    void *pixbuf; // CVPixelBufferRef (NV12, video range); NULL for an error picture
+    bool error;   // the access unit could not be decoded; width/height come from its SPS (0 if none)
     uint32_t width;
     uint32_t height;
     int64_t pts;
@@ -103,9 +107,10 @@ H264VtDecoder *h264vt_create(const char *log_tag);
 void h264vt_destroy(H264VtDecoder *d);
 
 // Decodes one Annex-B access unit. Returns 0 or a negative H264VT_ERR_*; *ready (may be NULL)
-// receives the number of pictures that became available during the call. An access unit that
-// only carries parameter sets, or slices before the first SPS/PPS, is accepted and decodes
-// nothing.
+// receives the number of pictures that became available during the call. Every access unit
+// with a coded slice yields exactly one picture, in POC order: a decoded one, or an error
+// picture (H264VtFrame.error) when it cannot be decoded (VideoToolbox error, no or rejected
+// parameter sets). An access unit without a slice (parameter sets, SEI) yields none.
 #define H264VT_ERR_NOMEM (-1)
 #define H264VT_ERR_SESSION (-2) // format description / session creation failed
 #define H264VT_ERR_DECODE (-3)  // VTDecompressionSessionDecodeFrame refused the sample

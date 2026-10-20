@@ -243,6 +243,8 @@ static bool parse_sps(const uint8_t *nal, size_t size, H264SpsInfo *out, PocPara
     }
     free(rbsp);
     if (b->overrun) return false;
+    s.pic_order_cnt_type = (uint8_t)pp.pic_order_cnt_type;
+    s.log2_max_pic_order_cnt_lsb = (uint8_t)pp.log2_max_poc_lsb;
     s.valid = true;
     *out = s;
     if (poc) {
@@ -306,6 +308,11 @@ typedef struct AuTag {
     H264AuFlags au;
     int32_t poc;
     uint32_t reorder_depth;
+    // Lifetime: one reference for the decoder (dropped once the outcome of the access unit is
+    // known) and one for VideoToolbox's callback. Both fields are protected by q_lock.
+    int refs;
+    bool delivered; // a picture (decoded or error) was queued for this access unit
+    struct AuTag *next_pending;
 } AuTag;
 
 struct H264VtDecoder {
@@ -329,6 +336,8 @@ struct H264VtDecoder {
     uint32_t prev_frame_num;
     uint8_t *avcc;
     size_t avcc_cap;
+    AuTag *pending; // submitted access units whose picture has not come back yet
+    bool warned_no_session;
 
     pthread_mutex_t q_lock; // picture queues
     // VideoToolbox hands pictures out in decode order; they wait here, sorted by POC, until
@@ -362,46 +371,101 @@ static void release_all(H264VtDecoder *d) {
     pthread_mutex_unlock(&d->q_lock);
 }
 
-static void output_cb(void *refcon, void *frame_refcon, OSStatus status, VTDecodeInfoFlags flags, CVImageBufferRef image,
-                      CMTime pts, CMTime duration) {
-    (void)pts;
-    (void)duration;
-    H264VtDecoder *d = (H264VtDecoder *)refcon;
-    AuTag *t = (AuTag *)frame_refcon;
-    if (status != noErr || !image || (flags & kVTDecodeInfo_FrameDropped)) {
-        pthread_mutex_lock(&d->q_lock);
-        uint64_t n = d->errors++;
-        pthread_mutex_unlock(&d->q_lock);
-        if (n < 8) fprintf(stderr, "[%s] VideoToolbox decode error %d (flags 0x%x)\n", d->tag, (int)status, (unsigned)flags);
-        free(t);
-        return;
+// Picture size an SPS describes (7.4.2.1.1 frame cropping), for error pictures.
+static void sps_dims(const H264SpsInfo *s, uint32_t *w, uint32_t *h) {
+    *w = *h = 0;
+    if (!s->valid) return;
+    const uint32_t cux = (s->chroma_format_idc == 1 || s->chroma_format_idc == 2) ? 2 : 1;
+    const uint32_t cuy = (s->chroma_format_idc == 1 ? 2 : 1) * (2 - s->frame_mbs_only_flag);
+    const uint32_t fw = (s->pic_width_in_mbs_minus1 + 1) * 16;
+    const uint32_t fh = (s->pic_height_in_map_units_minus1 + 1) * 16 * (2 - s->frame_mbs_only_flag);
+    const uint32_t cw = cux * (s->frame_crop_left_offset + s->frame_crop_right_offset);
+    const uint32_t ch = cuy * (s->frame_crop_top_offset + s->frame_crop_bottom_offset);
+    if (cw < fw && ch < fh) {
+        *w = fw - cw;
+        *h = fh - ch;
     }
-    H264VtFrame *f = (H264VtFrame *)calloc(1, sizeof(*f));
-    if (!f) {
-        free(t);
-        return;
-    }
-    f->pixbuf = (void *)CVPixelBufferRetain(image);
-    f->width = (uint32_t)CVPixelBufferGetWidth(image);
-    f->height = (uint32_t)CVPixelBufferGetHeight(image);
-    if (t) {
-        f->pts = t->pts;
-        f->dts = t->dts;
-        f->attached = t->attached;
-        f->sps = t->sps;
-        f->au = t->au;
-        f->poc = t->poc;
-    }
-    const uint32_t depth = t ? t->reorder_depth : 0;
-    free(t);
-    pthread_mutex_lock(&d->q_lock);
-    // Sorted insert; a picture with the same POC goes after the ones already held.
+}
+
+// Sorted insert into the reorder list, then releases what exceeds the depth. q_lock held.
+static void hold_locked(H264VtDecoder *d, H264VtFrame *f, uint32_t depth) {
+    // A picture with the same POC goes after the ones already held.
     H264VtFrame **pp = &d->held;
     while (*pp && (*pp)->poc <= f->poc) pp = &(*pp)->next;
     f->next = *pp;
     *pp = f;
     d->held_count++;
     while (d->held_count > (int)depth) release_one_locked(d);
+}
+
+// Queues the picture of the tag's access unit: decoded (image) or an error picture (NULL).
+// q_lock held. Returns false if the tag already had its picture.
+static bool deliver_locked(H264VtDecoder *d, AuTag *t, CVImageBufferRef image) {
+    if (t->delivered) return false;
+    t->delivered = true;
+    H264VtFrame *f = (H264VtFrame *)calloc(1, sizeof(*f));
+    if (!f) return true;
+    if (image) {
+        f->pixbuf = (void *)CVPixelBufferRetain(image);
+        f->width = (uint32_t)CVPixelBufferGetWidth(image);
+        f->height = (uint32_t)CVPixelBufferGetHeight(image);
+    } else {
+        f->error = true;
+        sps_dims(&t->sps, &f->width, &f->height);
+    }
+    f->pts = t->pts;
+    f->dts = t->dts;
+    f->attached = t->attached;
+    f->sps = t->sps;
+    f->au = t->au;
+    f->poc = t->poc;
+    hold_locked(d, f, t->reorder_depth);
+    return true;
+}
+
+static void tag_unref_locked(AuTag *t) {
+    if (--t->refs == 0) free(t);
+}
+
+static void output_cb(void *refcon, void *frame_refcon, OSStatus status, VTDecodeInfoFlags flags, CVImageBufferRef image,
+                      CMTime pts, CMTime duration) {
+    (void)pts;
+    (void)duration;
+    H264VtDecoder *d = (H264VtDecoder *)refcon;
+    AuTag *t = (AuTag *)frame_refcon;
+    const bool failed = status != noErr || !image || (flags & kVTDecodeInfo_FrameDropped);
+    pthread_mutex_lock(&d->q_lock);
+    uint64_t n = failed ? d->errors++ : 0;
+    if (t) {
+        deliver_locked(d, t, failed ? NULL : image);
+        tag_unref_locked(t);
+    }
+    pthread_mutex_unlock(&d->q_lock);
+    if (failed && n < 8)
+        fprintf(stderr, "[%s] VideoToolbox decode error %d (flags 0x%x): error picture\n", d->tag, (int)status,
+                (unsigned)flags);
+}
+
+// Settles the decoder's reference of every pending access unit. With fail_undelivered, an access
+// unit whose picture never came back (after FinishDelayedFrames) gets an error picture; otherwise
+// only the delivered ones are dropped from the list. dec_lock held.
+static void settle_pending(H264VtDecoder *d, bool fail_undelivered) {
+    pthread_mutex_lock(&d->q_lock);
+    AuTag **pp = &d->pending;
+    while (*pp) {
+        AuTag *t = *pp;
+        if (t->delivered || fail_undelivered) {
+            if (!t->delivered) {
+                deliver_locked(d, t, NULL);
+                fprintf(stderr, "[%s] no picture for access unit %llu: error picture\n", d->tag,
+                        (unsigned long long)t->attached);
+            }
+            *pp = t->next_pending;
+            tag_unref_locked(t);
+        } else {
+            pp = &t->next_pending;
+        }
+    }
     pthread_mutex_unlock(&d->q_lock);
 }
 
@@ -438,6 +502,7 @@ void h264vt_destroy(H264VtDecoder *d) {
     if (!d) return;
     pthread_mutex_lock(&d->dec_lock);
     destroy_session(d);
+    settle_pending(d, true);
     pthread_mutex_unlock(&d->dec_lock);
     drop_queue(d);
     free(d->avcc);
@@ -648,6 +713,7 @@ static size_t parse_au(H264VtDecoder *d, const uint8_t *au, size_t size, H264AuF
                 break;
             default:
                 if (type == 5) flags->idr = 1;
+                if (type >= 1 && type <= 5) flags->slice = 1;
                 if ((type == 1 || type == 5) && !seen_slice) {
                     seen_slice = true;
                     *have_poc = slice_poc(d, au + s, n, poc);
@@ -671,73 +737,111 @@ static uint64_t emitted_count(H264VtDecoder *d) {
 
 static CMTime to_cmtime(int64_t t) { return t == H264VT_NO_TIME ? kCMTimeInvalid : CMTimeMake(t, 90000); }
 
+// Queues an error picture for an access unit that cannot be decoded at all. dec_lock held.
+static void error_picture(H264VtDecoder *d, const AuTag *proto) {
+    AuTag t = *proto;
+    t.delivered = false;
+    pthread_mutex_lock(&d->q_lock);
+    deliver_locked(d, &t, NULL);
+    d->errors++;
+    pthread_mutex_unlock(&d->q_lock);
+}
+
 int h264vt_decode(H264VtDecoder *d, const uint8_t *au, size_t size, int64_t pts, int64_t dts, uint64_t attached,
                   int *ready) {
     if (ready) *ready = 0;
     pthread_mutex_lock(&d->dec_lock);
     const uint64_t before = emitted_count(d);
     int rc = 0;
-    H264AuFlags flags = {0};
+    AuTag proto = {0};
     int32_t poc = 0;
     bool have_poc = false;
-    size_t len = parse_au(d, au, size, &flags, &poc, &have_poc);
+    size_t len = parse_au(d, au, size, &proto.au, &poc, &have_poc);
+    proto.pts = pts;
+    proto.dts = dts;
+    proto.attached = attached;
+    proto.sps = d->sps_info;
+    proto.poc = poc;
+    // Without a POC the picture cannot be placed, so it is not held back.
+    proto.reorder_depth = have_poc ? d->poc_params.reorder_depth : 0;
     if (len == (size_t)-1) {
         rc = H264VT_ERR_NOMEM;
+        error_picture(d, &proto);
         goto out;
     }
     if (d->params_dirty && d->sps_len && d->pps_len) {
         d->params_dirty = false;
         if (!create_session(d)) {
+            // The new parameter sets are unusable; the old session must not decode their slices.
             rc = H264VT_ERR_SESSION;
-            goto out;
+            destroy_session(d);
+            settle_pending(d, true);
         }
     }
-    if (d->session && len) {
-        AuTag *t = (AuTag *)calloc(1, sizeof(*t));
-        if (!t) {
-            rc = H264VT_ERR_NOMEM;
-            goto out;
+    if (!proto.au.slice) goto out; // parameter sets / SEI only: no picture
+    if (!d->session) {
+        // No SPS/PPS seen yet, or the session could not be created: every picture of the
+        // stream is an error picture, so callers still get one picture per access unit.
+        if (!d->warned_no_session) {
+            d->warned_no_session = true;
+            fprintf(stderr, "[%s] no decoder session (parameter sets missing or rejected): error pictures\n", d->tag);
         }
-        t->pts = pts;
-        t->dts = dts;
-        t->attached = attached;
-        t->sps = d->sps_info;
-        t->au = flags;
-        t->poc = poc;
-        // Without a POC the picture cannot be placed, so it is not held back.
-        t->reorder_depth = have_poc ? d->poc_params.reorder_depth : 0;
-        // An IDR picture starts a new POC sequence: every earlier picture is shown before it.
-        if (flags.idr) {
-            VTDecompressionSessionFinishDelayedFrames(d->session);
-            VTDecompressionSessionWaitForAsynchronousFrames(d->session);
-            release_all(d);
-        }
-        CMBlockBufferRef bb = NULL;
-        OSStatus st = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, len, kCFAllocatorDefault, NULL, 0,
-                                                         len, kCMBlockBufferAssureMemoryNowFlag, &bb);
-        if (st == noErr) st = CMBlockBufferReplaceDataBytes(d->avcc, bb, 0, len);
-        CMSampleBufferRef sb = NULL;
-        if (st == noErr) {
-            CMSampleTimingInfo timing = {kCMTimeInvalid, to_cmtime(pts), to_cmtime(dts)};
-            const size_t ssz = len;
-            st = CMSampleBufferCreateReady(kCFAllocatorDefault, bb, d->fmt, 1, 1, &timing, 1, &ssz, &sb);
-        }
-        if (st == noErr) {
-            VTDecodeInfoFlags info = 0;
-            // On success the output callback owns the tag (it runs exactly once per frame).
-            st = VTDecompressionSessionDecodeFrame(d->session, sb, kVTDecodeFrame_EnableTemporalProcessing, t, &info);
-            if (st != noErr) {
-                static int warned;
-                if (warned++ < 8) fprintf(stderr, "[%s] VTDecompressionSessionDecodeFrame: %d\n", d->tag, (int)st);
-                rc = H264VT_ERR_DECODE;
-            }
-        } else {
-            free(t);
-            rc = H264VT_ERR_NOMEM;
-        }
-        if (sb) CFRelease(sb);
-        if (bb) CFRelease(bb);
+        if (!rc) rc = H264VT_ERR_SESSION;
+        error_picture(d, &proto);
+        goto out;
     }
+    // An IDR picture starts a new POC sequence: every earlier picture is shown before it.
+    if (proto.au.idr) {
+        VTDecompressionSessionFinishDelayedFrames(d->session);
+        VTDecompressionSessionWaitForAsynchronousFrames(d->session);
+        settle_pending(d, true);
+        release_all(d);
+    }
+    AuTag *t = (AuTag *)malloc(sizeof(*t));
+    if (!t) {
+        rc = H264VT_ERR_NOMEM;
+        error_picture(d, &proto);
+        goto out;
+    }
+    *t = proto;
+    t->refs = 2; // the decoder and VideoToolbox's callback
+    CMBlockBufferRef bb = NULL;
+    OSStatus st = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, len, kCFAllocatorDefault, NULL, 0, len,
+                                                     kCMBlockBufferAssureMemoryNowFlag, &bb);
+    if (st == noErr) st = CMBlockBufferReplaceDataBytes(d->avcc, bb, 0, len);
+    CMSampleBufferRef sb = NULL;
+    if (st == noErr) {
+        CMSampleTimingInfo timing = {kCMTimeInvalid, to_cmtime(pts), to_cmtime(dts)};
+        const size_t ssz = len;
+        st = CMSampleBufferCreateReady(kCFAllocatorDefault, bb, d->fmt, 1, 1, &timing, 1, &ssz, &sb);
+    }
+    bool submitted = false;
+    if (st == noErr) {
+        VTDecodeInfoFlags info = 0;
+        st = VTDecompressionSessionDecodeFrame(d->session, sb, kVTDecodeFrame_EnableTemporalProcessing, t, &info);
+        submitted = true;
+        if (st != noErr) {
+            static int warned;
+            if (warned++ < 8) fprintf(stderr, "[%s] VTDecompressionSessionDecodeFrame: %d\n", d->tag, (int)st);
+            rc = H264VT_ERR_DECODE;
+        }
+    } else {
+        rc = H264VT_ERR_NOMEM;
+    }
+    if (sb) CFRelease(sb);
+    if (bb) CFRelease(bb);
+    pthread_mutex_lock(&d->q_lock);
+    if (!submitted) t->refs--; // VideoToolbox never saw the tag
+    if (st != noErr && deliver_locked(d, t, NULL)) d->errors++;
+    if (t->delivered) {
+        tag_unref_locked(t);
+    } else {
+        // Decoding is synchronous, so this does not happen with VideoToolbox as observed; if
+        // the picture comes later, the callback delivers it, else settle_pending() fails it.
+        t->next_pending = d->pending;
+        d->pending = t;
+    }
+    pthread_mutex_unlock(&d->q_lock);
 out:
     if (ready) *ready = (int)(emitted_count(d) - before);
     pthread_mutex_unlock(&d->dec_lock);
@@ -751,6 +855,7 @@ int h264vt_finish(H264VtDecoder *d) {
         VTDecompressionSessionFinishDelayedFrames(d->session);
         VTDecompressionSessionWaitForAsynchronousFrames(d->session);
     }
+    settle_pending(d, true);
     release_all(d);
     int n = (int)(emitted_count(d) - before);
     pthread_mutex_unlock(&d->dec_lock);
@@ -797,6 +902,7 @@ void h264vt_frame_free(H264VtFrame *f) {
 
 void h264vt_copy_nv12(const H264VtFrame *f, uint8_t *dst) {
     CVPixelBufferRef pb = (CVPixelBufferRef)f->pixbuf;
+    if (!pb) return; // error picture: nothing decoded
     const uint32_t w = f->width, h = f->height;
     const uint32_t pitch = h264vt_pitch(w);
     const uint32_t ah = h264vt_aligned_height(h);
