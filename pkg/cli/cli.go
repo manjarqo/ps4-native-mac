@@ -1125,12 +1125,28 @@ func packageAppBundle(cfg *Config, appName, compiledBin string) (string, error) 
 	}
 
 	// 5. Generate Contents/Info.plist
-	iconXml := ""
-	if hasIcon {
-		iconXml = "    <key>CFBundleIconFile</key>\n    <string>AppIcon</string>\n"
+	if err := os.WriteFile(filepath.Join(contentsDir, "Info.plist"), []byte(appInfoPlist(appName, hasIcon)), 0o644); err != nil {
+		return "", fmt.Errorf("failed to write Info.plist: %w", err)
 	}
 
-	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+	// 6. Sign the bundle ad hoc: binds Info.plist and seals the resources, so the system (Game
+	// Mode, Metal shader cache, Gatekeeper on a local build) sees one consistent app identity.
+	if err := signAppBundle(bundleDir); err != nil {
+		return "", err
+	}
+
+	return bundleDir, nil
+}
+
+// appInfoPlist is the Contents/Info.plist of a generated game bundle. LSSupportsGameMode and the
+// games category let macOS run it in Game Mode (CPU and GPU priority, lower Bluetooth latency for
+// controllers) when it is full screen.
+func appInfoPlist(appName string, hasIcon bool) string {
+	iconXML := ""
+	if hasIcon {
+		iconXML = "    <key>CFBundleIconFile</key>\n    <string>AppIcon</string>\n"
+	}
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -1152,17 +1168,26 @@ func packageAppBundle(cfg *Config, appName, compiledBin string) (string, error) 
     <string>1.0</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.games</string>
+    <key>LSSupportsGameMode</key>
+    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
 %s</dict>
 </plist>
-`, appName, appName, appName, appName, iconXml)
+`, appName, appName, appName, appName, iconXML)
+}
 
-	if err := os.WriteFile(filepath.Join(contentsDir, "Info.plist"), []byte(plistContent), 0o644); err != nil {
-		return "", fmt.Errorf("failed to write Info.plist: %w", err)
+// signAppBundle signs the bundle ad hoc and verifies the signature strictly.
+func signAppBundle(bundleDir string) error {
+	if out, err := exec.Command("codesign", "--force", "--sign", "-", bundleDir).CombinedOutput(); err != nil {
+		return fmt.Errorf("codesign %s: %w: %s", bundleDir, err, strings.TrimSpace(string(out)))
 	}
-
-	return bundleDir, nil
+	if out, err := exec.Command("codesign", "--verify", "--deep", "--strict", bundleDir).CombinedOutput(); err != nil {
+		return fmt.Errorf("codesign --verify %s: %w: %s", bundleDir, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // findGcnRecompiler locates the GCN shader recompiler library (shadPS4's
