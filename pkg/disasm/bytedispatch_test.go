@@ -37,6 +37,60 @@ func byteDispatchImage() []byte {
 	return img
 }
 
+// byteDispatchSplitImage is the dispatch exactly as Uncharted 4 has it: a conditional branch
+// between the byte load and the table jump, so the load is in a predecessor block.
+//
+//	0x100: movzx eax, byte [r10]
+//	0x104: test cl, cl
+//	0x106: jne case 3
+//	0x108: lea rcx, [rip+table] ; 0x10f: movsxd rax, [rcx+4*rax] ; 0x113: add rax, rcx
+//	0x116: jmp rax
+func byteDispatchSplitImage() []byte {
+	img := make([]byte, 0x2000)
+	copy(img[0x100:], []byte{
+		0x41, 0x0f, 0xb6, 0x02, // movzx eax, byte [r10]
+		0x84, 0xc9, // test cl, cl
+		0x75, 0x00, // jne case 3 (patched)
+		0x48, 0x8d, 0x0d, 0, 0, 0, 0, // lea rcx, [rip+table]
+		0x48, 0x63, 0x04, 0x81, // movsxd rax, [rcx+4*rax]
+		0x48, 0x01, 0xc8, // add rax, rcx
+		0xff, 0xe0, // jmp rax
+	})
+	img[0x107] = byte(bdCase(3) - 0x108)
+	binary.LittleEndian.PutUint32(img[0x10b:], uint32(int32(bdTable-0x10f)))
+	copy(img[bdCase0:], []byte{0xb8, 0x11, 0x22, 0x33, 0x44, 0xc3, 0xc3, 0xc3, 0xc3})
+	return img
+}
+
+// The byte load in a predecessor block caps the scan too (found through the predecessors).
+func TestByteDispatchCapFromPredecessor(t *testing.T) {
+	img := byteDispatchSplitImage()
+	for i := 0; i < 256; i++ {
+		putRel(img, i, bdCase(i%3))
+	}
+	putRel(img, 256, bdCase0+1) // the next table
+	putRel(img, 257, bdCase0+2)
+	d, err := NewDisassembler(switchTestELF(img))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.AnalyzeReachable([]uint64{0x100}); err != nil {
+		t.Fatal(err)
+	}
+	fn := d.Functions[0x100]
+	if fn == nil {
+		t.Fatal("function not recovered")
+	}
+	if got := fn.JumpTables[0x116]; len(got) != 3 {
+		t.Fatalf("table targets %#x, want the 3 cases", got)
+	}
+	for _, a := range []uint64{bdCase0 + 1, bdCase0 + 2} {
+		if fn.Blocks[a] != nil {
+			t.Errorf("0x%x inside case 0's mov became a block", a)
+		}
+	}
+}
+
 // bdCase returns the address of case i (0-3).
 func bdCase(i int) uint64 {
 	if i == 0 {

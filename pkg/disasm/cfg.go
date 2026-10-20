@@ -838,7 +838,53 @@ func (d *Disassembler) disasmBranchFollowing(entryAddr uint64) (*Function, []uin
 							return 0, false
 						}
 
-						if sw, ok := d.ResolveJumpTable(curBlock, findTableAddr, findCount, entryAddr, fnEnd); ok && len(sw.Targets) > 0 && sw.Count <= 0 {
+						// findCap follows the index register back through the predecessors to its
+						// source; a cap needs every path to end in a byte load (byteIndexCap).
+						findCap := func(idxReg x86asm.Reg) int {
+							type item struct {
+								block uint64
+								reg   x86asm.Reg
+							}
+							visited := make(map[uint64]bool)
+							var queue []item
+							for _, p := range blockPreds[blockStart] {
+								if !visited[p] {
+									visited[p] = true
+									queue = append(queue, item{p, idxReg})
+								}
+							}
+							found := 0
+							for depth := 0; len(queue) > 0 && depth < 16; depth++ {
+								var next []item
+								for _, it := range queue {
+									c, from, killed := byteIndexCapKill(blockInsts[it.block], it.reg)
+									if killed {
+										return 0
+									}
+									if c > 0 {
+										found = c
+										continue
+									}
+									preds := blockPreds[it.block]
+									if len(preds) == 0 {
+										return 0
+									}
+									for _, p := range preds {
+										if !visited[p] {
+											visited[p] = true
+											next = append(next, item{p, from})
+										}
+									}
+								}
+								queue = next
+							}
+							if len(queue) > 0 {
+								return 0
+							}
+							return found
+						}
+
+						if sw, ok := d.resolveJumpTableCapped(curBlock, findTableAddr, findCount, findCap, entryAddr, fnEnd); ok && len(sw.Targets) > 0 && sw.Count <= 0 {
 							weak = append(weak, weakSwitch{pc: pc, from: blockStart, targets: sw.Targets})
 						} else if ok && len(sw.Targets) > 0 {
 							fn.JumpTables[pc] = sw.Targets
