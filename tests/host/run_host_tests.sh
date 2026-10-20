@@ -137,6 +137,12 @@ clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_buffer_align_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
 "$T/gcn_buffer_align_test"
+# Uncharted 4 chapter 1 compute shaders the translator rejected (EXEC half writes, sharps
+# spilled to VGPR lanes, wave64 ballots through workgroup memory): translated and Metal-accepted.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_u4_cs_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gcn_u4_cs_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+"$T/gcn_u4_cs_test" "$R/tests/host/data" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
 # Fast-clear colours of integer/snorm targets.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/gnm_clear_color_test.mm" -framework Metal \
   -framework Foundation -o "$T/gnm_clear_color_test"

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <boost/container/small_vector.hpp>
 #include "common/assert.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
@@ -273,6 +275,71 @@ SamplerPatchResult CheckClearAnisoRatioAndThresholdPattern(IR::Value value) {
     return {inst->Arg(0), true};
 }
 
+// PS4Recomp: a sharp dword read back from a VGPR lane an SGPR was spilled to
+// (v_writelane_b32 vN, sX, L ... v_readlane_b32 sY, vN, L) that ReadLaneEliminationPass could not
+// resolve: vN is also written as part of a register array indexed in a loop (v_movreld, lowered
+// to Select(index == k, new, old) per register; Uncharted 4 chapter 1 async CS 0x130015c400). A
+// sharp cannot come from such a per-lane load, so the walk follows WriteLane chains, phis and the
+// old value of those selects, and resolves the dword only if exactly one spilled value reaches it.
+IR::Value SpilledLaneValue(const IR::Value& value) {
+    IR::Inst* read = value.TryInst();
+    if (!read || read->GetOpcode() != IR::Opcode::ReadLane || !read->Arg(1).IsImmediate()) {
+        return value;
+    }
+    const u32 lane = read->Arg(1).U32();
+    boost::container::small_vector<IR::Inst*, 32> visited;
+    boost::container::small_vector<IR::Inst*, 32> stack;
+    IR::Value found{};
+    if (read->Arg(0).IsImmediate()) {
+        return value;
+    }
+    stack.push_back(read->Arg(0).Inst());
+    while (!stack.empty()) {
+        IR::Inst* inst = stack.back();
+        stack.pop_back();
+        if (std::ranges::find(visited, inst) != visited.end()) {
+            continue;
+        }
+        visited.push_back(inst);
+        while (inst->GetOpcode() == IR::Opcode::WriteLane) {
+            if (!inst->Arg(2).IsImmediate()) {
+                return value; // a lane only the shader knows
+            }
+            if (inst->Arg(2).U32() == lane) {
+                break;
+            }
+            if (inst->Arg(0).IsImmediate()) {
+                return value;
+            }
+            inst = inst->Arg(0).Inst();
+        }
+        if (inst->GetOpcode() == IR::Opcode::WriteLane) {
+            const IR::Value v = inst->Arg(1);
+            if (found.IsEmpty()) {
+                found = v;
+            } else if (!(found == v)) {
+                return value;
+            }
+            continue;
+        }
+        if (inst->GetOpcode() == IR::Opcode::Phi) {
+            for (size_t i = 0; i < inst->NumArgs(); ++i) {
+                if (inst->Arg(i).IsImmediate()) {
+                    return value;
+                }
+                stack.push_back(inst->Arg(i).Inst());
+            }
+            continue;
+        }
+        if (inst->GetOpcode() == IR::Opcode::SelectU32 && !inst->Arg(2).IsImmediate()) {
+            stack.push_back(inst->Arg(2).Inst()); // the register's old value
+            continue;
+        }
+        return value;
+    }
+    return found.IsEmpty() ? value : found;
+}
+
 IR::Inst* FindSharpSource(IR::Inst* handle) {
     ASSERT(IsSharpSource(handle));
     return handle;
@@ -286,7 +353,8 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
         if (!source) {
             continue;
         }
-        ASSERT(IsSharpSource(source));
+        ASSERT_MSG(IsSharpSource(source), "Sharp dword {} of {} produced by {}", i, sharp.num_dwords,
+                   IR::NameOf(source->GetOpcode()));
         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {
             auto flags = source->Flags<IR::BufferInstInfo>();
             flags.sharp_source.Assign(1u);
@@ -308,6 +376,7 @@ void DiscoverBufferSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList
             inst && inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
             vsharp.dwords[i] = inst->Arg(0);
         }
+        vsharp.dwords[i] = SpilledLaneValue(vsharp.dwords[i]);
     }
 
     // Attempt to "see through" various V# access patterns and have binding reproduce them
@@ -340,11 +409,11 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
     // Gather T# dwords
     IR::Inst* tsharp_low = image_handle->Arg(0).Inst();
     for (size_t i = 0; i < tsharp_low->NumArgs(); ++i) {
-        tsharp.dwords[tsharp.num_dwords++] = tsharp_low->Arg(i);
+        tsharp.dwords[tsharp.num_dwords++] = SpilledLaneValue(tsharp_low->Arg(i));
     }
     if (auto tsharp_high = image_handle->Arg(1).TryInst()) {
         for (size_t i = 0; i < tsharp_high->NumArgs(); ++i) {
-            tsharp.dwords[tsharp.num_dwords++] = tsharp_high->Arg(i);
+            tsharp.dwords[tsharp.num_dwords++] = SpilledLaneValue(tsharp_high->Arg(i));
         }
     }
 
@@ -366,7 +435,7 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
     const IR::Inst* sampler = inst.Arg(1).Inst();
     auto& ssharp = resource.sharps[1];
     for (size_t i = 0; i < sampler->NumArgs(); ++i) {
-        ssharp.dwords[ssharp.num_dwords++] = sampler->Arg(i);
+        ssharp.dwords[ssharp.num_dwords++] = SpilledLaneValue(sampler->Arg(i));
     }
     if (auto [ssharp_dw0, tsharp_dw3, found] = CheckDisableAnisoLod0Pattern(ssharp.dwords[0]);
         found) {

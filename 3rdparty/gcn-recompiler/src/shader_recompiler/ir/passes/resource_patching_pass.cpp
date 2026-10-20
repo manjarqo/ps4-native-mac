@@ -579,7 +579,10 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
     }
     if (buffer.add_tid_enable) {
         ASSERT_MSG(info.sw_stage == SwStage::Compute,
-                   "Thread ID buffer addressing is not supported outside of compute.");
+                   "Thread ID buffer addressing is not supported outside of compute (V# base {:#x} "
+                   "stride {} num_records {:#x} dword3 {:#010x}).",
+                   u64(buffer.base_address), buffer.GetStride(), buffer.num_records,
+                   reinterpret_cast<const u32*>(&buffer)[3]);
         const IR::U32 thread_id{ir.LaneId()};
         index = ir.IAdd(index, thread_id);
     }
