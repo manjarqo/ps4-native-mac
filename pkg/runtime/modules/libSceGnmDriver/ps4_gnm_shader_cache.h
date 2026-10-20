@@ -50,7 +50,10 @@ bool MakeKey(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, uint6
              gcn_read_guest_fn read, void* ctx, Key* out);
 
 // A new shader for code_addr from a cached permutation compatible with this draw, or nullptr.
-// Entries of the key that the background loader has not reached yet are loaded here.
+// Never reads the disk and never waits for the startup loader: entries stored in this session
+// are in memory, and a key whose entries are still being loaded misses. Permutations are
+// indexed by their specialization hash (gcn_draw_spec_hash), so the cost does not grow with the
+// number of permutations of the program.
 gcn_shader* Lookup(const Key& key, uint64_t code_addr, const uint32_t ud[16],
                    gcn_read_guest_fn read, void* ctx);
 

@@ -504,6 +504,35 @@ GCN_API int gcn_shader_find_compatible_flat(const gcn_shader* const* list, uint3
                                             size_t flatbuf_dw, const gcn_runtime_info* runtime,
                                             gcn_read_guest_fn read, void* ctx);
 
+/* ---- Indexed permutation lookup --------------------------------------------------------- */
+/* For caches with many permutations of one program: the draw's specialization is built once
+ * (one pass over the pointer chains) against `base`, a permutation of the program, and hashed;
+ * permutations are indexed by the same hash, so a lookup compares only the permutations with an
+ * equal hash instead of all of them.
+ *
+ * gcn_shader_is_compatible() compares a buffer or image slot only where the draw has a resource
+ * bound, so hashes are taken under a slot mask: the draw's own (gcn_draw_spec_mask). For every
+ * permutation s with gcn_shader_same_resource_layout(s, base) that is compatible with the draw,
+ * gcn_shader_spec_hash(s, mask) == gcn_draw_spec_hash(spec, mask). The hash covers only part of
+ * what is compared, so equal hashes are confirmed with gcn_shader_matches_draw_spec(), which is
+ * exactly gcn_shader_is_compatible(). Permutations with another resource layout must be checked
+ * with gcn_shader_matches_draw_spec() directly. */
+typedef struct gcn_draw_spec gcn_draw_spec;
+/* NULL if the specialization cannot be built (bad arguments, geometry shaders): fall back to
+ * gcn_shader_is_compatible() for every permutation. */
+GCN_API gcn_draw_spec* gcn_draw_spec_create(const gcn_shader* base, const uint32_t user_data[16],
+                                            const gcn_runtime_info* runtime, gcn_read_guest_fn read,
+                                            void* ctx);
+GCN_API void gcn_draw_spec_destroy(gcn_draw_spec* spec);
+GCN_API void gcn_draw_spec_mask(const gcn_draw_spec* spec, uint64_t mask[2]);
+GCN_API uint64_t gcn_draw_spec_hash(const gcn_draw_spec* spec, const uint64_t mask[2]);
+GCN_API uint64_t gcn_shader_spec_hash(const gcn_shader* s, const uint64_t mask[2]);
+GCN_API bool gcn_shader_same_resource_layout(const gcn_shader* a, const gcn_shader* b);
+/* gcn_shader_is_compatible(s, user_data, runtime, read, ctx) for the draw `spec` was built for. */
+GCN_API bool gcn_shader_matches_draw_spec(const gcn_shader* s, const gcn_draw_spec* spec,
+                                          const uint32_t user_data[16], const gcn_runtime_info* runtime,
+                                          gcn_read_guest_fn read, void* ctx);
+
 /* ---- Sharp decoding (AmdGpu::Buffer / Image / Sampler) ----------------------------------- */
 typedef struct gcn_buffer_desc {
     uint64_t base_address;

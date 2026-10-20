@@ -121,11 +121,22 @@ struct Entry {
     gcn_shader* tmpl = nullptr; // owned
 };
 
-struct Bucket {
-    std::vector<std::string> files; // not deserialized yet
-    std::vector<Entry> entries;
-    bool loading = false;           // files are being deserialized by another thread
+// Permutations of a bucket indexed by their specialization hash under one draw slot mask
+// (gcn_draw_spec_mask): a lookup compares only the entries whose hash equals the draw's.
+struct MaskIndex {
+    uint64_t mask[2] = {0, 0};
+    std::unordered_map<uint64_t, std::vector<uint32_t>> by_hash; // spec hash -> entry indexes, ascending
 };
+
+struct Bucket {
+    std::vector<std::string> files; // not deserialized yet (startup loader)
+    std::vector<Entry> entries;
+    bool loading = false;           // files are being deserialized by the startup loader
+    std::vector<uint32_t> odd;      // entries with another resource layout than entries[0]
+    std::vector<MaskIndex> masks;   // one per draw slot mask seen (at most kMaxMasks)
+};
+// Distinct slot masks indexed per bucket; draws with yet another mask compare every entry.
+constexpr size_t kMaxMasks = 32;
 
 struct Cache {
     bool enabled = false;
@@ -137,12 +148,23 @@ struct Cache {
     std::unordered_set<std::string> names; // files present or being written
     dispatch_queue_t writer = nullptr;
     // statistics (since the last PrintStats)
-    std::atomic<uint64_t> lookups{0}, hits{0}, stores{0}, loaded{0}, rejected{0};
+    std::atomic<uint64_t> lookups{0}, hits{0}, stores{0}, loaded{0}, rejected{0}, not_ready{0}, compared{0};
     std::atomic<uint64_t> load_us{0}, lookup_us{0};
     std::atomic<uint64_t> total_hits{0};
 };
 
 Cache C;
+
+// Adds an entry to its bucket and to the bucket's mask indexes (C.mu held; only hashing, no I/O).
+void AddEntryLocked(Bucket& b, const Entry& e) {
+    const uint32_t idx = (uint32_t)b.entries.size();
+    b.entries.push_back(e);
+    if (!gcn_shader_same_resource_layout(e.tmpl, b.entries[0].tmpl)) {
+        b.odd.push_back(idx);
+        return;
+    }
+    for (MaskIndex& m : b.masks) m.by_hash[gcn_shader_spec_hash(e.tmpl, m.mask)].push_back(idx);
+}
 
 bool ReadFile(const std::string& path, std::vector<uint8_t>& out) {
     const int fd = open(path.c_str(), O_RDONLY);
@@ -235,7 +257,7 @@ void LoadBucket(uint64_t bucket) {
     {
         std::lock_guard<std::mutex> lk(C.mu);
         Bucket& b = C.buckets[bucket];
-        for (Entry& e : loaded) b.entries.push_back(e);
+        for (Entry& e : loaded) AddEntryLocked(b, e);
         b.loading = false;
     }
     C.loaded_cv.notify_all();
@@ -465,32 +487,95 @@ gcn_shader* Lookup(const Key& key, uint64_t code_addr, const uint32_t ud[16], gc
     if (!C.enabled) return nullptr;
     const double t0 = CFAbsoluteTimeGetCurrent();
     C.lookups++;
-    LoadBucket(key.bucket);
-    gcn_shader* hit = nullptr;
-    {
-        // Templates are immutable once inserted and never removed, so they can be tested
-        // outside the lock; the snapshot only guards the vector itself.
-        std::vector<std::pair<gcn_shader*, std::string>> cand;
-        {
-            std::lock_guard<std::mutex> lk(C.mu);
-            auto it = C.buckets.find(key.bucket);
-            if (it != C.buckets.end())
-                for (const Entry& e : it->second.entries)
-                    if (SameKey(e.key, key)) cand.push_back({e.tmpl, e.name});
+    auto done = [&](gcn_shader* hit) {
+        C.lookup_us += (uint64_t)((CFAbsoluteTimeGetCurrent() - t0) * 1e6);
+        if (hit) {
+            C.hits++;
+            C.total_hits++;
         }
-        for (const auto& [t, name] : cand)
-            if (gcn_shader_is_compatible(t, ud, &key.rt, read, ctx)) {
-                hit = gcn_shader_clone(t, code_addr);
-                MarkUsed(C.dir + "/" + name);
-                break;
+        return hit;
+    };
+    // No disk I/O and no waiting here: entries stored in this session are in memory (Store), and
+    // a bucket the startup loader has not finished counts as a miss (the caller translates).
+    const gcn_shader* base = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(C.mu);
+        auto it = C.buckets.find(key.bucket);
+        if (it == C.buckets.end()) return done(nullptr);
+        const Bucket& b = it->second;
+        if (b.loading || !b.files.empty()) {
+            C.not_ready++;
+            return done(nullptr);
+        }
+        if (b.entries.empty()) return done(nullptr);
+        base = b.entries[0].tmpl;
+    }
+    // The draw's specialization, built once outside the lock (it walks guest pointer chains).
+    // Templates are immutable once inserted and never removed.
+    gcn_draw_spec* ds = gcn_draw_spec_create(base, ud, &key.rt, read, ctx);
+    uint64_t mask[2] = {0, 0};
+    uint64_t dh = 0;
+    if (ds) {
+        gcn_draw_spec_mask(ds, mask);
+        dh = gcn_draw_spec_hash(ds, mask);
+    }
+    // The first compatible entry in insertion order, as a scan over all entries finds it. The
+    // comparisons run under the lock: they only compare specializations (entries of another
+    // layout read guest memory), no I/O, no compile.
+    const gcn_shader* found = nullptr;
+    std::string found_name;
+    {
+        std::lock_guard<std::mutex> lk(C.mu);
+        Bucket& b = C.buckets[key.bucket];
+        uint64_t compared = 0;
+        auto test = [&](uint32_t i) {
+            const Entry& e = b.entries[i];
+            if (!SameKey(e.key, key)) return false;
+            compared++;
+            if (!gcn_shader_matches_draw_spec(e.tmpl, ds, ud, &key.rt, read, ctx)) return false;
+            found = e.tmpl;
+            found_name = e.name;
+            return true;
+        };
+        MaskIndex* mi = nullptr;
+        if (ds) {
+            for (MaskIndex& m : b.masks)
+                if (m.mask[0] == mask[0] && m.mask[1] == mask[1]) mi = &m;
+            if (!mi && b.masks.size() < kMaxMasks) {
+                // first draw with this slot mask: index the bucket's entries under it (hashing only)
+                MaskIndex& m = b.masks.emplace_back();
+                m.mask[0] = mask[0];
+                m.mask[1] = mask[1];
+                const gcn_shader* b0 = b.entries[0].tmpl;
+                for (uint32_t i = 0; i < b.entries.size(); ++i)
+                    if (gcn_shader_same_resource_layout(b.entries[i].tmpl, b0))
+                        m.by_hash[gcn_shader_spec_hash(b.entries[i].tmpl, mask)].push_back(i);
+                mi = &m;
             }
+        }
+        if (mi) {
+            // merge the hash slot and the entries of another layout, both ascending
+            static const std::vector<uint32_t> none;
+            auto it = mi->by_hash.find(dh);
+            const std::vector<uint32_t>& slot = it == mi->by_hash.end() ? none : it->second;
+            size_t x = 0, y = 0;
+            while (x < slot.size() || y < b.odd.size()) {
+                const uint32_t i = y >= b.odd.size() || (x < slot.size() && slot[x] < b.odd[y]) ? slot[x++] : b.odd[y++];
+                if (test(i)) break;
+            }
+        } else {
+            for (uint32_t i = 0; i < b.entries.size(); ++i) // no index for this draw
+                if (test(i)) break;
+        }
+        C.compared += compared;
     }
-    C.lookup_us += (uint64_t)((CFAbsoluteTimeGetCurrent() - t0) * 1e6);
-    if (hit) {
-        C.hits++;
-        C.total_hits++;
+    gcn_shader* hit = nullptr;
+    if (found) {
+        hit = gcn_shader_clone(found, code_addr);
+        MarkUsed(C.dir + "/" + found_name);
     }
-    return hit;
+    gcn_draw_spec_destroy(ds);
+    return done(hit);
 }
 
 void Store(const Key& key, const gcn_shader* sh) {
@@ -513,17 +598,27 @@ void Store(const Key& key, const gcn_shader* sh) {
     char name[64];
     snprintf(name, sizeof(name), "%016llx_%016llx.gsc", (unsigned long long)key.bucket,
              (unsigned long long)h.blob_hash);
+    // The entry serves lookups of this session from memory at once (no reading back the file).
+    gcn_shader* tmpl = nullptr;
+    gcn_shader_deserialize(data, size, 0, &tmpl, nullptr, 0);
     {
         std::lock_guard<std::mutex> lk(C.mu);
         if (!C.names.insert(name).second) { // already on disk (or being written)
+            if (tmpl) gcn_shader_destroy(tmpl);
             free(data);
             return;
+        }
+        if (tmpl) {
+            Entry e;
+            e.key = key;
+            e.name = name;
+            e.content = h.blob_hash;
+            e.tmpl = tmpl;
+            AddEntryLocked(C.buckets[key.bucket], e);
         }
     }
     C.stores++;
     const std::string path = C.dir + "/" + name;
-    const std::string fname = name;
-    const uint64_t bucket = key.bucket;
     dispatch_async(C.writer, ^{
         char tmp[1200];
         snprintf(tmp, sizeof(tmp), "%s.tmp%d", path.c_str(), (int)getpid());
@@ -531,12 +626,7 @@ void Store(const Key& key, const gcn_shader* sh) {
         bool ok = f && fwrite(&h, sizeof(h), 1, f) == 1 && fwrite(data, 1, size, f) == size;
         if (f) ok = (fclose(f) == 0) && ok;
         if (ok) ok = rename(tmp, path.c_str()) == 0;
-        if (ok) {
-            // Later lookups of this key in the session (the same program at another address)
-            // load the entry from disk.
-            std::lock_guard<std::mutex> lk(C.mu);
-            C.buckets[bucket].files.push_back(fname);
-        } else {
+        if (!ok) {
             unlink(tmp);
             fprintf(stderr, "[gnm-cache] could not write %s\n", path.c_str());
         }
@@ -593,13 +683,14 @@ void PrintStats() {
     const uint64_t lookups = C.lookups.exchange(0), hits = C.hits.exchange(0), stores = C.stores.exchange(0);
     const uint64_t loaded = C.loaded.exchange(0), rejected = C.rejected.exchange(0);
     const uint64_t load_us = C.load_us.exchange(0), lookup_us = C.lookup_us.exchange(0);
+    const uint64_t not_ready = C.not_ready.exchange(0), compared = C.compared.exchange(0);
     if (!lookups && !stores && !loaded) return;
     fprintf(stderr,
             "[gnm-cache] lookups %llu, hits %llu (%llu this session), new entries %llu, loaded %llu (%.1f ms), "
-            "rejected %llu, lookup time %.1f ms\n",
+            "rejected %llu, lookup time %.1f ms, %llu permutations compared, %llu before their entries were loaded\n",
             (unsigned long long)lookups, (unsigned long long)hits, (unsigned long long)C.total_hits.load(),
             (unsigned long long)stores, (unsigned long long)loaded, load_us / 1000.0, (unsigned long long)rejected,
-            lookup_us / 1000.0);
+            lookup_us / 1000.0, (unsigned long long)compared, (unsigned long long)not_ready);
 }
 
 } // namespace ps4gnm_shader_cache

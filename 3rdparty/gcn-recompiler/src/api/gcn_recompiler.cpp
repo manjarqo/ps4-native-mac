@@ -1132,6 +1132,144 @@ GCN_API int gcn_shader_find_compatible_flat(const gcn_shader* const* list, uint3
     }
 }
 
+} // extern "C"
+
+struct gcn_draw_spec {
+    const gcn_shader* base = nullptr;
+    Shader::Info info;            // the draw's view of base->info (spec.info points here)
+    Shader::StageSpecialization spec;
+};
+
+namespace {
+inline void HashMix(u64& h, u64 v) {
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+}
+inline void HashMap(u64& h, const AmdGpu::CompMapping& m) {
+    u32 v;
+    std::memcpy(&v, m.array.data(), 4);
+    HashMix(h, v);
+}
+inline bool MaskBit(const u64 mask[2], u32 i) {
+    return i < 128 && ((mask[i >> 6] >> (i & 63)) & 1);
+}
+// Hash of the StageSpecialization fields operator== compares (a subset: runtime info, fetch
+// shader data and start bindings are left out, they are equal within one cache key in practice
+// and are confirmed by the full comparison), buffers and images only in the slots of `mask`.
+// Compatible specializations (operator== with other.bitset == mask) hash equal: every field
+// mixed here is one operator== requires equal, under the same conditions.
+u64 SpecHash(const Shader::StageSpecialization& sp, const u64 mask[2]) {
+    u64 h = 0x6a09e667f3bcc909ull;
+    HashMix(h, sp.vs_attribs.size());
+    for (const auto& a : sp.vs_attribs) {
+        HashMix(h, a.divisor);
+        HashMix(h, static_cast<u64>(a.num_class));
+        HashMap(h, a.dst_select);
+    }
+    HashMix(h, sp.fmasks.size());
+    for (const auto& f : sp.fmasks) HashMix(h, (u64(f.width) << 32) | f.height);
+    if (sp.buffers.empty() && sp.images.empty() && sp.samplers.empty()) return h; // see operator==
+    u32 binding = 0;
+    for (const auto& b : sp.buffers) {
+        if (MaskBit(mask, binding++)) {
+            HashMix(h, 1000 + binding);
+            HashMix(h, b.stride);
+            HashMix(h, (u64(b.is_formatted) << 1) | b.swizzle_enable);
+            if (b.is_formatted) {
+                HashMix(h, (u64(b.data_format) << 8) | b.num_format);
+                HashMap(h, b.dst_select);
+                HashMix(h, static_cast<u64>(b.num_conversion));
+            }
+            if (b.swizzle_enable) HashMix(h, (u64(b.index_stride) << 8) | b.element_size);
+        }
+    }
+    for (const auto& im : sp.images) {
+        if (MaskBit(mask, binding++)) {
+            HashMix(h, 2000 + binding);
+            HashMix(h, static_cast<u64>(im.type));
+            HashMix(h, (u64(im.is_integer) << 2) | (u64(im.is_storage) << 1) | im.is_srgb);
+            HashMap(h, im.dst_select);
+            HashMix(h, static_cast<u64>(im.num_conversion));
+            HashMix(h, im.num_bindings);
+        }
+    }
+    for (const auto& sa : sp.samplers) HashMix(h, (u64(sa.force_unnormalized) << 1) | sa.force_degamma);
+    return h;
+}
+bool SameLayout(const Shader::Info& a, const Shader::Info& b) {
+    return a.sw_stage == b.sw_stage && a.buffers.size() == b.buffers.size() &&
+           a.images.size() == b.images.size() && a.fmasks.size() == b.fmasks.size() &&
+           a.samplers.size() == b.samplers.size() && a.flattened_ud_buf.size() == b.flattened_ud_buf.size() &&
+           a.srt_info.flattened_bufsize_dw == b.srt_info.flattened_bufsize_dw;
+}
+} // namespace
+
+extern "C" {
+
+GCN_API gcn_draw_spec* gcn_draw_spec_create(const gcn_shader* base, const uint32_t user_data[16],
+                                            const gcn_runtime_info* runtime, gcn_read_guest_fn read,
+                                            void* ctx) {
+    if (!base || !user_data || !runtime || base->runtime.hw_stage == HwStage::Geometry) {
+        return nullptr;
+    }
+    try {
+        GcnShim::GuestMemoryScope scope{read, ctx};
+        RuntimeInfo rt{};
+        if (!ToRuntimeInfo(*runtime, rt, nullptr)) {
+            return nullptr;
+        }
+        // as gcn_shader_find_compatible: the draw's specialization against the base permutation
+        std::array<u32, 16> ud;
+        std::memcpy(ud.data(), user_data, 64);
+        auto d = std::make_unique<gcn_draw_spec>();
+        d->base = base;
+        d->info = base->info;
+        d->info.user_data = std::span<const u32>(ud);
+        d->info.RefreshFlatBuf();
+        d->spec = Shader::StageSpecialization(d->info, rt, base->profile, Backend::Bindings{});
+        d->spec.info = &d->info;
+        d->info.user_data = {}; // ud is gone after this call; only Valid() reads info later
+        return d.release();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+GCN_API void gcn_draw_spec_destroy(gcn_draw_spec* spec) {
+    delete spec;
+}
+
+GCN_API void gcn_draw_spec_mask(const gcn_draw_spec* spec, uint64_t mask[2]) {
+    mask[0] = mask[1] = 0;
+    if (!spec) return;
+    for (u32 i = 0; i < Shader::StageSpecialization::MaxStageResources; ++i)
+        if (spec->spec.bitset[i]) mask[i >> 6] |= 1ull << (i & 63);
+}
+
+GCN_API uint64_t gcn_draw_spec_hash(const gcn_draw_spec* spec, const uint64_t mask[2]) {
+    return spec ? SpecHash(spec->spec, mask) : 0;
+}
+
+GCN_API uint64_t gcn_shader_spec_hash(const gcn_shader* s, const uint64_t mask[2]) {
+    return s ? SpecHash(s->spec, mask) : 0;
+}
+
+GCN_API bool gcn_shader_same_resource_layout(const gcn_shader* a, const gcn_shader* b) {
+    return a && b && a->runtime.hw_stage != HwStage::Geometry && b->runtime.hw_stage != HwStage::Geometry &&
+           SameLayout(a->info, b->info);
+}
+
+GCN_API bool gcn_shader_matches_draw_spec(const gcn_shader* s, const gcn_draw_spec* spec,
+                                          const uint32_t user_data[16], const gcn_runtime_info* runtime,
+                                          gcn_read_guest_fn read, void* ctx) {
+    if (!s) return false;
+    // as gcn_shader_find_compatible: the base's specialization serves permutations of the same
+    // resource layout; others get the full check
+    if (spec && gcn_shader_same_resource_layout(s, spec->base)) return s->spec == spec->spec;
+    return gcn_shader_is_compatible(s, user_data, runtime, read, ctx);
+}
+
 GCN_API void gcn_decode_buffer(const uint32_t v[4], gcn_buffer_desc* o) {
     if (!v || !o) {
         return;

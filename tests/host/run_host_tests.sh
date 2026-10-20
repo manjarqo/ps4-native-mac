@@ -167,4 +167,15 @@ LK="$T/libbreaker"; mkdir -p "$LK"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/kernel_compile_test.mm" "$G/ps4_gnm_kernel_compile.mm" \
   -framework Metal -framework Foundation -o "$T/kernel_compile_test"
 "$T/kernel_compile_test" $NONCE
+# GCN translation cache lookups with 3000 permutations of one program: found from memory in the
+# session that stored them (files deleted), never waiting for the startup loader of a new
+# process, and at a cost that does not grow with the number of permutations.
+GC="$R/3rdparty/gcn-recompiler"
+clang++ -std=c++17 -fobjc-arc -O2 -Wall -Werror -I "$G" -I "$GC/include" "$R/tests/host/gcn_cache_lookup_test.mm" \
+  "$G/ps4_gnm_shader_cache.mm" "$GC/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" \
+  -framework Foundation -o "$T/gcn_cache_lookup_test"
+mkdir -p "$T/gcnl_s" "$T/gcnl_r"
+"$T/gcn_cache_lookup_test" session "$T/gcnl_s" 3000 2>&1 | grep '^gcn_cache_lookup_test'
+"$T/gcn_cache_lookup_test" write "$T/gcnl_r" 3000 2>&1 | grep '^gcn_cache_lookup_test'
+"$T/gcn_cache_lookup_test" restart "$T/gcnl_r" 3000 2>&1 | grep '^gcn_cache_lookup_test'
 rm -rf "$T"
