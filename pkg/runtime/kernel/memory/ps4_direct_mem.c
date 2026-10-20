@@ -1126,24 +1126,6 @@ void shim_sceKernelMprotect(GuestContext *ctx) {
 
 void ps4_gnm_notify_cpu_write(uint64_t addr, uint64_t size) __attribute__((weak));
 
-// Splits the non-free extent that strictly contains `at` into [addr, at) and [at, end), both
-// keeping the attributes. Caller holds vm_mutex.
-static void vm_split_extent_at(GuestContext *proc, uint64_t at) {
-    for (GuestVMExtent *e = proc->vm_extents; e; e = e->next) {
-        if (e->is_free || at <= e->addr || at >= e->addr + e->size) continue;
-        GuestVMExtent *tail = (GuestVMExtent *)calloc(1, sizeof(*tail));
-        if (!tail) return;
-        *tail = *e;
-        tail->addr = at;
-        tail->size = e->addr + e->size - at;
-        tail->prev = e;
-        e->size = at - e->addr;
-        e->next = tail;
-        if (tail->next) tail->next->prev = tail;
-        return;
-    }
-}
-
 // int sceKernelMtypeprotect(void *addr, size_t len, int mtype, int prot)
 //
 // Changes the protection and the memory type (cache attribute: 0 WB_ONION, 3 WC_GARLIC,
@@ -1171,8 +1153,10 @@ int sceKernelMtypeprotect(GuestContext *ctx, const void *addr, size_t size, int 
         if (!e->is_free && e->addr < end && e->addr + e->size > start) covered++;
     }
     if (covered) {
-        vm_split_extent_at(proc, start);
-        vm_split_extent_at(proc, end);
+        if (!recomp_vm_split_extent_at(proc, start) || !recomp_vm_split_extent_at(proc, end)) {
+            pthread_mutex_unlock(&proc->vm_mutex);
+            return 0x8002000c; // ORBIS_KERNEL_ERROR_ENOMEM: bookkeeping for the split is unavailable
+        }
         for (GuestVMExtent *e = proc->vm_extents; e; e = e->next) {
             if (e->is_free || e->addr < start || e->addr + e->size > end) continue;
             e->prot = prot;
@@ -1202,6 +1186,15 @@ void shim_sceKernelMtypeprotect(GuestContext *ctx) {
 // array with a positive count too. The map operations pass MAP_FIXED (0x10), exactly like
 // sceKernelBatchMap does on the console; `start` is the requested address (0 = anywhere) and
 // receives the mapped address.
+// The map operations pass MAP_FIXED. When an address was requested and the allocator placed the
+// mapping elsewhere (it falls back to any free range when the requested one is taken) the
+// console fails the entry; undo the stray mapping and fail it too.
+static int batch_fixed_result(GuestContext *ctx, int result, uint64_t requested, void *mapped, uint64_t length) {
+    if (result != 0 || requested == 0 || (uint64_t)mapped == requested) return result;
+    recomp_vm_free(ctx, (uint64_t)mapped, (size_t)length);
+    return 0x8002000c; // ORBIS_KERNEL_ERROR_ENOMEM
+}
+
 int sceKernelBatchMap(GuestContext *ctx, OrbisKernelBatchMapEntry *entries, int numEntries, int *numEntriesOut) {
     const int kFlagsMapFixed = 0x10;
     int result = 0;
@@ -1218,6 +1211,7 @@ int sceKernelBatchMap(GuestContext *ctx, OrbisKernelBatchMapEntry *entries, int 
         case ORBIS_KERNEL_BATCH_MAP_DIRECT:
             result = sceKernelMapDirectMemory(ctx, &mapped, (size_t)e->length, prot, kFlagsMapFixed,
                                               (off_t)e->offset, 0);
+            result = batch_fixed_result(ctx, result, e->start, mapped, e->length);
             if (result == 0) e->start = (uint64_t)mapped;
             break;
         case ORBIS_KERNEL_BATCH_MAP_UNMAP:
@@ -1228,6 +1222,7 @@ int sceKernelBatchMap(GuestContext *ctx, OrbisKernelBatchMapEntry *entries, int 
             break;
         case ORBIS_KERNEL_BATCH_MAP_FLEXIBLE:
             result = sceKernelMapNamedFlexibleMemory(ctx, &mapped, (size_t)e->length, prot, kFlagsMapFixed, "anon");
+            result = batch_fixed_result(ctx, result, e->start, mapped, e->length);
             if (result == 0) e->start = (uint64_t)mapped;
             break;
         case ORBIS_KERNEL_BATCH_MAP_TYPE_PROTECT:

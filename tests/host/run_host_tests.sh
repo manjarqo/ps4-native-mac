@@ -47,6 +47,9 @@ M="$R/pkg/runtime/modules"
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/kernel_batchmap_test.c" "$R/pkg/runtime/core/recomp_runtime.c" \
   "$R/pkg/runtime/kernel/memory/ps4_direct_mem.c" -o "$T/kernel_batchmap_test"
 "$T/kernel_batchmap_test" | grep -v '^\[ps4'
+clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/kernel_vmfree_test.c" "$R/pkg/runtime/core/recomp_runtime.c" \
+  -o "$T/kernel_vmfree_test"
+"$T/kernel_vmfree_test" | grep -v '^\[ps4'
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/sem_timedwait_test.c" "$R/pkg/runtime/kernel/sync/ps4_semaphore.c" \
   -o "$T/sem_timedwait_test"
 "$T/sem_timedwait_test"

@@ -32,6 +32,7 @@ uint64_t recomp_vm_alloc_named(GuestContext *ctx, size_t size, int prot, int fla
 uint64_t recomp_vm_alloc_named_aligned(GuestContext *ctx, size_t size, size_t alignment, int prot, int flags, const char *name);
 uint64_t recomp_vm_alloc_fixed(GuestContext *ctx, uint64_t desired_addr, size_t size, int prot, int flags, const char *name);
 int recomp_vm_free(GuestContext *ctx, uint64_t addr, size_t size);
+bool recomp_vm_split_extent_at(GuestContext *proc, uint64_t at);
 GuestVMExtent *recomp_vm_find(GuestContext *ctx, uint64_t addr);
 
 // Unresolved Symbol Diagnostics & Core Stubs

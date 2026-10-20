@@ -14,24 +14,7 @@
 #include <stdio.h>
 #include <sys/mman.h>
 
-// What recomp_runtime.c needs from the rest of the runtime; none of it is used by this test.
-int g_ps4_videoout_flip_count;
-void ps4_aio_destroy(void) {}
-void ps4_ajm_destroy(void) {}
-void ps4_equeue_destroy(void) {}
-void ps4_event_flag_destroy(void) {}
-void ps4_gnmdriver_destroy(void) {}
-void ps4_keyboard_destroy(void) {}
-void ps4_log_drain_sync(double t) { (void)t; }
-void ps4_metal_screen_destroy(void) {}
-void ps4_sync_destroy(void) {}
-void ps4_vfs_destroy(void) {}
-const char *ps4_vfs_get_app_root(void) { return NULL; }
-void ps4_videoout_destroy(void) {}
-void recomp_init_main_thread(GuestContext *ctx) { (void)ctx; }
-bool recomp_module_text_contains(uint64_t addr) { (void)addr; return false; }
-uint64_t recomp_resolve_symbol(const char *m, const char *s) { (void)m; (void)s; return 0; }
-__attribute__((used, section("__TEXT,__recomp_guest"))) static const char g_guest_text_marker[16];
+#include "runtime_stubs.h"
 
 // GPU hooks of the direct-memory code (weak in the runtime). The remap hook is not needed; the
 // CPU-write hook records what sceKernelMtypeprotect invalidates.
@@ -192,6 +175,22 @@ static void test_partial_failure(GuestContext *ctx) {
   CHECK(sceKernelBatchMap(ctx, cleanup, 2, &done) == 0 && done == 2, "cleanup");
 }
 
+// A map entry whose requested (MAP_FIXED) address is taken fails; the allocator's fallback
+// mapping elsewhere is undone.
+static void test_fixed_address_taken(GuestContext *ctx) {
+  const uint64_t a = 0x54000000;
+  int done = -1;
+  OrbisKernelBatchMapEntry first = entry(a, 0, 2 * MB, 3, 0, ORBIS_KERNEL_BATCH_MAP_FLEXIBLE);
+  CHECK(sceKernelBatchMap(ctx, &first, 1, &done) == 0, "first map");
+  int used = count_used_extents(ctx);
+  OrbisKernelBatchMapEntry again[2] = {entry(a + MB, 0, 2 * MB, 3, 0, ORBIS_KERNEL_BATCH_MAP_FLEXIBLE),
+                                       entry(0x55000000, 0, MB, 3, 0, ORBIS_KERNEL_BATCH_MAP_FLEXIBLE)};
+  CHECK(sceKernelBatchMap(ctx, again, 2, &done) == (int)0x8002000c && done == 0, "taken address fails: done=%d", done);
+  CHECK(count_used_extents(ctx) == used, "no stray mapping left (%d vs %d)", count_used_extents(ctx), used);
+  CHECK(find(ctx, 0x55000000)->is_free, "entries after the failure did not run");
+  CHECK(recomp_vm_free(ctx, a, 2 * MB) == 0, "cleanup");
+}
+
 // sceKernelMtypeprotect on a range inside a larger mapping: split in three, edges untouched.
 static void test_mtypeprotect_split(GuestContext *ctx) {
   const uint64_t base = 0x60000000;
@@ -256,6 +255,7 @@ int main(void) {
   GuestContext *ctx = new_ctx();
   test_all_operations(ctx);
   test_partial_failure(ctx);
+  test_fixed_address_taken(ctx);
   test_mtypeprotect_split(ctx);
   test_shim(ctx);
   fflush(stdout);

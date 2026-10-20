@@ -1159,114 +1159,120 @@ GuestVMExtent *recomp_vm_find(GuestContext *ctx, uint64_t addr) {
 
 void ps4_direct_mem_on_unmap(GuestContext *ctx, uint64_t addr, size_t size);
 
-// Frees [addr, addr+size) from the extent that contains addr; a range that runs past that
-// extent (a mapping that was split, e.g. by sceKernelMtypeprotect, is several extents) is
-// continued extent by extent, like munmap over several mappings.
+// Splits the non-free extent that strictly contains `at` into [addr, at) and [at, end); both
+// halves keep every attribute (name, prot, flags, mtype). Caller holds vm_mutex. Returns false
+// only when memory for the second half is unavailable (nothing is changed then).
+bool recomp_vm_split_extent_at(GuestContext *proc, uint64_t at) {
+  for (GuestVMExtent *e = proc->vm_extents; e; e = e->next) {
+    if (e->is_free || at <= e->addr || at >= e->addr + e->size)
+      continue;
+    GuestVMExtent *tail = (GuestVMExtent *)calloc(1, sizeof(*tail));
+    if (!tail)
+      return false;
+    *tail = *e;
+    tail->addr = at;
+    tail->size = e->addr + e->size - at;
+    tail->prev = e;
+    e->size = at - e->addr;
+    e->next = tail;
+    if (tail->next)
+      tail->next->prev = tail;
+    return true;
+  }
+  return true; // no extent to split: the boundary already exists (or is in a hole)
+}
+
+// Merges free extents that touch, for the extents overlapping [start, end] plus one neighbour
+// on each side. Caller holds vm_mutex.
+static void vm_coalesce_free(GuestContext *proc, uint64_t start, uint64_t end) {
+  GuestVMExtent *e = proc->vm_extents;
+  while (e && e->addr + e->size < start)
+    e = e->next;
+  if (e && e->prev)
+    e = e->prev;
+  while (e && e->next && e->addr <= end) {
+    GuestVMExtent *n = e->next;
+    if (e->is_free && n->is_free && e->addr + e->size == n->addr) {
+      e->size += n->size;
+      e->next = n->next;
+      if (n->next)
+        n->next->prev = e;
+      free(n);
+    } else {
+      e = n;
+    }
+  }
+}
+
+// munmap over [addr, addr+size) (page-widened). Every mapped extent in the range is freed,
+// also when the range spans several extents (a mapping that was split, e.g. by
+// sceKernelMtypeprotect, is several) or crosses a hole; the parts of extents outside the range
+// stay as they were with all their attributes; unmapped parts are skipped. The whole change is
+// made under one vm_mutex hold per phase and no range is ever freed by address twice:
+//  1. (locked) split the extents at both ends, note the mapped ranges inside;
+//  2. (unlocked, the ranges are still allocated so nobody can take them) detach direct-memory
+//     aliases and release the host pages, once per mapped range (ps4_direct_mem_on_unmap takes
+//     the direct-memory lock, which is held while mapping calls into the allocator, so it must
+//     not run under vm_mutex);
+//  3. (locked) mark the ranges free and merge neighbours.
+// Returns 0, or -1 for bad arguments or when memory for the bookkeeping is unavailable (the
+// extents are then unchanged apart from harmless splits).
 int recomp_vm_free(GuestContext *ctx, uint64_t addr, size_t size) {
   if (!ctx || addr == 0 || size == 0)
     return -1;
   GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
-  uint64_t aligned_addr = addr & ~4095ULL;
-  size_t aligned_size = (size + 4095ULL) & ~4095ULL;
-
-  // Detach any physically aliased direct-memory pages first (before MADV_DONTNEED).
-  ps4_direct_mem_on_unmap(proc, aligned_addr, aligned_size);
+  const uint64_t start = addr & ~4095ULL;
+  const uint64_t end = start + ((size + 4095ULL) & ~4095ULL);
+  if (end < start)
+    return -1;
 
   pthread_mutex_lock(&proc->vm_mutex);
-
-  GuestVMExtent *curr = proc->vm_extents;
-  while (curr) {
-    if (aligned_addr >= curr->addr && aligned_addr < curr->addr + curr->size) {
-      break;
-    }
-    curr = curr->next;
+  if (!recomp_vm_split_extent_at(proc, start) || !recomp_vm_split_extent_at(proc, end)) {
+    pthread_mutex_unlock(&proc->vm_mutex);
+    return -1;
   }
-
-  if (!curr) {
+  size_t n = 0;
+  for (GuestVMExtent *e = proc->vm_extents; e; e = e->next)
+    if (!e->is_free && e->addr >= start && e->addr + e->size <= end)
+      n++;
+  if (n == 0) {
     pthread_mutex_unlock(&proc->vm_mutex);
     return 0;
   }
-  const uint64_t first_end = curr->addr + curr->size; // before any split below
-
-  // Release host physical pages
-  if (proc->mem_base && aligned_addr + aligned_size <= proc->mem_size) {
-#if defined(__APPLE__) || defined(__linux__)
-    madvise(proc->mem_base + aligned_addr, aligned_size, MADV_DONTNEED);
-#endif
-  }
-
-  // If already free, nothing to do
-  if (curr->is_free) {
+  struct Range {
+    uint64_t addr, size;
+  } *ranges = (struct Range *)malloc(n * sizeof(*ranges));
+  if (!ranges) {
     pthread_mutex_unlock(&proc->vm_mutex);
-    return aligned_addr + aligned_size > first_end
-               ? recomp_vm_free(ctx, first_end, aligned_addr + aligned_size - first_end)
-               : 0;
+    return -1;
   }
-
-  // Case 1: aligned_addr is inside curr, but after curr->addr: split off the
-  // prefix
-  if (aligned_addr > curr->addr) {
-    GuestVMExtent *mid = (GuestVMExtent *)calloc(1, sizeof(GuestVMExtent));
-    if (mid) {
-      mid->addr = aligned_addr;
-      mid->size = curr->size - (aligned_addr - curr->addr);
-      mid->is_free = false;
-      mid->prev = curr;
-      mid->next = curr->next;
-      if (curr->next)
-        curr->next->prev = mid;
-      curr->next = mid;
-      curr->size = aligned_addr - curr->addr;
-      curr = mid;
+  size_t k = 0;
+  for (GuestVMExtent *e = proc->vm_extents; e && k < n; e = e->next)
+    if (!e->is_free && e->addr >= start && e->addr + e->size <= end) {
+      ranges[k].addr = e->addr;
+      ranges[k].size = e->size;
+      k++;
     }
-  }
-
-  // Case 2: aligned_size is less than curr->size: split off the suffix
-  if (aligned_size < curr->size) {
-    GuestVMExtent *suffix = (GuestVMExtent *)calloc(1, sizeof(GuestVMExtent));
-    if (suffix) {
-      suffix->addr = curr->addr + aligned_size;
-      suffix->size = curr->size - aligned_size;
-      suffix->is_free = false;
-      suffix->prev = curr;
-      suffix->next = curr->next;
-      if (curr->next)
-        curr->next->prev = suffix;
-      curr->next = suffix;
-      curr->size = aligned_size;
-    }
-  }
-
-  // Now curr matches [aligned_addr, aligned_addr + aligned_size] exactly
-  curr->is_free = true;
-
-  // Coalesce with next if adjacent and free
-  if (curr->next && curr->next->is_free &&
-      (curr->addr + curr->size == curr->next->addr)) {
-    GuestVMExtent *next_node = curr->next;
-    curr->size += next_node->size;
-    curr->next = next_node->next;
-    if (next_node->next)
-      next_node->next->prev = curr;
-    free(next_node);
-  }
-
-  // Coalesce with prev if adjacent and free
-  if (curr->prev && curr->prev->is_free &&
-      (curr->prev->addr + curr->prev->size == curr->addr)) {
-    GuestVMExtent *prev_node = curr->prev;
-    prev_node->size += curr->size;
-    prev_node->next = curr->next;
-    if (curr->next)
-      curr->next->prev = prev_node;
-    free(curr);
-    curr = prev_node;
-  }
-
   pthread_mutex_unlock(&proc->vm_mutex);
-  return aligned_addr + aligned_size > first_end
-             ? recomp_vm_free(ctx, first_end, aligned_addr + aligned_size - first_end)
-             : 0;
+
+  for (size_t i = 0; i < k; i++) {
+    ps4_direct_mem_on_unmap(proc, ranges[i].addr, ranges[i].size);
+    if (proc->mem_base && ranges[i].addr + ranges[i].size <= proc->mem_size) {
+#if defined(__APPLE__) || defined(__linux__)
+      madvise(proc->mem_base + ranges[i].addr, ranges[i].size, MADV_DONTNEED);
+#endif
+    }
+  }
+
+  pthread_mutex_lock(&proc->vm_mutex);
+  for (size_t i = 0; i < k; i++)
+    for (GuestVMExtent *e = proc->vm_extents; e; e = e->next)
+      if (!e->is_free && e->addr >= ranges[i].addr && e->addr + e->size <= ranges[i].addr + ranges[i].size)
+        e->is_free = true;
+  vm_coalesce_free(proc, start, end);
+  pthread_mutex_unlock(&proc->vm_mutex);
+  free(ranges);
+  return 0;
 }
 
 GuestContext *recomp_create_thread_context(GuestContext *parent,
