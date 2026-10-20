@@ -1,4 +1,5 @@
 tools/
+!/3rdparty/gcn-recompiler/tools/
 *.DS_Store
 .DS_Store
 /ps4-recomp
