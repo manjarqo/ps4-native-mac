@@ -1131,8 +1131,10 @@ func packageAppBundle(cfg *Config, appName, compiledBin string) (string, error) 
 
 	// 6. Sign the bundle ad hoc: binds Info.plist and seals the resources, so the system (Game
 	// Mode, Metal shader cache, Gatekeeper on a local build) sees one consistent app identity.
+	// A failure is reported but does not fail the build: the unsigned-bundle state of older
+	// builds still runs.
 	if err := signAppBundle(bundleDir); err != nil {
-		return "", err
+		fmt.Printf("             Warning: %v\n", err)
 	}
 
 	return bundleDir, nil
@@ -1181,6 +1183,11 @@ func appInfoPlist(appName string, hasIcon bool) string {
 
 // signAppBundle signs the bundle ad hoc and verifies the signature strictly.
 func signAppBundle(bundleDir string) error {
+	// Finder info and resource forks on files copied from the game folder are "detritus" that a
+	// strict signature does not allow.
+	if out, err := exec.Command("xattr", "-cr", bundleDir).CombinedOutput(); err != nil {
+		return fmt.Errorf("xattr -cr %s: %w: %s", bundleDir, err, strings.TrimSpace(string(out)))
+	}
 	if out, err := exec.Command("codesign", "--force", "--sign", "-", bundleDir).CombinedOutput(); err != nil {
 		return fmt.Errorf("codesign %s: %w: %s", bundleDir, err, strings.TrimSpace(string(out)))
 	}

@@ -33,6 +33,17 @@ func TestPackageAppBundleSignedWithGameMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("packageAppBundle: %v", err)
 	}
+	if err := signAppBundle(bundle); err != nil {
+		t.Fatalf("signAppBundle: %v", err)
+	}
+	// Finder info on a copied resource must not break the strict signature
+	res := filepath.Join(bundle, "Contents", "Resources", "guest_image.bin")
+	if o, err := exec.Command("xattr", "-wx", "com.apple.FinderInfo", "54455854"+strings.Repeat("0", 56), res).CombinedOutput(); err != nil {
+		t.Fatalf("xattr: %v: %s", err, o)
+	}
+	if err := signAppBundle(bundle); err != nil {
+		t.Fatalf("signAppBundle with Finder info on a resource: %v", err)
+	}
 	plist := filepath.Join(bundle, "Contents", "Info.plist")
 	if o, err := exec.Command("plutil", "-lint", plist).CombinedOutput(); err != nil {
 		t.Fatalf("Info.plist does not parse: %v: %s", err, o)
