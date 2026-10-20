@@ -767,6 +767,11 @@ static CMTime to_cmtime(int64_t t) { return t == H264VT_NO_TIME ? kCMTimeInvalid
 
 // Queues an error picture for an access unit that cannot be decoded at all. dec_lock held.
 static void error_picture(H264VtDecoder *d, const AuTag *proto) {
+    // An IDR starts a new sequence even when it cannot be decoded: earlier pictures go first.
+    if (proto->au.idr) {
+        settle_pending(d, true);
+        release_all(d);
+    }
     AuTag t = *proto;
     t.delivered = false;
     pthread_mutex_lock(&d->q_lock);
