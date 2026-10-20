@@ -13,16 +13,24 @@
 // src/core/libraries/audio/audioout.{h,cpp} (Copyright 2024-2026 shadPS4
 // Emulator Project, GPL-2.0-or-later).
 //
+// Other runtime modules (libSceAudio3d) use the ports through the host API in
+// ps4_audioout_internal.h; the guest shims below are wrappers over it.
+//
 // Debug env vars:
 //   PS4_AUDIO_LOG=1         log volume changes and per-port / final-mix
 //                           RMS + peak every ~2 s.
 //   PS4_AUDIO_DUMP=<path>   write the final mixed host output to a WAV file
 //                           (float32 stereo 48 kHz).
 //   PS4_AUDIO_MUTE=1        don't start the host output device (time-paced).
+//   PS4_AUDIO_NULL=1        headless output: instead of the host device, a
+//                           clock thread pulls and mixes 512 frames every
+//                           10.67 ms, so pacing, mixing, stats and
+//                           PS4_AUDIO_DUMP work without playing anything.
 //   PS4_AUDIO_PADSPK=<gain> gain for PADSPK (controller speaker) ports mixed
 //                           into the main output (default 0.5).
 
 #include "ps4_audioout.h"
+#include "ps4_audioout_internal.h"
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
@@ -41,13 +49,13 @@
 #define AUDIO_RATE 48000
 #define VOLUME_0DB 32768
 
-// Error codes (shadPS4 audioout_error.h)
-#define ORBIS_AUDIO_OUT_ERROR_NOT_OPENED 0x80260001
-#define ORBIS_AUDIO_OUT_ERROR_INVALID_PORT 0x80260004
-#define ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER 0x80260005
-#define ORBIS_AUDIO_OUT_ERROR_PORT_FULL 0x80260006
-#define ORBIS_AUDIO_OUT_ERROR_INVALID_SIZE 0x80260007
-#define ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT 0x80260008
+// Error codes: see ps4_audioout_internal.h.
+#define ORBIS_AUDIO_OUT_ERROR_NOT_OPENED PS4_AUDIO_OUT_ERROR_NOT_OPENED
+#define ORBIS_AUDIO_OUT_ERROR_INVALID_PORT PS4_AUDIO_OUT_ERROR_INVALID_PORT
+#define ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER PS4_AUDIO_OUT_ERROR_INVALID_POINTER
+#define ORBIS_AUDIO_OUT_ERROR_PORT_FULL PS4_AUDIO_OUT_ERROR_PORT_FULL
+#define ORBIS_AUDIO_OUT_ERROR_INVALID_SIZE PS4_AUDIO_OUT_ERROR_INVALID_SIZE
+#define ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT PS4_AUDIO_OUT_ERROR_INVALID_FORMAT
 
 #define RET_ERR(ctx, code) ((ctx)->rax = (uint64_t)(int64_t)(int32_t)(uint32_t)(code))
 
@@ -320,6 +328,38 @@ static OSStatus audio_render_cb(void *inRefCon, AudioUnitRenderActionFlags *ioAc
 }
 #endif
 
+// Headless output device (PS4_AUDIO_NULL): consumes and mixes the port rings
+// at the device rate (48 kHz, 512-frame periods) without playing anything.
+#define NULL_DEVICE_FRAMES 512
+static void *audio_null_device_main(void *arg) {
+  (void)arg;
+  static float buf[NULL_DEVICE_FRAMES * 2];
+  uint64_t start = get_time_micros();
+  uint64_t frames = 0;
+  for (;;) {
+    pthread_mutex_lock(&g_audio_lock);
+    audio_mix(buf, NULL_DEVICE_FRAMES);
+    g_render_calls++;
+    g_render_frames += NULL_DEVICE_FRAMES;
+    g_last_render_us = get_time_micros();
+    dump_write(buf, NULL_DEVICE_FRAMES);
+    pthread_cond_broadcast(&g_audio_cond);
+    pthread_mutex_unlock(&g_audio_lock);
+    frames += NULL_DEVICE_FRAMES;
+    uint64_t due = start + frames * 1000000ULL / AUDIO_RATE;
+    uint64_t now = get_time_micros();
+    if (due > now) {
+      usleep((useconds_t)(due - now));
+    } else if (now - due > 200000ULL) {
+      // The process was stalled for a long time: resynchronise instead of
+      // consuming the backlog in a burst (a real device drops it too).
+      start = now;
+      frames = 0;
+    }
+  }
+  return NULL;
+}
+
 // Called with g_audio_lock held.
 static void audio_host_start(void) {
   if (g_host_tried) {
@@ -334,6 +374,20 @@ static void audio_host_start(void) {
   const char *mute = getenv("PS4_AUDIO_MUTE");
   if (mute && *mute && strcmp(mute, "0") != 0) {
     fprintf(stderr, "[AudioOut] PS4_AUDIO_MUTE set; host output disabled\n");
+    return;
+  }
+  const char *null_dev = getenv("PS4_AUDIO_NULL");
+  if (null_dev && *null_dev && strcmp(null_dev, "0") != 0) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, audio_null_device_main, NULL) == 0) {
+      pthread_detach(t);
+      g_host_running = true;
+      g_last_render_us = get_time_micros();
+      fprintf(stderr, "[AudioOut] PS4_AUDIO_NULL set; headless output (clock-paced mix, "
+                      "nothing played)\n");
+    } else {
+      fprintf(stderr, "[AudioOut] PS4_AUDIO_NULL: thread creation failed; host output disabled\n");
+    }
     return;
   }
 #ifdef __APPLE__
@@ -522,14 +576,14 @@ static bool audio_port_wait_room(Ps4AudioPort *p, int32_t handle) {
   return p->in_use && p->handle == handle;
 }
 
-// Lock held. Converts and queues one grain into the port ring.
-static void audio_port_push(GuestContext *ctx, Ps4AudioPort *p, uint64_t pcm_addr) {
+// Lock held. Converts and queues one grain (host memory) into the port ring.
+static void audio_port_push(Ps4AudioPort *p, const void *pcm) {
   static float tmp[2048 * 2];
   if (!p->ring) {
     return;
   }
   uint32_t len = p->length > 2048 ? 2048 : p->length;
-  audio_convert(p, (const uint8_t *)(ctx->mem_base + pcm_addr), tmp, len);
+  audio_convert(p, (const uint8_t *)pcm, tmp, len);
   p->outputs++;
   if (!g_host_running) {
     return; // nobody consumes the ring
@@ -556,27 +610,18 @@ void shim_sceAudioOutInit(GuestContext *ctx) {
   SHIM_RETURN();
 }
 
-void shim_sceAudioOutOpen(GuestContext *ctx) {
-  // rdi = userId, rsi = type, rdx = index, rcx = len, r8 = freq, r9 = param
-  int32_t user = (int32_t)ctx->rdi;
-  int32_t type = (int32_t)ctx->rsi;
-  int32_t index = (int32_t)ctx->rdx;
-  uint32_t len = (uint32_t)ctx->rcx;
-  uint32_t freq = (uint32_t)ctx->r8;
-  uint32_t param = (uint32_t)ctx->r9;
+int32_t ps4_audioout_port_open(int32_t user, int32_t type, int32_t index, uint32_t len,
+                               uint32_t freq, uint32_t param) {
   uint32_t fmt = param & 0xFF;
-
   int is_float = 0;
   uint32_t ssize = 2, ch = 2;
   if (audio_format_info(fmt, &is_float, &ssize, &ch) != 0) {
     fprintf(stderr, "[AudioOut] sceAudioOutOpen: invalid format param=0x%x\n", param);
-    RET_ERR(ctx, ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT);
-    SHIM_RETURN();
+    return ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT;
   }
   if (len == 0 || len > 2048) {
     fprintf(stderr, "[AudioOut] sceAudioOutOpen: invalid len=%u\n", len);
-    RET_ERR(ctx, ORBIS_AUDIO_OUT_ERROR_INVALID_SIZE);
-    SHIM_RETURN();
+    return ORBIS_AUDIO_OUT_ERROR_INVALID_SIZE;
   }
   if (freq == 0) {
     freq = AUDIO_RATE;
@@ -593,8 +638,7 @@ void shim_sceAudioOutOpen(GuestContext *ctx) {
   }
   if (slot < 0) {
     pthread_mutex_unlock(&g_audio_lock);
-    RET_ERR(ctx, ORBIS_AUDIO_OUT_ERROR_PORT_FULL);
-    SHIM_RETURN();
+    return ORBIS_AUDIO_OUT_ERROR_PORT_FULL;
   }
 
   Ps4AudioPort *port = &g_ports[slot];
@@ -628,29 +672,31 @@ void shim_sceAudioOutOpen(GuestContext *ctx) {
   }
 
   pthread_mutex_unlock(&g_audio_lock);
-  ctx->rax = (uint64_t)slot;
+  return slot;
+}
+
+void shim_sceAudioOutOpen(GuestContext *ctx) {
+  // rdi = userId, rsi = type, rdx = index, rcx = len, r8 = freq, r9 = param
+  int32_t r = ps4_audioout_port_open((int32_t)ctx->rdi, (int32_t)ctx->rsi, (int32_t)ctx->rdx,
+                                     (uint32_t)ctx->rcx, (uint32_t)ctx->r8, (uint32_t)ctx->r9);
+  ctx->rax = (uint64_t)(int64_t)r;
   SHIM_RETURN();
 }
 
-void shim_sceAudioOutOutput(GuestContext *ctx) {
-  int32_t handle = (int32_t)ctx->rdi;
-  uint64_t pcm_ptr_addr = ctx->rsi;
-
+int32_t ps4_audioout_port_output(int32_t handle, const void *pcm) {
   pthread_mutex_lock(&g_audio_lock);
   Ps4AudioPort *port = audio_port_get(handle);
   if (!port) {
     pthread_mutex_unlock(&g_audio_lock);
-    RET_ERR(ctx, ORBIS_AUDIO_OUT_ERROR_INVALID_PORT);
-    SHIM_RETURN();
+    return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT;
   }
   uint32_t len = port->length;
   if (!audio_port_wait_room(port, handle)) {
     pthread_mutex_unlock(&g_audio_lock);
-    RET_ERR(ctx, ORBIS_AUDIO_OUT_ERROR_NOT_OPENED);
-    SHIM_RETURN();
+    return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
   }
-  if (pcm_ptr_addr) {
-    audio_port_push(ctx, port, pcm_ptr_addr);
+  if (pcm) {
+    audio_port_push(port, pcm);
   }
   bool host = g_host_running;
   audio_stats_maybe_log();
@@ -662,7 +708,39 @@ void shim_sceAudioOutOutput(GuestContext *ctx) {
     if (port->in_use && port->handle == handle) port->next_sync_time_us = next;
     pthread_mutex_unlock(&g_audio_lock);
   }
-  ctx->rax = pcm_ptr_addr ? (uint64_t)len : 0;
+  return pcm ? (int32_t)len : 0;
+}
+
+int32_t ps4_audioout_port_writable(int32_t handle) {
+  pthread_mutex_lock(&g_audio_lock);
+  Ps4AudioPort *p = audio_port_get(handle);
+  if (!p) {
+    pthread_mutex_unlock(&g_audio_lock);
+    return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT;
+  }
+  int32_t n;
+  if (g_host_running) {
+    if (get_time_micros() - g_last_render_us > 250000ULL) {
+      n = 1; // stalled device: audio_port_wait_room drops instead of blocking
+    } else {
+      n = p->ring_fill + p->length <= p->ring_limit
+              ? (int32_t)((p->ring_limit - p->ring_fill) / p->length)
+              : 0;
+    }
+  } else {
+    // Wall-time pacing: an output blocks while the previous grain's slot has
+    // not elapsed yet (see audio_port_pace_time).
+    n = (p->next_sync_time_us == 0 || p->next_sync_time_us <= get_time_micros()) ? 1 : 0;
+  }
+  pthread_mutex_unlock(&g_audio_lock);
+  return n;
+}
+
+void shim_sceAudioOutOutput(GuestContext *ctx) {
+  uint64_t pcm_addr = ctx->rsi;
+  int32_t r = ps4_audioout_port_output((int32_t)ctx->rdi,
+                                       pcm_addr ? (const void *)(ctx->mem_base + pcm_addr) : NULL);
+  ctx->rax = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)(uint32_t)r;
   SHIM_RETURN();
 }
 
@@ -706,7 +784,7 @@ void shim_sceAudioOutOutputs(GuestContext *ctx) {
     uint64_t pcm = *(uint64_t *)(ctx->mem_base + param_addr + i * 16ULL + 8);
     Ps4AudioPort *port = audio_port_get(handle);
     if (port && pcm) {
-      audio_port_push(ctx, port, pcm);
+      audio_port_push(port, ctx->mem_base + pcm);
     }
   }
   bool host = g_host_running;
@@ -725,13 +803,10 @@ void shim_sceAudioOutOutputs(GuestContext *ctx) {
   SHIM_RETURN();
 }
 
-void shim_sceAudioOutClose(GuestContext *ctx) {
-  int32_t handle = (int32_t)ctx->rdi;
+int32_t ps4_audioout_port_close(int32_t handle) {
   if (handle <= 0 || handle >= MAX_AUDIO_PORTS) {
-    RET_ERR(ctx, ORBIS_AUDIO_OUT_ERROR_INVALID_PORT);
-    SHIM_RETURN();
+    return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT;
   }
-
   pthread_mutex_lock(&g_audio_lock);
   Ps4AudioPort *port = &g_ports[handle];
   if (port->in_use) {
@@ -742,8 +817,12 @@ void shim_sceAudioOutClose(GuestContext *ctx) {
   }
   pthread_cond_broadcast(&g_audio_cond);
   pthread_mutex_unlock(&g_audio_lock);
+  return 0;
+}
 
-  ctx->rax = 0;
+void shim_sceAudioOutClose(GuestContext *ctx) {
+  int32_t r = ps4_audioout_port_close((int32_t)ctx->rdi);
+  ctx->rax = (uint64_t)(int64_t)r;
   SHIM_RETURN();
 }
 
