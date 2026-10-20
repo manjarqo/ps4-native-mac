@@ -397,6 +397,9 @@ func Execute(args []string) error {
 	fmt.Print(hle.SyscallSummary())
 	fmt.Printf("             Unresolved imports bound to the abort stub: %d calls, %d data (GLOB_DAT/R_64)\n",
 		em.UnresolvedFuncImports, em.UnresolvedDataImports)
+	for _, w := range em.Warnings {
+		fmt.Printf("             Warning: %s\n", w)
+	}
 	fmt.Printf("             Wrote %s\n", hlePath)
 
 	if cfg.AppDir != "" {

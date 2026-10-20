@@ -83,6 +83,24 @@ type AsmEmitter struct {
 	// bound to the same stub, so reading it as data yields the stub's address).
 	UnresolvedFuncImports int
 	UnresolvedDataImports int
+	// Warnings collects generation-time problems that do not stop the generation (the caller
+	// prints them in its summary).
+	Warnings []string
+}
+
+// maxModuleSegments is the number of segments a module registers with the runtime
+// (RecompModuleUnwindInfo.segments, the four of SceKernelModuleInfo).
+const maxModuleSegments = 4
+
+// registeredSegments returns the segments of module name that fit the runtime's table, with a
+// warning in e.Warnings when some do not.
+func (e *AsmEmitter) registeredSegments(name string, segs []*elfloader.Segment) []*elfloader.Segment {
+	if len(segs) <= maxModuleSegments {
+		return segs
+	}
+	e.Warnings = append(e.Warnings, fmt.Sprintf("module %s has %d segments; module info reports only the first %d",
+		name, len(segs), maxModuleSegments))
+	return segs[:maxModuleSegments]
 }
 
 // unresolvedImport is what shim_unresolved_stub reports when the guest calls a missing import.
@@ -761,11 +779,8 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 		if endAddr == 0 {
 			endAddr = e.elf.MaxVAddr
 		}
-		mainSegs := ownSegments(e.elf)
+		mainSegs := e.registeredSegments(mainName, ownSegments(e.elf))
 		numSegs := len(mainSegs)
-		if numSegs > 4 {
-			numSegs = 4
-		}
 		var segsInit strings.Builder
 		for si := 0; si < numSegs; si++ {
 			s := mainSegs[si]
@@ -809,13 +824,11 @@ func (e *AsmEmitter) EmitGuestModules(path string) error {
 				fmt.Fprintf(w, "    recomp_module_register_init(%q, recomp_module_init_%d, %d);\n", name, i, len(mod.Init))
 			}
 		}
-		modNumSegs := len(mod.Segments)
-		if modNumSegs > 4 {
-			modNumSegs = 4
-		}
+		modSegs := e.registeredSegments(mod.FileName, mod.Segments)
+		modNumSegs := len(modSegs)
 		var modSegsInit strings.Builder
 		for si := 0; si < modNumSegs; si++ {
-			s := mod.Segments[si]
+			s := modSegs[si]
 			prot := 0
 			if s.Flags&1 != 0 {
 				prot |= 1
