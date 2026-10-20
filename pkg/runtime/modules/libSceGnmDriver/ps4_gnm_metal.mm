@@ -20,6 +20,7 @@
 #include "ps4_gnm_metal.h"
 #include "ps4_gnm_draw.h"
 #include "ps4_gnm_resources.h"
+#include "ps4_gnm_ib.h"
 #include "ps4_gnmdriver.h"
 #include "gcn_recompiler.h"
 
@@ -432,7 +433,7 @@ static inline bool DecodeIndirectBuffer(GuestContext *ctx, const uint32_t *p, ui
     return true;
 }
 
-static const int kMaxIbDepth = 4;
+static const int kMaxIbDepth = ps4gnm_ib::kMaxDepth;
 // Concurrent guest dispatches: end-of-pipe signals (EOP/EOS/RELEASE_MEM) and CP writes do not
 // order the dispatches after them, as on GCN; waits, cache/partial flushes and CP DMA do. The
 // guest pairs each dependency with a wait, e.g. skinning dispatches: RELEASE_MEM ... WAIT_REG_MEM.
@@ -583,11 +584,7 @@ static void DumpShadersForDraw(GuestContext *ctx, const char *draw, bool compute
 static uint8_t g_const_ram[0x10000];
 
 struct CeState {
-    struct Frame {
-        const uint32_t *words;
-        uint32_t dw;
-        uint32_t pc;
-    };
+    using Frame = ps4gnm_ib::Frame;
     std::vector<Frame> stack;
     uint32_t ce_count = 0, de_count = 0;
     bool Done() const { return stack.empty(); }
@@ -659,9 +656,8 @@ static bool RunCe(GuestContext *ctx, CeState &ce, bool force) {
             uint32_t ib_dw = 0;
             f.pc += 1 + payload_dw;
             progress = true;
-            if (ce.stack.size() < (size_t)kMaxIbDepth + 1 && DecodeIndirectBuffer(ctx, p, payload_dw, &ib, &ib_dw)) {
-                ce.stack.push_back({ib, ib_dw, 0});
-            }
+            if (DecodeIndirectBuffer(ctx, p, payload_dw, &ib, &ib_dw))
+                ps4gnm_ib::Enter(ce.stack, ib, ib_dw, ps4gnm_ib::IsChained(p, payload_dw));
             continue;
         }
         case PM4_OP_WRITE_DATA:
@@ -756,11 +752,7 @@ static void DrawIndirectRecord(GuestContext *ctx, bool indexed, uint64_t args, u
 // A graphics command buffer in progress: the DCB with its INDIRECT_BUFFER nesting and the CE
 // state. It is kept when a WAIT_REG_MEM suspends the queue and continued later.
 struct GfxStream {
-    struct Frame {
-        const uint32_t *words;
-        uint32_t dw;
-        uint32_t pc;
-    };
+    using Frame = ps4gnm_ib::Frame;
     std::vector<Frame> frames;
     CeState ce;
 };
@@ -781,6 +773,7 @@ static bool ProcessGfxPackets(GuestContext *ctx, GfxStream &st) {
         }
         const uint32_t *push_ib = nullptr;
         uint32_t push_ib_dw = 0;
+        bool push_chain = false;
         uint32_t header = dcb_words[pc];
         hist_pc[hist_n++ & 7] = pc;
         uint32_t type = (header >> 30) & 0x3;
@@ -892,13 +885,15 @@ static bool ProcessGfxPackets(GuestContext *ctx, GfxStream &st) {
             case PM4_OP_INDIRECT_BUFFER: {
                 const uint32_t *ib = nullptr;
                 uint32_t ib_dw = 0;
-                if (depth >= kMaxIbDepth) {
+                const bool chain = ps4gnm_ib::IsChained(payload, payload_dw);
+                if (!chain && depth >= kMaxIbDepth) {
                     if (LogOnce(s_logged_ib_depth)) {
                         fprintf(stderr, "[ps4-gnm] INDIRECT_BUFFER nesting too deep; skipping (logged once)\n");
                     }
                 } else if (DecodeIndirectBuffer(ctx, payload, payload_dw, &ib, &ib_dw)) {
                     push_ib = ib; // entered after this packet is consumed
                     push_ib_dw = ib_dw;
+                    push_chain = chain;
                 }
                 break;
             }
@@ -1022,7 +1017,7 @@ static bool ProcessGfxPackets(GuestContext *ctx, GfxStream &st) {
             pc += 1;
         }
         st.frames.back().pc = pc;
-        if (push_ib) st.frames.push_back({push_ib, push_ib_dw, 0});
+        if (push_ib) ps4gnm_ib::Enter(st.frames, push_ib, push_ib_dw, push_chain);
     }
     return true;
 }
@@ -1104,6 +1099,16 @@ static void ProcessComputePackets(GuestContext *ctx, const uint32_t *words, uint
             case PM4_OP_INDIRECT_BUFFER: {
                 const uint32_t *ib = nullptr;
                 uint32_t ib_dw = 0;
+                // chained inside an IB: continue in the new buffer and do not return. At ring
+                // level (depth 0, with or without a read pointer) the CP returns to the ring, so
+                // the packet is a call.
+                if (ps4gnm_ib::ComputeChainReplaces(ps4gnm_ib::IsChained(payload, payload_dw), depth)) {
+                    if (!DecodeIndirectBuffer(ctx, payload, payload_dw, &ib, &ib_dw)) break;
+                    words = ib;
+                    dw = ib_dw;
+                    pc = 0;
+                    continue;
+                }
                 if (depth >= kMaxIbDepth) {
                     if (LogOnce(s_logged_ib_depth)) {
                         fprintf(stderr, "[ps4-gnm] INDIRECT_BUFFER nesting too deep; skipping (logged once)\n");

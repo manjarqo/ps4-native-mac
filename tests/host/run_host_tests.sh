@@ -85,10 +85,21 @@ clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/ru
   "$R/tests/host/audiodec_test.c" "$AD/ps4_audiodec.c" -framework AudioToolbox -o "$T/audiodec_test"
 "$T/audiodec_test" "$R/tests/host/data/audiodec_chirp_ffmpeg.aac" 2> "$T/audiodec.txt" || { cat "$T/audiodec.txt"; exit 1; }
 G="$R/pkg/runtime/modules/libSceGnmDriver"
+# PM4 INDIRECT_BUFFER chaining: chained chunks run to the end, calls return, deep calls stop.
+clang++ -std=c++17 -Wall -Werror -g -fsanitize=address,undefined -I "$G" "$R/tests/host/gnm_ib_chain_test.cc" \
+  -o "$T/gnm_ib_chain_test"
+"$T/gnm_ib_chain_test"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
   -framework Foundation -o "$T/guest_window_test"
 "$T/guest_window_test"
+# Shader translator (3rdparty/gcn-recompiler) scalar reads on Metal: SRT reads at offsets only the
+# shader knows, s_buffer_load past num_records, and a compute shader dumped from Uncharted 4.
+GR="$R/3rdparty/gcn-recompiler"
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_scalar_reads_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gcn_scalar_reads_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+"$T/gcn_scalar_reads_test" "$R/tests/host/data"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"
