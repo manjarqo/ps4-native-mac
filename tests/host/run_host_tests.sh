@@ -94,6 +94,12 @@ clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_scalar_reads_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
 "$T/gcn_scalar_reads_test" "$R/tests/host/data"
+# RectList draws: a translated vertex shader drawn as rectangles (capture, barrier, expansion);
+# the colours at all 4 corners of each rectangle, with Metal API validation on.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_rectlist_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gnm_rectlist_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+MTL_DEBUG_LAYER=1 "$T/gnm_rectlist_test" 2>&1 | { grep -v "Metal API Validation Enabled" || true; }
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"
