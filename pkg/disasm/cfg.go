@@ -838,7 +838,53 @@ func (d *Disassembler) disasmBranchFollowing(entryAddr uint64) (*Function, []uin
 							return 0, false
 						}
 
-						if sw, ok := d.ResolveJumpTable(curBlock, findTableAddr, findCount, entryAddr, fnEnd); ok && len(sw.Targets) > 0 && sw.Count <= 0 {
+						// findCap follows the index register back through the predecessors to its
+						// source; a cap needs every path to end in a byte load (byteIndexCap).
+						findCap := func(idxReg x86asm.Reg) int {
+							type item struct {
+								block uint64
+								reg   x86asm.Reg
+							}
+							visited := make(map[uint64]bool)
+							var queue []item
+							for _, p := range blockPreds[blockStart] {
+								if !visited[p] {
+									visited[p] = true
+									queue = append(queue, item{p, idxReg})
+								}
+							}
+							found := 0
+							for depth := 0; len(queue) > 0 && depth < 16; depth++ {
+								var next []item
+								for _, it := range queue {
+									c, from, killed := byteIndexCapKill(blockInsts[it.block], it.reg)
+									if killed {
+										return 0
+									}
+									if c > 0 {
+										found = c
+										continue
+									}
+									preds := blockPreds[it.block]
+									if len(preds) == 0 {
+										return 0
+									}
+									for _, p := range preds {
+										if !visited[p] {
+											visited[p] = true
+											next = append(next, item{p, from})
+										}
+									}
+								}
+								queue = next
+							}
+							if len(queue) > 0 {
+								return 0
+							}
+							return found
+						}
+
+						if sw, ok := d.resolveJumpTableCapped(curBlock, findTableAddr, findCount, findCap, entryAddr, fnEnd); ok && len(sw.Targets) > 0 && sw.Count <= 0 {
 							weak = append(weak, weakSwitch{pc: pc, from: blockStart, targets: sw.Targets})
 						} else if ok && len(sw.Targets) > 0 {
 							fn.JumpTables[pc] = sw.Targets
@@ -962,13 +1008,31 @@ func (d *Disassembler) disasmBranchFollowing(entryAddr uint64) (*Function, []uin
 	}
 	slices.Sort(sortedAddrs)
 
-	// Build basic blocks
+	// A branch into the middle of an instruction gives two overlapping instruction streams, and
+	// in address order an instruction of one stream can sit between an instruction of the other
+	// and its successor. Blocks must not run on across such a seam: the instruction after the
+	// seam starts a block, and so does the address the instruction before it falls through to.
+	for i := 0; i+1 < len(sortedAddrs); i++ {
+		in := instAtAddr[sortedAddrs[i]]
+		end := in.Address + uint64(in.Inst.Len)
+		if sortedAddrs[i+1] == end {
+			continue
+		}
+		leaders[sortedAddrs[i+1]] = true
+		if _, ok := instAtAddr[end]; ok {
+			leaders[end] = true
+		}
+	}
+
+	// Build basic blocks. A block ends where its last instruction ends (the fall-through
+	// address), which is not always where the next block in address order starts.
 	var currentBlock *BasicBlock
 	for _, addr := range sortedAddrs {
 		inst := instAtAddr[addr]
 		if leaders[addr] || currentBlock == nil {
 			if currentBlock != nil && len(currentBlock.Insts) > 0 {
-				currentBlock.EndAddr = addr
+				lastInst := currentBlock.Insts[len(currentBlock.Insts)-1]
+				currentBlock.EndAddr = lastInst.Address + uint64(lastInst.Inst.Len)
 				fn.Blocks[currentBlock.StartAddr] = currentBlock
 			}
 			currentBlock = &BasicBlock{
