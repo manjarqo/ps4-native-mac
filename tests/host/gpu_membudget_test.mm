@@ -37,6 +37,10 @@ static void test_policy(void) {
     check(p.budget == 3000 * MiB, "PS4_GNM_GPU_BUDGET_MB wins over the percentage");
     ps4_gpumem_policy_init(&p, 16 * GiB, "x", "12x", NULL);
     check(p.budget == 16 * GiB / 100 * 40, "junk MB and junk percentage keep the 40% default");
+    ps4_gpumem_policy_init(&p, 0, NULL, NULL, NULL);
+    check(p.budget == UINT64_MAX, "unknown RAM size: no budget");
+    ps4_gpumem_policy_init(&p, 0, NULL, "2048", NULL);
+    check(p.budget == 2048 * MiB, "unknown RAM size: the MB value still applies");
     ps4_gpumem_policy_init(&p, 16 * GiB, NULL, NULL, "0");
     check(p.idle_ns == 0, "PS4_GNM_GPU_WINDOW_IDLE_S=0 disables idle release");
     ps4_gpumem_policy_init(&p, 16 * GiB, NULL, NULL, "5");
@@ -227,8 +231,24 @@ static void test_metal_accounting(id<MTLDevice> dev) {
                                            options:nil
                                              error:&err];
     id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k"] error:&err];
-    int wired_seen = 0;
-    for (int attempt = 0; attempt < 3 && !wired_seen; ++attempt) {
+    // The driver wires and unwires asynchronously (sometimes only after the command buffer has
+    // completed), and other processes move the system-wide count too: poll for up to 3 s and
+    // demand most of the range, in up to 3 rounds.
+    auto poll = [](uint64_t from, bool up, uint64_t want) {
+        uint64_t best = 0;
+        for (int i = 0; i < 60; ++i) {
+            const uint64_t w = ps4_gpumem_wired_bytes();
+            const uint64_t d = up ? (w > from ? w - from : 0) : (from > w ? from - w : 0);
+            best = d > best ? d : best;
+            if (best >= want) break;
+            usleep(50000);
+        }
+        return best;
+    };
+    int wired_seen = 0, unwired_seen = 0;
+    for (int round = 0; round < 3 && !(wired_seen && unwired_seen); ++round) {
+        if (!a) a = [dev newBufferWithBytesNoCopy:m length:len options:MTLResourceStorageModeShared deallocator:nil];
+        usleep(200000);
         const uint64_t w0 = ps4_gpumem_wired_bytes();
         id<MTLCommandBuffer> cb = [q commandBuffer];
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
@@ -238,23 +258,18 @@ static void test_metal_accounting(id<MTLDevice> dev) {
         [ce endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
+        cb = nil;
+        const uint64_t up = poll(w0, true, len * 6 / 10);
         const uint64_t w1 = ps4_gpumem_wired_bytes();
-        // other processes move the system-wide count too: demand most of the range
-        wired_seen = w1 > w0 && w1 - w0 >= len * 6 / 10;
-        printf("  wired %+lld MiB after the GPU used a 512 MiB untouched no-copy buffer\n",
-               ((long long)w1 - (long long)w0) / (long long)MiB);
-        if (!wired_seen) { // re-arm: release and recreate
-            a = nil;
-            usleep(200000);
-            a = [dev newBufferWithBytesNoCopy:m length:len options:MTLResourceStorageModeShared deallocator:nil];
-        }
+        a = nil;
+        const uint64_t down = poll(w1, false, len * 6 / 10);
+        printf("  round %d: wired +%llu MiB after the GPU used a 512 MiB untouched no-copy buffer, "
+               "-%llu MiB after its release\n", round, (unsigned long long)(up / MiB), (unsigned long long)(down / MiB));
+        wired_seen |= up >= len * 6 / 10;
+        unwired_seen |= up >= len * 6 / 10 && down >= len * 6 / 10;
     }
     check(wired_seen, "GPU use wires the whole no-copy range");
-    const uint64_t w2 = ps4_gpumem_wired_bytes();
-    a = nil;
-    usleep(300000);
-    const uint64_t w3 = ps4_gpumem_wired_bytes();
-    check(w2 > w3 && w2 - w3 >= len * 6 / 10, "releasing the buffer unwires it");
+    check(unwired_seen, "releasing the buffer unwires it");
     munmap(m, 2 * len);
 }
 

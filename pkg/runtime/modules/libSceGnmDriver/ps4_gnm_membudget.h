@@ -43,7 +43,8 @@ typedef struct ps4_gpumem_policy {
 
 // budget_pct / budget_mb are the values of PS4_GNM_GPU_BUDGET_PCT / PS4_GNM_GPU_BUDGET_MB
 // (NULL when unset). A valid MB value wins over the percentage; the percentage defaults to 40
-// (also when it is not a positive number) and is clamped to [5, 90]. idle_s is PS4_GNM_GPU_WINDOW_IDLE_S (default 30, 0 = never).
+// (also when it is not a positive number) and is clamped to [5, 90]. With mem_total 0 (unknown)
+// and no MB value there is no budget (UINT64_MAX). idle_s is PS4_GNM_GPU_WINDOW_IDLE_S (default 30, 0 = never).
 void ps4_gpumem_policy_init(ps4_gpumem_policy *p, uint64_t mem_total, const char *budget_pct,
                             const char *budget_mb, const char *idle_s);
 

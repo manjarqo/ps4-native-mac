@@ -40,7 +40,8 @@ void ps4_gpumem_policy_init(ps4_gpumem_policy *p, uint64_t mem_total, const char
         if (!pct) pct = 40; // unset or not a number
         if (pct < 5) pct = 5;
         if (pct > 90) pct = 90;
-        p->budget = mem_total / 100 * pct;
+        // hw.memsize unknown: no budget rather than one of 0 that would always be exceeded
+        p->budget = mem_total ? mem_total / 100 * pct : UINT64_MAX;
     }
     p->nocopy_max = 1ull << 30;
     const uint64_t idle = idle_s ? parse_u64(idle_s) : 30;
