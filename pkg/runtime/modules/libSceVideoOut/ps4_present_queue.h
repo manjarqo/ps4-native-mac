@@ -66,6 +66,10 @@ typedef struct ps4_present_queue {
     uint64_t order[PS4_PRESENT_MAX_SLOTS]; // submission order of queued slots
     uint64_t next_order;
     uint64_t superseded; // mailbox replacements so far
+    // FIFO only: drawables the presenter holds for frames not yet acquired. The producer may
+    // take a slot only against such a credit, so it blocks exactly where it used to block in
+    // nextDrawable and never runs ahead of the display (no added latency).
+    int credits;
 } ps4_present_queue;
 
 // n slots (1..PS4_PRESENT_MAX_SLOTS); mailbox selects the replacing policy.
@@ -73,7 +77,7 @@ void ps4_pq_init(ps4_present_queue *q, int n, bool mailbox);
 
 // Non-blocking transitions; the caller holds q->mu.
 // Producer: a FREE slot (lowest index), or with mailbox the oldest QUEUED slot that is not
-// `keep` (then *superseded = 1). -1 when none.
+// `keep` (then *superseded = 1). FIFO also needs a drawable credit (consumed). -1 when none.
 int ps4_pq_try_acquire_locked(ps4_present_queue *q, int *superseded);
 // Producer: RENDERING -> QUEUED. Returns false for a slot it does not own.
 bool ps4_pq_submit_locked(ps4_present_queue *q, int slot, bool keep);
@@ -83,6 +87,8 @@ bool ps4_pq_cancel_locked(ps4_present_queue *q, int slot);
 int ps4_pq_try_take_locked(ps4_present_queue *q);
 // Presenter: PRESENTING -> FREE.
 bool ps4_pq_release_locked(ps4_present_queue *q, int slot);
+// Presenter (FIFO): it holds a drawable for the next frame. Credits do not accumulate past one.
+void ps4_pq_grant_locked(ps4_present_queue *q);
 // No slot is QUEUED or PRESENTING.
 bool ps4_pq_idle_locked(const ps4_present_queue *q);
 
@@ -94,6 +100,7 @@ bool ps4_pq_cancel(ps4_present_queue *q, int slot);
 // Presenter: waits for a queued slot; -1 once stopped.
 int ps4_pq_take(ps4_present_queue *q);
 bool ps4_pq_release(ps4_present_queue *q, int slot);
+void ps4_pq_grant(ps4_present_queue *q);
 // Waits up to `timeout` until nothing is queued or being presented; false on timeout.
 bool ps4_pq_drain(ps4_present_queue *q, double timeout);
 // Wakes every waiter; take and acquire return -1 from now on.

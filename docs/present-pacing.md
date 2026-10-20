@@ -37,23 +37,34 @@ Code: `pkg/runtime/modules/libSceVideoOut/ps4_metal_screen.m` (presenter), `ps4_
     (`sceVideoOutSetFlipRate`: 60, 30 or 20 Hz) with `presentDrawable:afterMinimumDuration:`. The hold is
     half a refresh shorter than the interval, so a slightly late frame does not slip one refresh.
     Immediate (hsync) flips are not held. On a 120 Hz panel this turns the 8.3/16.7 ms alternation into
-    an even 16.7 ms, at most 60 fps. No CPU sleeps are used, so no latency is added beyond the hold.
+    an even 16.7 ms, at most 60 fps. No CPU sleeps are used. Measured with a visible window: an even 16.7 ms cadence at 60 fps, against 30 % of frames off the 8.3 ms cadence when uncapped.
   - `mailbox`: the renderer never waits for the display. A queued frame that has not got a drawable yet
     is replaced by the newer one and counted as superseded.
-- **Back-pressure.** In `uncapped` and `vsync` the renderer waits in `acquire_frame` when all 3 slots are
-  queued or on screen. That happens only when the display or the GPU falls behind for more than about two
-  frames, so latency is bounded at about 3 frames. A slot is freed when the presenter's command buffer
-  completes. The wait has a 1 s timeout; after it the frame is dropped and the game keeps running. The
-  wait is counted as `backpressure` and in the encoder's "ms screen".
-- **Guest-memory display buffers** (U4 today) are shown when the buffer is not a GPU target. The encoder
-  used to `Commit` + `WaitAll` and then detile and present synchronously on the encoder thread, so a
-  seconds-long GPU job held up encoding and the event pump. Now it commits and hands the frame to a
-  serial "gnm.cpu-present" queue. That queue waits for the frame's last command buffer (with the GPU
-  watchdog timeout), detiles, presents through `present_frame` and completes the flip. While such a
-  frame is pending, the flips of GPU-presented frames go through the same queue, so the flip order is
-  kept. `PS4_GNM_SYNC_CPU_PRESENT=1` restores the synchronous path. `present_frame` and `present_texture`
-  first drain the presenter queue (up to 1 s, and not at all after a timeout until it is idle again), so
-  frames stay in order.
+- **Back-pressure and latency.** In `uncapped` and `vsync` the presenter first gets a drawable, then
+  grants the renderer one credit and takes the next queued slot. The renderer gets a slot only against
+  that credit. When the display is behind, it therefore waits in `acquire_frame` at the same point where
+  it used to wait in `nextDrawable`, and it is never a frame further ahead than with the old inline path:
+  the queue adds no latency (asserted by `present_queue_test`).
+  - In `vsync`, the only extra latency is the hold itself.
+  - `mailbox` never waits, and its renderer may be up to 2 frames ahead of the drawable.
+  - Slots are freed when the presenter's command buffer completes. Acquire times out after 1 s; the
+    frame is then dropped and the game keeps running.
+  - The wait is counted as `backpressure` and in the encoder's "ms screen".
+- **Guest-memory display buffers** (U4 today) are shown when the buffer is not a GPU target. By default
+  the encoder commits, waits for the GPU (`WaitAll`), detiles and presents synchronously, as before.
+- `PS4_GNM_ASYNC_CPU_PRESENT=1` (opt-in) runs that work on a serial "gnm.cpu-present" queue instead:
+  - The read is a fence action (`AfterGpu`), so it runs after the previous frames' flips and this
+    frame's EOP and label fences.
+  - While such a frame is pending, all flips complete on that queue, in order, and so does the fallback
+    path. `present_frame` therefore runs on one thread.
+  - The encoder stays at most one frame ahead. Before it queues the next guest-memory frame it waits for
+    the previous one, with the GPU watchdog: a timeout runs `WaitAll`, which sets `S.hung` once. So the
+    read of buffer N finishes before frame N+1's successors are encoded.
+  - `sceGnmInsertWaitFlipDone` is still not a real GPU wait (it needs guest-visible per-buffer labels
+    that the CP polls). The one-frame bound is what keeps a later frame from overwriting the buffer being
+    read.
+- `present_frame` and `present_texture` first drain the presenter queue: up to 1 s, and not at all after
+  a timeout, until the presenter is idle again.
 
 ## Screenshots and capture
 

@@ -735,7 +735,8 @@ static id<MTLTexture> hud_texture(NSUInteger target_h) {
 // enabled) is copied into the window's drawable, which is presented when `cb` has executed, at
 // least `min_duration` seconds after the previous frame appeared (0 = next refresh). shot_idx
 // >= 0 also saves the frame as a screenshot. The caller commits.
-static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long shot_idx, double min_duration) {
+static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long shot_idx, double min_duration,
+                           id<CAMetalDrawable> drawable) {
     @autoreleasepool {
         NSUInteger dw = src.width, dh = src.height;
         id<MTLTexture> up = upscale_encode(cb, src, &dw, &dh);
@@ -757,7 +758,9 @@ static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long sho
             td.storageMode = MTLStorageModeShared;
             shot = [g_device newTextureWithDescriptor:td];
         }
-        id<CAMetalDrawable> drawable = next_drawable_timed();
+        // the drawable was taken before the frame's size was known: a resize needs a new one
+        if (drawable && (drawable.texture.width != dw || drawable.texture.height != dh)) drawable = nil;
+        if (!drawable) drawable = next_drawable_timed();
         NSUInteger ox = 0, oy = 0;
         const float gamma = current_gamma();
         id<MTLRenderPipelineState> gamma_pso = fabsf(gamma - 1.0f) > 0.001f ? gamma_pipeline() : nil;
@@ -904,14 +907,14 @@ static bool slot_texture(PresentSlot *ps, NSUInteger w, NSUInteger h) {
     return ps->tex != nil;
 }
 
-static void present_slot(int s) {
+static void present_slot(int s, id<CAMetalDrawable> drawable) {
     PresentSlot *ps = &g_pr.slot[s];
     id<MTLCommandBuffer> cb = [g_pr.queue commandBuffer];
     [cb encodeWaitForEvent:g_pr.ready value:ps->ready];
     const double min_duration =
         ps4_present_min_duration(g_pr.mode, atomic_load(&g_guest_flip_rate), atomic_load(&g_guest_flip_mode),
                                  (double)atomic_load(&g_pr.display_hz));
-    present_encode(cb, ps->tex, ps->shot_idx, min_duration);
+    present_encode(cb, ps->tex, ps->shot_idx, min_duration, drawable);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         (void)done;
         ps4_pq_release(&g_pr.q, s);
@@ -930,10 +933,15 @@ static void *presenter_main(void *arg) {
     (void)arg;
     pthread_setname_np("Metal Present");
     for (;;) {
-        const int s = ps4_pq_take(&g_pr.q);
-        if (s < 0) return NULL;
         @autoreleasepool {
-            present_slot(s);
+            // Get the drawable first and only then let the renderer have a slot (a credit):
+            // while the display is behind, the renderer waits at the same point where it waited
+            // in nextDrawable before, so the thread adds no frames of latency. Mailbox never waits.
+            id<CAMetalDrawable> drawable = next_drawable_timed();
+            if (g_pr.mode != PS4_PRESENT_MAILBOX) ps4_pq_grant(&g_pr.q);
+            const int s = ps4_pq_take(&g_pr.q);
+            if (s < 0) return NULL;
+            present_slot(s, drawable);
         }
     }
 }
@@ -1031,6 +1039,7 @@ int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
             }
             if (s < 0) {
                 ps4_present_stats_on_superseded(pstats()); // this frame is not shown
+                (void)screenshot_due();                    // but keeps the per-flip numbering
                 ps4_metal_screen_pump_events();
                 return 0;
             }
@@ -1042,9 +1051,12 @@ int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
         [cb encodeSignalEvent:g_pr.ready value:v];
         id<MTLSharedEvent> ev = g_pr.ready;
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            // a failed command buffer may not have reached its signal; the presenter must not
-            // wait for it forever
-            if (done.status == MTLCommandBufferStatusError && ev.signaledValue < v) ev.signaledValue = v;
+            // A failed command buffer may not have reached its signal; the presenter must not
+            // wait for it forever. Only while v is the newest value handed out: a later command
+            // buffer's GPU signal could otherwise be lowered again by this CPU write.
+            if (done.status == MTLCommandBufferStatusError && atomic_load(&g_pr.ready_value) == v &&
+                ev.signaledValue < v)
+                ev.signaledValue = v;
         }];
         g_pr.slot[s].ready = v;
         g_pr.slot[s].shot_idx = screenshot_due();
@@ -1136,6 +1148,8 @@ void *ps4_metal_screen_get_texture(void) {
     return (__bridge void *)g_screenTexture;
 }
 
+// No caller today (the process ends with _exit). The presenter thread is stopped, not joined:
+// a caller that tears down the device while frames are in flight must drain first.
 void ps4_metal_screen_destroy(void) {
     if (atomic_load(&g_pr.started)) {
         presenter_drain();

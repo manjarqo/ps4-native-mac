@@ -56,9 +56,11 @@ static int oldest_queued(const ps4_present_queue *q, bool skip_keep) {
 
 int ps4_pq_try_acquire_locked(ps4_present_queue *q, int *superseded) {
     if (superseded) *superseded = 0;
+    if (!q->mailbox && q->credits <= 0) return -1;
     for (int i = 0; i < q->n; i++) {
         if (q->state[i] == PS4_PQ_FREE) {
             q->state[i] = PS4_PQ_RENDERING;
+            if (!q->mailbox) q->credits--;
             return i;
         }
     }
@@ -96,6 +98,10 @@ bool ps4_pq_release_locked(ps4_present_queue *q, int slot) {
     q->state[slot] = PS4_PQ_FREE;
     q->keep[slot] = false;
     return true;
+}
+
+void ps4_pq_grant_locked(ps4_present_queue *q) {
+    if (q->credits < 1) q->credits++;
 }
 
 bool ps4_pq_idle_locked(const ps4_present_queue *q) {
@@ -162,6 +168,13 @@ bool ps4_pq_release(ps4_present_queue *q, int slot) {
     pthread_cond_broadcast(&q->cv);
     pthread_mutex_unlock(&q->mu);
     return ok;
+}
+
+void ps4_pq_grant(ps4_present_queue *q) {
+    pthread_mutex_lock(&q->mu);
+    ps4_pq_grant_locked(q);
+    pthread_cond_broadcast(&q->cv);
+    pthread_mutex_unlock(&q->mu);
 }
 
 bool ps4_pq_drain(ps4_present_queue *q, double timeout) {

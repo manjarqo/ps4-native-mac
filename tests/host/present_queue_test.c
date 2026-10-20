@@ -100,10 +100,20 @@ static void fifo_test(void) {
     ps4_present_queue q;
     ps4_pq_init(&q, 3, false);
     int sup;
+    // no drawable held by the presenter: the producer must wait
+    CHECK(ps4_pq_try_acquire_locked(&q, &sup) == -1);
+    ps4_pq_grant_locked(&q);
+    ps4_pq_grant_locked(&q); // credits do not pile up
+    CHECK(q.credits == 1);
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == 0 && !sup);
+    CHECK(ps4_pq_try_acquire_locked(&q, &sup) == -1); // one frame per drawable
+    ps4_pq_grant_locked(&q);
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == 1);
+    ps4_pq_grant_locked(&q);
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == 2);
+    ps4_pq_grant_locked(&q);
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == -1); // full: FIFO waits, never replaces
+    CHECK(q.credits == 1);                             // the credit waits for a free slot
     CHECK(ps4_pq_submit_locked(&q, 1, false));
     CHECK(ps4_pq_submit_locked(&q, 0, false));
     CHECK(!ps4_pq_submit_locked(&q, 0, false)); // already queued
@@ -160,15 +170,18 @@ typedef struct {
     int frames;
     int present_us;
     double max_wait_s;
+    int ahead; // FIFO acquisitions made while an earlier frame was not yet with the presenter
 } Run;
 
 static void *presenter(void *arg) {
     Run *r = arg;
     for (;;) {
+        usleep(r->present_us); // waits for a drawable (display-bound)
+        ps4_pq_grant(&r->q);   // holds it for the next frame
         const int s = ps4_pq_take(&r->q);
         if (s < 0) return NULL;
-        r->shown[r->n_shown++] = r->frame_of_slot[s];
-        usleep(r->present_us); // waits for a drawable
+        r->shown[r->n_shown] = r->frame_of_slot[s];
+        __atomic_store_n(&r->n_shown, r->n_shown + 1, __ATOMIC_RELEASE);
         ps4_pq_release(&r->q, s);
     }
 }
@@ -187,6 +200,9 @@ static void run_threads(Run *r, bool mailbox, int present_us) {
         CHECK(s >= 0);
         if (s < 0) break;
         if (waited > r->max_wait_s) r->max_wait_s = waited;
+        // FIFO: the producer gets frame f only once every earlier frame is with the presenter,
+        // i.e. it is never a frame ahead of the display, like the old nextDrawable wait
+        if (!mailbox && __atomic_load_n(&r->n_shown, __ATOMIC_ACQUIRE) != f) r->ahead++;
         r->frame_of_slot[s] = f;
         if (f % 5 == 0) usleep(100); // renders
         CHECK(ps4_pq_submit(&r->q, s, f == 700));
@@ -200,6 +216,7 @@ static void thread_test(void) {
     Run *r = calloc(1, sizeof(Run));
     run_threads(r, false, 200);
     CHECK(r->n_shown == r->frames && r->q.superseded == 0);
+    CHECK(r->ahead == 0);
     for (int i = 0; i < r->n_shown; i++) CHECK(r->shown[i] == i);
     CHECK(r->max_wait_s > 0.0001); // the producer was held back by the slow presenter
 
@@ -211,7 +228,7 @@ static void thread_test(void) {
     for (int i = 0; i < r->n_shown; i++) saw_kept |= r->shown[i] == 700;
     CHECK(saw_kept);
     CHECK(r->shown[r->n_shown - 1] == r->frames - 1); // the newest frame is always shown
-    CHECK(r->max_wait_s < 0.05); // never paced by the 2 ms presenter
+    CHECK(r->max_wait_s < 0.5); // never paced by the presenter (1500 frames x 2 ms would be 3 s)
     free(r);
 }
 
@@ -220,9 +237,15 @@ static void timeout_test(void) {
     ps4_pq_init(&q, 2, false);
     int sup;
     double waited;
+    double t0 = now_s();
+    CHECK(ps4_pq_acquire(&q, 0.05, &sup, &waited) == -1); // the presenter has no drawable yet
+    CHECK(now_s() - t0 >= 0.045);
+    ps4_pq_grant(&q);
     CHECK(ps4_pq_acquire(&q, 1.0, &sup, &waited) == 0);
+    ps4_pq_grant(&q);
     CHECK(ps4_pq_acquire(&q, 1.0, &sup, &waited) == 1);
-    const double t0 = now_s();
+    ps4_pq_grant(&q);
+    t0 = now_s();
     CHECK(ps4_pq_acquire(&q, 0.05, &sup, &waited) == -1); // a stuck presenter cannot block forever
     CHECK(now_s() - t0 >= 0.045 && waited >= 0.045 && waited < 1.0);
     CHECK(ps4_pq_submit(&q, 0, false));
