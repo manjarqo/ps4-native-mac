@@ -54,4 +54,40 @@ inline bool Enter(std::vector<Frame> &frames, const uint32_t *ib, uint32_t ib_dw
     return true;
 }
 
+// What the executor of a walk reports for the packet at frames.back().pc.
+struct Packet {
+    uint32_t step = 0;     // dwords the packet takes; 0 = truncated: drop the rest of the buffer
+    bool suspend = false;  // stop at this packet; the next walk starts with it again
+    const uint32_t *ib = nullptr; // INDIRECT_BUFFER target (nullptr: none or not decodable)
+    uint32_t ib_dw = 0;
+    bool chain = false;
+};
+
+// Walks `frames` (resumable: the frames are the whole state) until they are exhausted (true)
+// or the executor suspends at a packet (false). exec(const Frame &top, int depth, Packet &out)
+// runs the packet at top.pc; progress(pc) reports that frames[0] is consumed up to pc (a
+// ring's read pointer). Used by the compute queues, whose WAIT_REG_MEM suspends the queue.
+template <class Exec, class Progress>
+inline bool Walk(std::vector<Frame> &frames, bool bottom_is_ring, Exec &&exec, Progress &&progress) {
+    while (!frames.empty()) {
+        Frame &f = frames.back();
+        if (f.pc >= f.dw) {
+            frames.pop_back();
+            continue;
+        }
+        const int depth = (int)frames.size() - 1;
+        Packet pk;
+        exec(static_cast<const Frame &>(f), depth, pk);
+        if (pk.suspend) return false;
+        if (pk.step == 0) {
+            frames.pop_back();
+            continue;
+        }
+        f.pc += pk.step;
+        if (depth == 0) progress(f.pc < f.dw ? f.pc : f.dw);
+        if (pk.ib) Enter(frames, pk.ib, pk.ib_dw, pk.chain, bottom_is_ring);
+    }
+    return true;
+}
+
 } // namespace ps4gnm_ib

@@ -101,6 +101,11 @@ G="$R/pkg/runtime/modules/libSceGnmDriver"
 # PM4 INDIRECT_BUFFER chaining: chained chunks run to the end, calls return, deep calls stop.
 clang++ -std=c++17 -Wall -Werror -g -fsanitize=address,undefined -I "$G" "$R/tests/host/gnm_ib_chain_test.cc" \
   -o "$T/gnm_ib_chain_test"
+# Compute queues stop at an unsatisfied WAIT_REG_MEM and continue there later.
+clang++ -std=c++17 -Wall -Werror -g -fsanitize=address,undefined -I "$G" "$R/tests/host/gnm_compute_wait_test.cc" \
+  -o "$T/gnm_compute_wait_test"
+"$T/gnm_compute_wait_test" > "$T/gnm_compute_wait.txt" || { cat "$T/gnm_compute_wait.txt"; exit 1; }
+echo "gnm_compute_wait_test: PASS"
 "$T/gnm_ib_chain_test"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
