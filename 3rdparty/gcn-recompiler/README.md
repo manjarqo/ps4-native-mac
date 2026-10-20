@@ -40,6 +40,12 @@ Vendored externals, each under its own license:
 - `backend/spirv/emit_spirv_context_get_set.cpp` (`EmitReadConstBuffer`): `s_buffer_load` past
   the V#'s `num_records` reads 0, as on GCN (bounds from `push_data.buf_sizes`, like the vector
   buffer loads).
+- `api/gcn_rectlist.cpp` (new) and `api/gcn_msl.cpp` (`ConvertCapture`):
+  `gcn_shader_rectlist_msl()` for RectList draws on Metal, which has no stage between the vertex
+  and fragment shaders for shadPS4's RectList tessellation control shader
+  (`backend/spirv/emit_spirv_quad_rect.cpp`). It returns the vertex shader's SPIRV-Cross
+  `capture_output_to_buffer` variant and a generated vertex shader that expands the captured
+  vertices to two triangles per rectangle, with the 4th vertex as in shadPS4's TCS.
 - `info.h`, `frontend/fetch_shader.cpp`: shadPS4 dereferences guest GPU addresses directly. In
   this library those reads go through `compat/guest_memory.h`, using a per-thread reader that
   the C API installs.

@@ -582,6 +582,37 @@ GCN_API gcn_status gcn_shader_deserialize(const void* data, size_t size, uint64_
 /* Independent copy of a shader for the same program loaded at guest address code_addr. */
 GCN_API gcn_shader* gcn_shader_clone(const gcn_shader* s, uint64_t code_addr);
 
+/* ---- RectList ---------------------------------------------------------------------------- */
+
+/* A RectList draw (primitive type 17) gives 3 vertices per rectangle; the GPU makes the 4th.
+ * Metal has no rectangle primitive and no stage between the vertex and the fragment shader
+ * (shadPS4 adds the vertex in a tessellation control shader, emit_spirv_quad_rect.cpp), so the
+ * draw becomes two draws in the same render pass:
+ *  1. capture_msl: the vertex shader with rasterization disabled. Same resource slots and vertex
+ *     inputs as gcn_shader_msl(); it stores the output struct (vertex_stride bytes) of vertex v
+ *     of instance i at [[buffer(capture_buffer)]] + (i - base instance) * n + (v - base vertex),
+ *     with n = ((device uint*)[[buffer(params_buffer)]])[0].
+ *  2. A vertex-to-vertex buffer memory barrier, then expand_msl: 6 vertices (two triangles) per
+ *     rectangle and no vertex inputs. [[buffer(0)]] the captured vertices, [[buffer(1)]] uint
+ *     slots[3 * rectangles] (capture index of each rectangle's vertices, the index buffer values
+ *     of an indexed draw), [[buffer(2)]] uint n as above. The corner is the vertex that shares x
+ *     with one of the others and y with the other (vertex 0 if none does); the 4th vertex is the
+ *     sum of the other two minus the corner, for the position and every output. The output
+ *     struct is the vertex shader's, so the fragment shader links unchanged.
+ * Both entry points are "main0". opt: the options the shader was compiled with (NULL =>
+ * defaults). Free with gcn_rectlist_msl_free(). */
+typedef struct gcn_rectlist_msl {
+    char* capture_msl;
+    char* expand_msl;
+    uint32_t vertex_stride;  /* bytes per captured vertex */
+    uint32_t capture_buffer; /* [[buffer(n)]] of the capture variant's output */
+    uint32_t params_buffer;  /* [[buffer(n)]] of its uint n */
+} gcn_rectlist_msl;
+
+GCN_API gcn_status gcn_shader_rectlist_msl(const gcn_shader* vs, const gcn_msl_options* opt,
+                                           gcn_rectlist_msl* out, char* err, size_t err_size);
+GCN_API void gcn_rectlist_msl_free(gcn_rectlist_msl* m);
+
 /* ---- Misc -------------------------------------------------------------------------------- */
 
 /* Locate the OrbShdr footer of a shader binary (AmdGpu::SearchBinaryInfo). */

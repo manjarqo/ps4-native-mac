@@ -18,9 +18,11 @@ namespace {
 
 // One SPIRV-Cross run. arg_ids: SPIR-V binding -> [[id(n)]] of the storage buffers to place in
 // the descriptor set 0 argument buffer (empty: every resource gets a discrete slot).
+// capture: non-null for a vertex shader whose outputs go to a buffer instead of the rasterizer
+// (SPIRV-Cross capture_output_to_buffer).
 bool ConvertOnce(const std::vector<uint32_t>& spirv, const gcn_msl_options& opt,
                  const std::map<uint32_t, uint32_t>& arg_ids, std::string& out, Bindings* bindings,
-                 uint32_t* num_buffer_slots) {
+                 uint32_t* num_buffer_slots, const CaptureSlots* capture = nullptr) {
     using namespace spirv_cross;
     CompilerMSL msl(spirv);
     auto mo = msl.get_msl_options();
@@ -37,6 +39,11 @@ bool ConvertOnce(const std::vector<uint32_t>& spirv, const gcn_msl_options& opt,
     mo.pad_fragment_output_components = opt.pad_fragment_output_components;
     mo.enable_point_size_builtin = opt.enable_point_size_builtin;
     mo.invariant_float_math = opt.invariant_float_math;
+    if (capture) {
+        mo.capture_output_to_buffer = true;
+        mo.shader_output_buffer_index = capture->output_buffer;
+        mo.indirect_params_buffer_index = capture->params_buffer;
+    }
     msl.set_msl_options(mo);
 
     std::set<uint32_t> coherent_ids; // [[id]]s of Coherent/Volatile storage buffers
@@ -245,9 +252,35 @@ bool Convert(const std::vector<uint32_t>& spirv, const gcn_msl_options& opt, std
         return false;
     }
 }
+bool ConvertCapture(const std::vector<uint32_t>& spirv, const gcn_msl_options& opt,
+                    const Bindings& like, const CaptureSlots& slots, std::string& out,
+                    std::string& err) {
+    try {
+        // The same argument buffer choice as the shader's own MSL, so that every resource
+        // keeps its slot.
+        uint32_t n = 0;
+        Bindings b;
+        ConvertOnce(spirv, opt, like.arg_entries, out, &b, &n, &slots);
+        if (b.buffers != like.buffers || b.textures != like.textures || b.samplers != like.samplers ||
+            b.push_constant_buffer != like.push_constant_buffer ||
+            b.argument_buffer != like.argument_buffer) {
+            err = "resource slots of the capture variant differ from the shader's";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
 #else
 bool Convert(const std::vector<uint32_t>&, const gcn_msl_options&, std::string&, std::string& err,
              Bindings*, const std::vector<uint32_t>*) {
+    err = "gcn_recompiler was built without SPIRV-Cross (GCN_BUILD_MSL=OFF)";
+    return false;
+}
+bool ConvertCapture(const std::vector<uint32_t>&, const gcn_msl_options&, const Bindings&,
+                    const CaptureSlots&, std::string&, std::string& err) {
     err = "gcn_recompiler was built without SPIRV-Cross (GCN_BUILD_MSL=OFF)";
     return false;
 }
