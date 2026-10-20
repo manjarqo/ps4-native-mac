@@ -27,13 +27,15 @@
 //   Config 1 = ADTS [V]: the access unit starts with the ADTS header (U4 passes the frame from
 //   the syncword on). Config 2 = raw [V: U4 then passes its buffer as is, with the frequency
 //   index from its stream info and no ADTS check]; the channel count comes from the first
-//   syntactic element of the first access unit (SCE = 1, CPE = 2) [I]. Others -> UNSUPPORTED.
+//   syntactic element of each access unit (CPE = 2, else 1) [I]; a stereo frame that starts with
+//   a DSE/PCE/FIL element would be taken for mono. Others -> UNSUPPORTED.
 //   HE-AAC (SBR) is not implemented: enable HE-AAC != 0 -> UNSUPPORTED [I].
 // BsiInfo, M4AAC (0x14) [V size]: 00 u32 size, then written by Decode [I, U4 never reads it]:
 //   04 u32 sampling frequency (Hz), 08 u32 channels, 0C u32 samples per channel of the last
 //   access unit, 10 u32 HE-AAC flag (0).
 // AuInfo (0x18) [V]: 00 u32 size 0x18, 08 au address, 10 u32 au size. Decode writes the number
-//   of bytes it consumed to au size [I: U4 does not read it back].
+//   of bytes it consumed to au size [I]; harmless for U4, which rewrites the au fields before
+//   every call (0x16cd699, 0x16cd6c7, 0x16cd709) [V].
 // PcmItem (0x18) [V]: 00 u32 size 0x18, 08 pcm address, 10 u32 pcm buffer size (U4: 0x4000).
 //   Decode writes the bytes of PCM it produced [V: U4 reads it back and plays size / 8 stereo or
 //   size / 4 mono float frames]. PCM is interleaved, one AAC frame (1024 samples per channel).
@@ -71,7 +73,8 @@
 #include <string.h>
 
 #define AUDIODEC_MAX_DECODERS 16
-#define AUDIODEC_SLOT_BITS 4
+// Handle = generation << AUDIODEC_SLOT_BITS | (slot + 1): slot + 1 (1..16) needs 5 bits.
+#define AUDIODEC_SLOT_BITS 5
 #define AUDIODEC_FRAME 1024u
 #define AUDIODEC_MAX_CH 2u
 
@@ -104,6 +107,7 @@ _Static_assert(sizeof(AudiodecCtrl) == 0x20, "ctrl");
 _Static_assert(sizeof(AudiodecParamM4aac) == 0x18, "param");
 _Static_assert(sizeof(AudiodecBsiM4aac) == 0x14, "bsi");
 _Static_assert(sizeof(AudiodecBuffer) == 0x18, "au/pcm");
+_Static_assert(AUDIODEC_MAX_DECODERS < (1 << AUDIODEC_SLOT_BITS), "slot + 1 must fit the slot field");
 
 static const uint32_t k_rates[13] = {96000, 88200, 64000, 48000, 44100, 32000, 24000,
                                      22050, 16000, 12000, 11025, 8000,  7350};
@@ -282,7 +286,7 @@ static int32_t audiodec_decode_raw(Audiodec *d, const uint8_t *data, uint32_t si
     UInt32 frames = AUDIODEC_FRAME;
     OSStatus st = AudioConverterFillComplexBuffer(d->conv, audiodec_input, d, &frames, &list, NULL);
     if (st != noErr && st != 'pend') {
-        static int warned;
+        static _Atomic int warned;
         if (warned++ < 8) fprintf(stderr, "[libSceAudiodec] frame of %u bytes rejected: %d\n", size, (int)st);
         // Start the next frame from a clean decoder state.
         AudioConverterReset(d->conv);
@@ -456,7 +460,7 @@ static int32_t audiodec_decode(GuestContext *ctx, Audiodec *d, uint64_t ctrl_add
         AdtsHeader h;
         if (!adts_parse(data, au->data_size, &h) || h.frame_size > au->data_size) return PS4_AUDIODEC_ERROR_INVALID_SIZE;
         if (h.object_type != 2 || h.raw_blocks != 1 || h.channels == 0) {
-            static int warned;
+            static _Atomic int warned;
             if (warned++ < 4)
                 fprintf(stderr, "[libSceAudiodec] ADTS frame not supported: object type %u, %u raw blocks, channel config %u\n",
                         h.object_type, h.raw_blocks, h.channels);
@@ -468,8 +472,10 @@ static int32_t audiodec_decode(GuestContext *ctx, Audiodec *d, uint64_t ctrl_add
         frame_size = h.frame_size - h.header_size;
         consumed = h.frame_size;
     } else {
-        // The first syntactic element of a raw_data_block: ID_SCE (0) or ID_CPE (1).
-        channels = d->conv ? d->channels : ((data[0] >> 5) == 1 ? 2u : 1u);
+        // The first syntactic element of the raw_data_block, per access unit: ID_CPE (1) = 2
+        // channels, anything else (ID_SCE, or a leading DSE/PCE/FIL) = 1. A change rebuilds the
+        // decoder, as a changed ADTS header does.
+        channels = (data[0] >> 5) == 1 ? 2u : 1u;
         frame = data;
         frame_size = au->data_size;
         consumed = au->data_size;

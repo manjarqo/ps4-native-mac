@@ -12,7 +12,9 @@
 // per-channel SNR, RMS and a sum-of-magnitudes checksum within tolerance; channels not swapped);
 // s16 and s32 output agree with float output; the raw (config 2) mode gives the same samples as
 // ADTS; ADTS with a CRC field; a damaged frame fails without breaking the decoder; parameter,
-// size, handle and channel errors; Decode racing DeleteDecoder.
+// size, handle and channel errors; all 16 handle slots created, used and deleted three times;
+// Decode racing DeleteDecoder. A stored stream from an independent encoder (FFmpeg) is checked
+// against FFmpeg's own decoder output, frame by frame.
 #include "ps4_audiodec.h"
 
 #include <AudioToolbox/AudioToolbox.h>
@@ -461,21 +463,118 @@ static void test_errors(const Stream *s) {
     CHECK(call(shim_sceAudiodecDecode, (uint32_t)h, f.ctrl) == PS4_AUDIODEC_ERROR_INVALID_HANDLE, "stale after reuse");
     CHECK(call(shim_sceAudiodecDecode, (uint32_t)h2, f.ctrl) == 0, "Decode new handle");
     CHECK(call(shim_sceAudiodecDeleteDecoder, (uint32_t)h2, 0) == 0, "Delete new");
-    // All handles in use.
-    int32_t hs[17];
-    int ok = 0;
-    for (int i = 0; i < 17; i++) {
-        hs[i] = call(shim_sceAudiodecCreateDecoder, f.ctrl, 3);
-        if (hs[i] > 0) ok++;
+    // All 16 slots, three times over: every handle decodes and deletes, the 17th Create is
+    // refused, and no slot is lost between rounds (slot 15 once collided with the generation).
+    n = adts_wrap(au, s, 6, 0);
+    for (int round = 0; round < 3; round++) {
+        int32_t hs[17];
+        for (int i = 0; i < 17; i++) hs[i] = call(shim_sceAudiodecCreateDecoder, f.ctrl, 3);
+        for (int i = 0; i < 16; i++) {
+            CHECK(hs[i] > 0, "round %d: Create %d returned 0x%08x", round, i, (uint32_t)hs[i]);
+            for (int j = 0; j < i; j++) CHECK(hs[i] != hs[j], "round %d: handles %d and %d equal", round, i, j);
+        }
+        CHECK(hs[16] == PS4_AUDIODEC_ERROR_ALL_HANDLES_IN_USE, "round %d: 17th Create returned 0x%08x", round,
+              (uint32_t)hs[16]);
+        for (int i = 0; i < 16; i++) {
+            set_au(&f, au, n, 0x4000);
+            const int32_t rc = call(shim_sceAudiodecDecode, (uint32_t)hs[i], f.ctrl);
+            CHECK(rc == 0, "round %d: Decode on handle %d (0x%x) returned 0x%08x", round, i, (uint32_t)hs[i], (uint32_t)rc);
+        }
+        for (int i = 0; i < 16; i++) {
+            const int32_t rc = call(shim_sceAudiodecDeleteDecoder, (uint32_t)hs[i], 0);
+            CHECK(rc == 0, "round %d: Delete handle %d (0x%x) returned 0x%08x", round, i, (uint32_t)hs[i], (uint32_t)rc);
+        }
     }
-    CHECK(ok == 16 && hs[16] == PS4_AUDIODEC_ERROR_ALL_HANDLES_IN_USE, "%d handles, last 0x%08x", ok, (uint32_t)hs[16]);
-    for (int i = 0; i < 16; i++) call(shim_sceAudiodecDeleteDecoder, (uint32_t)hs[i], 0);
 
     CHECK(call(shim_sceAudiodecTermLibrary, 3, 0) == 0, "Term");
     // CreateDecoder does not require InitLibrary (U4 calls Term per player shutdown).
     const int32_t h3 = call(shim_sceAudiodecCreateDecoder, f.ctrl, 3);
     CHECK(h3 > 0, "Create after Term: 0x%08x", (uint32_t)h3);
-    call(shim_sceAudiodecDeleteDecoder, (uint32_t)h3, 0);
+    CHECK(call(shim_sceAudiodecDeleteDecoder, (uint32_t)h3, 0) == 0, "Delete after Term");
+}
+
+// A stream from an independent encoder (tests/host/data/audiodec_chirp_ffmpeg.aac, made with
+// FFmpeg 8.1.1's native AAC encoder: the same chirps as the stereo stream over 0.5 s, 48 kHz,
+// 128 kbit/s, ADTS). Its frames are fed as stored, headers included. Reference: the RMS of every
+// 1024-sample frame as FFmpeg's own decoder outputs it (`ffmpeg -i <file> -f f32le`, no priming
+// trimmed). That encoder is lossier than AudioToolbox's: FFmpeg's decoder also gets 14.6 / 16.2 dB
+// SNR against the analytic chirps.
+static const double k_ffmpeg_rms[2][25] = {
+    {0.00096, 0.36046, 0.35074, 0.33148, 0.35104, 0.34452, 0.32958, 0.34071, 0.32804, 0.33165, 0.35529, 0.35006, 0.35370,
+     0.40659, 0.41733, 0.34906, 0.35484, 0.38224, 0.34944, 0.35114, 0.34747, 0.42601, 0.36153, 0.35480, 0.23550},
+    {0.00754, 0.23219, 0.22854, 0.20895, 0.20686, 0.21081, 0.21213, 0.20270, 0.20899, 0.21039, 0.21150, 0.17985, 0.19845,
+     0.22897, 0.21194, 0.21255, 0.20909, 0.20705, 0.21006, 0.21072, 0.21231, 0.20916, 0.22880, 0.22916, 0.14233},
+};
+
+static void test_ffmpeg_fixture(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    CHECK(fp != NULL, "cannot open %s", path);
+    if (!fp) return;
+    static uint8_t file[65536];
+    const uint32_t size = (uint32_t)fread(file, 1, sizeof(file), fp);
+    fclose(fp);
+    Stream src;
+    const double s0[2] = {200, 3000}, s1[2] = {2000, 600}, a2[2] = {0.5, 0.3};
+    memset(&src, 0, sizeof(src));
+    src.rate = 48000;
+    src.channels = 2;
+    src.frames = 24000;
+    src.pcm = (float *)calloc((size_t)src.frames * 2, sizeof(float));
+    for (uint32_t i = 0; i < src.frames; i++)
+        for (uint32_t c = 0; c < 2; c++) {
+            const double t = (double)i / 48000;
+            src.pcm[(size_t)i * 2 + c] = (float)(a2[c] * sin(2 * M_PI * (s0[c] * t + (s1[c] - s0[c]) * t * t / (2 * 0.5))));
+        }
+    Frame f = make_frame(2, 1, 3, 2, 0x4000);
+    set_au(&f, file, size < 0x4000 ? size : 0x4000, 0x4000);
+    const int32_t h = call(shim_sceAudiodecCreateDecoder, f.ctrl, 3);
+    CHECK(h > 0, "fixture: Create 0x%08x", (uint32_t)h);
+    float *dec = (float *)calloc(64 * FRAME * 2, sizeof(float));
+    uint32_t pos = 0, units = 0, frames = 0;
+    while (h > 0 && pos + 7 <= size && units < 64) {
+        const uint32_t len = ((file[pos + 3] & 3u) << 11) | ((uint32_t)file[pos + 4] << 3) | (file[pos + 5] >> 5);
+        if (len < 7 || pos + len > size) break;
+        set_au(&f, file + pos, len, 0x4000);
+        const int32_t rc = call(shim_sceAudiodecDecode, (uint32_t)h, f.ctrl);
+        CHECK(rc == 0, "fixture: access unit %u returned 0x%08x", units, (uint32_t)rc);
+        if (rc) break;
+        CHECK(rd32(f.au + 0x10) == len, "fixture: consumed %u of %u", rd32(f.au + 0x10), len);
+        const uint32_t bytes = rd32(f.pcm + 0x10);
+        CHECK(bytes == FRAME * 2 * 4, "fixture: pcm size %u", bytes);
+        memcpy(dec + (size_t)frames * 2, gp(f.pcm_buf), bytes);
+        frames += bytes / 8;
+        pos += len;
+        units++;
+    }
+    CHECK(pos == size, "fixture: stopped at byte %u of %u", pos, size);
+    CHECK(frames == units * FRAME && frames >= src.frames, "fixture: %u frames from %u access units", frames, units);
+    for (uint32_t c = 0; c < 2; c++) {
+        int lag;
+        double snr, rms;
+        compare(&src, dec, frames, c, &lag, &snr, &rms);
+        printf("audiodec_test: ffmpeg fixture ch%u: %u access units, lag %d, SNR %.1f dB, RMS %.4f\n", c, units, lag, snr,
+               rms);
+        CHECK(lag == 1024, "fixture ch%u: delay %d (FFmpeg's encoder delay is 1024)", c, lag);
+        CHECK(snr > 12.0, "fixture ch%u: SNR %.1f dB", c, snr);
+        CHECK(fabs(rms - a2[c] / sqrt(2)) < 0.05 * a2[c] / sqrt(2), "fixture ch%u: RMS %.4f", c, rms);
+    }
+    CHECK(units == 25, "fixture: %u access units", units);
+    double worst = 0;
+    for (uint32_t c = 0; c < 2; c++)
+        for (uint32_t u = 0; u < units && u < 25; u++) {
+            double e = 0;
+            for (uint32_t i = 0; i < FRAME; i++) {
+                const double v = dec[((size_t)u * FRAME + i) * 2 + c];
+                e += v * v;
+            }
+            const double rms = sqrt(e / FRAME), ref = k_ffmpeg_rms[c][u];
+            worst = fmax(worst, fabs(rms - ref));
+            CHECK(fabs(rms - ref) <= 0.01 * ref + 1e-4, "fixture ch%u frame %u: RMS %.5f, FFmpeg %.5f", c, u, rms, ref);
+        }
+    printf("audiodec_test: ffmpeg fixture per-frame RMS vs FFmpeg's decoder: max difference %.6f\n", worst);
+    CHECK(call(shim_sceAudiodecDeleteDecoder, (uint32_t)h, 0) == 0, "fixture: Delete");
+    free(dec);
+    free(src.pcm);
 }
 
 // Decode on one thread while another deletes the decoder: no use after free (ASan), every call
@@ -522,7 +621,11 @@ static void test_delete_race(const Stream *s) {
     }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <audiodec_chirp_ffmpeg.aac>\n", argv[0]);
+        return 2;
+    }
     g.mem_size = 64ULL << 20;
     g.mem_base = (uint8_t *)calloc(1, g.mem_size);
     const double s0[2] = {200, 3000}, s1[2] = {2000, 600}, a2[2] = {0.5, 0.3};
@@ -534,6 +637,7 @@ int main(void) {
     CHECK(st.npkt >= 47 && mono.npkt >= 44, "encoder produced %u / %u packets", st.npkt, mono.npkt);
     test_stereo(&st);
     test_mono(&mono);
+    test_ffmpeg_fixture(argv[1]);
     test_errors(&st);
     test_delete_race(&st);
     free_stream(&st);
