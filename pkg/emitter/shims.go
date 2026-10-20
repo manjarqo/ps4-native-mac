@@ -1094,6 +1094,12 @@ var knownDirectShims = []string{
 	"sceAudio3dAudioOutOpen",
 	"sceAudio3dAudioOutClose",
 	"sceAudio3dAudioOutOutputs",
+	// libSceAudiodec (libSceAudiodec/ps4_audiodec.c)
+	"sceAudiodecInitLibrary",
+	"sceAudiodecTermLibrary",
+	"sceAudiodecCreateDecoder",
+	"sceAudiodecDecode",
+	"sceAudiodecDeleteDecoder",
 	// AudioIn
 	"sceAudioInOpen",
 	"sceAudioInClose",

@@ -511,3 +511,24 @@ func TestAudio3dShimsByNID(t *testing.T) {
 		}
 	}
 }
+
+// The libSceAudiodec imports of Uncharted 4 (NIDs from its eboot) bind to the shims in
+// libSceAudiodec/ps4_audiodec.c.
+func TestAudiodecShimsByNID(t *testing.T) {
+	cases := []struct{ plain, nid string }{
+		{"sceAudiodecInitLibrary", "VjhsmxpcezI"},
+		{"sceAudiodecTermLibrary", "h5jSB2QIDV0"},
+		{"sceAudiodecCreateDecoder", "O3f1sLMWRvs"},
+		{"sceAudiodecDecode", "KHXHMDLkILw"},
+		{"sceAudiodecDeleteDecoder", "Tp+ZEy69mLk"},
+	}
+	for _, tc := range cases {
+		if nid := elfloader.CalculateNID(tc.plain); nid != tc.nid {
+			t.Fatalf("%s NID=%s want %s", tc.plain, nid, tc.nid)
+		}
+		encoded := tc.nid + "#u#s"
+		if shim, ok := LookupShim(encoded); !ok || shim != "shim_"+tc.plain {
+			t.Fatalf("LookupShim(%s)=%q ok=%v want shim_%s", encoded, shim, ok, tc.plain)
+		}
+	}
+}

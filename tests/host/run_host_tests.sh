@@ -78,6 +78,12 @@ clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address -I "$R/pkg/runtime/core
   "$R/pkg/runtime/modules/libSceVdecsw/ps4_vdecsw.c" "$V/ps4_videodec.c" "$V/ps4_h264_vt.c" -framework VideoToolbox \
   -framework CoreMedia -framework CoreVideo -framework CoreFoundation -o "$T/vdecsw_test"
 "$T/vdecsw_test"
+# AAC through libSceAudiodec on AudioToolbox: streams made by AudioToolbox's encoder, fed with
+# U4's ctrl layout, must decode to the source signal (frame count, delay, SNR, checksum).
+AD="$R/pkg/runtime/modules/libSceAudiodec"
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/runtime/core" -I "$AD" \
+  "$R/tests/host/audiodec_test.c" "$AD/ps4_audiodec.c" -framework AudioToolbox -o "$T/audiodec_test"
+"$T/audiodec_test" 2> "$T/audiodec.txt" || { cat "$T/audiodec.txt"; exit 1; }
 G="$R/pkg/runtime/modules/libSceGnmDriver"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
