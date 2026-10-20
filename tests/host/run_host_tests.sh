@@ -7,6 +7,15 @@ T=$(mktemp -d)
 clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/kernel/threading" "$R/tests/host/stall_profile_test.c" \
   "$R/pkg/runtime/kernel/threading/ps4_stall_profile.c" -o "$T/stall_profile_test"
 "$T/stall_profile_test"
+# libSceAudio3d on the real libSceAudioOut (headless device): panner, attribute validation, queue
+# levels and device-clock pacing, bed plus object mixed to a known output.
+A3="$R/pkg/runtime/modules/libSceAudio3d"
+AO="$R/pkg/runtime/modules/libSceAudioOut"
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/runtime/core" -I "$AO" -I "$A3" \
+  "$R/tests/host/audio3d_test.c" "$A3/ps4_audio3d.c" "$A3/ps4_audio3d_mix.c" "$AO/ps4_audioout.c" \
+  -framework AudioToolbox -o "$T/audio3d_test"
+"$T/audio3d_test" 2> "$T/audio3d.txt" || { cat "$T/audio3d.txt"; exit 1; }
+grep "^audio3d_test" "$T/audio3d.txt"
 # Asynchronous stdout/stderr: nothing is lost on abort() or exit(), with one shared file and with two.
 clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/core" "$R/tests/host/log_abort_test.c" "$R/pkg/runtime/core/ps4_log.c" \
   -o "$T/log_abort_test"

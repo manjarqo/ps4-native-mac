@@ -432,3 +432,37 @@ func TestNonLocalTransfersAreShimmed(t *testing.T) {
 		t.Errorf("found %d of longjmp, _longjmp, __cxa_throw in libc.prx", found)
 	}
 }
+
+// The libSceAudio3d imports of Uncharted 4 (NIDs from its eboot) and the three extra entry points
+// (NIDs from shadPS4's audio3d.cpp) bind to the shims in libSceAudio3d/ps4_audio3d.c.
+func TestAudio3dShimsByNID(t *testing.T) {
+	cases := []struct{ plain, nid string }{
+		{"sceAudio3dAudioOutClose", "pZlOm1aF3aA"},
+		{"sceAudio3dAudioOutOpen", "ucEsi62soTo"},
+		{"sceAudio3dAudioOutOutputs", "HbxYY27lK6E"},
+		{"sceAudio3dGetDefaultOpenParameters", "Im+jOoa5WAI"},
+		{"sceAudio3dInitialize", "UmCvjSmuZIw"},
+		{"sceAudio3dObjectReserve", "jO2tec4dJ2M"},
+		{"sceAudio3dObjectSetAttributes", "4uyHN9q4ZeU"},
+		{"sceAudio3dObjectUnreserve", "1HXxo-+1qCw"},
+		{"sceAudio3dPortAdvance", "lw0qrdSjZt8"},
+		{"sceAudio3dPortClose", "OyVqOeVNtSk"},
+		{"sceAudio3dPortGetAttributesSupported", "9ZA23Ia46Po"},
+		{"sceAudio3dPortOpen", "XeDDK0xJWQA"},
+		{"sceAudio3dPortPush", "VEVhZ9qd4ZY"},
+		{"sceAudio3dPortSetAttribute", "Yq9bfUQ0uJg"},
+		{"sceAudio3dTerminate", "WW1TS2iz5yc"},
+		{"sceAudio3dPortGetQueueLevel", "YaaDbDwKpFM"},
+		{"sceAudio3dBedWrite", "9tEwE0GV0qo"},
+		{"sceAudio3dBedWrite2", "xH4Q9UILL3o"},
+	}
+	for _, tc := range cases {
+		if nid := elfloader.CalculateNID(tc.plain); nid != tc.nid {
+			t.Fatalf("%s NID=%s want %s", tc.plain, nid, tc.nid)
+		}
+		encoded := tc.nid + "#BA#4"
+		if shim, ok := LookupShim(encoded); !ok || shim != "shim_"+tc.plain {
+			t.Fatalf("LookupShim(%s)=%q ok=%v want shim_%s", encoded, shim, ok, tc.plain)
+		}
+	}
+}
