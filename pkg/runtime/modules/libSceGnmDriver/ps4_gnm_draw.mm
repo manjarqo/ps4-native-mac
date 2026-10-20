@@ -1325,8 +1325,11 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
     bool msl_known = false;
     if (!lib && !stored_fn) msl_known = !StoreMslInDiskCache(mh, msl);
     // MSL compiled in an earlier session is cheap to compile again (Metal's shader cache), so
-    // only new shaders are compiled in the background.
-    if (!lib && !stored_fn && allow_async && S.async_compile && !msl_known) {
+    // only new shaders are compiled in the background. The same MSL already compiling in the
+    // background (another permutation or address of the program, in this session) waits for
+    // that compile instead of compiling it again inside the frame.
+    const bool compiling = !lib && !stored_fn && S.libs_pending.count(mh) != 0;
+    if (!lib && !stored_fn && allow_async && S.async_compile && (!msl_known || compiling)) {
         // Compile the Metal library in the background; draws using this shader are skipped
         // until it is ready instead of stalling the frame (a cold Metal compile can take
         // 100+ ms per shader, and new areas bring dozens at once).
