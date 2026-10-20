@@ -344,6 +344,9 @@ struct H264VtDecoder {
     // more than reorder_depth are held (or a flush), then move to the output queue below.
     H264VtFrame *held;
     int held_count;
+    // Early release (see hold_locked): POC of the last released picture.
+    bool have_last_out;
+    int32_t last_out_poc;
     H264VtFrame *head;
     H264VtFrame *tail;
     int queued;
@@ -358,6 +361,8 @@ static void release_one_locked(H264VtDecoder *d) {
     d->held = f->next;
     d->held_count--;
     f->next = NULL;
+    d->have_last_out = true;
+    d->last_out_poc = f->poc;
     if (d->tail) d->tail->next = f;
     else d->head = f;
     d->tail = f;
@@ -388,7 +393,21 @@ static void sps_dims(const H264SpsInfo *s, uint32_t *w, uint32_t *h) {
 }
 
 // Sorted insert into the reorder list, then releases what exceeds the depth. q_lock held.
+//
+// Besides the depth bound (the most pictures that can precede one in display order), the lowest
+// held picture leaves early when its POC is the last released POC + 1: no picture can fall
+// between two consecutive integers, so this never misorders. VideoToolbox's encoder steps POC by
+// 1 per frame and writes no VUI max_num_reorder_frames, where the bound alone would be
+// MaxDpbFrames (8-16 pictures of delay); x264 steps by 2 but writes the VUI value. An IDR
+// picture starts a new sequence after a full flush and leaves at once.
 static void hold_locked(H264VtDecoder *d, H264VtFrame *f, uint32_t depth) {
+    if (f->au.idr && !d->held) {
+        f->next = NULL;
+        d->held = f;
+        d->held_count = 1;
+        release_one_locked(d);
+        return;
+    }
     // A picture with the same POC goes after the ones already held.
     H264VtFrame **pp = &d->held;
     while (*pp && (*pp)->poc <= f->poc) pp = &(*pp)->next;
@@ -396,6 +415,7 @@ static void hold_locked(H264VtDecoder *d, H264VtFrame *f, uint32_t depth) {
     *pp = f;
     d->held_count++;
     while (d->held_count > (int)depth) release_one_locked(d);
+    while (d->held && d->have_last_out && d->held->poc == d->last_out_poc + 1) release_one_locked(d);
 }
 
 // Queues the picture of the tag's access unit: decoded (image) or an error picture (NULL).
@@ -649,8 +669,16 @@ static bool slice_poc(H264VtDecoder *d, const uint8_t *nal, size_t n, int32_t *p
                 for (uint32_t i = 0; i <= in_cycle; i++) expected += pp->offset_for_ref_frame[i];
             }
             if (!ref) expected += pp->offset_for_non_ref_pic;
-            top = expected + delta0;
-            bot = field ? top : top + pp->offset_for_top_to_bottom_field + delta1;
+            // 8-6..8-10: a frame has both counts; a bottom field alone uses delta[0] plus the
+            // top-to-bottom offset. (Field pictures are decoded but not paired into frames.)
+            if (!field) {
+                top = expected + delta0;
+                bot = top + pp->offset_for_top_to_bottom_field + delta1;
+            } else if (!bottom) {
+                top = bot = expected + delta0;
+            } else {
+                top = bot = expected + pp->offset_for_top_to_bottom_field + delta0;
+            }
         } else {
             int32_t t = idr ? 0 : (int32_t)(2 * (offset + frame_num)) - (ref ? 0 : 1);
             top = bot = t;
