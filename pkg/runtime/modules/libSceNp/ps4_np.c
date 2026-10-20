@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <stdbool.h>
+#include <pthread.h>
 
 // Guest pointer arguments are guest addresses; translate them to host pointers.
 #define NP_GPTR(ctx, a) ((a) ? (void *)((ctx)->mem_base + (a)) : NULL)
@@ -568,18 +570,94 @@ void shim_sceNpMatching2CreateContextA(GuestContext *ctx) {
 // libSceNpSignaling
 //=============================================================================
 
+// Library state: initialised flag and the live contexts with their option flags.
+#define SIGNALING_MAX_CTX 64
+static pthread_mutex_t g_signaling_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool g_signaling_initialized;
+static struct {
+    uint32_t id; // 0 = free slot
+    uint32_t flags;
+} g_signaling_ctx[SIGNALING_MAX_CTX];
+
+static void signaling_ctx_add(uint32_t id) {
+    pthread_mutex_lock(&g_signaling_mutex);
+    for (int i = 0; i < SIGNALING_MAX_CTX; i++) {
+        if (g_signaling_ctx[i].id == 0) {
+            g_signaling_ctx[i].id = id;
+            g_signaling_ctx[i].flags = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_signaling_mutex);
+}
+
+void ps4_np_signaling_ctx_forget(uint32_t id) {
+    pthread_mutex_lock(&g_signaling_mutex);
+    for (int i = 0; i < SIGNALING_MAX_CTX; i++) {
+        if (g_signaling_ctx[i].id == id) g_signaling_ctx[i].id = 0;
+    }
+    pthread_mutex_unlock(&g_signaling_mutex);
+}
+
+// Option flags of a live context, or -1 when the id is not a live context.
+int64_t ps4_np_signaling_ctx_flags(uint32_t id) {
+    int64_t r = -1;
+    pthread_mutex_lock(&g_signaling_mutex);
+    for (int i = 0; i < SIGNALING_MAX_CTX; i++) {
+        if (g_signaling_ctx[i].id == id && id != 0) r = g_signaling_ctx[i].flags;
+    }
+    pthread_mutex_unlock(&g_signaling_mutex);
+    return r;
+}
+
 int32_t sceNpSignalingInitialize(int64_t memorySize, int32_t threadPriority, int32_t cpuAffinityMask, int64_t threadStackSize) {
     (void)memorySize;
     (void)threadPriority;
     (void)cpuAffinityMask;
     (void)threadStackSize;
     NP_LOG("sceNpSignalingInitialize");
+    pthread_mutex_lock(&g_signaling_mutex);
+    g_signaling_initialized = true;
+    pthread_mutex_unlock(&g_signaling_mutex);
     return 0;
 }
 
 int32_t sceNpSignalingTerminate(void) {
     NP_LOG("sceNpSignalingTerminate");
+    pthread_mutex_lock(&g_signaling_mutex);
+    g_signaling_initialized = false;
+    memset(g_signaling_ctx, 0, sizeof(g_signaling_ctx));
+    pthread_mutex_unlock(&g_signaling_mutex);
     return 0;
+}
+
+// int sceNpSignalingSetContextOption(uint32_t ctxId, int optionId, int optionValue)
+//
+// The only option is CONTEXT_OPTION_FLAG (1); its value 0 clears and 1 sets bit 0x2 of the
+// context's flags. Checks in the order of shadPS4 (libraries/np/np_signaling/np_signaling.cpp):
+// library not initialised, unknown context, unknown option id, option value other than 0/1.
+int32_t sceNpSignalingSetContextOption(uint32_t ctxId, int32_t optionId, int32_t optionValue) {
+    int32_t rc = 0;
+    pthread_mutex_lock(&g_signaling_mutex);
+    int idx = -1;
+    for (int i = 0; i < SIGNALING_MAX_CTX && ctxId != 0; i++) {
+        if (g_signaling_ctx[i].id == ctxId) idx = i;
+    }
+    if (!g_signaling_initialized) {
+        rc = (int32_t)ORBIS_NP_SIGNALING_ERROR_NOT_INITIALIZED;
+    } else if (idx < 0) {
+        rc = (int32_t)0x80552705; // CTX_NOT_FOUND
+    } else if (optionId != 1) { // ORBIS_NP_SIGNALING_CONTEXT_OPTION_FLAG
+        rc = (int32_t)ORBIS_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
+    } else if (optionValue == 0) {
+        g_signaling_ctx[idx].flags &= ~0x2u;
+    } else if (optionValue == 1) {
+        g_signaling_ctx[idx].flags |= 0x2u;
+    } else {
+        rc = (int32_t)ORBIS_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
+    }
+    pthread_mutex_unlock(&g_signaling_mutex);
+    return rc;
 }
 
 int32_t sceNpSignalingCreateContext(const void* npId, void* callback, void* callbackArg, uint32_t* outContextId) {
@@ -588,6 +666,7 @@ int32_t sceNpSignalingCreateContext(const void* npId, void* callback, void* call
     (void)callbackArg;
     if (!outContextId) return ORBIS_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
     *outContextId = (uint32_t)(g_signaling_ctx_counter++);
+    signaling_ctx_add(*outContextId);
     NP_LOG("sceNpSignalingCreateContext -> outContextId=%u", *outContextId);
     return 0;
 }
@@ -598,6 +677,7 @@ int32_t sceNpSignalingCreateContextA(int32_t userId, void* callback, void* callb
     (void)callbackArg;
     if (!outContextId) return ORBIS_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
     *outContextId = (uint32_t)(g_signaling_ctx_counter++);
+    signaling_ctx_add(*outContextId);
     NP_LOG("sceNpSignalingCreateContextA -> outContextId=%u", *outContextId);
     return 0;
 }
@@ -614,6 +694,11 @@ void shim_sceNpSignalingTerminate(GuestContext *ctx) {
 
 void shim_sceNpSignalingCreateContext(GuestContext *ctx) {
     ctx->rax = (uint64_t)sceNpSignalingCreateContext((const void*)NP_GPTR(ctx, ctx->rdi), (void*)NP_GPTR(ctx, ctx->rsi), (void*)NP_GPTR(ctx, ctx->rdx), (uint32_t*)NP_GPTR(ctx, ctx->rcx));
+    SHIM_RETURN();
+}
+
+void shim_sceNpSignalingSetContextOption(GuestContext *ctx) {
+    ctx->rax = (uint64_t)(int64_t)sceNpSignalingSetContextOption((uint32_t)ctx->rdi, (int32_t)ctx->rsi, (int32_t)ctx->rdx);
     SHIM_RETURN();
 }
 

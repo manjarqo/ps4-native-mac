@@ -43,6 +43,30 @@ int32_t sceNpProfileDialogOpenA(const OrbisNpProfileDialogParamA *param) {
     return 0;
 }
 
+// int sceNpProfileDialogClose(void)
+//
+// Closes the running dialog. Behaviour as in shadPS4
+// (libraries/np/np_profile_dialog/np_profile_dialog.cpp sceNpProfileDialogClose): before
+// Initialize it is NOT_INITIALIZED, outside RUNNING it is NOT_RUNNING, and for a running
+// dialog it finishes it with result OK (user action OK, as UpdateStatus does for the
+// auto-finishing offline dialog) and returns SCE_OK. The dialog then reads FINISHED.
+int32_t sceNpProfileDialogClose(void) {
+    pthread_mutex_lock(&g_npprofile_mutex);
+    int32_t rc = 0;
+    if (g_npprofile_status == ORBIS_COMMON_DIALOG_STATUS_NONE) {
+        rc = (int32_t)0x80b80003; // NOT_INITIALIZED
+    } else if (g_npprofile_status != ORBIS_COMMON_DIALOG_STATUS_RUNNING) {
+        rc = (int32_t)0x80b8000b; // NOT_RUNNING
+    } else {
+        g_npprofile_result.userData = g_npprofile_user_data;
+        g_npprofile_result.result = 0;
+        g_npprofile_result.userAction = ORBIS_COMMON_DIALOG_RESULT_OK;
+        g_npprofile_status = ORBIS_COMMON_DIALOG_STATUS_FINISHED;
+    }
+    pthread_mutex_unlock(&g_npprofile_mutex);
+    return rc;
+}
+
 OrbisCommonDialogStatus sceNpProfileDialogUpdateStatus(void) {
     pthread_mutex_lock(&g_npprofile_mutex);
     if (g_npprofile_status == ORBIS_COMMON_DIALOG_STATUS_RUNNING) {
@@ -100,6 +124,11 @@ void shim_sceNpProfileDialogOpenA(GuestContext *ctx) {
     ctx->rax = (uint64_t)sceNpProfileDialogOpenA(
         ctx->rdi ? (const OrbisNpProfileDialogParamA *)(ctx->mem_base + ctx->rdi) : NULL
     );
+    SHIM_RETURN();
+}
+
+void shim_sceNpProfileDialogClose(GuestContext *ctx) {
+    ctx->rax = (uint64_t)(int64_t)sceNpProfileDialogClose();
     SHIM_RETURN();
 }
 

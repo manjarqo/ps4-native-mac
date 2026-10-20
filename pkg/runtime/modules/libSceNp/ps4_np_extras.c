@@ -113,6 +113,7 @@ void shim_sceNpSignalingActivateConnection(GuestContext *ctx) {
 
 // int sceNpSignalingDeleteContext(uint32_t ctxId)
 void shim_sceNpSignalingDeleteContext(GuestContext *ctx) {
+    ps4_np_signaling_ctx_forget((uint32_t)ctx->rdi);
     ctx->rax = 0;
     SHIM_RETURN();
 }
