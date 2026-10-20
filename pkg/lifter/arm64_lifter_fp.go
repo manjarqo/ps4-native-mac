@@ -230,8 +230,8 @@ func fpToIntX86(dst, src string, trunc bool) []string {
 		fmt.Sprintf("    eor x1, x1, %s", x), // 0 iff it fits
 		"    clz x1, x1",
 		"    lsr x1, x1, #6",
-		"    sub x1, x1, #1",     // 0 iff it fits, else all ones
-		"    orn x1, x1, x2",     // ... or NaN
+		"    sub x1, x1, #1", // 0 iff it fits, else all ones
+		"    orn x1, x1, x2", // ... or NaN
 		fmt.Sprintf("    bic %s, %s, w1", w, w),
 		"    and w1, w1, #0x80000000",
 		fmt.Sprintf("    orr %s, %s, w1", w, w))
@@ -1186,7 +1186,7 @@ func (l *Arm64Lifter) liftCvtdq(inst disasm.Instruction, nextPC uint64, lines []
 			lines = append(lines, "    ldr d30, [x28, x16]")
 		} else {
 			lines = append(lines, "    ldr q30, [x28, x16]")
-			if (op == x86asm.CVTTPD2DQ || op == x86asm.VCVTTPD2DQ || op == x86asm.CVTPD2PS || op == x86asm.VCVTPD2PS) {
+			if op == x86asm.CVTTPD2DQ || op == x86asm.VCVTTPD2DQ || op == x86asm.CVTPD2PS || op == x86asm.VCVTPD2PS {
 				// If AVX instruction operating on YMM memory (256-bit to 128-bit)
 				// For memory operands, x86asm doesn't have YMM register for src, but we check if dst is YMM or prefix is 256-bit
 				// But CVTTPD2DQ destination is XMM! We check if operand has 256-bit attribute or inst is 256-bit

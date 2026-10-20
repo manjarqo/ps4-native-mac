@@ -442,8 +442,27 @@ void shim_sceKernelIsAddressSanitizerEnabled(GuestContext *ctx) {
 typedef struct GuestGprs {
     uint64_t rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15, rip;
 } GuestGprs;
-_Static_assert(offsetof(GuestContext, rax) == 0 && offsetof(GuestContext, r15) == offsetof(GuestGprs, r15) &&
-               offsetof(GuestContext, fs_base) == sizeof(GuestGprs), "GuestGprs is the start of GuestContext");
+#define GUEST_GPRS_FIELD(f) \
+    _Static_assert(offsetof(GuestGprs, f) == offsetof(GuestContext, f), "GuestGprs." #f " matches GuestContext")
+GUEST_GPRS_FIELD(rax);
+GUEST_GPRS_FIELD(rcx);
+GUEST_GPRS_FIELD(rdx);
+GUEST_GPRS_FIELD(rbx);
+GUEST_GPRS_FIELD(rsp);
+GUEST_GPRS_FIELD(rbp);
+GUEST_GPRS_FIELD(rsi);
+GUEST_GPRS_FIELD(rdi);
+GUEST_GPRS_FIELD(r8);
+GUEST_GPRS_FIELD(r9);
+GUEST_GPRS_FIELD(r10);
+GUEST_GPRS_FIELD(r11);
+GUEST_GPRS_FIELD(r12);
+GUEST_GPRS_FIELD(r13);
+GUEST_GPRS_FIELD(r14);
+GUEST_GPRS_FIELD(r15);
+GUEST_GPRS_FIELD(rip);
+#undef GUEST_GPRS_FIELD
+_Static_assert(offsetof(GuestContext, fs_base) == sizeof(GuestGprs), "GuestGprs is the start of GuestContext");
 
 // What running guest code changes in its GuestContext: the GPRs and rip, the flags, the vector,
 // x87, MXCSR and MMX state (cf up to mmx). fs_base and gs_base in between and everything after
@@ -473,10 +492,13 @@ static uint64_t g_exception_handlers[64] = {0};
 static pthread_mutex_t g_exception_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_sigusr1_installed = false;
 
+// The handler table is indexed by the Orbis signal number; the host SIGUSR1 handler looks its
+// entry up by the host number, which is the same (30 on FreeBSD and macOS).
+_Static_assert(SIGUSR1 == 30, "host SIGUSR1 is Orbis signal 30");
+
 static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     (void)si;
-    (void)ucontext_raw;
-    if (sig != 30) return;
+    if (sig != SIGUSR1) return;
 
     uint64_t handler = __atomic_load_n(&g_exception_handlers[sig], __ATOMIC_ACQUIRE);
     if (!handler) return;
@@ -489,7 +511,7 @@ static void host_sigusr1_handler(int sig, siginfo_t *si, void *ucontext_raw) {
     // guest thread executes: in fiber thread mode it runs on its own host thread, so pass the
     // exception on; in coroutine mode this host thread is between endpoints (a hand-over in
     // progress) and the handler runs on ctx with the slot pointed at it.
-    uint64_t *slot = (uint64_t *)(ctx->mem_base + ctx->fs_base + 0x70ULL);
+    uint64_t *slot = (uint64_t *)(ctx->mem_base + ctx->fs_base + RECOMP_TCB_CTX_SLOT);
     const uint64_t saved_slot = *slot;
     if (saved_slot != (uint64_t)(uintptr_t)ctx && ps4_fiber_threads_mode()) {
         pthread_t target;
@@ -754,80 +776,38 @@ typedef struct OrbisModuleInfoForUnwind {
     uint64_t seg0_size;
 } OrbisModuleInfoForUnwind;
 
-static void populate_segments(const RecompModuleUnwindInfo *mod, OrbisKernelModuleSegmentInfo *segs, uint32_t *count) {
-    if (mod && mod->num_segments > 0) {
-        *count = mod->num_segments > 4 ? 4 : mod->num_segments;
-        for (uint32_t i = 0; i < *count; i++) {
-            segs[i].address = mod->segments[i].addr;
-            segs[i].size = (uint32_t)mod->segments[i].size;
-            segs[i].prot = mod->segments[i].prot;
-        }
-        return;
+// Copies the segments of m (recomp_module_snapshot_segments: the ones the emitter registered)
+// into the console's segment-info layout; returns their number.
+static uint32_t snapshot_segments_out(const RecompModuleSnapshot *m, OrbisKernelModuleSegmentInfo segs[4]) {
+    RecompModuleSegment s[4];
+    const uint32_t n = recomp_module_snapshot_segments(m, s);
+    for (uint32_t i = 0; i < n; i++) {
+        segs[i].address = s[i].addr;
+        segs[i].size = (uint32_t)s[i].size;
+        segs[i].prot = s[i].prot;
     }
-    if (mod && mod->start_addr == 0 && mod->end_addr >= 0x2200000ULL) {
-        // eboot.bin default segments (Code R-X, Rodata R--, Data/BSS RW-)
-        segs[0].address = mod->seg0_addr ? mod->seg0_addr : 0x0ULL;
-        segs[0].size = mod->seg0_size ? (uint32_t)mod->seg0_size : 0x1e07508;
-        segs[0].prot = 5; // PF_R | PF_X
-        segs[1].address = 0x2000000ULL;
-        segs[1].size = 0x71a50;
-        segs[1].prot = 4; // PF_R
-        segs[2].address = 0x2200000ULL;
-        segs[2].size = (uint32_t)(mod->end_addr - 0x2200000ULL);
-        segs[2].prot = 6; // PF_R | PF_W
-        *count = 3;
-        return;
-    }
-    if (mod) {
-        segs[0].address = mod->seg0_addr ? mod->seg0_addr : mod->start_addr;
-        segs[0].size = mod->seg0_size ? (uint32_t)mod->seg0_size : (uint32_t)(mod->end_addr - mod->start_addr);
-        segs[0].prot = 5;
-        *count = 1;
-        if (mod->end_addr > segs[0].address + segs[0].size) {
-            segs[1].address = segs[0].address + segs[0].size;
-            segs[1].size = (uint32_t)(mod->end_addr - segs[1].address);
-            segs[1].prot = 6;
-            *count = 2;
-        }
-        return;
-    }
-    // Fallback if mod is not found
-    segs[0].address = 0x0ULL;
-    segs[0].size = 0x1e07508;
-    segs[0].prot = 5;
-    segs[1].address = 0x2000000ULL;
-    segs[1].size = 0x71a50;
-    segs[1].prot = 4;
-    segs[2].address = 0x2200000ULL;
-    segs[2].size = 0x1e6820;
-    segs[2].prot = 6;
-    *count = 3;
+    return n;
 }
 
 static int fill_module_info_ex(GuestContext *ctx, uint64_t addr, uint64_t info_addr) {
-    if (!info_addr || !ctx->mem_base) return 0x8002000e; // ORBIS_KERNEL_ERROR_EFAULT
-    const RecompModuleUnwindInfo *mod = recomp_module_find_by_addr(addr);
+    if (!info_addr || !ctx->mem_base) return ORBIS_KERNEL_ERROR_EFAULT;
+    RecompModuleSnapshot snap;
+    if (recomp_module_info_by_addr(addr, &snap) != 0) return ORBIS_KERNEL_ERROR_ESRCH;
     OrbisKernelModuleInfoEx *info = (OrbisKernelModuleInfoEx *)(ctx->mem_base + info_addr);
     memset(info, 0, sizeof(*info));
     info->st_size = sizeof(OrbisKernelModuleInfoEx);
-    if (mod && mod->name) {
-        snprintf(info->name, sizeof(info->name), "%s", mod->name);
-    } else {
-        snprintf(info->name, sizeof(info->name), "eboot.bin");
-    }
-    info->id = 1;
-    if (mod) {
-        info->eh_frame_hdr_addr = mod->eh_frame_hdr_addr;
-        info->eh_frame_hdr_size = (uint32_t)mod->eh_frame_hdr_size;
-        info->eh_frame_addr = mod->eh_frame_addr;
-        info->eh_frame_size = (uint32_t)mod->eh_frame_size;
-    }
-    populate_segments(mod, info->segments, &info->segment_count);
+    snprintf(info->name, sizeof(info->name), "%s", snap.name);
+    info->id = snap.handle;
+    info->eh_frame_hdr_addr = snap.eh_frame_hdr_addr;
+    info->eh_frame_hdr_size = (uint32_t)snap.eh_frame_hdr_size;
+    info->eh_frame_addr = snap.eh_frame_addr;
+    info->eh_frame_size = (uint32_t)snap.eh_frame_size;
+    info->segment_count = snapshot_segments_out(&snap, info->segments);
     // Logged on the first call only (unwinding can call this for every frame).
     static int s_logged;
     if (!__atomic_exchange_n(&s_logged, 1, __ATOMIC_RELAXED)) {
-        fprintf(stderr, "[ps4-kernel] GetModuleInfoFromAddr: addr=0x%llx -> mod=%s, num_segments=%u (first call)\n",
-                (unsigned long long)addr, info->name, info->segment_count);
+        fprintf(stderr, "[ps4-kernel] GetModuleInfoFromAddr: addr=0x%llx -> mod=%s (handle %d), num_segments=%u (first call)\n",
+                (unsigned long long)addr, info->name, info->id, info->segment_count);
         for (uint32_t i = 0; i < info->segment_count; i++) {
             fprintf(stderr, "    seg[%u]: addr=0x%llx, size=0x%x, prot=%d\n",
                     i, (unsigned long long)info->segments[i].address, info->segments[i].size, info->segments[i].prot);
@@ -836,18 +816,20 @@ static int fill_module_info_ex(GuestContext *ctx, uint64_t addr, uint64_t info_a
     return 0;
 }
 
+// The first segment of the module containing rsi, to rdx; ESRCH if no module contains it.
 void shim_sceKernelInternalMemoryGetModuleSegmentInfo(GuestContext *ctx) {
     uint64_t seg_out = ctx->rdx;
-    if (seg_out && ctx->mem_base) {
-        const RecompModuleUnwindInfo *mod = recomp_module_find_by_addr(ctx->rsi);
-        OrbisKernelModuleSegmentInfo *seg = (OrbisKernelModuleSegmentInfo *)(ctx->mem_base + seg_out);
-        uint32_t count = 0;
-        OrbisKernelModuleSegmentInfo segs[4];
-        populate_segments(mod, segs, &count);
-        if (count > 0) {
-            *seg = segs[0];
-        }
+    if (!seg_out || !ctx->mem_base) {
+        ctx->rax = (uint64_t)(int64_t)(int32_t)ORBIS_KERNEL_ERROR_EFAULT;
+        SHIM_RETURN();
     }
+    RecompModuleSnapshot snap;
+    OrbisKernelModuleSegmentInfo segs[4];
+    if (recomp_module_info_by_addr(ctx->rsi, &snap) != 0 || snapshot_segments_out(&snap, segs) == 0) {
+        ctx->rax = (uint64_t)(int64_t)(int32_t)ORBIS_KERNEL_ERROR_ESRCH;
+        SHIM_RETURN();
+    }
+    *(OrbisKernelModuleSegmentInfo *)(ctx->mem_base + seg_out) = segs[0];
     ctx->rax = 0;
     SHIM_RETURN();
 }
@@ -865,25 +847,21 @@ void shim_sceKernelGetModuleInfoInternal(GuestContext *ctx) {
         ctx->rax = (uint64_t)(int64_t)0x8002000e; // ORBIS_KERNEL_ERROR_EFAULT
         SHIM_RETURN();
     }
-    const RecompModuleUnwindInfo *mod = recomp_module_find_by_handle(handle);
-    if (!mod) {
+    RecompModuleSnapshot snap;
+    if (recomp_module_info_by_handle(handle, &snap) != 0) {
         ctx->rax = (uint64_t)(int64_t)0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
         SHIM_RETURN();
     }
     OrbisKernelModuleInfoEx *info = (OrbisKernelModuleInfoEx *)(ctx->mem_base + info_addr);
     memset(info, 0, sizeof(*info));
     info->st_size = sizeof(OrbisKernelModuleInfoEx);
-    if (mod->name) {
-        snprintf(info->name, sizeof(info->name), "%s", mod->name);
-    } else {
-        snprintf(info->name, sizeof(info->name), "eboot.bin");
-    }
+    snprintf(info->name, sizeof(info->name), "%s", snap.name);
     info->id = handle;
-    info->eh_frame_hdr_addr = mod->eh_frame_hdr_addr;
-    info->eh_frame_hdr_size = (uint32_t)mod->eh_frame_hdr_size;
-    info->eh_frame_addr = mod->eh_frame_addr;
-    info->eh_frame_size = (uint32_t)mod->eh_frame_size;
-    populate_segments(mod, info->segments, &info->segment_count);
+    info->eh_frame_hdr_addr = snap.eh_frame_hdr_addr;
+    info->eh_frame_hdr_size = (uint32_t)snap.eh_frame_hdr_size;
+    info->eh_frame_addr = snap.eh_frame_addr;
+    info->eh_frame_size = (uint32_t)snap.eh_frame_size;
+    info->segment_count = snapshot_segments_out(&snap, info->segments);
     ctx->rax = 0;
     SHIM_RETURN();
 }

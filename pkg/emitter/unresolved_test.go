@@ -1,6 +1,7 @@
 package emitter
 
 import (
+	"debug/elf"
 	"encoding/binary"
 	"os"
 	"path/filepath"
@@ -20,6 +21,10 @@ const (
 	linkedPlt    = 0x540020
 	linkedGot    = 0x560030
 	linkedTarget = 0x300000 // export of a companion module the linked import resolves to
+	namedPlt     = 0x540030 // unresolved import whose NID the NID database names
+	namedGot     = 0x560040
+	ebootMin     = 0x400000
+	ebootMax     = 0x600000
 )
 
 // unresolvedTestELF builds the image that elfloader.ResolveModuleRelocations leaves for three
@@ -32,15 +37,27 @@ func unresolvedTestELF() *elfloader.LoadedELF {
 	put(unresGlobDat, unresGlobDat)
 	put(shimmedGot, shimmedPlt)
 	put(linkedGot, linkedTarget)
+	put(namedGot, namedPlt)
 	return &elfloader.LoadedELF{
 		FileName:    "eboot.bin",
 		MemoryImage: img,
 		MaxVAddr:    0x600000,
-		ImportLibs:  map[uint16]string{0: "libSceFoo"},
+		// The eboot's own segments (ELF program header flags) and one a merged companion module
+		// (libSceFios2) appended after OrigMaxVAddr, which module info must not report.
+		OrigMinVAddr: ebootMin,
+		OrigMaxVAddr: ebootMax,
+		Segments: []*elfloader.Segment{
+			{Vaddr: ebootMin, Memsz: 0x180000, Flags: elf.PF_R | elf.PF_X},
+			{Vaddr: 0x580000, Memsz: 0x40000, Flags: elf.PF_R},
+			{Vaddr: 0x5c0000, Memsz: 0x40000, Flags: elf.PF_R | elf.PF_W},
+			{Vaddr: 0x800000, Memsz: 0x10000, Flags: elf.PF_R | elf.PF_X},
+		},
+		ImportLibs: map[uint16]string{0: "libSceFoo"},
 		Relocations: []elfloader.Relocation{
 			{Type: elfloader.R_X86_64_JUMP_SLOT, Offset: unresGot, PltAddr: unresPlt, SymName: "AbCdEfGhIjK#A#A"},
 			{Type: elfloader.R_X86_64_GLOB_DAT, Offset: unresGlobDat, SymName: "LmNoPqRsTuV#A#A"},
 			{Type: elfloader.R_X86_64_JUMP_SLOT, Offset: shimmedGot, PltAddr: shimmedPlt, SymName: "memcpy"},
+			{Type: elfloader.R_X86_64_JUMP_SLOT, Offset: namedGot, PltAddr: namedPlt, SymName: "kgOk-kzW+8M#A#A"}, // sceRazorCpuInit
 			{Type: elfloader.R_X86_64_JUMP_SLOT, Offset: linkedGot, PltAddr: linkedPlt, SymName: "WxYzAbCdEfG#A#A"},
 		},
 	}
@@ -67,6 +84,13 @@ func TestUnresolvedImportsAreBound(t *testing.T) {
 		}
 	}
 
+	if em.UnresolvedFuncImports != 2 || em.UnresolvedDataImports != 1 {
+		t.Errorf("unresolved counts: %d calls, %d data, want 2 and 1", em.UnresolvedFuncImports, em.UnresolvedDataImports)
+	}
+	if got := strings.Join(em.UnresolvedDataNames, "|"); got != "LmNoPqRsTuV (libSceFoo)" {
+		t.Errorf("unresolved data import names %q, want LmNoPqRsTuV (libSceFoo)", got)
+	}
+
 	path := filepath.Join(t.TempDir(), "guest_modules.c")
 	if err := em.EmitGuestModules(path); err != nil {
 		t.Fatal(err)
@@ -80,6 +104,8 @@ func TestUnresolvedImportsAreBound(t *testing.T) {
 		`recomp_register_unresolved(0x540000ULL, "AbCdEfGhIjK", "", "libSceFoo");`,
 		`recomp_register_unresolved(0x560000ULL, "AbCdEfGhIjK", "", "libSceFoo");`,
 		`recomp_register_unresolved(0x560010ULL, "LmNoPqRsTuV", "", "libSceFoo");`,
+		`recomp_register_unresolved(0x540030ULL, "kgOk-kzW+8M", "sceRazorCpuInit", "libSceFoo");`,
+		`recomp_register_unresolved(0x560040ULL, "kgOk-kzW+8M", "sceRazorCpuInit", "libSceFoo");`,
 		"recomp_register_fn(0x540000ULL, fn_0x540000);",
 		"recomp_register_fn(0x560000ULL, fn_0x560000);",
 	} {

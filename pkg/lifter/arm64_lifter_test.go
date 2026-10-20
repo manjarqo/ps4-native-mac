@@ -842,9 +842,9 @@ func TestArm64LifterBasic(t *testing.T) {
 			expected: []string{"msr  fpcr, x7", "frintx d28, d28", "msr  fpcr, x5"},
 		},
 		{
-			name:     "vpclmulqdq x0, x1, x2, 0",
-			bytes:    []byte{0xc4, 0xe3, 0x71, 0x44, 0xc2, 0x00},
-			pc:       0x1000,
+			name:  "vpclmulqdq x0, x1, x2, 0",
+			bytes: []byte{0xc4, 0xe3, 0x71, 0x44, 0xc2, 0x00},
+			pc:    0x1000,
 		},
 		{
 			name:     "sar al, 7",
@@ -853,9 +853,9 @@ func TestArm64LifterBasic(t *testing.T) {
 			expected: []string{"sxtb x4, w17", "asr x0, x4, #7", "cmn wzr, w0, lsl #24", "bfi x19, x0, #0, #8"},
 		},
 		{
-			name:     "vpcmpistri x1, x0, 0",
-			bytes:    []byte{0xc4, 0xe3, 0x79, 0x63, 0xc8, 0x00},
-			pc:       0x1000,
+			name:  "vpcmpistri x1, x0, 0",
+			bytes: []byte{0xc4, 0xe3, 0x79, 0x63, 0xc8, 0x00},
+			pc:    0x1000,
 			expected: []string{
 				"stp  x8,  x9,  [sp, #32]",
 				"stp  x10, x11, [sp, #48]",
@@ -869,9 +869,9 @@ func TestArm64LifterBasic(t *testing.T) {
 			},
 		},
 		{
-			name:     "setae byte [rbp - 0x10]",
-			bytes:    []byte{0x0f, 0x93, 0x45, 0xf0},
-			pc:       0x1000,
+			name:  "setae byte [rbp - 0x10]",
+			bytes: []byte{0x0f, 0x93, 0x45, 0xf0},
+			pc:    0x1000,
 			expected: []string{
 				"cset w16, cs",
 				"sub x17, x17, #16",
@@ -1205,6 +1205,3 @@ func TestVectorShiftPreservesFlags(t *testing.T) {
 		t.Errorf("expected PSRLQ to preserve NZCV, got:\n%s", joinedPsrlq)
 	}
 }
-
-
-

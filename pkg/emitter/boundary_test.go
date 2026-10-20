@@ -4,6 +4,7 @@ package emitter
 
 import (
 	"bytes"
+	"debug/elf"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 
 	"golang.org/x/arch/x86/x86asm"
 	"ps4-recomp/pkg/disasm"
+	"ps4-recomp/pkg/elfloader"
 	"ps4-recomp/pkg/lifter"
 )
 
@@ -42,10 +44,11 @@ var boundaryStubs = [][2]string{
 var boundaryOutputChecks = map[string][]string{
 	"profile": {"[stall-profile] samples in recompiled guest code: PC only (no frame chain)\n",
 		"[stall-profile]   unnamed: busy 100%", ": guest_spin 100%\n"},
-	"longjmp":        {"FATAL: guest longjmp(env=0x1000700, val=1) called from 0x0: non-local jumps are not supported"},
-	"unresolved-plt": {"Called unimplemented function NID 'AbCdEfGhIjK' (Lib: libSceFoo) at RIP=0x540000 "},
-	"unresolved-got": {"Called unimplemented function NID 'AbCdEfGhIjK' (Lib: libSceFoo) at RIP=0x560000 "},
-	"crash":          {"In recompiled guest code (guest_crash+0x", "RBX=0xd001 RCX=", " R12=0xd00c R13=0xd00d R14=0xd00e R15=0xd00f "},
+	"longjmp":          {"FATAL: guest longjmp(env=0x1000700, val=1) called from 0x0: non-local jumps are not supported"},
+	"unresolved-named": {"Called unimplemented function 'sceRazorCpuInit' (NID: kgOk-kzW+8M, Lib: libSceFoo) at RIP=0x540030 "},
+	"unresolved-plt":   {"Called unimplemented function NID 'AbCdEfGhIjK' (Lib: libSceFoo) at RIP=0x540000 "},
+	"unresolved-got":   {"Called unimplemented function NID 'AbCdEfGhIjK' (Lib: libSceFoo) at RIP=0x560000 "},
+	"crash":            {"In recompiled guest code (guest_crash+0x", "RBX=0xd001 RCX=", " R12=0xd00c R13=0xd00d R14=0xd00e R15=0xd00f "},
 }
 
 // boundaryStubAddr is the guest address of boundaryStubs[i] (harness.c: STUB_ADDR).
@@ -59,6 +62,8 @@ var boundaryRuntimeSources = []string{
 	"kernel/threading/ps4_stall_profile.c",
 	"modules/libSceFiber/ps4_fiber.c",
 	"modules/libkernel/ps4_kernel_sys.c",
+	"modules/libkernel/ps4_kernel_modules.c",
+	"modules/libkernel/ps4_sysmodule.c",
 }
 
 // liftedHelperFns are guest functions around one instruction the lifter lowers to a runtime
@@ -221,7 +226,10 @@ func buildBoundaryHarness(t *testing.T) string {
 	// guest_modules.c and its synthetic stubs as the emitter writes them for the image of
 	// unresolvedTestELF: recomp_register_guest_modules registers its unresolved imports.
 	modPath := filepath.Join(dir, "guest_modules.c")
-	if err := NewAsmEmitter(unresolvedTestELF(), nil, nil).EmitGuestModules(modPath); err != nil {
+	modEm := NewAsmEmitter(unresolvedTestELF(), nil, nil)
+	modEm.Modules = []GuestModule{{FileName: "libFake.prx", StartAddr: 0x800000, EndAddr: 0x810000,
+		Segments: []*elfloader.Segment{{Vaddr: 0x800000, Memsz: 0x10000, Flags: elf.PF_R | elf.PF_X}}}}
+	if err := modEm.EmitGuestModules(modPath); err != nil {
 		t.Fatal(err)
 	}
 	lifted := filepath.Join(dir, "lifted_gen.s")
@@ -263,7 +271,9 @@ func TestGuestStateBoundary(t *testing.T) {
 		{"stall-profile-in-guest-code", "profile", []string{"PS4_STALL_PROFILE=20"}, false},
 		{"crash-in-guest-code", "crash", nil, true},
 		{"guest-longjmp-stops", "longjmp", nil, true},
+		{"module-info-segments-and-handles", "module-info", nil, false},
 		{"unresolved-import-plt-reports", "unresolved-plt", nil, true},
+		{"unresolved-import-named-reports", "unresolved-named", nil, true},
 		{"unresolved-import-got-reports", "unresolved-got", nil, true},
 		{"exception-in-helper", "signal-in-helper", nil, false},
 		{"exception-after-helper", "signal-after-helper", nil, false},

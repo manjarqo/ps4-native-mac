@@ -94,6 +94,10 @@ void guest_exc_state_handler(void);
 #define HELPER_LOOP_FLAG 0x1000800ULL
 void guest_longjmp(void);
 void recomp_register_guest_modules(void);  // emitted guest_modules.c
+void shim_sceKernelGetModuleList(GuestContext *ctx);
+void shim_sceKernelGetModuleInfo(GuestContext *ctx);
+void shim_sceKernelGetModuleInfo2(GuestContext *ctx);
+void shim_sceKernelGetModuleInfoInternal(GuestContext *ctx);
 #define ADDR_LONGJMP 0x400f00ULL
 #define ADDR_CRASH 0x400e00ULL
 void guest_rip(void);
@@ -624,6 +628,84 @@ static void test_exception_fiber(void) {
   expect("TCB slot", tcb_slot(t1), (uint64_t)(uintptr_t)t1);
 }
 
+
+// Module info of the image boundary_test.go emits (unresolvedTestELF plus a recompiled PRX): the
+// eboot reports its own three segments with the ELF flags (not the merged companion module's),
+// and every handle sceKernelGetModuleList returns works with GetModuleInfo, GetModuleInfo2 and
+// GetModuleInfoInternal.
+#define MI_LIST (D + 0x8000)
+#define MI_COUNT (D + 0x8100)
+#define MI_INFO (D + 0x8200)
+typedef struct { uint64_t address; uint32_t size; int32_t prot; } MiSeg;
+static void expect_seg(const char *what, const MiSeg *s, uint64_t addr, uint32_t size, int32_t prot) {
+  expect(what, s->address, addr);
+  expect(what, s->size, size);
+  expect(what, (uint64_t)s->prot, (uint64_t)prot);
+}
+static void test_module_info(void) {
+  recomp_register_guest_modules();
+  GuestContext *ctx = g_proc;
+  expect("GetModuleList", call_shim(ctx, shim_sceKernelGetModuleList, MI_LIST, 16, MI_COUNT, 0, 0, 0, 0), 0);
+  const uint64_t n = *gmem64(MI_COUNT);
+  const int32_t *list = (const int32_t *)(g_proc->mem_base + MI_LIST);
+  if (n < 2) fail("GetModuleList returned %llu modules, want the eboot and PRXs", (unsigned long long)n);
+  expect("main module handle", (uint64_t)list[0], 0);
+  void (*const shims[3])(GuestContext *) = {shim_sceKernelGetModuleInfo, shim_sceKernelGetModuleInfo2,
+                                            shim_sceKernelGetModuleInfoInternal};
+  const char *const names[3] = {"GetModuleInfo", "GetModuleInfo2", "GetModuleInfoInternal"};
+  for (uint64_t i = 0; i < n; i++) {
+    for (int k = 0; k < 3; k++) {
+      memset(g_proc->mem_base + MI_INFO, 0xee, 1024);
+      *gmem64(MI_INFO) = k == 2 ? 0x1c0 : 0x160;  // st_size, ignored by the shims
+      char what[96];
+      snprintf(what, sizeof what, "%s(handle %d from GetModuleList)", names[k], list[i]);
+      expect(what, call_shim(ctx, shims[k], (uint64_t)(int64_t)list[i], MI_INFO, 0, 0, 0, 0, 0), 0);
+    }
+  }
+  // The eboot: info layout is st_size u64, name[256], segments[4] {u64 addr, u32 size, s32 prot}, u32 count.
+  call_shim(ctx, shim_sceKernelGetModuleInfo, 0, MI_INFO, 0, 0, 0, 0, 0);
+  const MiSeg *seg = (const MiSeg *)(g_proc->mem_base + MI_INFO + 8 + 256);
+  const uint32_t count = *(const uint32_t *)(g_proc->mem_base + MI_INFO + 8 + 256 + 4 * sizeof(MiSeg));
+  expect("eboot segment count", count, 3);
+  expect_seg("eboot text", &seg[0], 0x400000, 0x180000, 5);
+  expect_seg("eboot rodata", &seg[1], 0x580000, 0x40000, 4);
+  expect_seg("eboot data", &seg[2], 0x5c0000, 0x40000, 6);
+  // GetModuleInfoInternal: id, then segments[4] and the count after the eh_frame fields.
+  call_shim(ctx, shim_sceKernelGetModuleInfoInternal, 0, MI_INFO, 0, 0, 0, 0, 0);
+  const uint8_t *ex = g_proc->mem_base + MI_INFO;
+  const MiSeg *xseg = (const MiSeg *)(ex + 8 + 256 + 4 + 4 + 8 + 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4);
+  expect_seg("Internal eboot text", &xseg[0], 0x400000, 0x180000, 5);
+  expect_seg("Internal eboot data", &xseg[2], 0x5c0000, 0x40000, 6);
+
+  // GetModuleInfoFromAddr (same layout as Internal): the id is the module's handle, the segments
+  // its own; an address in no module is ESRCH, as on the console.
+  int32_t prx_handle = -1;
+  for (uint64_t i = 0; i < n; i++) {
+    call_shim(ctx, shim_sceKernelGetModuleInfo, (uint64_t)(int64_t)list[i], MI_INFO, 0, 0, 0, 0, 0);
+    if (strcmp((const char *)ex + 8, "libFake.prx") == 0) prx_handle = list[i];
+  }
+  if (prx_handle <= 0) fail("GetModuleList has no libFake.prx with a PRX handle (got %d)", prx_handle);
+  memset(g_proc->mem_base + MI_INFO, 0xee, 1024);
+  expect("FromAddr(eboot text)", call_shim(ctx, shim_sceKernelGetModuleInfoFromAddr, 0x400100, 0, MI_INFO, 0, 0, 0, 0), 0);
+  expect("FromAddr(eboot) id", (uint64_t)(int64_t)*(const int32_t *)(ex + 8 + 256), 0);
+  expect("FromAddr(eboot) segment count", *(const uint32_t *)((const uint8_t *)xseg + 4 * sizeof(MiSeg)), 3);
+  expect_seg("FromAddr eboot rodata", &xseg[1], 0x580000, 0x40000, 4);
+  memset(g_proc->mem_base + MI_INFO, 0xee, 1024);
+  expect("FromAddr(PRX text)", call_shim(ctx, shim_sceKernelGetModuleInfoFromAddr, 0x800100, 0, MI_INFO, 0, 0, 0, 0), 0);
+  expect("FromAddr(PRX) id", (uint64_t)(int64_t)*(const int32_t *)(ex + 8 + 256), (uint64_t)(int64_t)prx_handle);
+  if (strcmp((const char *)ex + 8, "libFake.prx") != 0) fail("FromAddr(PRX) name %.32s", (const char *)ex + 8);
+  expect("FromAddr(PRX) segment count", *(const uint32_t *)((const uint8_t *)xseg + 4 * sizeof(MiSeg)), 1);
+  expect_seg("FromAddr PRX text", &xseg[0], 0x800000, 0x10000, 5);
+  expect("FromAddr(no module)", call_shim(ctx, shim_sceKernelGetModuleInfoFromAddr, 0x30000000, 0, MI_INFO, 0, 0, 0, 0),
+         (uint64_t)(int64_t)(int32_t)0x80020003);
+  memset(g_proc->mem_base + MI_INFO, 0xee, 1024);
+  expect("SegmentInfo(PRX)", call_shim(ctx, shim_sceKernelInternalMemoryGetModuleSegmentInfo, 0, 0x800100, MI_INFO, 0, 0, 0, 0), 0);
+  expect_seg("SegmentInfo PRX text", (const MiSeg *)ex, 0x800000, 0x10000, 5);
+  expect("SegmentInfo(no module)",
+         call_shim(ctx, shim_sceKernelInternalMemoryGetModuleSegmentInfo, 0, 0x30000000, MI_INFO, 0, 0, 0, 0),
+         (uint64_t)(int64_t)(int32_t)0x80020003);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -701,13 +783,17 @@ int main(int argc, char **argv) {
     // shim_guest_nonlocal_jump reports and aborts; boundary_test.go checks the report.
     recomp_call_guest(g_proc, ADDR_LONGJMP);
     fail("longjmp returned");
-  } else if (strcmp(c, "unresolved-plt") == 0 || strcmp(c, "unresolved-got") == 0) {
+  } else if (strcmp(c, "unresolved-plt") == 0 || strcmp(c, "unresolved-got") == 0 || strcmp(c, "unresolved-named") == 0) {
     // The generated guest_modules.c binds the unresolved import (unresolvedTestELF in
     // unresolved_test.go) to shim_unresolved_stub, which reports its NID and library and aborts;
     // boundary_test.go checks the report.
     recomp_register_guest_modules();
-    recomp_call_guest(g_proc, strcmp(c, "unresolved-plt") == 0 ? 0x540000ULL : 0x560000ULL);
+    recomp_call_guest(g_proc, strcmp(c, "unresolved-plt") == 0   ? 0x540000ULL
+                             : strcmp(c, "unresolved-got") == 0 ? 0x560000ULL
+                                                                : 0x540030ULL);
     fail("the unresolved import returned");
+  } else if (strcmp(c, "module-info") == 0) {
+    test_module_info();
   } else if (strcmp(c, "crash") == 0) {
     // The crash handler reports and exits 1; boundary_test.go checks its report.
     recomp_call_guest(g_proc, ADDR_CRASH);

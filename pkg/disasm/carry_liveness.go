@@ -192,6 +192,13 @@ func shiftImmCount(inst x86asm.Inst) (uint64, bool) {
 	return 0, false
 }
 
+// isOrbisDebugBreak reports whether inst is INT 0x41, which the lifter lowers to a no-op (see
+// the INT case in pkg/lifter/arm64_lifter.go): control continues at the next instruction.
+func isOrbisDebugBreak(inst x86asm.Inst) bool {
+	imm, ok := inst.Args[0].(x86asm.Imm)
+	return inst.Op == x86asm.INT && ok && imm == 0x41
+}
+
 // blockSuccessors returns the start addresses of the blocks control can reach from the end of b
 // inside fn; unknown is true when a successor cannot be determined (indirect jump without a
 // recovered table, fallthrough into an address that is not a block of fn, direct jump to an
@@ -214,6 +221,9 @@ func blockSuccessors(fn *Function, b *BasicBlock, isFunc func(uint64) bool) (suc
 		}
 	}
 	switch op := last.Inst.Op; {
+	case op == x86asm.INT && isOrbisDebugBreak(last.Inst):
+		// INT 0x41 (the Orbis debugger break) is lowered to a no-op and falls through to
+		// nextPC; it is handled like any other instruction below.
 	case op == x86asm.RET || op == x86asm.LRET || op == x86asm.UD2 || op == x86asm.HLT || op == x86asm.INT:
 		return nil, false
 	case op == x86asm.JMP:
