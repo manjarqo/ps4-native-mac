@@ -293,12 +293,8 @@ void PruneOtherConfigs(const std::string& gcn_root, const std::string& keep) {
 void Start(const gcn_profile& profile, const gcn_msl_options& msl) {
     if (C.enabled || getenv("PS4_GNM_NO_SHADER_CACHE") || getenv("PS4_GNM_NO_GCN_CACHE")) return;
     // Same per-title cache root as the MSL cache (ps4_gnm_draw.mm StartShaderWarmup).
-    const char* home = getenv("HOME");
-    if (!home) return;
-    const char* root = ps4_vfs_get_app_root();
-    const char* base = root ? strrchr(root, '/') : nullptr;
-    base = base && base[1] ? base + 1 : "default";
-    const std::string title_dir = std::string(home) + "/Library/Caches/PS4Recomp/" + base;
+    const std::string title_dir = TitleDir();
+    if (title_dir.empty()) return;
     const char* id = gcn_shader_cache_id();
     uint64_t cfg = Fnv(id, strlen(id));
     cfg = Fnv(&kFormat, sizeof(kFormat), cfg);
@@ -358,6 +354,28 @@ void Start(const gcn_profile& profile, const gcn_msl_options& msl) {
 
 bool Enabled() {
     return C.enabled;
+}
+
+std::string TitleDir() {
+    static const std::string dir = [] {
+        std::string r;
+        if (const char* e = getenv("PS4RECOMP_CACHE_DIR"); e && e[0]) {
+            r = e;
+        } else if (const char* home = getenv("HOME"); home && home[0]) {
+            r = std::string(home) + "/Library/Caches/PS4Recomp";
+        } else {
+            return std::string();
+        }
+        while (r.size() > 1 && r.back() == '/') r.pop_back();
+        const char* root = ps4_vfs_get_app_root();
+        const char* base = root ? strrchr(root, '/') : nullptr;
+        base = base && base[1] ? base + 1 : "default";
+        r += "/";
+        r += base;
+        fprintf(stderr, "[gnm-cache] shader caches of this title: %s\n", r.c_str());
+        return r;
+    }();
+    return dir;
 }
 
 uint64_t BudgetBytes(uint64_t default_mb) {

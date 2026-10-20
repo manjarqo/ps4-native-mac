@@ -48,7 +48,6 @@
 #include <vector>
 #include <unistd.h>
 
-extern "C" const char* ps4_vfs_get_app_root(void);
 #include <set>
 
 #include "gcn_recompiler.h"
@@ -71,6 +70,8 @@ extern "C" void ps4_sync_print_stats(int frames);
 // bit 2 = trace the work of the next present ([gnm-trace] lines).
 extern "C" volatile int g_ps4_gnm_dump_request;
 volatile int g_ps4_gnm_dump_request;
+
+extern "C" void ps4_host_quit(int code) __attribute__((noreturn));
 
 namespace ps4draw {
 using namespace ps4gnm;
@@ -546,6 +547,41 @@ struct HitchStats {
 };
 HitchStats g_hitch;
 
+// Session totals of Metal compile work by where it ran (printed with the frame-time lines):
+// synchronous work runs on the CP or encoder thread inside a frame and is what hitches.
+struct CompileCounter {
+    std::atomic<uint64_t> n{0}, us{0}, max_us{0}, over8{0};
+    void Add(double ms) {
+        const uint64_t u = (uint64_t)(ms * 1000.0);
+        n.fetch_add(1, std::memory_order_relaxed);
+        us.fetch_add(u, std::memory_order_relaxed);
+        if (u > 8000) over8.fetch_add(1, std::memory_order_relaxed);
+        for (uint64_t m = max_us.load(std::memory_order_relaxed);
+             u > m && !max_us.compare_exchange_weak(m, u, std::memory_order_relaxed);) {
+        }
+    }
+};
+struct CompileStats {
+    CompileCounter lib_sync, pso_sync, cpso_sync;
+    std::atomic<uint64_t> lib_async{0}, lib_prewarmed{0}, pso_async{0};
+};
+CompileStats g_compile;
+
+void PrintCompileStats() {
+    auto c = [](const CompileCounter& k, char* out, size_t n) {
+        snprintf(out, n, "%llu (%.0f ms, max %.1f ms, %llu over 8 ms)", (unsigned long long)k.n.load(),
+                 k.us.load() / 1000.0, k.max_us.load() / 1000.0, (unsigned long long)k.over8.load());
+    };
+    char a[96], b[96], d[96];
+    c(g_compile.lib_sync, a, sizeof(a));
+    c(g_compile.pso_sync, b, sizeof(b));
+    c(g_compile.cpso_sync, d, sizeof(d));
+    fprintf(stderr, "[gnm-compile] session: libraries in frame %s, in background %llu, from warm-up %llu; "
+                    "render pipelines in frame %s, in background %llu; compute pipelines in frame %s\n",
+            a, (unsigned long long)g_compile.lib_async.load(), (unsigned long long)g_compile.lib_prewarmed.load(), b,
+            (unsigned long long)g_compile.pso_async.load(), d);
+}
+
 bool g_trace_reads = false;
 bool ReadGuest(void* c, uint64_t addr, void* dst, uint64_t size) {
     GuestContext* ctx = (GuestContext*)c;
@@ -964,12 +1000,10 @@ bool StoreMslInDiskCache(uint64_t mh, const char* msl) {
 }
 
 void StartShaderWarmup() {
-    const char* home = getenv("HOME");
-    if (getenv("PS4_GNM_NO_SHADER_CACHE") || !home) return;
-    const char* root = ps4_vfs_get_app_root();
-    const char* base = root ? strrchr(root, '/') : nullptr;
-    base = base && base[1] ? base + 1 : "default";
-    S.msl_cache_dir = std::string(home) + "/Library/Caches/PS4Recomp/" + base + "/msl";
+    if (getenv("PS4_GNM_NO_SHADER_CACHE")) return;
+    const std::string title_dir = ps4gnm_shader_cache::TitleDir();
+    if (title_dir.empty()) return;
+    S.msl_cache_dir = title_dir + "/msl";
     [[NSFileManager defaultManager] createDirectoryAtPath:[NSString stringWithUTF8String:S.msl_cache_dir.c_str()]
                               withIntermediateDirectories:YES attributes:nil error:nil];
     S.pso_list_path = S.msl_cache_dir + "/pipelines.bin";
@@ -1141,6 +1175,7 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
             if (pit != S.prewarmed.end()) {
                 lib = pit->second;
                 S.prewarmed.erase(pit);
+                g_compile.lib_prewarmed++;
                 char path[1200];
                 snprintf(path, sizeof(path), "%s/%016llx.metal", S.msl_cache_dir.c_str(), (unsigned long long)mh);
                 ps4gnm_shader_cache::MarkUsed(path);
@@ -1161,6 +1196,7 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
         const bool first = waiters.empty();
         waiters.push_back(s);
         if (first) {
+            g_compile.lib_async++;
             MTLCompileOptions* opt = [MTLCompileOptions new];
             opt.fastMathEnabled = NO;
             if (@available(macOS 11.0, *)) opt.preserveInvariance = YES;
@@ -1180,6 +1216,7 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
         const double mtl_t0 = CFAbsoluteTimeGetCurrent();
         lib = [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl] options:opt error:&e];
         g_hitch.mtl_ms += (CFAbsoluteTimeGetCurrent() - mtl_t0) * 1000.0;
+        g_compile.lib_sync.Add((CFAbsoluteTimeGetCurrent() - mtl_t0) * 1000.0);
         if (!lib) {
             RLog("msl-fail", "Metal rejected MSL of shader 0x%llx (hw %u): %s",
                  (unsigned long long)code_addr, hw, e.localizedDescription.UTF8String);
@@ -3159,6 +3196,7 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
                                           S.async_psos_ready.fetch_add(1, std::memory_order_release);
                                       }];
             g_hitch.psos++;
+            g_compile.pso_async++;
         }
         return nil;
     }
@@ -3167,6 +3205,7 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
     id<MTLRenderPipelineState> p = [S.dev newRenderPipelineStateWithDescriptor:d error:&e];
     g_hitch.pso_ms += (CFAbsoluteTimeGetCurrent() - pso_t0) * 1000.0;
     g_hitch.psos++;
+    g_compile.pso_sync.Add((CFAbsoluteTimeGetCurrent() - pso_t0) * 1000.0);
     if (p && !known) RememberPipeline(stable);
     // known pipelines missing from the archive are added once (the next session loads them fast)
     if (p && !ps4gnm_pso_archive::Contains(stable)) ps4gnm_pso_archive::Add(stable, d);
@@ -3503,6 +3542,18 @@ bool Init(GuestContext* ctx) {
                                                 options:MTLResourceStorageModeShared deallocator:nil];
         if (!S.gds_buf) S.gds_buf = S.dummy;
         gcn_profile_default_metal(&S.profile);
+        // PS4_GNM_QUIT_AFTER_S=<s> (benchmarks): quit through the normal quit path after <s>
+        // seconds, so the caches are saved as when the player quits (a killed process loses the
+        // pipeline archive additions since its last save).
+        if (const char* q = getenv("PS4_GNM_QUIT_AFTER_S"); q && atof(q) > 0) {
+            const double secs = atof(q);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(secs * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                               fprintf(stderr, "[gnm-draw] PS4_GNM_QUIT_AFTER_S: quitting after %.0f s\n", secs);
+                               PrintCompileStats();
+                               ps4_host_quit(0);
+                           });
+        }
         StartShaderWarmup();
         if (!S.msl_cache_dir.empty()) {
             // PS4_GNM_PSO_ARCHIVE_MB: archive size budget; not a positive number -> 384
@@ -4634,6 +4685,7 @@ void DispatchEncode(DispatchRec& r) {
             if (!pso) pso = [S.dev newComputePipelineStateWithFunction:cs->fn error:&e];
             g_hitch.pso_ms += (CFAbsoluteTimeGetCurrent() - cpso_t0) * 1000.0;
             g_hitch.psos++;
+            g_compile.cpso_sync.Add((CFAbsoluteTimeGetCurrent() - cpso_t0) * 1000.0);
             if (!pso)
                 RLog("cpso-fail", "compute pipeline 0x%llx failed: %s", (unsigned long long)addr,
                      e.localizedDescription.UTF8String);
@@ -4924,7 +4976,7 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                             (unsigned long long)S.present_idx + 1);
                 double host_ms[PS4_HITCH_KINDS];
                 for (int k = 0; k < PS4_HITCH_KINDS; ++k) host_ms[k] = ps4_hitch_take_ns(k) / 1e6;
-                if (dt > 50.0)
+                if (dt > (long_ms > 0 && long_ms < 50.0 ? long_ms : 50.0))
                     fprintf(stderr, "[gnm-draw] hitch: frame %.1f ms; shaders %u (%.1f ms: gcn %.1f, metal %.1f, lookup %.1f, fn %.1f), pipelines %u (%.1f ms), "
                                     "texture uploads %u (%.1f ms), gpu uploads %u, gpu waits %.1f ms, draws waiting for shaders %u; "
                                     "io %.1f, vm %.1f, mtlbuf %.1f, texlock %.1f, shader_fs %.1f ms\n",
@@ -4950,6 +5002,7 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                                 ">33ms %zu, >50ms %zu, >100ms %zu\n",
                         v.size(), pct(0.50), pct(0.95), pct(0.99), v.back(), over33, over50, over100);
                 ps4gnm_shader_cache::PrintStats();
+                PrintCompileStats();
                 intervals.clear();
             }
         }
