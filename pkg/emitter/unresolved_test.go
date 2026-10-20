@@ -57,7 +57,7 @@ func unresolvedTestELF() *elfloader.LoadedELF {
 			{Type: elfloader.R_X86_64_JUMP_SLOT, Offset: unresGot, PltAddr: unresPlt, SymName: "AbCdEfGhIjK#A#A"},
 			{Type: elfloader.R_X86_64_GLOB_DAT, Offset: unresGlobDat, SymName: "LmNoPqRsTuV#A#A"},
 			{Type: elfloader.R_X86_64_JUMP_SLOT, Offset: shimmedGot, PltAddr: shimmedPlt, SymName: "memcpy"},
-			{Type: elfloader.R_X86_64_JUMP_SLOT, Offset: namedGot, PltAddr: namedPlt, SymName: "VjBtg5Btl94#A#A"}, // sceKernelSetFsstParam
+			{Type: elfloader.R_X86_64_JUMP_SLOT, Offset: namedGot, PltAddr: namedPlt, SymName: "kgOk-kzW+8M#A#A"}, // sceRazorCpuInit
 			{Type: elfloader.R_X86_64_JUMP_SLOT, Offset: linkedGot, PltAddr: linkedPlt, SymName: "WxYzAbCdEfG#A#A"},
 		},
 	}
@@ -104,8 +104,8 @@ func TestUnresolvedImportsAreBound(t *testing.T) {
 		`recomp_register_unresolved(0x540000ULL, "AbCdEfGhIjK", "", "libSceFoo");`,
 		`recomp_register_unresolved(0x560000ULL, "AbCdEfGhIjK", "", "libSceFoo");`,
 		`recomp_register_unresolved(0x560010ULL, "LmNoPqRsTuV", "", "libSceFoo");`,
-		`recomp_register_unresolved(0x540030ULL, "VjBtg5Btl94", "sceKernelSetFsstParam", "libSceFoo");`,
-		`recomp_register_unresolved(0x560040ULL, "VjBtg5Btl94", "sceKernelSetFsstParam", "libSceFoo");`,
+		`recomp_register_unresolved(0x540030ULL, "kgOk-kzW+8M", "sceRazorCpuInit", "libSceFoo");`,
+		`recomp_register_unresolved(0x560040ULL, "kgOk-kzW+8M", "sceRazorCpuInit", "libSceFoo");`,
 		"recomp_register_fn(0x540000ULL, fn_0x540000);",
 		"recomp_register_fn(0x560000ULL, fn_0x560000);",
 	} {

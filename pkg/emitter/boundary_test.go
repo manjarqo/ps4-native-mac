@@ -45,7 +45,7 @@ var boundaryOutputChecks = map[string][]string{
 	"profile": {"[stall-profile] samples in recompiled guest code: PC only (no frame chain)\n",
 		"[stall-profile]   unnamed: busy 100%", ": guest_spin 100%\n"},
 	"longjmp":          {"FATAL: guest longjmp(env=0x1000700, val=1) called from 0x0: non-local jumps are not supported"},
-	"unresolved-named": {"Called unimplemented function 'sceKernelSetFsstParam' (NID: VjBtg5Btl94, Lib: libSceFoo) at RIP=0x540030 "},
+	"unresolved-named": {"Called unimplemented function 'sceRazorCpuInit' (NID: kgOk-kzW+8M, Lib: libSceFoo) at RIP=0x540030 "},
 	"unresolved-plt":   {"Called unimplemented function NID 'AbCdEfGhIjK' (Lib: libSceFoo) at RIP=0x540000 "},
 	"unresolved-got":   {"Called unimplemented function NID 'AbCdEfGhIjK' (Lib: libSceFoo) at RIP=0x560000 "},
 	"crash":            {"In recompiled guest code (guest_crash+0x", "RBX=0xd001 RCX=", " R12=0xd00c R13=0xd00d R14=0xd00e R15=0xd00f "},
