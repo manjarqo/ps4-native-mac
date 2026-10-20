@@ -1099,18 +1099,13 @@ static void ProcessComputePackets(GuestContext *ctx, const uint32_t *words, uint
             case PM4_OP_INDIRECT_BUFFER: {
                 const uint32_t *ib = nullptr;
                 uint32_t ib_dw = 0;
-                if (ps4gnm_ib::IsChained(payload, payload_dw)) {
+                // chained inside an IB: continue in the new buffer and do not return. At ring
+                // level (read_ptr set) the CP returns to the ring, so the packet is a call.
+                if (ps4gnm_ib::ChainReplacesTop(ps4gnm_ib::IsChained(payload, payload_dw), read_ptr != nullptr)) {
                     if (!DecodeIndirectBuffer(ctx, payload, payload_dw, &ib, &ib_dw)) break;
-                    // chained: continue in the new buffer and do not return. The ring read
-                    // pointer only tracks the top-level ring: it ends past this packet.
-                    if (read_ptr && ring_size_dw)
-                        __atomic_store_n(read_ptr, (read_base_dw + pc + 1 + payload_dw) % ring_size_dw,
-                                         __ATOMIC_SEQ_CST);
                     words = ib;
                     dw = ib_dw;
                     pc = 0;
-                    read_ptr = nullptr;
-                    ring_size_dw = 0;
                     continue;
                 }
                 if (depth >= kMaxIbDepth) {

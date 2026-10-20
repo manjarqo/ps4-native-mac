@@ -25,11 +25,20 @@ inline bool IsChained(const uint32_t *payload, uint32_t payload_dw) {
     return payload_dw >= 3 && ((payload[2] >> 20) & 1u) != 0;
 }
 
+// Whether an INDIRECT_BUFFER packet replaces the buffer that holds it. CHAIN means "do not
+// return to this IB"; a ring is not an IB, so the CP always returns to the ring after the IB
+// (a CHAIN bit on a ring-level packet makes it a plain call).
+inline bool ChainReplacesTop(bool chain, bool top_is_ring) {
+    return chain && !top_is_ring;
+}
+
 // Enters the IB [ib, ib + ib_dw) after the top frame has consumed the packet: a chained IB
 // replaces the top frame, a call pushes a new frame unless the nesting limit is reached.
+// bottom_is_ring: frames[0] is a ring (compute queue), not a submitted command buffer.
 // Returns false when the call is skipped.
-inline bool Enter(std::vector<Frame> &frames, const uint32_t *ib, uint32_t ib_dw, bool chain) {
-    if (chain && !frames.empty()) {
+inline bool Enter(std::vector<Frame> &frames, const uint32_t *ib, uint32_t ib_dw, bool chain,
+                  bool bottom_is_ring = false) {
+    if (!frames.empty() && ChainReplacesTop(chain, bottom_is_ring && frames.size() == 1)) {
         frames.back() = {ib, ib_dw, 0};
         return true;
     }

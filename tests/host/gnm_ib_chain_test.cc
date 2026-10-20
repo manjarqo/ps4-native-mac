@@ -32,8 +32,10 @@ static void Ib(std::vector<uint32_t> &b, uint32_t target, uint32_t size_dw, bool
     b.push_back(size_dw | (chain ? 1u << 20 : 0u));
 }
 
-// Walks the buffers like ProcessGfxPackets: returns the markers in execution order.
-static std::vector<uint32_t> Walk(const std::vector<uint32_t> &arena, uint32_t start, uint32_t size_dw) {
+// Walks the buffers like ProcessGfxPackets (ring: like ProcessComputePackets on a compute
+// ring, which returns from an IB even when it is chained): the markers in execution order.
+static std::vector<uint32_t> Walk(const std::vector<uint32_t> &arena, uint32_t start, uint32_t size_dw,
+                                  bool ring = false) {
     std::vector<uint32_t> seen;
     std::vector<ps4gnm_ib::Frame> frames{{arena.data() + start, size_dw, 0}};
     while (!frames.empty() && seen.size() < 1000) {
@@ -47,7 +49,8 @@ static std::vector<uint32_t> Walk(const std::vector<uint32_t> &arena, uint32_t s
         const uint32_t *p = f.words + f.pc + 1;
         f.pc += 1 + n;
         if (op == kOpNop) seen.push_back(p[0]);
-        if (op == kOpIb) ps4gnm_ib::Enter(frames, arena.data() + p[0], p[2] & 0xFFFFF, ps4gnm_ib::IsChained(p, n));
+        if (op == kOpIb)
+            ps4gnm_ib::Enter(frames, arena.data() + p[0], p[2] & 0xFFFFF, ps4gnm_ib::IsChained(p, n), ring);
     }
     return seen;
 }
@@ -101,6 +104,32 @@ int main() {
         a[s1 + 5] = 2 | 1u << 20; // size 2, chained
         const std::vector<uint32_t> seen = Walk(a, 0, main_dw);
         check(seen == std::vector<uint32_t>({1, 2, 3, 4}), "chain inside a call: no return into the chunk, back to the caller");
+    }
+    // Compute ring: a CHAIN bit on a ring-level IB is a call (the CP returns to the ring), so
+    // the ring packets after it still run; inside that IB a chain replaces the IB.
+    {
+        std::vector<uint32_t> a;
+        Marker(a, 1);
+        Ib(a, 0, 0, true); // ring-level chained IB -> s1, patched below
+        Marker(a, 5);      // must run (the walker used to stop the ring segment here)
+        const uint32_t ring_dw = (uint32_t)a.size();
+        const uint32_t s1 = (uint32_t)a.size();
+        Marker(a, 2);
+        Ib(a, 0, 0, true); // chained inside the IB -> s2
+        Marker(a, 77);     // after a chain inside an IB: never runs
+        const uint32_t s2 = (uint32_t)a.size();
+        Marker(a, 3);
+        a[3] = s1;
+        a[5] = (s2 - s1) | 1u << 20;
+        a[s1 + 3] = s2;
+        a[s1 + 5] = 2 | 1u << 20;
+        check(Walk(a, 0, ring_dw, true) == std::vector<uint32_t>({1, 2, 3, 5}),
+              "compute ring: chained ring-level IB returns to the ring, chain inside it does not");
+        check(Walk(a, 0, ring_dw, false) == std::vector<uint32_t>({1, 2, 3}),
+              "submitted command buffer: a chained IB at the top level ends it");
+        check(!ps4gnm_ib::ChainReplacesTop(true, true) && ps4gnm_ib::ChainReplacesTop(true, false) &&
+                  !ps4gnm_ib::ChainReplacesTop(false, false),
+              "ChainReplacesTop: only a chain inside an IB replaces it");
     }
     // Calls nested deeper than the limit are skipped (cycle guard): a buffer that calls itself.
     {
