@@ -149,6 +149,19 @@ static void test_format_local(void) {
         (char *)mem + 0x100);
 }
 
+// sceRtcFormatRFC3339 with an explicit zone does not depend on the host zone and matches the
+// local-time formatter's text.
+static void test_format_explicit_zone(void) {
+  setenv("TZ", "America/St_Johns", 1);
+  tzset();
+  OrbisRtcTick tick = {1792413296ULL * 1000000 + 789012};
+  char buf[64];
+  CHECK(sceRtcFormatRFC3339(buf, &tick, 0) == 0 && strcmp(buf, "2026-10-19T12:34:56.78Z") == 0, "UTC: '%s'", buf);
+  CHECK(sceRtcFormatRFC3339(buf, &tick, 180) == 0 && strcmp(buf, "2026-10-19T15:34:56.78+03:00") == 0, "+03:00: '%s'", buf);
+  CHECK(sceRtcFormatRFC3339(buf, &tick, -210) == 0 && strcmp(buf, "2026-10-19T09:04:56.78-03:30") == 0, "-03:30: '%s'", buf);
+  CHECK(sceRtcFormatRFC3339(NULL, &tick, 0) != 0, "NULL buffer");
+}
+
 static void test_set_time_t_shim(void) {
   static uint8_t mem[0x10000];
   GuestContext ctx;
@@ -186,6 +199,7 @@ static void test_set_time_t_shim(void) {
 int main(void) {
   test_set_time_t();
   test_format_local();
+  test_format_explicit_zone();
   test_set_time_t_shim();
   fflush(stdout);
   if (g_failures) {
