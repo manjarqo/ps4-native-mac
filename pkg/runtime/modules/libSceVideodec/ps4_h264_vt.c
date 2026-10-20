@@ -908,11 +908,28 @@ H264VtFrame *h264vt_pop(H264VtDecoder *d) {
     return f;
 }
 
-const H264VtFrame *h264vt_peek(H264VtDecoder *d) {
+int h264vt_pop_fitting(H264VtDecoder *d, uint64_t capacity, uint64_t extra, H264VtFrame **out,
+                       uint64_t *need) {
+    *out = NULL;
     pthread_mutex_lock(&d->q_lock);
-    const H264VtFrame *f = d->head;
+    H264VtFrame *f = d->head;
+    if (!f) {
+        pthread_mutex_unlock(&d->q_lock);
+        return H264VT_POP_EMPTY;
+    }
+    const uint64_t n = h264vt_nv12_size(f->width, f->height) + extra;
+    if (need) *need = n;
+    if (capacity < n) {
+        pthread_mutex_unlock(&d->q_lock);
+        return H264VT_POP_TOO_SMALL;
+    }
+    d->head = f->next;
+    if (!d->head) d->tail = NULL;
+    d->queued--;
+    f->next = NULL;
     pthread_mutex_unlock(&d->q_lock);
-    return f;
+    *out = f;
+    return H264VT_POP_OK;
 }
 
 int h264vt_queued(H264VtDecoder *d) {

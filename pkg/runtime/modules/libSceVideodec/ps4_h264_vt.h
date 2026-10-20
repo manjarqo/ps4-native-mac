@@ -123,9 +123,13 @@ int h264vt_finish(H264VtDecoder *d);
 void h264vt_reset(H264VtDecoder *d);
 
 H264VtFrame *h264vt_pop(H264VtDecoder *d);
-// The oldest queued picture without removing it (NULL if none). Only the consumer that pops may
-// use the result, and only until its next pop.
-const H264VtFrame *h264vt_peek(H264VtDecoder *d);
+// Pops the oldest queued picture only if h264vt_nv12_size() of it plus `extra` fits in
+// `capacity`; the check and the pop are one step under the queue lock, so a concurrent reset or
+// pop cannot free the picture in between. *need (may be NULL) receives the size required.
+#define H264VT_POP_OK 0
+#define H264VT_POP_EMPTY 1
+#define H264VT_POP_TOO_SMALL 2
+int h264vt_pop_fitting(H264VtDecoder *d, uint64_t capacity, uint64_t extra, H264VtFrame **out, uint64_t *need);
 int h264vt_queued(H264VtDecoder *d);
 void h264vt_frame_free(H264VtFrame *f);
 

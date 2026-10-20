@@ -668,9 +668,12 @@ static int32_t vdecsw_TrySyncDecodeOutput(GuestContext *ctx, Vdecsw *d) {
         pthread_mutex_unlock(&d->lock);
         return VDECSW_ERROR_OUTPUT_BUFFER_EMPTY;
     }
-    // Only this call (under d->lock) pops, so the peeked picture stays valid until the pop.
-    const H264VtFrame *peek = h264vt_peek(d->core);
-    if (!peek) {
+    // Size check and pop in one step: ResetDecoder can drop the queue at any time (it holds
+    // only in_lock), so a picture must never be looked at outside the queue lock before it is ours.
+    H264VtFrame *f = NULL;
+    uint64_t need = 0;
+    const int pr = h264vt_pop_fitting(d->core, d->output.frame_buffer_size, sizeof(VdecswAvcPictureInfo), &f, &need);
+    if (pr == H264VT_POP_EMPTY) {
         int32_t rc = VDECSW_ERROR_DECODE_PENDING;
         if (d->finalized) {
             info->is_last_frame = 1;
@@ -680,19 +683,17 @@ static int32_t vdecsw_TrySyncDecodeOutput(GuestContext *ctx, Vdecsw *d) {
         pthread_mutex_unlock(&d->lock);
         return rc;
     }
-    const uint64_t frame_size = h264vt_nv12_size(peek->width, peek->height);
-    if (d->output.frame_buffer_size < frame_size + sizeof(VdecswAvcPictureInfo)) {
+    if (pr == H264VT_POP_TOO_SMALL) {
         // The picture and the output buffer both stay; the guest can retry with a larger
         // buffer only after a reset, as on hardware an oversized stream is an error.
         static int warned;
         if (warned++ < 8)
-            fprintf(stderr, "[libSceVdecsw] %ux%u picture does not fit the frame buffer (0x%llx < 0x%llx)\n", peek->width,
-                    peek->height, (unsigned long long)d->output.frame_buffer_size,
-                    (unsigned long long)(frame_size + sizeof(VdecswAvcPictureInfo)));
+            fprintf(stderr, "[libSceVdecsw] picture does not fit the frame buffer (0x%llx < 0x%llx)\n",
+                    (unsigned long long)d->output.frame_buffer_size, (unsigned long long)need);
         pthread_mutex_unlock(&d->lock);
         return VDECSW_ERROR_FRAME_BUFFER_SIZE;
     }
-    H264VtFrame *f = h264vt_pop(d->core);
+    const uint64_t frame_size = h264vt_nv12_size(f->width, f->height);
     const VdecswFrameBuffer fb = d->output;
     d->have_output = false;
     const bool last = d->finalized && h264vt_queued(d->core) == 0;
