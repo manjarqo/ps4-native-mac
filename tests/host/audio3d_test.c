@@ -365,6 +365,7 @@ static void test_pacing(void) {
            PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
   CHECK_EQ(ps4_audio3d_audioout_open(3, 0xFF, 0, 0, 256, 48000, PS4_AUDIO_OUT_FMT_FLOAT_STEREO),
            PS4_AUDIO3D_ERROR_INVALID_PORT);
+  CHECK_EQ(ps4_audio3d_audioout_open(port, 0xFF, 0, 0, 256, 48000, 0x20), PS4_AUDIO3D_ERROR_INVALID_PARAMETER);
   int32_t h = ps4_audio3d_audioout_open(port, 0xFF, 0, 0, 256, 48000, PS4_AUDIO_OUT_FMT_FLOAT_STEREO);
   CHECK(h > 0);
   static float st[256 * 2];

@@ -84,6 +84,9 @@
 //   object, NOT_READY for full queues, uninitialised library and double
 //   Initialize, NOT_SUPPORTED as above. A failing ObjectSetAttributes applies
 //   nothing (all attributes are validated first) [I].
+//   AudioOutOpen with an unknown data format is INVALID_PARAMETER; other
+//   failures of the underlying AudioOut open (e.g. PORT_FULL) pass through as
+//   AudioOut codes [I].
 //
 // Mixing: see ps4_audio3d_mix.c (pairwise constant-power 7.1 panner). The
 //   port mixes in 7.1; libSceAudioOut folds it to the stereo host device.
@@ -863,7 +866,7 @@ int32_t ps4_audio3d_audioout_open(uint32_t port_id, int32_t user_id, int32_t typ
     if (slot == A3D_MAX_ASSOC) {
       r = PS4_AUDIO3D_ERROR_OUT_OF_RESOURCES;
     } else if (bytes == 0) {
-      r = PS4_AUDIO_OUT_ERROR_INVALID_FORMAT;
+      r = PS4_AUDIO3D_ERROR_INVALID_PARAMETER; // unknown AudioOut data format
     } else {
       A3dAssoc *a = &p->assoc[slot];
       uint8_t *pend = (uint8_t *)realloc(a->pending, (size_t)bytes * p->queue_depth);
