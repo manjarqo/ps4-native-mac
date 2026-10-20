@@ -87,6 +87,9 @@ func TestUnresolvedImportsAreBound(t *testing.T) {
 	if em.UnresolvedFuncImports != 2 || em.UnresolvedDataImports != 1 {
 		t.Errorf("unresolved counts: %d calls, %d data, want 2 and 1", em.UnresolvedFuncImports, em.UnresolvedDataImports)
 	}
+	if got := strings.Join(em.UnresolvedDataNames, "|"); got != "LmNoPqRsTuV (libSceFoo)" {
+		t.Errorf("unresolved data import names %q, want LmNoPqRsTuV (libSceFoo)", got)
+	}
 
 	path := filepath.Join(t.TempDir(), "guest_modules.c")
 	if err := em.EmitGuestModules(path); err != nil {

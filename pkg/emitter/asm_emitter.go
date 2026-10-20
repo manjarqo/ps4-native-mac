@@ -83,6 +83,9 @@ type AsmEmitter struct {
 	// bound to the same stub, so reading it as data yields the stub's address).
 	UnresolvedFuncImports int
 	UnresolvedDataImports int
+	// UnresolvedDataNames lists the unresolved data imports, sorted, each as its name (the NID
+	// when the NID database does not know it) and importing library.
+	UnresolvedDataNames []string
 	// Warnings collects generation-time problems that do not stop the generation (the caller
 	// prints them in its summary).
 	Warnings []string
@@ -118,8 +121,9 @@ const unresolvedStubShim = "shim_unresolved_stub"
 // (or at itself when there is no PLT) when neither a module export nor the canary applies, and
 // the emitter binds a host shim to the slots it can serve. What is left would jump to itself
 // forever, so it is routed to shim_unresolved_stub with its name instead.
-func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]string) (out map[uint64]unresolvedImport, funcs, data int) {
+func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]string) (out map[uint64]unresolvedImport, funcs, data int, dataNames []string) {
 	out = make(map[uint64]unresolvedImport)
+	seenData := make(map[string]bool)
 	for _, rel := range loaded.Relocations {
 		switch rel.Type {
 		case elfloader.R_X86_64_JUMP_SLOT, elfloader.R_X86_64_GLOB_DAT, elfloader.R_X86_64_64:
@@ -136,14 +140,25 @@ func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]st
 		if slot != rel.Offset && (rel.PltAddr == 0 || slot != rel.PltAddr) {
 			continue
 		}
+		imp := unresolvedImport{nid: elfloader.NIDPrefix(rel.SymName), lib: loaded.LibraryForNID(rel.SymName)}
+		if canon, ok := elfloader.ResolveNID(rel.SymName); ok {
+			imp.name = canon
+		}
 		if rel.Type == elfloader.R_X86_64_JUMP_SLOT {
 			funcs++
 		} else {
 			data++
-		}
-		imp := unresolvedImport{nid: elfloader.NIDPrefix(rel.SymName), lib: loaded.LibraryForNID(rel.SymName)}
-		if canon, ok := elfloader.ResolveNID(rel.SymName); ok {
-			imp.name = canon
+			label := imp.name
+			if label == "" {
+				label = imp.nid
+			}
+			if imp.lib != "" {
+				label += " (" + imp.lib + ")"
+			}
+			if !seenData[label] {
+				seenData[label] = true
+				dataNames = append(dataNames, label)
+			}
 		}
 		for _, addr := range []uint64{rel.PltAddr, rel.Offset} {
 			if addr == 0 {
@@ -157,7 +172,8 @@ func collectUnresolvedImports(loaded *elfloader.LoadedELF, shimMap map[uint64]st
 			}
 		}
 	}
-	return out, funcs, data
+	slices.Sort(dataNames)
+	return out, funcs, data, dataNames
 }
 
 // NewAsmEmitter creates a new ARM64 assembly emitter.
@@ -204,7 +220,7 @@ func NewAsmEmitter(loaded *elfloader.LoadedELF, d *disasm.Disassembler, l *lifte
 		bindAddr(sym.Name, sym.Address)
 	}
 
-	unresolved, unresFuncs, unresData := collectUnresolvedImports(loaded, shimMap)
+	unresolved, unresFuncs, unresData, unresDataNames := collectUnresolvedImports(loaded, shimMap)
 	for addr := range unresolved {
 		shimMap[addr] = unresolvedStubShim
 	}
@@ -218,6 +234,7 @@ func NewAsmEmitter(loaded *elfloader.LoadedELF, d *disasm.Disassembler, l *lifte
 
 		UnresolvedFuncImports: unresFuncs,
 		UnresolvedDataImports: unresData,
+		UnresolvedDataNames:   unresDataNames,
 	}
 }
 
