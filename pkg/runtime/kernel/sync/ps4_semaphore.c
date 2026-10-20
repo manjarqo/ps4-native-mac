@@ -191,8 +191,8 @@ void shim_sem_timedwait(GuestContext *ctx) {
   while (s->value <= 0 && s->magic == SEM_MAGIC) {
     if (!timed) {
       pthread_cond_wait(&s->cond, &s->mutex);
-    } else if (pthread_cond_timedwait(&s->cond, &s->mutex, &deadline) == ETIMEDOUT) {
-      break;
+    } else if (pthread_cond_timedwait(&s->cond, &s->mutex, &deadline) != 0) {
+      break; // ETIMEDOUT, or an error that would otherwise spin (EINVAL): report a timeout
     }
   }
   if (s->magic != SEM_MAGIC) { // destroyed while waiting
