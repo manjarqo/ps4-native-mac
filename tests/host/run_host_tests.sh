@@ -69,6 +69,15 @@ clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/boot_hle_test.c" "$M
   "$M/libSceNp/ps4_np_extras.c" "$M/libSceNpProfileDialog/ps4_np_profile_dialog.c" "$M/libSceNet/ps4_net.c" \
   "$M/libSceNetCtl/ps4_netctl.c" "$M/libSceHttp/ps4_http.c" "$M/libSceNoopStubs/ps4_noop_stubs.c" -o "$T/boot_hle_test"
 "$T/boot_hle_test" 2>/dev/null
+
+# H.264 through libSceVdecsw and libSceVideodec on the shared VideoToolbox core: a stream made
+# by VideoToolbox's encoder (with B-frames) must come out complete, in display order, with the
+# right OutputInfo / picture-info fields.
+V="$R/pkg/runtime/modules/libSceVideodec"
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address -I "$R/pkg/runtime/core" -I "$V" "$R/tests/host/vdecsw_test.c" \
+  "$R/pkg/runtime/modules/libSceVdecsw/ps4_vdecsw.c" "$V/ps4_videodec.c" "$V/ps4_h264_vt.c" -framework VideoToolbox \
+  -framework CoreMedia -framework CoreVideo -framework CoreFoundation -o "$T/vdecsw_test"
+"$T/vdecsw_test"
 G="$R/pkg/runtime/modules/libSceGnmDriver"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
