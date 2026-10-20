@@ -41,7 +41,7 @@ static int32_t g_np_auth_counter = 1;
 static int32_t g_score_req_counter = 1;
 static int32_t g_tus_req_counter = 1;
 static int32_t g_matching_ctx_counter = 1;
-static int32_t g_signaling_ctx_counter = 1;
+static _Atomic int32_t g_signaling_ctx_counter = 1;
 static int32_t g_webapi_user_ctx_counter = 1;
 static int64_t g_webapi_req_counter = 1;
 
@@ -579,16 +579,20 @@ static struct {
     uint32_t flags;
 } g_signaling_ctx[SIGNALING_MAX_CTX];
 
-static void signaling_ctx_add(uint32_t id) {
+// Registers a new context; false when all slots are used (the console's context limit).
+static bool signaling_ctx_add(uint32_t id) {
+    bool ok = false;
     pthread_mutex_lock(&g_signaling_mutex);
     for (int i = 0; i < SIGNALING_MAX_CTX; i++) {
         if (g_signaling_ctx[i].id == 0) {
             g_signaling_ctx[i].id = id;
             g_signaling_ctx[i].flags = 0;
+            ok = true;
             break;
         }
     }
     pthread_mutex_unlock(&g_signaling_mutex);
+    return ok;
 }
 
 void ps4_np_signaling_ctx_forget(uint32_t id) {
@@ -665,8 +669,11 @@ int32_t sceNpSignalingCreateContext(const void* npId, void* callback, void* call
     (void)callback;
     (void)callbackArg;
     if (!outContextId) return ORBIS_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
-    *outContextId = (uint32_t)(g_signaling_ctx_counter++);
-    signaling_ctx_add(*outContextId);
+    *outContextId = (uint32_t)atomic_fetch_add(&g_signaling_ctx_counter, 1);
+    if (!signaling_ctx_add(*outContextId)) {
+        *outContextId = 0;
+        return (int32_t)0x80552712; // ORBIS_NP_SIGNALING_ERROR_CTX_MAX
+    }
     NP_LOG("sceNpSignalingCreateContext -> outContextId=%u", *outContextId);
     return 0;
 }
@@ -676,8 +683,11 @@ int32_t sceNpSignalingCreateContextA(int32_t userId, void* callback, void* callb
     (void)callback;
     (void)callbackArg;
     if (!outContextId) return ORBIS_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
-    *outContextId = (uint32_t)(g_signaling_ctx_counter++);
-    signaling_ctx_add(*outContextId);
+    *outContextId = (uint32_t)atomic_fetch_add(&g_signaling_ctx_counter, 1);
+    if (!signaling_ctx_add(*outContextId)) {
+        *outContextId = 0;
+        return (int32_t)0x80552712; // ORBIS_NP_SIGNALING_ERROR_CTX_MAX
+    }
     NP_LOG("sceNpSignalingCreateContextA -> outContextId=%u", *outContextId);
     return 0;
 }

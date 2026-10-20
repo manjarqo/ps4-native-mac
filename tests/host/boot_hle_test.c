@@ -104,6 +104,21 @@ static void test_np_signaling(void) {
   CHECK(sceNpSignalingCreateContextA(1, NULL, NULL, &id) == 0, "createA");
   CHECK(sceNpSignalingTerminate() == 0, "terminate");
   CHECK(call(shim_sceNpSignalingSetContextOption, id, 1, 1) == NOT_INITIALIZED, "after terminate");
+
+  // The context table is finite: the console's CTX_MAX instead of an id that no option call finds.
+  CHECK(sceNpSignalingInitialize(0, 0, 0, 0) == 0, "init");
+  int ok = 0;
+  uint32_t last = 0;
+  for (int i = 0; i < 200; i++) {
+    int32_t rc = sceNpSignalingCreateContext(NULL, NULL, NULL, &last);
+    if (rc != 0) {
+      CHECK(rc == (int32_t)0x80552712 && last == 0, "table full: rc=0x%x out=%u", (unsigned)rc, last);
+      break;
+    }
+    ok++;
+  }
+  CHECK(ok == 64, "64 contexts fit, got %d", ok);
+  CHECK(sceNpSignalingTerminate() == 0, "terminate");
 }
 
 static void test_profile_dialog(void) {
@@ -143,6 +158,17 @@ static void test_https_load_cert(void) {
   CHECK(call(shim_sceHttpsLoadCert, (uint64_t)http, 0, 0) == INVALID_ID, "terminated context");
   CHECK(sceHttpTerm(http2) == 0, "term 2");
   CHECK(call(shim_sceHttpsLoadCert, (uint64_t)http2, 0, 0) == BEFORE_INIT, "no library again");
+
+  // A full context table reports out-of-memory instead of an id LoadCert would not know.
+  int32_t ids[300];
+  int n = 0;
+  for (; n < 300; n++) {
+    ids[n] = sceHttpInit(1, 1, 0x10000);
+    if (ids[n] < 0) break;
+  }
+  CHECK(n == 256 && ids[n] == (int32_t)0x80431022, "256 contexts fit, then out of memory: n=%d rc=0x%x", n, (unsigned)ids[n < 300 ? n : 299]);
+  for (int i = 0; i < n; i++) sceHttpTerm(ids[i]);
+  CHECK(sceHttpInit(1, 1, 0x10000) > 0, "slots are reusable");
 }
 
 static void test_netctl_net(void) {

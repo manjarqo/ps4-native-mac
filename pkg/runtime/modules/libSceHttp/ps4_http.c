@@ -34,16 +34,19 @@ int32_t sceHttpInit(int32_t libnetMemId, int32_t libsslCtxId, uint64_t poolSize)
     (void)libsslCtxId;
     (void)poolSize;
     int32_t id = alloc_http_id();
+    bool stored = false;
     pthread_mutex_lock(&g_http_mutex);
     for (int i = 0; i < HTTP_MAX_CTX; i++) {
         if (g_http_ctx[i].id == 0) {
             g_http_ctx[i].id = id;
             g_http_ctx[i].custom_ca = false;
+            stored = true;
             break;
         }
     }
     pthread_mutex_unlock(&g_http_mutex);
-    return id;
+    // All slots used: the console's answer when its context pool is exhausted.
+    return stored ? id : (int32_t)0x80431022; // ORBIS_HTTP_ERROR_OUT_OF_MEMORY
 }
 
 int32_t sceHttpTerm(int32_t libhttpCtxId) {
@@ -62,7 +65,8 @@ int32_t sceHttpTerm(int32_t libhttpCtxId) {
 // This runtime's libSceHttp never opens a network connection (requests fail with a network
 // error), so there is no TLS handshake the certificates could be used in; what remains
 // observable is the call's validation and the per-context record that custom CAs were
-// supplied (ps4_http_ctx_has_custom_ca). Checks as in shadPS4
+// supplied (ps4_http_ctx_has_custom_ca). No runtime path reads that flag today: the request
+// functions never reach a TLS layer, so it is state for a future network implementation. Checks as in shadPS4
 // (libraries/network/http.cpp sceHttpsLoadCert): no initialised library is BEFORE_INIT, an
 // unknown context id is INVALID_ID. The certificate blobs are not parsed.
 int32_t sceHttpsLoadCert(int32_t libhttpCtxId, int32_t caCertNum, const void **caList, const void *cert,
