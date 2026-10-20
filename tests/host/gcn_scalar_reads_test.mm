@@ -7,7 +7,9 @@
 //  2. s_buffer_load_dword past the V#'s num_records must read 0, as on GCN. Uncharted 4's tiled
 //     lighting takes its per-tile light count this way; reading past the end ran a loop for
 //     seconds and the GPU watchdog killed the command buffer.
-//  3. A compute shader dumped from Uncharted 4 (data/u4_cs_blur.*: a blur whose weights are read
+//  3. A pointer read at such an offset cannot be followed without direct memory access: the
+//     reads through it are not flattened. That must be logged as an error, not dropped silently.
+//  4. A compute shader dumped from Uncharted 4 (data/u4_cs_blur.*: a blur whose weights are read
 //     at s[0:1] + 72 + 4 * i) translates without SRT walker errors, and its weights come from a
 //     guest buffer based at the pointer it reads through.
 //
@@ -55,6 +57,24 @@ struct Guest {
         auto* g = static_cast<Guest*>(ctx);
         if (addr < kGuestBase || addr + size > kGuestBase + kGuestSize) return false;
         std::memcpy(dst, g->p(addr), size);
+        return true;
+    }
+};
+
+// Guest memory for compile-only tests (no Metal buffer).
+struct FakeGuest {
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> regions;
+    void Add(uint64_t base, const void* p, size_t n) {
+        regions.push_back({base, std::vector<uint8_t>((const uint8_t*)p, (const uint8_t*)p + n)});
+    }
+    static bool Read(void* ctx, uint64_t addr, void* dst, uint64_t size) {
+        for (const auto& [base, data] : static_cast<FakeGuest*>(ctx)->regions) {
+            if (addr >= base && addr + size <= base + data.size()) {
+                std::memcpy(dst, data.data() + (addr - base), size);
+                return true;
+            }
+        }
+        std::memset(dst, 0, size); // the table itself: pointers read as 0
         return true;
     }
 };
@@ -157,22 +177,30 @@ void TestHandWritten(id<MTLDevice> dev) {
     //   v_mov_b32 v0, 0
     //   buffer_store_dword v1, v0, s[4:7], 0
     //   buffer_store_dword v2, v0, s[4:7], 0 offset:4
+    //   s_movk_i32 s20, 0
+    //   s_buffer_load_dwordx4 s[16:19], s[8:11], s20 ; SGPR byte offset; dwords 2-3 past the end
+    //   s_waitcnt lgkmcnt(0)
+    //   v_mov_b32 v3..v6, s16..s19
+    //   buffer_store_dword v3..v6, v0, s[4:7], 0 offset:8..20
     //   s_endpgm
     const auto prog = WithFooter({0xB00C0000, 0xB00D0000, 0xC007000C, 0xBF8C007F, 0x800D0E0D, 0x800C840C,
                                   0xBF0A900C, 0xBF85FFFA, 0xC2078904, 0xBF8C007F, 0x7E02020D, 0x7E04020F,
-                                  0x7E000280, 0xE0700000, 0x80010100, 0xE0700004, 0x80010200, 0xBF810000},
+                                  0x7E000280, 0xE0700000, 0x80010100, 0xE0700004, 0x80010200, 0xB0140000,
+                                  0xC2880814, 0xBF8C007F, 0x7E060210, 0x7E080211, 0x7E0A0212, 0x7E0C0213,
+                                  0xE0700008, 0x80010300, 0xE070000C, 0x80010400, 0xE0700010, 0x80010500,
+                                  0xE0700014, 0x80010600, 0xBF810000},
                                  0x5CA1A2EAD5000001ULL);
     std::memcpy(g.p(code), prog.data(), prog.size() * 4);
     g.Put32(table, {1000, 200, 30, 4, 0x55555555}); // the loop sums the first four
-    g.Put32(small, {7, 8, 0, 0, 0xDEADBEEF});       // dword 4 lies past num_records
-    g.Put32(out, {0xFFFFFFFF, 0xFFFFFFFF});
+    g.Put32(small, {7, 8, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF}); // num_records 8: dwords 2.. are past it
+    g.Put32(out, {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF});
 
     gcn_profile prof;
     gcn_profile_default_metal(&prof);
     gcn_runtime_info rt{};
     rt.hw_stage = GCN_HW_CS;
     rt.sw_stage = GCN_SW_COMPUTE;
-    rt.num_allocated_vgprs = 4;
+    rt.num_allocated_vgprs = 8;
     rt.num_user_data = 12;
     rt.cs.workgroup_size[0] = rt.cs.workgroup_size[1] = rt.cs.workgroup_size[2] = 1;
     gcn_compile_desc d{};
@@ -196,10 +224,59 @@ void TestHandWritten(id<MTLDevice> dev) {
     if (!sh) return;
     CHECK(g_log.find("Failed to compute offset") == std::string::npos, "SRT walker error:\n%s", g_log.c_str());
     CHECK(RunCompute(dev, g, sh, d.user_data), "hand-written CS did not run");
-    uint32_t r[2];
-    std::memcpy(r, g.p(out), 8);
+    uint32_t r[6];
+    std::memcpy(r, g.p(out), sizeof(r));
     CHECK(r[0] == 1234, "s_load_dword with a loop-counter offset: sum %u, expected 1234", r[0]);
     CHECK(r[1] == 0, "s_buffer_load_dword past num_records read 0x%08x, expected 0", r[1]);
+    CHECK(r[2] == 7 && r[3] == 8 && r[4] == 0 && r[5] == 0,
+          "s_buffer_load_dwordx4 (SGPR offset) straddling num_records read %08x %08x %08x %08x, expected 7 8 0 0",
+          r[2], r[3], r[4], r[5]);
+    gcn_shader_destroy(sh);
+}
+
+void TestLostPointerLogged() {
+    FakeGuest mem;
+    const uint64_t code = kGuestBase, table = kGuestBase + 0x1000;
+    //   v_readfirstlane_b32 s12, v0        ; offset only the shader knows
+    //   s_load_dwordx2 s[16:17], s[0:1], s12
+    //   s_waitcnt lgkmcnt(0)
+    //   s_load_dword s18, s[16:17], 0      ; read through that pointer
+    //   s_waitcnt lgkmcnt(0)
+    //   v_mov_b32 v1, s18
+    //   v_mov_b32 v0, 0
+    //   buffer_store_dword v1, v0, s[4:7], 0
+    //   s_endpgm
+    const auto prog = WithFooter({0x7E180500, 0xC048000C, 0xBF8C007F, 0xC0091100, 0xBF8C007F, 0x7E020212,
+                                  0x7E000280, 0xE0700000, 0x80010100, 0xBF810000},
+                                 0x5CA1A2EAD5000002ULL);
+    mem.Add(code, prog.data(), prog.size() * 4);
+    gcn_profile prof;
+    gcn_profile_default_metal(&prof);
+    gcn_runtime_info rt{};
+    rt.hw_stage = GCN_HW_CS;
+    rt.sw_stage = GCN_SW_COMPUTE;
+    rt.num_allocated_vgprs = 4;
+    rt.num_user_data = 8;
+    rt.cs.workgroup_size[0] = rt.cs.workgroup_size[1] = rt.cs.workgroup_size[2] = 1;
+    gcn_compile_desc d{};
+    d.hw_stage = GCN_HW_CS;
+    d.sw_stage = GCN_SW_COMPUTE;
+    d.code_addr = code;
+    d.user_data[0] = uint32_t(table);
+    d.user_data[1] = uint32_t(table >> 32);
+    VSharp(&d.user_data[4], kGuestBase + 0x3000, 64);
+    d.runtime = &rt;
+    d.profile = &prof;
+    d.read_guest = FakeGuest::Read;
+    d.read_ctx = &mem;
+    d.flags = GCN_COMPILE_EMIT_MSL;
+    g_log.clear();
+    gcn_shader* sh = nullptr;
+    char err[512] = {};
+    const gcn_status st = gcn_compile(&d, &sh, err, sizeof(err));
+    CHECK(st == GCN_OK && sh, "lost-pointer CS does not compile: %s", err);
+    CHECK(g_log.find("SRT pointer read at an offset only the shader knows") != std::string::npos,
+          "a pointer read at a shader-only offset was not logged; log:\n%s", g_log.c_str());
     gcn_shader_destroy(sh);
 }
 
@@ -296,6 +373,7 @@ int main(int argc, char** argv) {
         }
         gcn_set_log_callback(LogSink, nullptr);
         TestHandWritten(dev);
+        TestLostPointerLogged();
         TestU4Blur(dev, argc > 1 ? argv[1] : ".");
         if (g_fail) return 1;
         std::printf("gcn_scalar_reads_test: PASS\n");
