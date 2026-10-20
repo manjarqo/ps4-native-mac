@@ -568,6 +568,21 @@ gcn_shader* Lookup(const Key& key, uint64_t code_addr, const uint32_t ud[16], gc
                 if (test(i)) break;
         }
         C.compared += compared;
+        static const bool verify_index = getenv("PS4_GNM_GCN_INDEX_VERIFY") != nullptr;
+        if (verify_index) {
+            // Debug (PS4_GNM_GCN_INDEX_VERIFY): the index must pick what a scan over every entry
+            // with gcn_shader_is_compatible picks.
+            const gcn_shader* scan = nullptr;
+            for (const Entry& e : b.entries)
+                if (SameKey(e.key, key) && gcn_shader_is_compatible(e.tmpl, ud, &key.rt, read, ctx)) {
+                    scan = e.tmpl;
+                    break;
+                }
+            if (scan != found)
+                fprintf(stderr, "[gnm-cache] verify: index lookup %s, a scan %s (bucket %016llx, %zu entries, %s)\n",
+                        found ? "hit" : "missed", scan ? "hits" : "misses", (unsigned long long)key.bucket,
+                        b.entries.size(), mi ? "indexed" : "not indexed");
+        }
     }
     gcn_shader* hit = nullptr;
     if (found) {
