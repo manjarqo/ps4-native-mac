@@ -15,6 +15,8 @@
 
 #include "gcn_recompiler.h"
 
+#include <fmt/format.h>
+
 #include "api/gcn_msl.h"
 #include "api/gcn_shader_internal.h"
 #include "common/assert.h"
@@ -1061,6 +1063,74 @@ bool SameResourceLayout(const Info& a, const Info& b) {
            SameSrt(a, b);
 }
 } // namespace
+
+GCN_API bool gcn_shader_explain_mismatch(const gcn_shader* s, const uint32_t user_data[16],
+                                         const gcn_runtime_info* runtime, gcn_read_guest_fn read,
+                                         void* ctx, char* out, size_t out_size) {
+    auto put = [&](const std::string& m) {
+        if (out && out_size) {
+            std::snprintf(out, out_size, "%s", m.c_str());
+        }
+    };
+    put("");
+    if (!s || !user_data || !runtime) {
+        put("bad arguments");
+        return true;
+    }
+    try {
+        GcnShim::GuestMemoryScope scope{read, ctx};
+        std::array<u32, 16> ud;
+        std::memcpy(ud.data(), user_data, 64);
+        RuntimeInfo rt{};
+        if (!ToRuntimeInfo(*runtime, rt, nullptr)) {
+            put("runtime info not convertible");
+            return true;
+        }
+        Info tmp = s->info;
+        tmp.user_data = std::span<const u32>(ud);
+        tmp.RefreshFlatBuf();
+        const StageSpecialization spec(tmp, rt, s->profile, Backend::Bindings{});
+        const StageSpecialization& have = s->spec;
+        if (have == spec) {
+            return false;
+        }
+        if (!(have.runtime_info == spec.runtime_info)) {
+            put("runtime info");
+        } else if (have.vs_attribs != spec.vs_attribs) {
+            put("vertex attributes");
+        } else if (have.fetch_shader_data != spec.fetch_shader_data) {
+            put("fetch shader");
+        } else if (have.buffers.size() != spec.buffers.size() || have.images.size() != spec.images.size() ||
+                   have.samplers.size() != spec.samplers.size()) {
+            put("resource counts");
+        } else {
+            for (size_t i = 0; i < spec.buffers.size(); ++i) {
+                const auto& a = have.buffers[i];
+                const auto& b = spec.buffers[i];
+                if (!(a == b)) {
+                    put(fmt::format("buffer {}: stride {}/{} misalign {}/{} formatted {}/{} fmt {}/{} {}/{} "
+                                    "swizzle {}/{}",
+                                    i, u32(a.stride), u32(b.stride), u32(a.misalign), u32(b.misalign),
+                                    u32(a.is_formatted), u32(b.is_formatted), u32(a.data_format),
+                                    u32(b.data_format), u32(a.num_format), u32(b.num_format),
+                                    u32(a.swizzle_enable), u32(b.swizzle_enable)));
+                    return true;
+                }
+            }
+            for (size_t i = 0; i < spec.images.size(); ++i) {
+                if (!(have.images[i] == spec.images[i])) {
+                    put(fmt::format("image {}: type {}/{}", i, u32(have.images[i].type), u32(spec.images[i].type)));
+                    return true;
+                }
+            }
+            put("samplers, fmasks or bindings");
+        }
+        return true;
+    } catch (...) {
+        put("exception");
+        return true;
+    }
+}
 
 GCN_API bool gcn_shader_same_srt(const gcn_shader* a, const gcn_shader* b) {
     return a && b && (a == b || SameSrt(a->info, b->info));

@@ -8,7 +8,8 @@
 //     renderer's cap of 48 and then skipped the draws). It must be found.
 //  2. gcn_shader_same_srt tells whether the flattened user data built for one permutation can be
 //     bound for another (the renderer's StageFlat reuse).
-//  3. The push constants: the MSL struct the translated shaders declare must be exactly
+//  3. gcn_shader_explain_mismatch names why a permutation does not fit a draw (debug log).
+//  4. The push constants: the MSL struct the translated shaders declare must be exactly
 //     ps4gnm_push::kBindBytes long, with gcn_push_data's member offsets (Metal reflection).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -143,6 +144,13 @@ void TestPermutationsWithAnotherSrtProgram() {
           ib.num_buffers, ia.flatbuf_size_dw, ib.flatbuf_size_dw);
     CHECK(!gcn_shader_is_compatible(sa, ud, &rt, Guest::Read, &g), "A must not fit the current memory (stride 12)");
     CHECK(gcn_shader_is_compatible(sb, ud, &rt, Guest::Read, &g), "B must fit the current memory");
+    // the renderer's diagnostic for programs with many permutations names the differing part
+    char why[256];
+    CHECK(gcn_shader_explain_mismatch(sa, ud, &rt, Guest::Read, &g, why, sizeof(why)) &&
+              std::string(why).find("stride 32/12") != std::string::npos,
+          "explain_mismatch for A: \"%s\", expected the stride 32/12 difference", why);
+    CHECK(!gcn_shader_explain_mismatch(sb, ud, &rt, Guest::Read, &g, why, sizeof(why)) && why[0] == 0,
+          "explain_mismatch for the fitting B: \"%s\"", why);
 
     CHECK(gcn_shader_same_srt(sa, sa), "a shader has its own SRT program");
     CHECK(!gcn_shader_same_srt(sa, sb), "programs reading the table at different offsets have different SRT programs");

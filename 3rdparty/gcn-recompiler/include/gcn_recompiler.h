@@ -505,6 +505,13 @@ GCN_API int gcn_shader_find_compatible_flat(const gcn_shader* const* list, uint3
                                             size_t flatbuf_dw, const gcn_runtime_info* runtime,
                                             gcn_read_guest_fn read, void* ctx);
 
+/* Debug: why gcn_shader_is_compatible() refuses s for a draw: the first differing part of the
+ * specialization ("buffer 2: stride 12 vs 32", ...), written to out. Returns false if s is
+ * compatible (out = ""). */
+GCN_API bool gcn_shader_explain_mismatch(const gcn_shader* s, const uint32_t user_data[16],
+                                         const gcn_runtime_info* runtime, gcn_read_guest_fn read,
+                                         void* ctx, char* out, size_t out_size);
+
 /* True if a and b flatten user data the same way (same SRT walker program and flattened size),
  * so the flattened user data built for one is valid for the other. */
 GCN_API bool gcn_shader_same_srt(const gcn_shader* a, const gcn_shader* b);

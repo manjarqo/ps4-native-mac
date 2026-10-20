@@ -473,6 +473,7 @@ struct State {
     // caches
     std::unordered_map<uint64_t, std::vector<Shader*>> shaders;
     std::unordered_set<uint64_t> shader_fail;
+    std::unordered_set<uint64_t> async_retry; // fail_keys whose worker translation failed: retried on the CP thread
     std::unordered_map<uint64_t, id<MTLLibrary>> libs;
     // Asynchronous shader/pipeline compilation: Metal completion handlers push results here and
     // the submitting thread applies them (DrainAsyncCompiles) before each draw/dispatch.
@@ -507,6 +508,8 @@ struct State {
     };
     std::vector<std::shared_ptr<GcnJob>> async_gcn_done;
     std::unordered_set<uint64_t> gcn_pending;
+    // programs (GetShader key) with a worker translation in flight: one per program, see GetShader
+    std::unordered_set<uint64_t> gcn_pending_prog;
     Shader pending_shader; // returned while a translation is in flight (fn == nil)
     // Shaders made ready ahead of time by the warm-up threads, by MSL hash: functions loaded from
     // the library store (fn) or libraries compiled from the on-disk MSL cache (lib). h2 is the
@@ -1510,10 +1513,14 @@ void DrainAsyncCompiles() {
     }
     for (auto& j : jobs) {
         S.gcn_pending.erase(j->pend_key);
+        S.gcn_pending_prog.erase(j->key);
         if (!j->sh) {
-            RLog("compile-fail", "shader 0x%llx (hw %u) failed to compile: status %d: %s",
+            // The worker read the draw's memory later than the draw (it may hold another draw's
+            // sharps by then): translate it again on the CP thread at the next draw, and only
+            // give up if that fails too.
+            RLog("compile-fail-async", "shader 0x%llx (hw %u) failed to compile on the worker: status %d: %s",
                  (unsigned long long)j->code_addr, j->hw, j->status, j->err.c_str());
-            S.shader_fail.insert(j->fail_key);
+            S.async_retry.insert(j->fail_key);
             continue;
         }
         if (Shader* fs = FinishShader(j->sh, j->hw, j->code_addr, j->key, j->fail_key, true, CFAbsoluteTimeGetCurrent()))
@@ -1822,6 +1829,15 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
             hit = gcn_shader_find_compatible(list, n, ud, &rt, ReadGuest, S.ctx);
         }
         if (hit >= 0) return vec[order[hit]];
+        if (n == 8 || n == 16 || n == 32 || n == 47) {
+            // Many permutations of one program: say why the first and the latest do not fit.
+            char why0[256], why1[256];
+            gcn_shader_explain_mismatch(vec[base]->sh, ud, &rt, ReadGuest, S.ctx, why0, sizeof(why0));
+            gcn_shader_explain_mismatch(vec[n - 1]->sh, ud, &rt, ReadGuest, S.ctx, why1, sizeof(why1));
+            fprintf(stderr, "[gnm-draw] shader 0x%llx (hw %u) has %u permutations; no fit: base %u%s: %s; latest%s: %s\n",
+                    (unsigned long long)code_addr, hw, n, base, vec[base]->from_worker ? " (worker)" : "", why0,
+                    vec[n - 1]->from_worker ? " (worker)" : "", why1);
+        }
     }
     const uint64_t fail_key = Fnv(&rt, sizeof(rt), key * 1000003ull);
     if (S.shader_fail.count(fail_key)) return nullptr;
@@ -1892,7 +1908,13 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
     // game rewrites per draw, so read later they likely belong to another draw (a copy of the
     // existing permutation's SRT reads did not cover them). New programs, the bulk of a new
     // area, still go to the worker.
-    if (allow_async && S.async_compile && vec.empty()) {
+    if (allow_async && S.async_compile && vec.empty() && !S.async_retry.count(fail_key)) {
+        // One worker translation per program: the draws of a new program differ in user data,
+        // and one job per draw (cold cache, a busy first frame) made dozens of permutations from
+        // memory read after their draws; none fitted, and Uncharted 4's UI vertex shader hit
+        // the cap of 48 ("too many permutations", ~400 skipped draws per frame). The other draws
+        // wait for the first translation; further permutations are then made on this thread.
+        if (!S.gcn_pending_prog.insert(key).second) return &S.pending_shader;
         // Translate GCN -> MSL on a worker thread (1-2 ms per shader, but new areas bring
         // hundreds at once); draws using it are skipped until the result is applied.
         S.gcn_pending.insert(pend_key);
