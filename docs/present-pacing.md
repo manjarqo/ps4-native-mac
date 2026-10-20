@@ -45,9 +45,15 @@ Code: `pkg/runtime/modules/libSceVideoOut/ps4_metal_screen.m` (presenter), `ps4_
   frames, so latency is bounded at about 3 frames. A slot is freed when the presenter's command buffer
   completes. The wait has a 1 s timeout; after it the frame is dropped and the game keeps running. The
   wait is counted as `backpressure` and in the encoder's "ms screen".
-- **CPU present paths** (`present_frame` and `present_texture`, used for guest-memory display buffers)
-  first drain the presenter queue (up to 1 s), then present synchronously as before, so frames stay in
-  order.
+- **Guest-memory display buffers** (U4 today) are shown when the buffer is not a GPU target. The encoder
+  used to `Commit` + `WaitAll` and then detile and present synchronously on the encoder thread, so a
+  seconds-long GPU job held up encoding and the event pump. Now it commits and hands the frame to a
+  serial "gnm.cpu-present" queue. That queue waits for the frame's last command buffer (with the GPU
+  watchdog timeout), detiles, presents through `present_frame` and completes the flip. While such a
+  frame is pending, the flips of GPU-presented frames go through the same queue, so the flip order is
+  kept. `PS4_GNM_SYNC_CPU_PRESENT=1` restores the synchronous path. `present_frame` and `present_texture`
+  first drain the presenter queue (up to 1 s, and not at all after a timeout until it is idle again), so
+  frames stay in order.
 
 ## Screenshots and capture
 

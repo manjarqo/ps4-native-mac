@@ -4794,12 +4794,50 @@ extern "C" int ps4_gnm_read_display_cpu(GuestContext* ctx, uint64_t addr, uint32
 
 void PresentFromGuestMemory(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
                             uint32_t tiling_mode, uint32_t pixel_format) {
-    static std::vector<uint8_t> buf;
+    thread_local std::vector<uint8_t> buf; // the encoder and the CPU present queue both come here
     buf.resize((size_t)width * height * 4);
     if (ps4_gnm_read_display_cpu(ctx, addr, width, height, pitch, tiling_mode, pixel_format, buf.data()))
         ps4_metal_screen_present_frame(buf.data(), (size_t)width * 4, (int)width, (int)height);
     else
         ps4_metal_screen_present_frame(ctx->mem_base + addr, (size_t)pitch * 4, (int)width, (int)height);
+}
+
+// Display buffers that are not GPU targets are read from guest memory once the GPU work
+// written so far has finished. That wait, the CPU detile and the synchronous present run on
+// this serial queue instead of the encoder thread, so a long GPU job does not hold up command
+// encoding (and the event pump the encoder drives). Flips complete on this queue in order; while
+// such a frame is pending, the flips of GPU-presented frames are routed through it as well.
+dispatch_queue_t CpuPresentQueue() {
+    static dispatch_queue_t q = dispatch_queue_create(
+        "gnm.cpu-present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    return q;
+}
+std::atomic<int> g_cpu_present_pending{0};
+
+// Encoder thread: commits the frame's work and queues the guest-memory present behind it.
+void PresentFromGuestMemoryAsync(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
+                                 uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done) {
+    Commit();
+    id<MTLCommandBuffer> last = S.inflight.empty() ? nil : S.inflight.back(); // the queue completes in order
+    const double timeout_ms = S.gpu_timeout_ms;
+    auto done = std::make_shared<std::function<void()>>(std::move(on_done));
+    g_cpu_present_pending.fetch_add(1);
+    dispatch_async(CpuPresentQueue(), ^{
+        double waited = 0;
+        while (last && last.status < MTLCommandBufferStatusCompleted && waited < timeout_ms) {
+            usleep(200);
+            waited += 0.2;
+        }
+        if (last && last.status < MTLCommandBufferStatusCompleted) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true))
+                fprintf(stderr, "[gnm-draw] CPU present: command buffer %s did not complete in %.0f ms; presenting "
+                                "guest memory as it is\n", last.label.UTF8String, timeout_ms);
+        }
+        PresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format);
+        if (*done) (*done)();
+        g_cpu_present_pending.fetch_sub(1);
+    });
 }
 
 bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
@@ -4842,7 +4880,13 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
             RLog("present-miss", "display buffer 0x%llx is not a GPU target (draws %llu dispatches %llu skipped %llu)",
                  (unsigned long long)addr, (unsigned long long)S.n_draws, (unsigned long long)S.n_dispatches,
                  (unsigned long long)S.n_skipped);
-            // the caller reads guest memory on the CPU: let all GPU work land first
+            // the frame is read from guest memory on the CPU once all GPU work has landed: on the
+            // CPU present queue when the encoder thread runs (the caller would wait here otherwise)
+            static const bool dbg_sync_cpu = getenv("PS4_GNM_SYNC_CPU_PRESENT") != nullptr;
+            if (encq::t_worker && !dbg_sync_cpu) {
+                PresentFromGuestMemoryAsync(ctx, addr, width, height, pitch, tiling_mode, pixel_format, std::move(on_done));
+                return true;
+            }
             Commit();
             WaitAll();
             return false;
@@ -4900,7 +4944,15 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
         if (ps4_metal_screen_encode_present((__bridge void*)S.cmd, (__bridge void*)dst) != 0)
             RLog("present-screen", "the Metal screen could not take the frame");
         S.screen_ms += (CFAbsoluteTimeGetCurrent() - tp0) * 1000.0; // includes waiting for a present slot
-        if (on_done) AfterGpu(std::move(on_done));
+        if (on_done) {
+            if (g_cpu_present_pending.load() > 0) {
+                // keep flips in order behind the guest-memory presents still queued
+                auto f = std::make_shared<std::function<void()>>(std::move(on_done));
+                AfterGpu([f] { dispatch_async(CpuPresentQueue(), ^{ (*f)(); }); });
+            } else {
+                AfterGpu(std::move(on_done));
+            }
+        }
         Commit();
         static const bool writeback_all = getenv("PS4_GNM_WRITEBACK_ALL") != nullptr;
         if (writeback_all) { // experiment: make every GPU surface CPU-visible
