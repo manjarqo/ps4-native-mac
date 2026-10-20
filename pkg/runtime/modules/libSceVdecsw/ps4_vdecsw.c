@@ -53,7 +53,10 @@
 //   QueryDecoderMemoryInfo / CreateDecoder: size checks as shadPS4 [S]; codec != AVC ->
 //     CODEC_TYPE [I]; memory sizes below the query -> MEMORY_SIZE, NULL block -> MEMORY_POINTER [I].
 //   SetDecodeInput: decodes the access unit synchronously (it is copied into the sample, so the
-//     guest may reuse its buffer at once [S]) and queues an input completion. Returns
+//     guest may reuse its buffer at once [S]) and queues an input completion. Every access unit
+//     with a slice yields exactly one picture (player B relies on it [V]); one that cannot be
+//     decoded (VideoToolbox error, missing or rejected SPS/PPS) yields an error picture at its
+//     POC: OutputInfo is_error_frame 1, frame buffer untouched, trailer written [I]. Returns
 //     INPUT_QUEUE_FULL when decode_pipeline_depth completions are not yet synced, and
 //     OUTPUT_BUFFER_FULL when 16 decoded pictures wait for output buffers [I: both codes are
 //     handled by U4 player A as "retry later" (0x169a5a1) and by player B as "not accepted,
@@ -64,7 +67,8 @@
 //     synchronous); U4 accepts both codes [V].
 //   SetDecodeOutput: one pending buffer at a time, else OUTPUT_BUFFER_FULL [S]; U4 player B
 //     ignores that error and retries [V].
-//   TrySyncDecodeOutput: no pending buffer -> OUTPUT_BUFFER_EMPTY [S]; no picture yet ->
+//   TrySyncDecodeOutput: a buffer too small for the picture -> FRAME_BUFFER_SIZE, keeping both
+//     the picture and the buffer [I]; no pending buffer -> OUTPUT_BUFFER_EMPTY [S]; no picture yet ->
 //     DECODE_PENDING [S] (U4 also accepts OUTPUT_PENDING 0x81510115 [V], never produced); after
 //     FinalizeDecodeSequence with nothing left -> OK with is_valid 0, is_last_frame 1 [S];
 //     otherwise writes one NV12 picture (see ps4_h264_vt.h), OutputInfo and the trailer. The
@@ -72,6 +76,9 @@
 //   FinalizeDecodeSequence: flushes the pictures held for reordering [S]. A later
 //     SetDecodeInput starts a new sequence [I].
 //   ResetDecoder: drops queued pictures, completions and the pending output buffer [S].
+//   DeleteDecoder: a call in progress on another thread keeps the decoder alive until it
+//     returns; handles carry a generation, so a stale one never reaches a newer decoder [I].
+//   Guest ranges (AU, frame buffer, trailer) are checked without wrap-around.
 //   GetAvcPictureInfo: (OutputInfo.this_size | 8) == 0x38, picture_count 0 -> OK without
 //     writing [S]; the second picture (interlaced) is never produced.
 // Picture-info values: pts/dts/attached_data of the access unit the picture came from [S];
@@ -286,6 +293,9 @@ typedef struct VdecswCompletion {
 } VdecswCompletion;
 
 typedef struct Vdecsw {
+    int refs;     // the table's reference + one per call in progress (g_table_lock)
+    int slot;
+    uint64_t handle; // tag | generation << 8 | slot + 1, so a stale handle never names a new decoder
     H264VtDecoder *core;
     uint32_t pipeline_depth;
     pthread_mutex_t in_lock; // serialises SetDecodeInput / Finalize / Reset
@@ -300,6 +310,7 @@ typedef struct Vdecsw {
 } Vdecsw;
 
 static pthread_mutex_t g_table_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_generation;
 static Vdecsw *g_decoders[VDECSW_MAX_DECODERS];
 
 #define VDECSW_RETURN(code)                                                                    \
@@ -310,14 +321,47 @@ static Vdecsw *g_decoders[VDECSW_MAX_DECODERS];
 
 static inline void *gptr(GuestContext *ctx, uint64_t addr) { return addr ? ctx->mem_base + addr : NULL; }
 
-static Vdecsw *vdecsw_lookup(uint64_t handle) {
-    if ((handle & ~0xFFULL) != VDECSW_HANDLE_TAG) return NULL;
+static void vdecsw_free(Vdecsw *d) {
+    h264vt_destroy(d->core);
+    pthread_mutex_destroy(&d->in_lock);
+    pthread_mutex_destroy(&d->lock);
+    free(d);
+}
+
+// Takes a reference on the decoder behind a guest handle (NULL if none). A decoder deleted
+// while another guest thread is inside a call is freed when that call releases it.
+static Vdecsw *vdecsw_acquire(uint64_t handle) {
+    if ((handle & 0xFFFFFFFF00000000ULL) != VDECSW_HANDLE_TAG) return NULL;
     uint64_t slot = (handle & 0xFF) - 1;
     if (slot >= VDECSW_MAX_DECODERS) return NULL;
     pthread_mutex_lock(&g_table_lock);
     Vdecsw *d = g_decoders[slot];
+    if (d && d->handle != handle) d = NULL;
+    if (d) d->refs++;
     pthread_mutex_unlock(&g_table_lock);
     return d;
+}
+
+static void vdecsw_release(Vdecsw *d) {
+    pthread_mutex_lock(&g_table_lock);
+    const bool last = --d->refs == 0;
+    pthread_mutex_unlock(&g_table_lock);
+    if (last) vdecsw_free(d);
+}
+
+// Runs fn on the decoder named by ctx->rdi with a reference held for the duration of the call.
+#define VDECSW_WITH_DECODER(fn)                                                                \
+    do {                                                                                       \
+        Vdecsw *d_ = vdecsw_acquire(ctx->rdi);                                                 \
+        if (!d_) VDECSW_RETURN(VDECSW_ERROR_DECODER_INSTANCE);                                 \
+        int32_t rc_ = fn(ctx, d_);                                                             \
+        vdecsw_release(d_);                                                                    \
+        VDECSW_RETURN(rc_);                                                                    \
+    } while (0)
+
+// Guest range [addr, addr + size) inside guest memory, without wrapping around.
+static inline bool grange_ok(GuestContext *ctx, uint64_t addr, uint64_t size) {
+    return addr <= ctx->mem_size && size <= ctx->mem_size - addr;
 }
 
 static uint64_t max_frame_buffer_size(const VdecswDecoderConfigInfo *cfg) {
@@ -419,6 +463,9 @@ void shim_sceVdecswCreateDecoder(GuestContext *ctx) {
         if (!g_decoders[i]) {
             g_decoders[i] = d;
             slot = i;
+            d->slot = i;
+            d->refs = 1;
+            d->handle = VDECSW_HANDLE_TAG | (uint64_t)(++g_generation & 0xFFFFFF) << 8 | (uint64_t)(i + 1);
             break;
         }
     pthread_mutex_unlock(&g_table_lock);
@@ -429,7 +476,7 @@ void shim_sceVdecswCreateDecoder(GuestContext *ctx) {
         free(d);
         VDECSW_RETURN(VDECSW_ERROR_API_FAIL);
     }
-    *out = VDECSW_HANDLE_TAG | (uint64_t)(slot + 1);
+    *out = d->handle;
     fprintf(stderr, "[libSceVdecsw] decoder %d: max %dx%d, profile %u level %u, pipeline depth %u\n", slot,
             cfg->max_frame_width, cfg->max_frame_height, cfg->profile, cfg->max_level, d->pipeline_depth);
     VDECSW_RETURN(VDECSW_OK);
@@ -437,22 +484,21 @@ void shim_sceVdecswCreateDecoder(GuestContext *ctx) {
 
 // int sceVdecswDeleteDecoder(SceVdecswDecoder decoder)
 void shim_sceVdecswDeleteDecoder(GuestContext *ctx) {
-    Vdecsw *d = vdecsw_lookup(ctx->rdi);
+    Vdecsw *d = vdecsw_acquire(ctx->rdi);
     if (!d) VDECSW_RETURN(VDECSW_ERROR_DECODER_INSTANCE);
     pthread_mutex_lock(&g_table_lock);
-    g_decoders[(ctx->rdi & 0xFF) - 1] = NULL;
+    const bool mine = g_decoders[d->slot] == d; // a concurrent Delete may have won
+    if (mine) {
+        g_decoders[d->slot] = NULL;
+        d->refs--; // the table's reference
+    }
     pthread_mutex_unlock(&g_table_lock);
-    h264vt_destroy(d->core);
-    pthread_mutex_destroy(&d->in_lock);
-    pthread_mutex_destroy(&d->lock);
-    free(d);
-    VDECSW_RETURN(VDECSW_OK);
+    vdecsw_release(d);
+    VDECSW_RETURN(mine ? VDECSW_OK : VDECSW_ERROR_DECODER_INSTANCE);
 }
 
 // int sceVdecswResetDecoder(SceVdecswDecoder decoder)
-void shim_sceVdecswResetDecoder(GuestContext *ctx) {
-    Vdecsw *d = vdecsw_lookup(ctx->rdi);
-    if (!d) VDECSW_RETURN(VDECSW_ERROR_DECODER_INSTANCE);
+static int32_t vdecsw_ResetDecoder(GuestContext *ctx, Vdecsw *d) {
     pthread_mutex_lock(&d->in_lock);
     h264vt_reset(d->core);
     pthread_mutex_lock(&d->lock);
@@ -461,18 +507,17 @@ void shim_sceVdecswResetDecoder(GuestContext *ctx) {
     d->finalized = false;
     pthread_mutex_unlock(&d->lock);
     pthread_mutex_unlock(&d->in_lock);
-    VDECSW_RETURN(VDECSW_OK);
+    return VDECSW_OK;
 }
+void shim_sceVdecswResetDecoder(GuestContext *ctx) { VDECSW_WITH_DECODER(vdecsw_ResetDecoder); }
 
 // int sceVdecswSetDecodeInput(SceVdecswDecoder decoder, const SceVdecswInputData *in)
-void shim_sceVdecswSetDecodeInput(GuestContext *ctx) {
-    Vdecsw *d = vdecsw_lookup(ctx->rdi);
-    if (!d) VDECSW_RETURN(VDECSW_ERROR_DECODER_INSTANCE);
+static int32_t vdecsw_SetDecodeInput(GuestContext *ctx, Vdecsw *d) {
     const VdecswInputData *in = (const VdecswInputData *)gptr(ctx, ctx->rsi);
-    if (!in) VDECSW_RETURN(VDECSW_ERROR_ARGUMENT_POINTER);
-    if (in->this_size != sizeof(*in)) VDECSW_RETURN(VDECSW_ERROR_STRUCT_SIZE);
-    if (!in->au_data) VDECSW_RETURN(VDECSW_ERROR_ACCESS_UNIT_POINTER);
-    if (in->au_size == 0 || in->au_data + in->au_size > ctx->mem_size) VDECSW_RETURN(VDECSW_ERROR_ACCESS_UNIT_SIZE);
+    if (!in) return VDECSW_ERROR_ARGUMENT_POINTER;
+    if (in->this_size != sizeof(*in)) return VDECSW_ERROR_STRUCT_SIZE;
+    if (!in->au_data) return VDECSW_ERROR_ACCESS_UNIT_POINTER;
+    if (in->au_size == 0 || !grange_ok(ctx, in->au_data, in->au_size)) return VDECSW_ERROR_ACCESS_UNIT_SIZE;
 
     pthread_mutex_lock(&d->in_lock);
     pthread_mutex_lock(&d->lock);
@@ -488,8 +533,8 @@ void shim_sceVdecswSetDecodeInput(GuestContext *ctx) {
         int err = h264vt_decode(d->core, ctx->mem_base + in->au_data, (size_t)in->au_size, (int64_t)in->pts_data,
                                 (int64_t)in->dts_data, in->attached_data, &ready);
         if (err != 0) {
-            // A VideoToolbox failure is not a stream error the game could act on; U4 asserts on
-            // any unexpected code, so the access unit is consumed and only logged.
+            // U4 asserts on any unexpected code, so the access unit is consumed; the core has
+            // queued an error picture for it (is_error_frame), keeping one picture per AU.
             static int warned;
             if (warned++ < 8) fprintf(stderr, "[libSceVdecsw] access unit at 0x%llx (%llu bytes) failed: %d\n",
                                       (unsigned long long)in->au_data, (unsigned long long)in->au_size, err);
@@ -504,19 +549,18 @@ void shim_sceVdecswSetDecodeInput(GuestContext *ctx) {
         pthread_mutex_unlock(&d->lock);
     }
     pthread_mutex_unlock(&d->in_lock);
-    VDECSW_RETURN(rc);
+    return rc;
 }
+void shim_sceVdecswSetDecodeInput(GuestContext *ctx) { VDECSW_WITH_DECODER(vdecsw_SetDecodeInput); }
 
 // int sceVdecswTrySyncDecodeInput(SceVdecswDecoder decoder, SceVdecswInputResult *result)
-void shim_sceVdecswTrySyncDecodeInput(GuestContext *ctx) {
-    Vdecsw *d = vdecsw_lookup(ctx->rdi);
-    if (!d) VDECSW_RETURN(VDECSW_ERROR_DECODER_INSTANCE);
+static int32_t vdecsw_TrySyncDecodeInput(GuestContext *ctx, Vdecsw *d) {
     VdecswInputResult *res = (VdecswInputResult *)gptr(ctx, ctx->rsi);
-    if (!res) VDECSW_RETURN(VDECSW_ERROR_ARGUMENT_POINTER);
+    if (!res) return VDECSW_ERROR_ARGUMENT_POINTER;
     pthread_mutex_lock(&d->lock);
     if (d->done_count == 0) {
         pthread_mutex_unlock(&d->lock);
-        VDECSW_RETURN(VDECSW_ERROR_INPUT_QUEUE_EMPTY);
+        return VDECSW_ERROR_INPUT_QUEUE_EMPTY;
     }
     VdecswCompletion c = d->done[d->done_head];
     d->done_head = (d->done_head + 1) % VDECSW_MAX_INPUTS;
@@ -525,19 +569,18 @@ void shim_sceVdecswTrySyncDecodeInput(GuestContext *ctx) {
     res->decoded_au = c.au;
     res->output_frame_count = c.frames;
     res->reserved0 = 0;
-    VDECSW_RETURN(c.result);
+    return c.result;
 }
+void shim_sceVdecswTrySyncDecodeInput(GuestContext *ctx) { VDECSW_WITH_DECODER(vdecsw_TrySyncDecodeInput); }
 
 // int sceVdecswSetDecodeOutput(SceVdecswDecoder decoder, SceVdecswFrameBuffer *fb)
-void shim_sceVdecswSetDecodeOutput(GuestContext *ctx) {
-    Vdecsw *d = vdecsw_lookup(ctx->rdi);
-    if (!d) VDECSW_RETURN(VDECSW_ERROR_DECODER_INSTANCE);
+static int32_t vdecsw_SetDecodeOutput(GuestContext *ctx, Vdecsw *d) {
     const VdecswFrameBuffer *fb = (const VdecswFrameBuffer *)gptr(ctx, ctx->rsi);
-    if (!fb) VDECSW_RETURN(VDECSW_ERROR_ARGUMENT_POINTER);
-    if (fb->this_size != sizeof(*fb)) VDECSW_RETURN(VDECSW_ERROR_STRUCT_SIZE);
-    if (!fb->frame_buffer) VDECSW_RETURN(VDECSW_ERROR_FRAME_BUFFER_POINTER);
-    if (fb->frame_buffer_size == 0 || fb->frame_buffer + fb->frame_buffer_size > ctx->mem_size)
-        VDECSW_RETURN(VDECSW_ERROR_FRAME_BUFFER_SIZE);
+    if (!fb) return VDECSW_ERROR_ARGUMENT_POINTER;
+    if (fb->this_size != sizeof(*fb)) return VDECSW_ERROR_STRUCT_SIZE;
+    if (!fb->frame_buffer) return VDECSW_ERROR_FRAME_BUFFER_POINTER;
+    if (fb->frame_buffer_size == 0 || !grange_ok(ctx, fb->frame_buffer, fb->frame_buffer_size))
+        return VDECSW_ERROR_FRAME_BUFFER_SIZE;
     pthread_mutex_lock(&d->lock);
     int32_t rc = VDECSW_OK;
     if (d->have_output) {
@@ -547,8 +590,9 @@ void shim_sceVdecswSetDecodeOutput(GuestContext *ctx) {
         d->have_output = true;
     }
     pthread_mutex_unlock(&d->lock);
-    VDECSW_RETURN(rc);
+    return rc;
 }
+void shim_sceVdecswSetDecodeOutput(GuestContext *ctx) { VDECSW_WITH_DECODER(vdecsw_SetDecodeOutput); }
 
 static void fill_picture_info(VdecswAvcPictureInfo *p, const H264VtFrame *f) {
     const uint32_t pitch = h264vt_pitch(f->width);
@@ -609,12 +653,10 @@ static void fill_picture_info(VdecswAvcPictureInfo *p, const H264VtFrame *f) {
 }
 
 // int sceVdecswTrySyncDecodeOutput(SceVdecswDecoder decoder, SceVdecswOutputInfo *info)
-void shim_sceVdecswTrySyncDecodeOutput(GuestContext *ctx) {
-    Vdecsw *d = vdecsw_lookup(ctx->rdi);
-    if (!d) VDECSW_RETURN(VDECSW_ERROR_DECODER_INSTANCE);
+static int32_t vdecsw_TrySyncDecodeOutput(GuestContext *ctx, Vdecsw *d) {
     VdecswOutputInfo *info = (VdecswOutputInfo *)gptr(ctx, ctx->rsi);
-    if (!info) VDECSW_RETURN(VDECSW_ERROR_ARGUMENT_POINTER);
-    if (info->this_size != 0x30 && info->this_size != 0x38) VDECSW_RETURN(VDECSW_ERROR_STRUCT_SIZE);
+    if (!info) return VDECSW_ERROR_ARGUMENT_POINTER;
+    if (info->this_size != 0x30 && info->this_size != 0x38) return VDECSW_ERROR_STRUCT_SIZE;
     info->is_valid = 0;
     info->is_last_frame = 0;
     info->is_error_frame = 0;
@@ -624,10 +666,11 @@ void shim_sceVdecswTrySyncDecodeOutput(GuestContext *ctx) {
     pthread_mutex_lock(&d->lock);
     if (!d->have_output) {
         pthread_mutex_unlock(&d->lock);
-        VDECSW_RETURN(VDECSW_ERROR_OUTPUT_BUFFER_EMPTY);
+        return VDECSW_ERROR_OUTPUT_BUFFER_EMPTY;
     }
-    H264VtFrame *f = h264vt_pop(d->core);
-    if (!f) {
+    // Only this call (under d->lock) pops, so the peeked picture stays valid until the pop.
+    const H264VtFrame *peek = h264vt_peek(d->core);
+    if (!peek) {
         int32_t rc = VDECSW_ERROR_DECODE_PENDING;
         if (d->finalized) {
             info->is_last_frame = 1;
@@ -635,30 +678,40 @@ void shim_sceVdecswTrySyncDecodeOutput(GuestContext *ctx) {
             rc = VDECSW_OK;
         }
         pthread_mutex_unlock(&d->lock);
-        VDECSW_RETURN(rc);
+        return rc;
     }
+    const uint64_t frame_size = h264vt_nv12_size(peek->width, peek->height);
+    if (d->output.frame_buffer_size < frame_size + sizeof(VdecswAvcPictureInfo)) {
+        // The picture and the output buffer both stay; the guest can retry with a larger
+        // buffer only after a reset, as on hardware an oversized stream is an error.
+        static int warned;
+        if (warned++ < 8)
+            fprintf(stderr, "[libSceVdecsw] %ux%u picture does not fit the frame buffer (0x%llx < 0x%llx)\n", peek->width,
+                    peek->height, (unsigned long long)d->output.frame_buffer_size,
+                    (unsigned long long)(frame_size + sizeof(VdecswAvcPictureInfo)));
+        pthread_mutex_unlock(&d->lock);
+        return VDECSW_ERROR_FRAME_BUFFER_SIZE;
+    }
+    H264VtFrame *f = h264vt_pop(d->core);
     const VdecswFrameBuffer fb = d->output;
     d->have_output = false;
     const bool last = d->finalized && h264vt_queued(d->core) == 0;
     pthread_mutex_unlock(&d->lock);
 
-    const uint64_t frame_size = h264vt_nv12_size(f->width, f->height);
-    if (fb.frame_buffer_size < frame_size + sizeof(VdecswAvcPictureInfo)) {
-        fprintf(stderr, "[libSceVdecsw] %ux%u picture does not fit the frame buffer (0x%llx < 0x%llx), dropped\n",
-                f->width, f->height, (unsigned long long)fb.frame_buffer_size,
-                (unsigned long long)(frame_size + sizeof(VdecswAvcPictureInfo)));
-        h264vt_frame_free(f);
-        VDECSW_RETURN(VDECSW_ERROR_FRAME_BUFFER_SIZE);
-    }
     uint8_t *dst = ctx->mem_base + fb.frame_buffer;
-    h264vt_copy_nv12(f, dst);
+    // An error picture leaves the frame buffer as it is; the trailer is still written.
+    if (!f->error) h264vt_copy_nv12(f, dst);
     VdecswAvcPictureInfo pic;
     fill_picture_info(&pic, f);
     memcpy(dst + frame_size, &pic, sizeof(pic));
-    if (ps4_gnm_notify_cpu_write) ps4_gnm_notify_cpu_write(fb.frame_buffer, frame_size + sizeof(pic));
+    if (ps4_gnm_notify_cpu_write) {
+        if (f->error) ps4_gnm_notify_cpu_write(fb.frame_buffer + frame_size, sizeof(pic));
+        else ps4_gnm_notify_cpu_write(fb.frame_buffer, frame_size + sizeof(pic));
+    }
 
     info->is_valid = 1;
     info->is_last_frame = last ? 1 : 0;
+    info->is_error_frame = f->error ? 1 : 0;
     info->picture_count = 1;
     info->codec_type = VDECSW_CODEC_AVC;
     info->frame_width = (f->width + 15u) & ~15u;
@@ -670,23 +723,24 @@ void shim_sceVdecswTrySyncDecodeOutput(GuestContext *ctx) {
         info->frame_format = 0;
         info->frame_pitch_in_bytes = info->frame_pitch;
     }
-    if (d->frames_out++ == 0) fprintf(stderr, "[libSceVdecsw] first picture decoded (%ux%u)\n", f->width, f->height);
+    if (!f->error && d->frames_out++ == 0)
+        fprintf(stderr, "[libSceVdecsw] first picture decoded (%ux%u)\n", f->width, f->height);
     h264vt_frame_free(f);
-    VDECSW_RETURN(VDECSW_OK);
+    return VDECSW_OK;
 }
+void shim_sceVdecswTrySyncDecodeOutput(GuestContext *ctx) { VDECSW_WITH_DECODER(vdecsw_TrySyncDecodeOutput); }
 
 // int sceVdecswFinalizeDecodeSequence(SceVdecswDecoder decoder)
-void shim_sceVdecswFinalizeDecodeSequence(GuestContext *ctx) {
-    Vdecsw *d = vdecsw_lookup(ctx->rdi);
-    if (!d) VDECSW_RETURN(VDECSW_ERROR_DECODER_INSTANCE);
+static int32_t vdecsw_FinalizeDecodeSequence(GuestContext *ctx, Vdecsw *d) {
     pthread_mutex_lock(&d->in_lock);
     h264vt_finish(d->core);
     pthread_mutex_lock(&d->lock);
     d->finalized = true;
     pthread_mutex_unlock(&d->lock);
     pthread_mutex_unlock(&d->in_lock);
-    VDECSW_RETURN(VDECSW_OK);
+    return VDECSW_OK;
 }
+void shim_sceVdecswFinalizeDecodeSequence(GuestContext *ctx) { VDECSW_WITH_DECODER(vdecsw_FinalizeDecodeSequence); }
 
 // int sceVdecswGetAvcPictureInfo(const SceVdecswOutputInfo *info, SceVdecswAvcPictureInfo *first,
 //                                SceVdecswAvcPictureInfo *second)
@@ -700,10 +754,10 @@ void shim_sceVdecswGetAvcPictureInfo(GuestContext *ctx) {
     uint64_t size;
     memcpy(&size, first, sizeof(size));
     if (size <= 8 || size > sizeof(VdecswAvcPictureInfo)) VDECSW_RETURN(VDECSW_ERROR_STRUCT_SIZE);
-    const uint64_t trailer = info->frame_buffer + info->frame_buffer_size;
-    if (!info->frame_buffer || trailer + sizeof(VdecswAvcPictureInfo) > ctx->mem_size)
+    if (!info->frame_buffer || !grange_ok(ctx, info->frame_buffer, info->frame_buffer_size) ||
+        !grange_ok(ctx, info->frame_buffer + info->frame_buffer_size, sizeof(VdecswAvcPictureInfo)))
         VDECSW_RETURN(VDECSW_ERROR_FRAME_BUFFER_POINTER);
     // The caller's this_size stays; the rest is the start of the trailer's layout.
-    memcpy(first + 8, ctx->mem_base + trailer + 8, size - 8);
+    memcpy(first + 8, ctx->mem_base + info->frame_buffer + info->frame_buffer_size + 8, size - 8);
     VDECSW_RETURN(VDECSW_OK);
 }
