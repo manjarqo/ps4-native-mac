@@ -885,6 +885,12 @@ int h264vt_finish(H264VtDecoder *d) {
     }
     settle_pending(d, true);
     release_all(d);
+    // The sequence ended: the next picture is not "last + 1" of it (early release restarts at
+    // the next IDR).
+    pthread_mutex_lock(&d->q_lock);
+    d->have_last_out = false;
+    d->last_out_poc = 0;
+    pthread_mutex_unlock(&d->q_lock);
     int n = (int)(emitted_count(d) - before);
     pthread_mutex_unlock(&d->dec_lock);
     return n;
