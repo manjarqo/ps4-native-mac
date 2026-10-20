@@ -375,12 +375,16 @@ int main(int argc, char** argv) {
             NSError* e = nil;
             CHECK(bad_vs && ![dev newRenderPipelineStateWithDescriptor:RenderDesc(bad_vs, sf) error:&e],
                   "breaker: the incompatible pair built a pipeline");
-            CHECK(ls::ReportPipelineFailure(kf), "breaker: first report not taken");
+            CHECK(ls::ReportPipelineFailure(&kf), "breaker: first report not taken");
             struct stat st;
-            CHECK(stat((sd + "/" + ls::FileName(kf)).c_str(), &st) != 0 && !ls::Has(kf) && !ls::Load(kf, ls::kFragment, &why),
-                  "breaker: reported entry kept");
+            CHECK(stat((sd + "/" + ls::FileName(kf)).c_str(), &st) != 0 && !ls::Has(kf), "breaker: reported entry kept");
             CHECK(ls::Failures() == 1 && ls::Enabled(), "breaker: one failure must count once and keep the store on");
-            CHECK(!ls::ReportPipelineFailure(kf) && ls::Failures() == 1, "breaker: a second report of the entry counted");
+            // the same entry again: a second report, or a load after the report, counts nothing
+            CHECK(!ls::ReportPipelineFailure(&kf) && ls::Failures() == 1, "breaker: a second report of the entry counted");
+            CHECK(!ls::Load(kf, ls::kFragment, &why) && ls::Failures() == 1, "breaker: a load after the report counted");
+            // a failed pipeline without a stored function is not the store's failure
+            CHECK(!ls::ReportPipelineFailure(nullptr, nullptr) && ls::Failures() == 1,
+                  "breaker: a pipeline without stored functions counted");
             // the retry: the fragment function compiled from MSL with the stored vertex function
             id<MTLFunction> sv = ls::Load(kv, ls::kVertex, &why);
             CHECK(sv && [dev newRenderPipelineStateWithDescriptor:RenderDesc(sv, Compile(dev, fsrc)) error:&e],
@@ -394,8 +398,10 @@ int main(int argc, char** argv) {
             fputc(0xa5, f);
             fclose(f);
             CHECK(!ls::Load(kc, ls::kKernel, &why) && ls::Failures() == 2 && ls::Enabled(), "breaker: refused load not counted");
+            // the other order for one entry: a report after its refused load counts nothing
+            CHECK(!ls::ReportPipelineFailure(&kc) && ls::Failures() == 2, "breaker: a report after a refused load counted");
             // 3. the third failure disables the store for the session
-            CHECK(ls::ReportPipelineFailure(kv) && ls::Failures() == ls::kMaxFailuresPerSession, "breaker: third failure");
+            CHECK(ls::ReportPipelineFailure(&kv) && ls::Failures() == ls::kMaxFailuresPerSession, "breaker: third failure");
             CHECK(!ls::Enabled() && !ls::Has(kv) && !ls::Load(kv, ls::kVertex, &why), "breaker: store still on");
             // nothing is written while off
             id<MTLFunction> v = Compile(dev, vsrc), fr = Compile(dev, fsrc);
@@ -408,6 +414,9 @@ int main(int argc, char** argv) {
                   "breaker: new session not reset");
             ls::StoreRender(&kv, &kf, rd);
             CHECK(ls::Flush(60) && CountEntries(sd) == 2 && ls::Load(kv, ls::kVertex, &why), "breaker: new session cannot store");
+            // one failed pipeline with a stored VS and a stored PS is one failure, both entries go
+            CHECK(ls::ReportPipelineFailure(&kv, &kf) && ls::Failures() == 1 && CountEntries(sd) == 0 && ls::Enabled(),
+                  "breaker: one pipeline counted more than once");
             printf("lib_store_test breaker: PASS\n");
             return 0;
         }

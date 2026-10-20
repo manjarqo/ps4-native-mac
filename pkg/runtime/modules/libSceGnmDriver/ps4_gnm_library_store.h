@@ -111,11 +111,12 @@ bool Peek(const Key& k, Key* full, uint32_t* stage);
 // the library from it; an entry that fails is deleted (it is written again by a later pipeline).
 // why (optional) gets the reason of a failure.
 id<MTLFunction> Load(const Key& k, uint32_t stage, std::string* why);
-// A pipeline could not be built with a function loaded from the entry of k: deletes the entry
-// (the caller compiles the MSL and retries) and counts a failure toward the circuit breaker.
-// Returns true the first time for k in this session, false if k was already reported (no new
-// failure is counted). Works also after the breaker tripped.
-bool ReportPipelineFailure(const Key& k);
+// One pipeline could not be built with functions loaded from the entries a and b (either may be
+// null; pass only the stored ones): deletes the entries (the caller compiles the MSL and
+// retries) and counts one failure toward the circuit breaker — none if every entry has counted
+// already this session (as a refused load or an earlier report). Returns true if it counted.
+// Works also after the breaker tripped.
+bool ReportPipelineFailure(const Key* a, const Key* b = nullptr);
 // Failures counted this session (refused loads and reported pipelines).
 uint32_t Failures();
 

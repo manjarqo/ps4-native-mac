@@ -1226,7 +1226,7 @@ void DrainAsyncCompiles() {
 }
 
 bool UsesStoredFn(const Shader* s);
-bool ReplaceStoredFn(const Shader* s);
+bool ReplaceStoredFns(const Shader* vs, const Shader* ps);
 
 void DrainAsyncPsos() {
     std::vector<State::AsyncPso> psos;
@@ -1241,10 +1241,7 @@ void DrainAsyncPsos() {
         S.psos_pending.erase(r.key);
         if (!r.pso && (r.retry_vs || r.retry_ps)) {
             // built with a stored function: compile its MSL; the next draw builds the pipeline again
-            bool ok = true;
-            if (r.retry_vs && UsesStoredFn(r.retry_vs)) ok = ReplaceStoredFn(r.retry_vs) && ok;
-            if (r.retry_ps && UsesStoredFn(r.retry_ps)) ok = ReplaceStoredFn(r.retry_ps) && ok;
-            if (ok) continue;
+            if (ReplaceStoredFns(r.retry_vs, r.retry_ps)) continue;
         }
         if (!r.pso)
             RLog("pso-fail", "render pipeline failed: %s", r.err ? r.err.UTF8String : "unknown error");
@@ -1291,12 +1288,8 @@ bool UsesStoredFn(const Shader* s) {
     return s && s->from_store && !S.fallback_fns.count(s->msl_hash);
 }
 
-// A pipeline failed with the shader's stored function (encoder thread): the store entry is
-// deleted (ps4gnm_lib_store::ReportPipelineFailure, which also counts toward the store's session
-// circuit breaker) and the MSL is compiled for the shader's pipelines from now on. False if the
-// MSL does not compile either.
-bool ReplaceStoredFn(const Shader* s) {
-    ps4gnm_lib_store::ReportPipelineFailure(s->lib_key);
+// Compiles a shader's MSL for its pipelines (encoder thread); false if it does not compile.
+bool CompileFallbackFn(const Shader* s) {
     const std::string msl = FinalMsl(s->sh, s->hw);
     NSError* e = nil;
     const double t0 = CFAbsoluteTimeGetCurrent();
@@ -1309,6 +1302,21 @@ bool ReplaceStoredFn(const Shader* s) {
         RLog("msl-fail", "shader 0x%llx: MSL of a failed stored library does not compile: %s",
              (unsigned long long)s->code_addr, e ? e.localizedDescription.UTF8String : "no main0");
     return fn != nil;
+}
+
+// One pipeline failed (encoder thread). Of its shaders, those whose pipelines are built with a
+// stored function get their MSL compiled instead, and their store entries are deleted and
+// reported as one failure toward the store's session circuit breaker
+// (ps4gnm_lib_store::ReportPipelineFailure). False if no shader used a stored function (the
+// failure is not the store's) or an MSL does not compile; true: build the pipeline again.
+bool ReplaceStoredFns(const Shader* vs, const Shader* ps) {
+    const bool v = UsesStoredFn(vs), f = UsesStoredFn(ps);
+    if (!v && !f) return false;
+    ps4gnm_lib_store::ReportPipelineFailure(v ? &vs->lib_key : nullptr, f ? &ps->lib_key : nullptr);
+    bool ok = true;
+    if (v) ok = CompileFallbackFn(vs) && ok;
+    if (f) ok = CompileFallbackFn(ps) && ok;
+    return ok;
 }
 
 // Second half of shader creation: reflection, MSL post-processing and the Metal library
@@ -3419,12 +3427,9 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
     NSError* e = nil;
     const double pso_t0 = CFAbsoluteTimeGetCurrent();
     id<MTLRenderPipelineState> p = [S.dev newRenderPipelineStateWithDescriptor:d error:&e];
-    if (!p && (UsesStoredFn(vs) || UsesStoredFn(ps))) {
+    if (!p) {
         // built with a stored function: compile the MSL of the stored shader(s) and retry once
-        bool ok = true;
-        if (UsesStoredFn(vs)) ok = ReplaceStoredFn(vs) && ok;
-        if (UsesStoredFn(ps)) ok = ReplaceStoredFn(ps) && ok;
-        if (ok) {
+        if (ReplaceStoredFns(vs, ps)) {
             d.vertexFunction = PipelineFn(vs);
             d.fragmentFunction = ps ? PipelineFn(ps) : nil;
             e = nil;
@@ -4910,7 +4915,7 @@ void DispatchEncode(DispatchRec& r) {
             ps4gnm_pso_archive::Attach(cpd);
             const double cpso_t0 = CFAbsoluteTimeGetCurrent();
             pso = [S.dev newComputePipelineStateWithDescriptor:cpd options:MTLPipelineOptionNone reflection:nil error:&e];
-            if (!pso && UsesStoredFn(cs) && ReplaceStoredFn(cs)) {
+            if (!pso && ReplaceStoredFns(cs, nullptr)) {
                 // built with a stored function: retry once with the function compiled from MSL
                 cpd.computeFunction = PipelineFn(cs);
                 e = nil;

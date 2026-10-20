@@ -75,7 +75,9 @@ struct StoreState {
     uint64_t budget = 0;
     dispatch_queue_t q = nil;       // writes and use marks, in order
     std::mutex mu;                  // present, pending, touched, bytes
-    std::set<std::pair<uint64_t, uint64_t>> present, pending, touched, reported;
+    std::set<std::pair<uint64_t, uint64_t>> present, pending, touched;
+    // entries that already counted toward the circuit breaker (each counts once per session)
+    std::set<std::pair<uint64_t, uint64_t>> counted;
     uint64_t bytes = 0;             // size of the entries on disk
     bool full = false;              // over the budget: no more writes this session
     // statistics (session)
@@ -178,8 +180,17 @@ void Forget(const Key& k, bool remove_file) {
     G.present.erase(Id(k));
 }
 
-// Counts one failure; at kMaxFailuresPerSession the store is disabled for the session.
-void CountFailure() {
+// Counts one failure for an event involving the given entries, unless every one of them has
+// counted already (a failed load racing a reported pipeline of the same entry counts once); at
+// kMaxFailuresPerSession the store is disabled for the session. Returns true if it counted.
+bool CountFailure(const Key* const* keys, size_t n) {
+    bool any = false;
+    {
+        std::lock_guard<std::mutex> lk(G.mu);
+        for (size_t i = 0; i < n; ++i)
+            if (keys[i] && G.counted.insert(Id(*keys[i])).second) any = true;
+    }
+    if (!any) return false;
     if (G.failures.fetch_add(1) + 1 == kMaxFailuresPerSession) {
         G.enabled = false;
         fprintf(stderr,
@@ -187,6 +198,7 @@ void CountFailure() {
                 "libraries come from MSL\n",
                 kMaxFailuresPerSession);
     }
+    return true;
 }
 
 struct Item {
@@ -454,7 +466,7 @@ bool Open(id<MTLDevice> dev, const std::string& title_dir, MTLCompileOptions* op
                                 dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
     G.opened = G.present.size();
     G.failures = 0;
-    G.reported.clear();
+    G.counted.clear();
     G.enabled = true;
     fprintf(stderr, "[gnm-lib-store] %s: %zu libraries (%.1f MB)\n", G.dir.c_str(), G.opened, total / 1048576.0);
     return true;
@@ -536,8 +548,16 @@ id<MTLFunction> Load(const Key& k, uint32_t stage, std::string* why) {
     if (!fn) {
         G.load_fail++;
         fprintf(stderr, "[gnm-lib-store] entry %s unusable (%s): deleted\n", FileName(k).c_str(), fail.c_str());
-        Forget(k, true);
-        CountFailure();
+        // only the caller that removes the entry counts it (another thread may have reported or
+        // refused it meanwhile)
+        bool was_present;
+        {
+            std::lock_guard<std::mutex> lk(G.mu);
+            was_present = G.present.erase(Id(k)) != 0;
+        }
+        unlink(PathOf(k).c_str());
+        const Key* kp = &k;
+        if (was_present) CountFailure(&kp, 1);
         if (why) *why = fail;
         return nil;
     }
@@ -546,17 +566,16 @@ id<MTLFunction> Load(const Key& k, uint32_t stage, std::string* why) {
     return fn;
 }
 
-bool ReportPipelineFailure(const Key& k) {
+bool ReportPipelineFailure(const Key* a, const Key* b) {
     if (G.dir.empty()) return false;
-    {
-        std::lock_guard<std::mutex> lk(G.mu);
-        if (!G.reported.insert(Id(k)).second) return false;
+    const Key* keys[2] = {a, b};
+    for (const Key* k : keys) {
+        if (!k) continue;
+        fprintf(stderr, "[gnm-lib-store] a pipeline could not be built from the stored library %s: deleted, compiling the MSL\n",
+                FileName(*k).c_str());
+        Forget(*k, true);
     }
-    fprintf(stderr, "[gnm-lib-store] a pipeline could not be built from the stored library %s: deleted, compiling the MSL\n",
-            FileName(k).c_str());
-    Forget(k, true);
-    CountFailure();
-    return true;
+    return CountFailure(keys, 2);
 }
 
 uint32_t Failures() {
