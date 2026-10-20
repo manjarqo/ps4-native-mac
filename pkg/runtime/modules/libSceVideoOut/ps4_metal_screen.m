@@ -5,10 +5,12 @@
 #import <ImageIO/ImageIO.h>
 #import <MetalFX/MetalFX.h>
 #include <math.h>
+#include <pthread.h>
 #include <strings.h>
 #include <stdlib.h>
 #include <string.h>
 #include "ps4_metal_screen.h"
+#include "ps4_present_queue.h"
 #include "ps4_present_stats.h"
 #include "recomp_runtime.h"
 
@@ -179,6 +181,11 @@ static int metal_screen_init_main(int width, int height, const char *title) {
         // The FPS display is the presenter's own overlay (hud_texture); the system Metal HUD
         // still appears when MTL_HUD_ENABLED=1 is set in the environment at launch.
         g_metalLayer.drawableSize = CGSizeMake(g_width, g_height);
+        // Drawable policy (docs/present-pacing.md): three drawables (one on screen, one waiting
+        // for its refresh, one being filled) and vsync; the presenter thread is the only GPU-path
+        // caller of nextDrawable, so waiting for one never stalls the renderer.
+        g_metalLayer.maximumDrawableCount = 3;
+        g_metalLayer.displaySyncEnabled = YES;
 
         [g_view setLayer:g_metalLayer];
         [g_window setContentView:g_view];
@@ -302,12 +309,15 @@ static void maybe_save_screenshot(id<MTLTexture> tex) {
     save_screenshot(tex, screenshot_due());
 }
 
+static void presenter_drain(void);
+
 int ps4_metal_screen_present_frame(const void *pixels, size_t pitch, int width, int height) {
     if (!g_inited) {
         if (ps4_metal_screen_init(width, height, "PS4Recomp - Native Metal Display") != 0) {
             return -1;
         }
     }
+    presenter_drain();
 
     @autoreleasepool {
         // The game may present at a different size than the one the screen
@@ -372,6 +382,7 @@ int ps4_metal_screen_present_texture(void *texture) {
     if (!g_inited) {
         if (ps4_metal_screen_init(width, height, "PS4Recomp - Native Metal Display") != 0) return -1;
     }
+    presenter_drain();
     @autoreleasepool {
         if (width != g_width || height != g_height || !g_screenTexture) {
             g_width = width;
@@ -720,17 +731,11 @@ static id<MTLTexture> hud_texture(NSUInteger target_h) {
     return tex;
 }
 
-// Encodes the presentation of `texture` into `command_buffer` behind the work already
-// recorded there: the texture (MetalFX-upscaled if enabled) is copied into the window's
-// drawable, which is presented when the command buffer has executed. Nothing waits for the
-// GPU here; the caller commits.
-int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
-    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)command_buffer;
-    id<MTLTexture> src = (__bridge id<MTLTexture>)texture;
-    if (!cb || !src) return -1;
-    if (!g_inited) {
-        if (ps4_metal_screen_init((int)src.width, (int)src.height, "PS4Recomp - Native Metal Display") != 0) return -1;
-    }
+// Presenter thread: encodes the presentation of `src` into `cb`: the frame (MetalFX-upscaled if
+// enabled) is copied into the window's drawable, which is presented when `cb` has executed, at
+// least `min_duration` seconds after the previous frame appeared (0 = next refresh). shot_idx
+// >= 0 also saves the frame as a screenshot. The caller commits.
+static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long shot_idx, double min_duration) {
     @autoreleasepool {
         NSUInteger dw = src.width, dh = src.height;
         id<MTLTexture> up = upscale_encode(cb, src, &dw, &dh);
@@ -743,7 +748,6 @@ int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
             });
         }
         const NSUInteger iw = img.width, ih = img.height;
-        const long shot_idx = screenshot_due();
         id<MTLTexture> shot = nil;
         if (shot_idx >= 0) {
             MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -825,7 +829,10 @@ int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
             [blit endEncoding];
         }
         if (drawable) {
-            [cb presentDrawable:drawable];
+            if (min_duration > 0)
+                [cb presentDrawable:drawable afterMinimumDuration:min_duration];
+            else
+                [cb presentDrawable:drawable];
             ps4_present_stats_on_submit(pstats(), CACurrentMediaTime());
         }
         if (shot) {
@@ -834,6 +841,214 @@ int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
                 save_screenshot(shot, shot_idx);
             }];
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Presenter thread (docs/present-pacing.md). The renderer converts each flipped display buffer
+// into a present slot and queues it (ps4_metal_screen_acquire_frame / _encode_present); this
+// thread waits for a drawable, copies the slot into it on its own command buffer, which waits
+// on the GPU for the renderer's work (shared event), and presents it.
+//   PS4_PRESENT_MODE=uncapped (default) | vsync | mailbox   (see ps4_present_queue.h)
+// ---------------------------------------------------------------------------
+#define PRESENT_SLOTS 3
+
+typedef struct PresentSlot {
+    id<MTLTexture> tex; // the converted display buffer (BGRA8Unorm)
+    uint64_t ready;     // g_pr.ready value the renderer's command buffer signals once tex is written
+    long shot_idx;      // screenshot index of this frame, -1 = none
+} PresentSlot;
+
+static struct {
+    dispatch_once_t once;
+    _Atomic bool started;
+    ps4_present_queue q;
+    PresentSlot slot[PRESENT_SLOTS];
+    id<MTLCommandQueue> queue; // the presenter's own: a frame waiting for its renderer work never
+                               // holds up the CPU present paths on g_commandQueue
+    id<MTLSharedEvent> ready;
+    _Atomic uint64_t ready_value;
+    _Atomic bool drain_timed_out;
+    ps4_present_mode mode;
+    _Atomic uint64_t display_hz; // refresh rate of the window's screen, 0 = unknown
+    _Atomic bool hz_query_queued;
+    uint64_t presented; // presenter thread only
+} g_pr;
+
+static _Atomic int g_guest_flip_rate = 0;
+static _Atomic int g_guest_flip_mode = PS4_FLIP_MODE_VSYNC;
+
+void ps4_metal_screen_set_guest_flip_rate(int flip_rate) {
+    atomic_store(&g_guest_flip_rate, flip_rate);
+}
+
+void ps4_metal_screen_set_guest_flip_mode(int flip_mode) {
+    atomic_store(&g_guest_flip_mode, flip_mode);
+}
+
+static uint64_t query_display_hz_main(void) {
+    NSScreen *scr = g_window.screen ? g_window.screen : [NSScreen mainScreen];
+    const NSInteger fps = scr ? scr.maximumFramesPerSecond : 0;
+    return fps > 0 ? (uint64_t)fps : 0;
+}
+
+static bool slot_texture(PresentSlot *ps, NSUInteger w, NSUInteger h) {
+    if (ps->tex && ps->tex.width == w && ps->tex.height == h) return true;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                  width:w
+                                                                                 height:h
+                                                                              mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    ps->tex = [g_device newTextureWithDescriptor:td];
+    return ps->tex != nil;
+}
+
+static void present_slot(int s) {
+    PresentSlot *ps = &g_pr.slot[s];
+    id<MTLCommandBuffer> cb = [g_pr.queue commandBuffer];
+    [cb encodeWaitForEvent:g_pr.ready value:ps->ready];
+    const double min_duration =
+        ps4_present_min_duration(g_pr.mode, atomic_load(&g_guest_flip_rate), atomic_load(&g_guest_flip_mode),
+                                 (double)atomic_load(&g_pr.display_hz));
+    present_encode(cb, ps->tex, ps->shot_idx, min_duration);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        ps4_pq_release(&g_pr.q, s);
+    }];
+    [cb commit];
+    if ((++g_pr.presented % 120) == 0 && !atomic_exchange(&g_pr.hz_query_queued, true)) {
+        // the window may have moved to another screen
+        dispatch_async(dispatch_get_main_queue(), ^{
+            atomic_store(&g_pr.display_hz, query_display_hz_main());
+            atomic_store(&g_pr.hz_query_queued, false);
+        });
+    }
+}
+
+static void *presenter_main(void *arg) {
+    (void)arg;
+    pthread_setname_np("Metal Present");
+    for (;;) {
+        const int s = ps4_pq_take(&g_pr.q);
+        if (s < 0) return NULL;
+        @autoreleasepool {
+            present_slot(s);
+        }
+    }
+}
+
+static void presenter_start(void) {
+    dispatch_once(&g_pr.once, ^{
+        const char *m = getenv("PS4_PRESENT_MODE");
+        if (!ps4_present_parse_mode(m, &g_pr.mode))
+            fprintf(stderr, "[metal-screen] unknown PS4_PRESENT_MODE=%s (uncapped, vsync, mailbox); using uncapped\n", m);
+        ps4_pq_init(&g_pr.q, PRESENT_SLOTS, g_pr.mode == PS4_PRESENT_MAILBOX);
+        for (int i = 0; i < PRESENT_SLOTS; i++) g_pr.slot[i].shot_idx = -1;
+        g_pr.queue = [g_device newCommandQueue];
+        g_pr.queue.label = @"present";
+        g_pr.ready = [g_device newSharedEvent];
+        __block uint64_t hz = 0;
+        run_on_main(^{
+            hz = query_display_hz_main();
+        });
+        atomic_store(&g_pr.display_hz, hz);
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        // on the frame's critical path like the GNM encoder thread
+        pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+        pthread_t th;
+        const int rc = pthread_create(&th, &attr, presenter_main, NULL);
+        pthread_attr_destroy(&attr);
+        if (rc != 0) {
+            fprintf(stderr, "[metal-screen] cannot start the presenter thread (%d)\n", rc);
+            abort();
+        }
+        atomic_store(&g_pr.started, true);
+        fprintf(stderr, "[metal-screen] presenter thread: mode %s, %d slots, %lu drawables, display %llu Hz\n",
+                ps4_present_mode_name(g_pr.mode), PRESENT_SLOTS, (unsigned long)g_metalLayer.maximumDrawableCount,
+                (unsigned long long)hz);
+    });
+}
+
+// The synchronous CPU paths present on the screen's queue directly: let queued frames go first so
+// frames stay in order. Once a drain has timed out (the renderer's GPU work does not finish) the
+// CPU paths stop waiting until the presenter is idle again.
+static void presenter_drain(void) {
+    if (!atomic_load(&g_pr.started)) return;
+    const bool idle = ps4_pq_drain(&g_pr.q, atomic_load(&g_pr.drain_timed_out) ? 0.0 : 1.0);
+    if (!idle && !atomic_exchange(&g_pr.drain_timed_out, true))
+        fprintf(stderr, "[metal-screen] presenter still busy after 1 s; CPU presents no longer wait for it\n");
+    if (idle) atomic_store(&g_pr.drain_timed_out, false);
+}
+
+void *ps4_metal_screen_acquire_frame(int width, int height) {
+    if (width <= 0 || height <= 0) return NULL;
+    if (!g_inited && ps4_metal_screen_init(width, height, "PS4Recomp - Native Metal Display") != 0) return NULL;
+    presenter_start();
+    int superseded = 0;
+    double waited = 0;
+    const int s = ps4_pq_acquire(&g_pr.q, 1.0, &superseded, &waited);
+    ps4_present_stats_on_backpressure(pstats(), waited * 1000.0);
+    if (superseded) ps4_present_stats_on_superseded(pstats());
+    if (s < 0) {
+        static _Atomic bool logged;
+        if (!atomic_exchange(&logged, true))
+            fprintf(stderr, "[metal-screen] no present slot became free within 1 s (presenter or GPU stuck)\n");
+        return NULL;
+    }
+    if (!slot_texture(&g_pr.slot[s], (NSUInteger)width, (NSUInteger)height)) {
+        ps4_pq_cancel(&g_pr.q, s);
+        return NULL;
+    }
+    return (__bridge void *)g_pr.slot[s].tex;
+}
+
+int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)command_buffer;
+    id<MTLTexture> src = (__bridge id<MTLTexture>)texture;
+    if (!cb || !src) return -1;
+    if (!g_inited) {
+        if (ps4_metal_screen_init((int)src.width, (int)src.height, "PS4Recomp - Native Metal Display") != 0) return -1;
+    }
+    presenter_start();
+    int s = -1;
+    pthread_mutex_lock(&g_pr.q.mu);
+    for (int i = 0; i < PRESENT_SLOTS; i++)
+        if (g_pr.q.state[i] == PS4_PQ_RENDERING && g_pr.slot[i].tex == src) s = i;
+    pthread_mutex_unlock(&g_pr.q.mu);
+    @autoreleasepool {
+        if (s < 0) {
+            // not an acquired slot: copy it into a free one behind the caller's work, without waiting
+            int superseded = 0;
+            double waited = 0;
+            s = ps4_pq_acquire(&g_pr.q, 0, &superseded, &waited);
+            if (superseded) ps4_present_stats_on_superseded(pstats());
+            if (s >= 0 && (src.pixelFormat != MTLPixelFormatBGRA8Unorm || !slot_texture(&g_pr.slot[s], src.width, src.height))) {
+                ps4_pq_cancel(&g_pr.q, s);
+                s = -1;
+            }
+            if (s < 0) {
+                ps4_present_stats_on_superseded(pstats()); // this frame is not shown
+                ps4_metal_screen_pump_events();
+                return 0;
+            }
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit copyFromTexture:src toTexture:g_pr.slot[s].tex];
+            [blit endEncoding];
+        }
+        const uint64_t v = atomic_fetch_add(&g_pr.ready_value, 1) + 1;
+        [cb encodeSignalEvent:g_pr.ready value:v];
+        id<MTLSharedEvent> ev = g_pr.ready;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            // a failed command buffer may not have reached its signal; the presenter must not
+            // wait for it forever
+            if (done.status == MTLCommandBufferStatusError && ev.signaledValue < v) ev.signaledValue = v;
+        }];
+        g_pr.slot[s].ready = v;
+        g_pr.slot[s].shot_idx = screenshot_due();
+        ps4_pq_submit(&g_pr.q, s, g_pr.slot[s].shot_idx >= 0);
     }
     ps4_metal_screen_pump_events();
     return 0;
@@ -922,6 +1137,10 @@ void *ps4_metal_screen_get_texture(void) {
 }
 
 void ps4_metal_screen_destroy(void) {
+    if (atomic_load(&g_pr.started)) {
+        presenter_drain();
+        ps4_pq_stop(&g_pr.q);
+    }
     @autoreleasepool {
         if (g_window) {
             NSWindow *w = g_window;

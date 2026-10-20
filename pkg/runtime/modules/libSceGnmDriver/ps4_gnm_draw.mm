@@ -60,6 +60,7 @@ extern "C" const char* ps4_vfs_get_app_root(void);
 #include "ps4_metal_screen.h"
 #include "ps4_hitch.h"
 
+extern "C" void* ps4_metal_screen_acquire_frame(int width, int height);
 extern "C" int ps4_metal_screen_encode_present(void* command_buffer, void* texture);
 extern "C" uint64_t ps4_gnm_take_cp_ns(void);
 extern "C" void ps4_gnm_print_sync_stats(void);
@@ -4866,22 +4867,28 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
         } else if (lin != f || src.textureType != MTLTextureType2D)
             view = [src newTextureViewWithPixelFormat:lin textureType:MTLTextureType2D
                                                levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
-        if (!S.present_tex || S.present_tex.width != width || S.present_tex.height != height) {
-            MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                          width:width
-                                                                                         height:height
-                                                                                      mipmapped:NO];
-            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            td.storageMode = MTLStorageModePrivate;
-            S.present_tex = [S.dev newTextureWithDescriptor:td];
+        // Convert into a present slot of the window's presenter (it waits here while every slot
+        // is queued or on screen: back-pressure from the display) and queue it behind the frame's
+        // work: the CPU does not wait for the GPU, so the next frame's command processing
+        // overlaps this frame's GPU execution and the presenter's wait for a drawable.
+        const double tp0 = CFAbsoluteTimeGetCurrent();
+        id<MTLTexture> dst = (__bridge id<MTLTexture>)ps4_metal_screen_acquire_frame((int)width, (int)height);
+        if (!dst) { // no slot: the presenter copies this texture if it can, or drops the frame
+            if (!S.present_tex || S.present_tex.width != width || S.present_tex.height != height) {
+                MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                              width:width
+                                                                                             height:height
+                                                                                          mipmapped:NO];
+                td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                td.storageMode = MTLStorageModePrivate;
+                S.present_tex = [S.dev newTextureWithDescriptor:td];
+            }
+            dst = S.present_tex;
         }
-        // Convert into the presentation texture and hand it to the window in the same command
-        // buffer as the frame: the CPU does not wait for the GPU (the queue orders the work),
-        // so the next frame's command processing overlaps this frame's GPU execution.
         EndEncoders();
         EnsureCmd();
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture = S.present_tex;
+        rp.colorAttachments[0].texture = dst;
         rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> e = [S.cmd renderCommandEncoderWithDescriptor:rp];
@@ -4890,10 +4897,9 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
         [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [e endEncoding];
         LogWork("present");
-        const double tp0 = CFAbsoluteTimeGetCurrent();
-        if (ps4_metal_screen_encode_present((__bridge void*)S.cmd, (__bridge void*)S.present_tex) != 0)
+        if (ps4_metal_screen_encode_present((__bridge void*)S.cmd, (__bridge void*)dst) != 0)
             RLog("present-screen", "the Metal screen could not take the frame");
-        S.screen_ms += (CFAbsoluteTimeGetCurrent() - tp0) * 1000.0; // includes waiting for a drawable
+        S.screen_ms += (CFAbsoluteTimeGetCurrent() - tp0) * 1000.0; // includes waiting for a present slot
         if (on_done) AfterGpu(std::move(on_done));
         Commit();
         static const bool writeback_all = getenv("PS4_GNM_WRITEBACK_ALL") != nullptr;

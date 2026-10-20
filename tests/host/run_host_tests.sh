@@ -89,6 +89,10 @@ VO="$R/pkg/runtime/modules/libSceVideoOut"
 clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/tests/host/present_stats_test.c" \
   "$VO/ps4_present_stats.c" -o "$T/present_stats_test"
 "$T/present_stats_test"
+# Presenter frame queue (FIFO / mailbox slots, blocking and timeouts) and the vsync pacing policy.
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/tests/host/present_queue_test.c" \
+  "$VO/ps4_present_queue.c" -o "$T/present_queue_test"
+"$T/present_queue_test"
 G="$R/pkg/runtime/modules/libSceGnmDriver"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
