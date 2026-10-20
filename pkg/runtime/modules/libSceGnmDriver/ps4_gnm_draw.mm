@@ -2369,11 +2369,12 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             }
             if (bd.size_bytes >= 0x80000000u) bd.size_bytes = 64u << 20; // "unbounded" V#
             if (base & 3) {
-                RLog("buf-align", "shader 0x%llx: buffer %u not dword aligned (0x%llx)",
-                     (unsigned long long)s->code_addr, i, (unsigned long long)base);
+                // Bound at the dword below: the shader is specialized on base & 3 and reads its
+                // dwords shifted by that many bytes (gcn BufferSpecialization::misalign); the
+                // bounds limit below includes the bytes below the base.
                 base &= ~3ull;
             }
-            if (!GuestBuffer(base, bd.size_bytes, bb.is_written ? GuestAccess::Write : GuestAccess::Read, &mb, &off)) {
+            if (!GuestBuffer(base, bd.size_bytes + (uint32_t)(bd.base_address - base), bb.is_written ? GuestAccess::Write : GuestAccess::Read, &mb, &off)) {
                 RLog("buf-range", "shader 0x%llx: buffer %u out of range (0x%llx+0x%x)",
                      (unsigned long long)s->code_addr, i, (unsigned long long)base, bd.size_bytes);
                 mb = S.dummy;

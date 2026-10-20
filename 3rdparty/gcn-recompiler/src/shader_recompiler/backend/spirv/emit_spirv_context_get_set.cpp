@@ -396,14 +396,28 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
 
     const Id size = spv_buffer.Size(PointerSize::B32);
     const Id zero = alias == PointerType::U32 ? ctx.u32_zero_value : ctx.ConstF32(0.0f);
+    const auto load_dword = [&](Id index) {
+        const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, ctx.ClampIndex(index, size));
+        return ctx.ZeroIfOutOfBounds(data_types[1], zero, ctx.OpLoad(data_types[1], ptr), index, size);
+    };
     boost::container::static_vector<Id, N> ids;
-    for (u32 i = 0; i < N; i++) {
-        const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
-        const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value,
-                                           ctx.ClampIndex(index_i, size));
-        const Id result_i = ctx.ZeroIfOutOfBounds(data_types[1], zero,
-                                                  ctx.OpLoad(data_types[1], ptr_i), index_i, size);
-        ids.push_back(result_i);
+    if (spv_buffer.misalign != 0) {
+        // PS4Recomp: the buffer is bound at the dword below its base address; dword i of the
+        // guest buffer spans bound dwords i and i+1 (GCN reads it unaligned).
+        const u32 shift = spv_buffer.misalign * 8;
+        const auto as_u32 = [&](Id v) { return alias == PointerType::U32 ? v : ctx.OpBitcast(ctx.U32[1], v); };
+        Id lo = as_u32(load_dword(address));
+        for (u32 i = 0; i < N; i++) {
+            const Id hi = as_u32(load_dword(ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i + 1))));
+            const Id v = ctx.OpBitwiseOr(ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], lo, ctx.ConstU32(shift)),
+                                         ctx.OpShiftLeftLogical(ctx.U32[1], hi, ctx.ConstU32(32 - shift)));
+            ids.push_back(alias == PointerType::U32 ? v : ctx.OpBitcast(ctx.F32[1], v));
+            lo = hi;
+        }
+    } else {
+        for (u32 i = 0; i < N; i++) {
+            ids.push_back(load_dword(i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i))));
+        }
     }
 
     const Id result = N == 1 ? ids[0] : ctx.OpCompositeConstruct(data_types[N], ids);

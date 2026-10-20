@@ -29,11 +29,15 @@ struct BufferSpecialization {
     u32 num_format : 4;
     u32 index_stride : 2;
     u32 element_size : 2;
+    // PS4Recomp: base address & 3. Metal binds buffers at dword-aligned offsets; the shader
+    // reads such a buffer from the dword below and shifts (see EmitLoadBufferB32xN).
+    u32 misalign : 2;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
 
     bool operator==(const BufferSpecialization& other) const {
         return stride == other.stride && is_formatted == other.is_formatted &&
+               misalign == other.misalign &&
                swizzle_enable == other.swizzle_enable &&
                (!is_formatted ||
                 (data_format == other.data_format && num_format == other.num_format &&
@@ -115,6 +119,8 @@ struct StageSpecialization {
         ForEachSharp(binding, buffers, info->buffers,
                      [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                          spec.stride = sharp.GetStride();
+                         spec.misalign = desc.buffer_type == BufferType::Guest
+                                             ? u32(sharp.base_address & 3) : 0;
                          spec.is_formatted = desc.is_formatted;
                          spec.swizzle_enable = sharp.swizzle_enable;
                          if (spec.is_formatted) {

@@ -900,6 +900,22 @@ void EmitContext::DefineBuffers() {
 
         // Define aliases depending on the shader usage.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
+        if (desc.buffer_type == BufferType::Guest && !profile.needs_buffer_offsets) {
+            // Bound at the dword below the base (Metal buffer offsets are dword aligned).
+            spv_buffer.misalign = u32(buf_sharp.base_address & 3);
+            if (spv_buffer.misalign != 0) {
+                spv_buffer.Offset(PointerSize::B8) = ConstU32(spv_buffer.misalign);
+                if ((spv_buffer.misalign & 1) == 0) {
+                    spv_buffer.Offset(PointerSize::B16) = ConstU32(spv_buffer.misalign >> 1);
+                }
+                if (desc.is_written) {
+                    LOG_WARNING(Render_Recompiler,
+                                "Buffer {} written at a base that is not dword aligned (+{}): stores land "
+                                "at the dword below",
+                                spv_buffer.binding, spv_buffer.misalign);
+                }
+            }
+        }
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
                 DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);

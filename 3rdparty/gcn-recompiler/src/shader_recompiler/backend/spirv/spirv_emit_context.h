@@ -391,6 +391,9 @@ public:
     struct BufferDefinition {
         u32 binding;
         BufferType buffer_type;
+        // PS4Recomp: guest base address & 3 when the profile has no buffer offsets. The buffer
+        // is bound at the dword below its base; loads add or shift by this many bytes.
+        u32 misalign = 0;
         std::array<Id, u32(PointerSize::NumClass)> offsets;
         std::array<Id, u32(PointerSize::NumClass)> sizes; // PS4Recomp: elements, for bounds checks
         std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
