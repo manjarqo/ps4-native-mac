@@ -296,7 +296,8 @@ void ps4_pad_handle_key(unsigned short keyCode, int isDown) {
 }
 
 // Debug aid for driving headless runs interactively: PS4_PAD_CTL=<file> is polled
-// for appended lines while the game runs. Commands are executed one after another:
+// for appended lines while the game runs. Commands are executed one after another, in file
+// order (a "shot" after a "w" is taken when the wait has ended):
 //   p <hexmask> <dur_ms> [<lx> <ly> [<rx> <ry>]]  hold buttons/sticks for dur_ms
 //   w <ms>                                       wait (neutral pad)
 //   shot                                         save a screenshot of the next frame
@@ -307,9 +308,36 @@ void ps4_pad_handle_key(unsigned short keyCode, int isDown) {
 //   trace                                        log the GPU work of the next frame
 //   close / terminate                            quit through the window close button / Cmd+Q
 // Stick values are 0..255 (128 = center); -1 keeps the stick untouched.
+// Menus auto-repeat a held direction: Uncharted 4's menus move twice for a 300 ms hold and
+// once for 100 ms, so taps should be short.
 extern volatile int g_ps4_screenshot_request;
 extern volatile int g_ps4_gnm_dump_request;
-typedef struct { long dur; uint32_t mask; int lx, ly, rx, ry; } PadCtlCmd;
+typedef enum {
+  PAD_CTL_HOLD, PAD_CTL_SHOT, PAD_CTL_DUMPRT, PAD_CTL_DUMPDRAWS, PAD_CTL_TRACE, PAD_CTL_CLOSE,
+  PAD_CTL_TERMINATE
+} PadCtlKind;
+typedef struct { PadCtlKind kind; long dur; uint32_t mask; int lx, ly, rx, ry; } PadCtlCmd;
+
+static void ps4_pad_control_action(PadCtlKind kind) {
+  switch (kind) {
+  case PAD_CTL_SHOT: g_ps4_screenshot_request = 1; break;
+  case PAD_CTL_DUMPRT: g_ps4_gnm_dump_request |= 1; break;
+  case PAD_CTL_DUMPDRAWS: g_ps4_gnm_dump_request |= 2; break;
+  case PAD_CTL_TRACE: g_ps4_gnm_dump_request |= 4; break;
+  case PAD_CTL_CLOSE: {
+    extern void ps4_metal_screen_request_close(void);
+    ps4_metal_screen_request_close();
+    break;
+  }
+  case PAD_CTL_TERMINATE: {
+    extern void ps4_metal_screen_request_terminate(void);
+    ps4_metal_screen_request_terminate();
+    break;
+  }
+  case PAD_CTL_HOLD: break;
+  }
+}
+
 static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, uint8_t *rx, uint8_t *ry) {
   static int init;
   static FILE *f;
@@ -339,27 +367,19 @@ static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, ui
     }
     line[line_len] = 0;
     line_len = 0;
-    PadCtlCmd cmd = {0, 0, -1, -1, -1, -1};
+    PadCtlCmd cmd = {PAD_CTL_HOLD, 0, 0, -1, -1, -1, -1};
     if (strncmp(line, "shot", 4) == 0) {
-      g_ps4_screenshot_request = 1;
-      continue;
+      cmd.kind = PAD_CTL_SHOT;
     } else if (strncmp(line, "dumprt", 6) == 0) {
-      g_ps4_gnm_dump_request |= 1;
-      continue;
+      cmd.kind = PAD_CTL_DUMPRT;
     } else if (strncmp(line, "dumpdraws", 9) == 0) {
-      g_ps4_gnm_dump_request |= 2;
-      continue;
+      cmd.kind = PAD_CTL_DUMPDRAWS;
     } else if (strncmp(line, "trace", 5) == 0) {
-      g_ps4_gnm_dump_request |= 4;
-      continue;
+      cmd.kind = PAD_CTL_TRACE;
     } else if (strncmp(line, "close", 5) == 0) {
-      extern void ps4_metal_screen_request_close(void);
-      ps4_metal_screen_request_close();
-      continue;
+      cmd.kind = PAD_CTL_CLOSE;
     } else if (strncmp(line, "terminate", 9) == 0) {
-      extern void ps4_metal_screen_request_terminate(void);
-      ps4_metal_screen_request_terminate();
-      continue;
+      cmd.kind = PAD_CTL_TERMINATE;
     } else if (line[0] == 'w') {
       cmd.dur = strtol(line + 1, NULL, 10);
     } else if (line[0] == 'p') {
@@ -381,13 +401,20 @@ static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, ui
     if ((q_tail + 1) % 512 != q_head) {
       queue[q_tail] = cmd;
       q_tail = (q_tail + 1) % 512;
+    } else {
+      fprintf(stderr, "[pad] control queue full, dropped: %s\n", line);
     }
   }
   const uint64_t now = get_time_micros();
   if (active && now >= cur_end_us) active = 0;
-  if (!active && q_head != q_tail) {
+  // Actions take no time: run every action that is due, up to the next hold or wait.
+  while (!active && q_head != q_tail) {
     cur = queue[q_head];
     q_head = (q_head + 1) % 512;
+    if (cur.kind != PAD_CTL_HOLD) {
+      ps4_pad_control_action(cur.kind);
+      continue;
+    }
     cur_end_us = now + (uint64_t)(cur.dur > 0 ? cur.dur : 0) * 1000;
     active = 1;
   }
@@ -461,6 +488,9 @@ int32_t scePadReadState(int32_t handle, OrbisPadData *data) {
     // Debug aid: PS4_PAD_SCRIPT="<t_ms>:<hex mask>[:<dur_ms>[:<lx>:<ly>]],..." presses the
     // buttons (and optionally sets the left stick) at absolute times since the first pad
     // read, e.g. "60000:8:200,61000:4000" = Options at 60 s, Cross at 61 s.
+    // The default hold is 200 ms. Menus auto-repeat a held direction, so use about 100 ms for one
+    // menu step (see PS4_PAD_CTL above). PS4_PAD_AUTOPRESS keeps pressing for the whole run unless
+    // PS4_PAD_AUTOPRESS_UNTIL ends it, and its presses then confirm whatever a menu has selected.
     typedef struct { long t, dur; uint32_t mask; int lx, ly; } PadStep;
     static PadStep steps[256];
     static int nsteps = -1;
@@ -748,14 +778,41 @@ void shim_scePadSetVibration(GuestContext *ctx) {
   SHIM_RETURN();
 }
 
-void shim_scePadGetControllerInformation(GuestContext *ctx) {
-  uint64_t info_addr = ctx->rsi;
-  if (info_addr) {
-    uint8_t *info = (uint8_t *)(ctx->mem_base + info_addr);
-    memset(info, 0, 32);
-    info[0] = 1; // connected
+// One connected local DualShock 4 per opened handle. The touch pad and dead-zone values are the
+// ones shadPS4 reports (src/core/libraries/pad/pad.cpp, GPL-2.0-or-later).
+int32_t scePadGetControllerInformation(int32_t handle, OrbisPadControllerInformation *info) {
+  if (!info)
+    return ORBIS_PAD_ERROR_INVALID_ARG;
+  pthread_mutex_lock(&g_pad_mutex);
+  int found = 0;
+  for (int i = 0; i < MAX_PAD_HANDLES; i++) {
+    if (g_pad_slots[i].in_use && g_pad_slots[i].handle == handle) {
+      found = 1;
+      break;
+    }
   }
-  ctx->rax = 0;
+  pthread_mutex_unlock(&g_pad_mutex);
+  if (!found)
+    return ORBIS_PAD_ERROR_INVALID_HANDLE;
+  memset(info, 0, sizeof(*info));
+  info->touchPadPixelDensity = 1.0f;
+  info->touchPadResolutionX = 1920;
+  info->touchPadResolutionY = 950;
+  info->deadZoneLeft = 1;
+  info->deadZoneRight = 1;
+  info->connectionType = ORBIS_PAD_CONNECTION_TYPE_LOCAL;
+  info->connectedCount = 1; // matches OrbisPadData.count
+  info->connected = 1;
+  info->deviceClass = ORBIS_PAD_DEVICE_CLASS_STANDARD;
+  return 0;
+}
+
+void shim_scePadGetControllerInformation(GuestContext *ctx) {
+  int32_t handle = (int32_t)ctx->rdi;
+  uint64_t info_addr = ctx->rsi;
+  OrbisPadControllerInformation *info =
+      info_addr ? (OrbisPadControllerInformation *)(ctx->mem_base + info_addr) : NULL;
+  ctx->rax = (uint64_t)(int64_t)scePadGetControllerInformation(handle, info);
   SHIM_RETURN();
 }
 
