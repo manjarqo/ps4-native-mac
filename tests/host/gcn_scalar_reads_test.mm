@@ -9,11 +9,15 @@
 //     seconds and the GPU watchdog killed the command buffer.
 //  3. A pointer read at such an offset cannot be followed without direct memory access: the
 //     reads through it are not flattened. That must be logged as an error, not dropped silently.
-//  4. A compute shader dumped from Uncharted 4 (data/u4_cs_blur.*: a blur whose weights are read
+//  4. A compute shader dumped from Uncharted 4 (u4_cs_blur.*: a blur whose weights are read
 //     at s[0:1] + 72 + 4 * i) translates without SRT walker errors, and its weights come from a
 //     guest buffer based at the pointer it reads through.
 //
-// usage: gcn_scalar_reads_test <dir with u4_cs_blur.bin/.txt>
+// Case 4 needs a local fixture: game data, not distributed; each developer dumps it from their own
+// copy of the game (tests/host/README.md). Without it the case prints a SKIP line and does not
+// count as passed; a fixture that is present but unreadable fails.
+//
+// usage: gcn_scalar_reads_test <local fixture dir with u4_cs_blur.bin/.txt>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -22,6 +26,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <sys/stat.h>
 #include <string>
 #include <vector>
 
@@ -287,6 +292,19 @@ bool LoadFile(const std::string& path, std::vector<uint8_t>& out) {
     return true;
 }
 
+// False (and a SKIP line) when one of the blur's fixture files is absent.
+bool HaveBlurFixture(const std::string& dir) {
+    for (const char* f : {"/u4_cs_blur.bin", "/u4_cs_blur.txt"}) {
+        struct stat st;
+        if (stat((dir + f).c_str(), &st) != 0) {
+            std::printf("SKIP: gcn_scalar_reads_test/u4_cs_blur: needs local fixture %s%s (game data, not distributed)\n",
+                        dir.c_str(), f);
+            return false;
+        }
+    }
+    return true;
+}
+
 void TestU4Blur(id<MTLDevice> dev, const std::string& dir) {
     std::vector<uint8_t> code;
     CHECK(LoadFile(dir + "/u4_cs_blur.bin", code) && code.size() >= 8, "cannot read %s/u4_cs_blur.bin", dir.c_str());
@@ -374,9 +392,12 @@ int main(int argc, char** argv) {
         gcn_set_log_callback(LogSink, nullptr);
         TestHandWritten(dev);
         TestLostPointerLogged();
-        TestU4Blur(dev, argc > 1 ? argv[1] : ".");
+        const std::string dir = argc > 1 ? argv[1] : ".";
+        const bool blur = HaveBlurFixture(dir);
+        if (blur) TestU4Blur(dev, dir);
         if (g_fail) return 1;
-        std::printf("gcn_scalar_reads_test: PASS\n");
+        if (blur) std::printf("gcn_scalar_reads_test: PASS\n");
+        else std::printf("gcn_scalar_reads_test: PASS (3 cases run, 1 skipped)\n");
     }
     return 0;
 }

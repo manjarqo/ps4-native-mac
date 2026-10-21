@@ -1,6 +1,6 @@
 // Wave-level GCN instructions on Metal, whose simdgroups are 32 wide (a wave64 compute shader
 // runs as two simdgroups), checked by running small compute shaders and reading their output.
-// Uncharted 4's chapter 1 compute shaders (tests/host/data/u4_cs_*, gcn_u4_cs_test) use them:
+// Uncharted 4's chapter 1 compute shaders (gcn_u4_cs_test, local fixtures) use them:
 //  A. s_mov_b32 exec_hi after v_cmpx: lanes 32-63 must take the written half, not the low half
 //     (they ran with exec_lo's bits: 16 lanes of 32 in the upper half here).
 //  B. V# dwords spilled to VGPR lanes (v_writelane / v_readlane) and used for a store.

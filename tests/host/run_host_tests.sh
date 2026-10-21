@@ -1,8 +1,17 @@
 #!/bin/bash
 # Builds and runs the host-side unit tests of runtime pieces that do not need the game.
+#
+# A few cases translate or run shaders dumped from a game. Those dumps are game data and are not
+# in the repository: each developer makes them from their own copy of the game and puts them in
+# tests/host/data/game/ (git-ignored), or in the directory named by PS4_HOST_GAME_FIXTURES. Without
+# them these cases print "SKIP: <case>: needs local fixture <path> (game data, not distributed)"
+# and are not counted as passed. How to regenerate them: tests/host/README.md.
 set -euo pipefail
 R=$(cd "$(dirname "$0")/../.." && pwd)
 T=$(mktemp -d)
+FIX="${PS4_HOST_GAME_FIXTURES:-$R/tests/host/data/game}"
+# output of the tests with fixture cases, for the SKIP count at the end
+: > "$T/fixture_cases.txt"
 "$R/tests/host/runtime_link_check.sh"
 clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/kernel/threading" "$R/tests/host/stall_profile_test.c" \
   "$R/pkg/runtime/kernel/threading/ps4_stall_profile.c" -o "$T/stall_profile_test"
@@ -122,12 +131,13 @@ clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_
   -framework Foundation -o "$T/guest_window_test"
 "$T/guest_window_test"
 # Shader translator (3rdparty/gcn-recompiler) scalar reads on Metal: SRT reads at offsets only the
-# shader knows, s_buffer_load past num_records, and a compute shader dumped from Uncharted 4.
+# shader knows, s_buffer_load past num_records, and a compute shader dumped from Uncharted 4
+# (local fixture).
 GR="$R/3rdparty/gcn-recompiler"
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_scalar_reads_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_scalar_reads_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-"$T/gcn_scalar_reads_test" "$R/tests/host/data"
+"$T/gcn_scalar_reads_test" "$FIX" | tee -a "$T/fixture_cases.txt"
 # GPU memory accounting and budget decisions, the hole check against real mappings, and the Metal
 # facts the accounting rests on (no-copy lengths in currentAllocatedSize, GPU use wires the range).
 clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$G" -c "$G/ps4_gnm_membudget.c" -o "$T/membudget.o"
@@ -156,10 +166,11 @@ tail -1 "$T/gnm_capture_tex.txt"
   > "$T/replay_build.txt" 2>&1 || { cat "$T/replay_build.txt"; exit 1; }
 "$T/replay/gnm_replay_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
 # Buffer loads and stores through V#s a compute shader loads at run time (Uncharted 4's GPU copy
-# shader, capture r13c pass 21) through the renderer: probe, guest page table, dispatch; each
-# destination gets its source's dwords, GCN's range check on loads and stores, an unimplemented
-# V# format skips the dispatch.
-"$T/replay/gnm_guest_memory_test" "$R/tests/host/data" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
+# shader, capture r13c pass 21; local fixture) through the renderer: probe, guest page table,
+# dispatch; each destination gets its source's dwords, GCN's range check on loads and stores, an
+# unimplemented V# format skips the dispatch. Hand-assembled shaders cover the same paths.
+"$T/replay/gnm_guest_memory_test" "$FIX" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; } \
+  | tee -a "$T/fixture_cases.txt"
 # RectList draws: a translated vertex shader drawn as rectangles (capture, barrier, expansion);
 # the colours at all 4 corners of each rectangle, with Metal API validation on.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_rectlist_test.mm" \
@@ -178,11 +189,12 @@ clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_
   -o "$T/gcn_buffer_align_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
 "$T/gcn_buffer_align_test"
 # Uncharted 4 chapter 1 compute shaders the translator rejected (EXEC half writes, sharps
-# spilled to VGPR lanes, wave64 ballots through workgroup memory): translated and Metal-accepted.
+# spilled to VGPR lanes, wave64 ballots through workgroup memory): translated and Metal-accepted
+# (local fixtures).
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_u4_cs_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_u4_cs_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-"$T/gcn_u4_cs_test" "$R/tests/host/data" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
+"$T/gcn_u4_cs_test" "$FIX" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; } | tee -a "$T/fixture_cases.txt"
 # T#s / S#s not read from the resource tables as they are: loaded through a run-time V# (null
 # image, counted, also after the shader cache; the S# cannot be fetched) or computed in the
 # shader (the translation fails, naming the instruction).
@@ -271,7 +283,13 @@ mkdir -p "$T/gcnl_s" "$T/gcnl_r" "$T/gcnl_o"
 "$T/gcn_cache_lookup_test" restart "$T/gcnl_r" 3000 2>&1 | grep '^gcn_cache_lookup_test'
 # an entry of another resource layout in the bucket: found through the one-by-one path
 "$T/gcn_cache_lookup_test" odd "$T/gcnl_o" 500 2>&1 | grep '^gcn_cache_lookup_test'
-# Capture tools (tools/*.py): overview page, fixture extraction, reference comparison.
+# Capture tools (tools/*.py): overview page, reference comparison.
 python3 -m unittest discover -s "$R/tools/tests" -p 'test_*.py' > "$T/tools_tests.txt" 2>&1 || { cat "$T/tools_tests.txt"; exit 1; }
 echo "capture tools: PASS ($(grep -o 'Ran [0-9]* tests' "$T/tools_tests.txt"))"
+skipped=$(grep -c '^SKIP:' "$T/fixture_cases.txt" || true)
+if [ "$skipped" -gt 0 ]; then
+  echo "host tests: PASS, $skipped case(s) SKIPPED (local game fixtures absent in $FIX, see tests/host/README.md)"
+else
+  echo "host tests: PASS (local game fixtures present)"
+fi
 rm -rf "$T"

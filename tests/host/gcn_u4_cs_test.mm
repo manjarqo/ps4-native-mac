@@ -1,21 +1,25 @@
 // Shaders dumped from Uncharted 4's chapter 1 (the boat) that the shader translator
 // (3rdparty/gcn-recompiler) rejected, so their dispatches were skipped:
-//  - data/u4_cs_execlo.*  (0x1300124f00): "s_mov_b32 exec_lo, -1" / "exec_hi, -1" (32-bit writes of
+//  - u4_cs_execlo.*  (0x1300124f00): "s_mov_b32 exec_lo, -1" / "exec_hi, -1" (32-bit writes of
 //    one EXEC half) failed with "SetDst: Unknown field 126".
-//  - data/u4_cs_spill.*   (0x130015c400, async compute, skipped ~5 times per frame): V#s and a
+//  - u4_cs_spill.*   (0x130015c400, async compute, skipped ~5 times per frame): V#s and a
 //    pointer spilled to VGPR lanes (v_writelane / v_readlane) through a VGPR also written as a
 //    relative-indexed register array in a loop; "Sharp dword 0 produced by ReadLane", then
 //    "ReadConst base low not from constant memory". Its wave64 ballots then read workgroup
 //    memory through a u64 view next to the u32 one, which the MSL backend dropped (undeclared
 //    shared_mem_u32): Metal rejected the shader.
-//  - data/u4_vs_fullscreen.* (0x1300000300): a vertex shader. The library declares the position
+//  - u4_vs_fullscreen.* (0x1300000300): a vertex shader. The library declares the position
 //    invariant itself (passes with depth func EQUAL after a prepass rely on equal positions).
 //    The renderer already rewrote the MSL to [[position, invariant]], so this is not the cause
 //    of the characters missing in U4's chapter 1; the check keeps the library's output right.
 // Each must translate (with zeroed guest memory: the sharps' contents do not matter here) and
 // the MSL must be accepted by Metal.
 //
-// usage: gcn_u4_cs_test <dir with the fixtures>
+// The fixtures are game data and are not distributed: each developer dumps them from their own
+// copy of the game (tests/host/README.md). A case whose fixture is absent prints a SKIP line and
+// does not count as passed; a fixture that is present but unreadable fails.
+//
+// usage: gcn_u4_cs_test <local fixture dir>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -23,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sys/stat.h>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -32,6 +37,7 @@
 namespace {
 
 int g_fail = 0;
+int g_run = 0, g_skipped = 0;
 #define CHECK(c, ...)                                                                   \
     do {                                                                                \
         if (!(c)) {                                                                     \
@@ -47,8 +53,29 @@ bool ZeroRead(void*, uint64_t, void* dst, uint64_t size) {
     return true;
 }
 
+bool Exists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+// False (and a SKIP line) when one of the case's fixture files is absent.
+bool HaveFixture(const std::string& dir, const std::string& name) {
+    for (const char* ext : {".bin", ".txt"}) {
+        const std::string path = dir + "/" + name + ext;
+        if (!Exists(path)) {
+            std::printf("SKIP: gcn_u4_cs_test/%s: needs local fixture %s (game data, not distributed)\n",
+                        name.c_str(), path.c_str());
+            g_skipped++;
+            return false;
+        }
+    }
+    g_run++;
+    return true;
+}
+
 void Run(id<MTLDevice> dev, const std::string& dir, const std::string& name, uint32_t hw = GCN_HW_CS,
          uint32_t sw = GCN_SW_COMPUTE) {
+    if (!HaveFixture(dir, name)) return;
     std::ifstream bin(dir + "/" + name + ".bin", std::ios::binary);
     std::vector<uint8_t> code((std::istreambuf_iterator<char>(bin)), std::istreambuf_iterator<char>());
     CHECK(code.size() >= 8, "cannot read %s/%s.bin", dir.c_str(), name.c_str());
@@ -129,7 +156,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "gcn_u4_cs_test: %d failure(s)\n", g_fail);
             return 1;
         }
-        std::printf("gcn_u4_cs_test: PASS\n");
+        if (g_run == 0) {
+            std::printf("gcn_u4_cs_test: SKIP (all %d cases need local fixtures)\n", g_skipped);
+            return 0;
+        }
+        if (g_skipped) std::printf("gcn_u4_cs_test: PASS (%d cases run, %d skipped)\n", g_run, g_skipped);
+        else std::printf("gcn_u4_cs_test: PASS\n");
         return 0;
     }
 }

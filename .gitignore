@@ -14,3 +14,6 @@ tools/
 
 # gcn-recompiler build output (built locally, see README)
 3rdparty/gcn-recompiler/libgcn_recompiler.a
+
+# Host test fixtures dumped from a game (game data, never committed; see tests/host/README.md)
+/tests/host/data/game/

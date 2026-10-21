@@ -101,7 +101,5 @@ One- and two-channel formats show R (and G). Multisampled textures have no view.
   notes on stderr list the store instructions in its shaders' GCN code). `--out <dir>` writes the replayed outputs (`.raw`, `.png`,
   `.bin`). The replay runs the renderer with `PS4_GNM_SYNC_ENCODE`, `PS4_GNM_SYNC_COMPILE` and no
   shader cache, PSO archive or library store, so it reads and writes nothing outside its process.
-- `tools/gnm_capture_extract.py <frame_dir> <pass> <out>`: one pass as a minimal frame for a
-  host test (`tests/host/data/replay/`), at most 4 MiB.
 - `tools/refcompare.py <frame.png> <reference.png>`: 4x4-region mean colour and luminance and a
   luminance histogram against a reference frame.

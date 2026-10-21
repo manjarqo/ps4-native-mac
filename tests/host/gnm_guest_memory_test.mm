@@ -1,6 +1,6 @@
 // Buffer accesses through V#s a compute shader loads at run time, run through the real renderer
 // (ps4draw::Dispatch: translation, the guest memory probe, the page table, the dispatch).
-// The shader is Uncharted 4's 152-byte GPU copy shader (data/u4_cs_copy.*, capture r13c pass 21):
+// The shader is Uncharted 4's 152-byte GPU copy shader (u4_cs_copy.*, capture r13c pass 21):
 // for each entry of a copy table it loads a source and a destination V# with s_load_dwordx4 at an
 // offset computed in its loop, then buffer_load_format_x / buffer_store_format_x through them.
 // The translator used to drop both (an empty if {} in the MSL), so the destinations were never
@@ -19,7 +19,12 @@
 //  - buffer_load_format_xyzw with dst_sel W Z 1 X, stored with buffer_store_dwordx4;
 //  - a chained probe: a V# loaded through a run-time V# from a page not mapped yet.
 //
-// usage: gnm_guest_memory_test <dir with the fixtures>
+// The copy shader cases need a local fixture: game data, not distributed; each developer dumps it
+// from their own copy of the game (tests/host/README.md). Without it those cases print SKIP lines
+// and do not count as passed; a fixture that is present but not the expected shader fails. The
+// hand-assembled cases need no fixture.
+//
+// usage: gnm_guest_memory_test <local fixture dir>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -27,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include <array>
 #include <fstream>
@@ -79,6 +85,30 @@ struct Entry {
     bool null_dst = false; // the destination V# is all zero (num_records 0)
 };
 
+// The register file of a 64x1x1 compute dispatch on every CU; the program, its resources and
+// user data are set by each case.
+std::vector<uint32_t> BaseComputeRegs() {
+    std::vector<uint32_t> regs(0x10000, 0);
+    regs[0x2E07] = 64; // COMPUTE_NUM_THREAD_X
+    regs[0x2E08] = 1;  // COMPUTE_NUM_THREAD_Y
+    regs[0x2E09] = 1;  // COMPUTE_NUM_THREAD_Z
+    regs[0x2E16] = 0xFFFFFFFFu; // COMPUTE_STATIC_THREAD_MGMT_SE0
+    regs[0x2E17] = 0xFFFFFFFFu; // COMPUTE_STATIC_THREAD_MGMT_SE1
+    return regs;
+}
+
+bool Exists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+// The first absent fixture file of the copy shader, or "" when both are present.
+std::string MissingFixture(const std::string& dir) {
+    for (const char* f : {"/u4_cs_copy.bin", "/u4_cs_copy.txt"})
+        if (!Exists(dir + f)) return dir + f;
+    return "";
+}
+
 bool Load(const std::string& dir) {
     std::ifstream bin(dir + "/u4_cs_copy.bin", std::ios::binary);
     g_code.assign(std::istreambuf_iterator<char>(bin), std::istreambuf_iterator<char>());
@@ -91,7 +121,8 @@ bool Load(const std::string& dir) {
         std::istringstream ss(line);
         std::string a, b;
         ss >> a >> b;
-        g_regs[std::strtoul(a.c_str(), nullptr, 16)] = std::strtoul(b.c_str(), nullptr, 16);
+        const uint32_t r = std::strtoul(a.c_str(), nullptr, 16);
+        if (r < g_regs.size()) g_regs[r] = std::strtoul(b.c_str(), nullptr, 16);
     }
     g_regs[0x2E0C] = uint32_t(kCode >> 8); // COMPUTE_PGM_LO
     g_regs[0x2E0D] = 0;
@@ -243,7 +274,7 @@ void RunProgram(const std::vector<uint32_t>& body, uint64_t hash, const std::vec
     memcpy(g_mem + kCode2, code.data(), code.size() * 4);
     memset(g_mem + kTable2, 0, 256);
     for (size_t i = 0; i < vsharps.size(); ++i) memcpy(At(kTable2 + 16 * i), vsharps[i].data(), 16);
-    std::vector<uint32_t> regs = g_regs;
+    std::vector<uint32_t> regs = BaseComputeRegs();
     regs[0x2E0C] = uint32_t(kCode2 >> 8);
     regs[0x2E12] = 1 | (2 << 6); // 8 VGPRs, 24 SGPRs
     regs[0x2E13] = 2 << 1 | 1 << 7; // 2 user SGPRs, s2 = workgroup id x
@@ -358,8 +389,10 @@ int main(int argc, char** argv) {
             fprintf(stderr, "usage: gnm_guest_memory_test <fixture dir>\n");
             return 2;
         }
-        if (!Load(argv[1])) {
-            fprintf(stderr, "gnm_guest_memory_test: FAIL cannot read %s/u4_cs_copy.*\n", argv[1]);
+        const std::string missing = MissingFixture(argv[1]);
+        const bool copy_shader = missing.empty();
+        if (copy_shader && !Load(argv[1])) {
+            fprintf(stderr, "gnm_guest_memory_test: FAIL %s/u4_cs_copy.* is not the expected copy shader\n", argv[1]);
             return 1;
         }
         setenv("PS4_GNM_SYNC_ENCODE", "1", 1);
@@ -381,10 +414,17 @@ int main(int argc, char** argv) {
             fprintf(stderr, "gnm_guest_memory_test: FAIL the renderer did not start\n");
             return 1;
         }
-        TestCopy();
-        TestStoreRangeCheck();
-        TestUnsupportedFormat();
-        TestNullDestination();
+        static const char* const kCopyCases[] = {"copy", "store_range_check", "unsupported_format", "null_destination"};
+        if (copy_shader) {
+            TestCopy();
+            TestStoreRangeCheck();
+            TestUnsupportedFormat();
+            TestNullDestination();
+        } else {
+            for (const char* c : kCopyCases)
+                printf("SKIP: gnm_guest_memory_test/%s: needs local fixture %s (game data, not distributed)\n", c,
+                       missing.c_str());
+        }
         TestDwordOffenStride0();
         TestDstSel();
         TestChainedProbe();
@@ -392,7 +432,8 @@ int main(int argc, char** argv) {
             fprintf(stderr, "gnm_guest_memory_test: %d failure(s)\n", g_fail);
             return 1;
         }
-        printf("gnm_guest_memory_test: PASS\n");
+        if (copy_shader) printf("gnm_guest_memory_test: PASS\n");
+        else printf("gnm_guest_memory_test: PASS (3 cases run, 4 skipped)\n");
         return 0;
     }
 }
