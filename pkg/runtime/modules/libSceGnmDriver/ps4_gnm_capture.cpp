@@ -127,6 +127,12 @@ bool Writer::Begin(std::string* err) {
     return true;
 }
 
+void Writer::Failed(const std::string& path) {
+    if (failures_++ == 0)
+        fprintf(stderr, "[gnm-capture] cannot write %s: %s (further write failures are only counted)\n", path.c_str(),
+                strerror(errno));
+}
+
 BlobRef Writer::Snapshot(const uint8_t* mem_base, uint64_t addr, uint64_t size) {
     BlobRef b;
     b.addr = addr;
@@ -142,7 +148,11 @@ BlobRef Writer::Snapshot(const uint8_t* mem_base, uint64_t addr, uint64_t size) 
     char name[96];
     snprintf(name, sizeof(name), "blobs/%llx_%llx_%016llx.bin", (unsigned long long)addr, (unsigned long long)size,
              (unsigned long long)b.hash);
-    if (WriteFile(dir_ + "/" + name, mem_base + addr, size)) b.file = name;
+    if (!WriteFile(dir_ + "/" + name, mem_base + addr, size)) {
+        Failed(dir_ + "/" + name);
+        return b;
+    }
+    b.file = name;
     blobs_[key] = b.file;
     return b;
 }
@@ -160,9 +170,12 @@ std::string Writer::SaveRegs(const uint32_t* regs, uint64_t* hash) {
     if (it != regs_.end()) return it->second;
     char name[64];
     snprintf(name, sizeof(name), "regs/%016llx.bin", (unsigned long long)h);
-    std::string file = WriteFile(dir_ + "/" + name, pairs.data(), pairs.size() * 4) ? name : "";
-    regs_[h] = file;
-    return file;
+    if (!WriteFile(dir_ + "/" + name, pairs.data(), pairs.size() * 4)) {
+        Failed(dir_ + "/" + name);
+        return "";
+    }
+    regs_[h] = name;
+    return name;
 }
 
 std::string Writer::SaveTexture(uint32_t pass, const std::string& role, const char* when,
@@ -170,7 +183,9 @@ std::string Writer::SaveTexture(uint32_t pass, const std::string& role, const ch
     *hash = Fnv64(raw.data(), raw.size());
     char name[96];
     snprintf(name, sizeof(name), "tex/p%05u_%s_%s.raw", pass, role.c_str(), when);
-    return WriteFile(dir_ + "/" + name, raw.data(), raw.size()) ? name : "";
+    if (WriteFile(dir_ + "/" + name, raw.data(), raw.size())) return name;
+    Failed(dir_ + "/" + name);
+    return "";
 }
 
 std::string Writer::SavePng(uint32_t pass, const std::string& role, const GpuTextureId& id,
@@ -195,7 +210,10 @@ std::string Writer::SavePng(uint32_t pass, const std::string& role, const GpuTex
     if (k > 1) *mode += ", 1/" + std::to_string(k) + " scale";
     char name[96];
     snprintf(name, sizeof(name), "png/p%05u_%s.png", pass, role.c_str());
-    return WritePngRgb8(dir_ + "/" + name, v.mtl_width, v.mtl_height, rgb) ? name : "";
+    if (WritePngRgb8(dir_ + "/" + name, v.mtl_width, v.mtl_height, rgb)) return name;
+    Failed(dir_ + "/" + name);
+    *mode = "write failed";
+    return "";
 }
 
 bool Writer::Finish(std::string* err) {

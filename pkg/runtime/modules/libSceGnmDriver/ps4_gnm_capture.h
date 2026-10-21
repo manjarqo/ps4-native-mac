@@ -77,7 +77,8 @@ uint64_t RawSize(const GpuTextureId& t);
 
 struct BlobRef {
     uint64_t addr = 0, size = 0, hash = 0;
-    std::string file; // relative to the frame directory; "" when not stored (too large)
+    std::string file; // relative to the frame directory; "" when not stored (too large, or the
+                      // write failed: Writer::Failures)
 };
 
 struct StageRec {
@@ -198,8 +199,13 @@ public:
     void AddPass(PassRec&& p) { frame_.passes.push_back(std::move(p)); }
     size_t NumPasses() const { return frame_.passes.size(); }
     bool Finish(std::string* err); // writes manifest.json
+    // Files that could not be written (blobs, register files, raw textures, PNGs). The first
+    // failure is reported on stderr; a failed file is not remembered, so a later call retries it.
+    uint64_t Failures() const { return failures_; }
 
 private:
+    void Failed(const std::string& path);
+    uint64_t failures_ = 0;
     std::string dir_;
     FrameRec frame_;
     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, std::string> blobs_;

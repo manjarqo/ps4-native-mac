@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cmath>
@@ -107,6 +108,37 @@ static void TestThumbnail(const std::string& dir) {
         const uint32_t ph = (png[20] << 24) | (png[21] << 16) | (png[22] << 8) | png[23];
         CHECK(pw == 4 && ph == 1, "thumbnail size %ux%u", pw, ph);
     }
+}
+
+// A file the writer cannot write is reported (Failures), and not remembered as written or as
+// "not stored": once the directory is writable again the same content is stored.
+static void TestWriteFailures(const std::string& dir) {
+    Writer w(dir, 9, 1 << 20, false, "");
+    std::string err, mode;
+    CHECK(w.Begin(&err), "Begin: %s", err.c_str());
+    std::vector<uint8_t> mem(1 << 20, 0x5A);
+    std::vector<uint32_t> regs(kNumRegs, 0);
+    regs[0x2E07] = 7;
+    GpuTextureId t;
+    t.mtl_format = kRGBA8Unorm;
+    t.mtl_type = 2;
+    t.mtl_width = 4;
+    t.mtl_height = 1;
+    const std::vector<uint8_t> raw(16, 0x80);
+    for (const char* sub : {"/regs", "/blobs", "/png", "/tex"}) chmod((dir + sub).c_str(), 0555);
+    uint64_t h = 0;
+    CHECK(w.SaveRegs(regs.data(), &h).empty(), "register file written into a read-only directory");
+    CHECK(w.Snapshot(mem.data(), 0x4000, kPage).file.empty(), "blob written into a read-only directory");
+    CHECK(w.SavePng(0, "t0_color0", t, raw, 0, &mode).empty(), "png written into a read-only directory");
+    CHECK(w.SaveTexture(0, "t0_color0", "post", raw, &h).empty(), "raw written into a read-only directory");
+    CHECK(w.Failures() == 4, "write failures counted: %llu", (unsigned long long)w.Failures());
+    for (const char* sub : {"/regs", "/blobs", "/png", "/tex"}) chmod((dir + sub).c_str(), 0755);
+    const std::string rf = w.SaveRegs(regs.data(), &h);
+    CHECK(!rf.empty(), "a failed register file is not cached");
+    const BlobRef b = w.Snapshot(mem.data(), 0x4000, kPage);
+    std::vector<uint8_t> back;
+    CHECK(!b.file.empty() && ReadFile(dir + "/" + b.file, &back) && back.size() == kPage, "a failed blob is not cached");
+    CHECK(w.Failures() == 4, "no new failures: %llu", (unsigned long long)w.Failures());
 }
 
 static std::string TempDir() {
@@ -226,6 +258,7 @@ static void TestWriterRoundTrip() {
     CHECK(!ParseManifest("{\"version\": 99}", &bad, &err), "foreign version accepted");
     CHECK(!ParseManifest("{\"version\": 1, \"passes\": [", &bad, &err), "truncated manifest accepted");
     TestThumbnail(root + "/frame_1");
+    TestWriteFailures(root + "/frame_9");
     const std::string cmd = "rm -rf '" + root + "'";
     CHECK(system(cmd.c_str()) == 0, "cleanup");
 }

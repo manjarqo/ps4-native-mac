@@ -2905,9 +2905,9 @@ void EndFrame() {
     if (!g_writer || S.present_idx != g_writer->Frame()) return;
     std::string err;
     if (g_writer->Finish(&err))
-        fprintf(stderr, "[gnm-capture] frame %llu: %zu passes written to %s (%llu MiB raw)\n",
+        fprintf(stderr, "[gnm-capture] frame %llu: %zu passes written to %s (%llu MiB raw, %llu write failures)\n",
                 (unsigned long long)g_writer->Frame(), g_writer->NumPasses(), g_writer->Dir().c_str(),
-                (unsigned long long)(g_raw_bytes >> 20));
+                (unsigned long long)(g_raw_bytes >> 20), (unsigned long long)g_writer->Failures());
     else
         fprintf(stderr, "[gnm-capture] %s\n", err.c_str());
     g_writer.reset();
