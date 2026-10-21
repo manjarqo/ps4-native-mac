@@ -2580,6 +2580,10 @@ std::vector<id<MTLTexture>> g_tex;                  // texture of g_pass->textur
 // storage textures g_pass binds (BindStage): index of their ImageRec in g_pass->images, texture
 std::vector<std::pair<size_t, id<MTLTexture>>> g_storage;
 uint32_t g_next = 0;
+// a guest memory dispatch (GuestMemoryDispatch): its inputs were stored after its probe, before
+// it ran; the guest ranges it wrote are outputs
+bool g_inputs_taken = false;
+std::vector<std::pair<uint64_t, uint64_t>> g_guest_written;
 
 bool InFrame() { return g_writer && S.present_idx == g_writer->Frame(); }
 
@@ -2643,6 +2647,8 @@ void Begin(const char* type, const char* queue, const char* name, const uint32_t
     g_reads.clear();
     g_tex.clear();
     g_storage.clear();
+    g_inputs_taken = false;
+    g_guest_written.clear();
 }
 
 void SetSkipped(const char* why) {
@@ -2919,16 +2925,21 @@ void Finish() {
     }
     // estimated lengths (fetch shaders, ApproxImageBytes) may reach into guard pages: only readable
     // guest memory is stored
-    if (p->replayable)
+    if (p->replayable && !g_inputs_taken)
         for (auto& [a, n] : ClampReadable(S.ctx->mem_base, CoalescePages(g_reads, S.ctx->mem_size)))
             p->inputs.push_back(g_writer->Snapshot(S.ctx->mem_base, a, n));
     Commit();
     WaitAll();
-    if (p->replayable)
+    if (p->replayable) {
         for (const BufferRec& b : p->buffers)
             if (b.written)
                 for (auto& [a, n] : ClampReadable(S.ctx->mem_base, {{b.addr, b.size}}))
                     p->outputs.push_back(g_writer->Snapshot(S.ctx->mem_base, a, n));
+        for (auto& [a, n] : ClampReadable(S.ctx->mem_base, CoalescePages(g_guest_written, S.ctx->mem_size)))
+            p->outputs.push_back(g_writer->Snapshot(S.ctx->mem_base, a, n));
+    }
+    g_inputs_taken = false;
+    g_guest_written.clear();
     for (size_t i = 0; i < p->textures.size(); ++i) {
         TextureRec& tr = p->textures[i];
         // contents that cannot be read (msaa, format, EQAA twin) have no view either; the budget only
@@ -2943,6 +2954,23 @@ void Finish() {
     g_tex.clear();
     g_reads.clear();
     g_storage.clear();
+}
+
+// GuestMemoryDispatch, after the probe found every page the dispatch accesses and before the
+// dispatch runs: what it reads (resource tables and buffers noted so far, the guest ranges it
+// reads or writes, read before it writes them) is stored now; what it writes is stored as its
+// output in Finish.
+void NoteGuestMemory(const std::vector<std::pair<uint64_t, uint64_t>>& accessed,
+                     const std::vector<std::pair<uint64_t, uint64_t>>& written) {
+    if (!g_pass) return;
+    if (g_pass->replayable) {
+        std::vector<std::pair<uint64_t, uint64_t>> in = g_reads;
+        in.insert(in.end(), accessed.begin(), accessed.end());
+        for (auto& [a, n] : ClampReadable(S.ctx->mem_base, CoalescePages(in, S.ctx->mem_size)))
+            g_pass->inputs.push_back(g_writer->Snapshot(S.ctx->mem_base, a, n));
+        g_inputs_taken = true;
+    }
+    g_guest_written = written;
 }
 
 // PresentImpl, before S.present_idx moves past the captured frame.
@@ -2997,6 +3025,160 @@ struct EncodeScope {
     }
 };
 } // namespace cap
+
+// =====================================================================================
+// Guest memory dispatches (gcn_shader_info.uses_guest_memory; GCN_GUEST_* in gcn_recompiler.h).
+// A compute shader that reads or writes buffers through V#s it loads at run time (Uncharted 4's
+// GPU copy shader: a table of source and destination V#s) cannot have them bound: it reaches
+// guest memory through a page table of 64 MiB guest windows (the no-copy MTLBuffers of
+// GuestBuffer). Which windows it needs is only known in the shader, so the dispatch first runs
+// as a probe that writes nothing and reports the windows it would access; those are mapped and
+// the probe repeats until it finds none missing, then the dispatch runs. Both passes are waited
+// for: the CP thread reads guest memory the dispatch may have written (resource tables of later
+// draws), and the written 1 MiB pages are known only afterwards.
+// =====================================================================================
+struct GuestMemoryState {
+    id<MTLBuffer> table = nil; // GCN_GUEST_PAGES uint64 (shared)
+    id<MTLBuffer> fault = nil; // GCN_GUEST_FAULT_DWORDS uint32 (shared)
+    std::vector<uint32_t> pages; // mapped 64 MiB pages, in mapping order
+    std::vector<uint8_t> mapped; // per page: in `pages`
+} g_gmem;
+
+bool EnsureGuestMemoryState() {
+    if (g_gmem.table) return true;
+    g_gmem.table = [S.dev newBufferWithLength:GCN_GUEST_PAGES * sizeof(uint64_t) options:MTLResourceStorageModeShared];
+    g_gmem.fault = [S.dev newBufferWithLength:GCN_GUEST_FAULT_DWORDS * sizeof(uint32_t)
+                                      options:MTLResourceStorageModeShared];
+    if (!g_gmem.table || !g_gmem.fault) {
+        g_gmem.table = g_gmem.fault = nil;
+        return false;
+    }
+    memset(g_gmem.table.contents, 0, g_gmem.table.length);
+    g_gmem.mapped.assign(GCN_GUEST_PAGES, 0);
+    return true;
+}
+
+// The page table with an entry for every mapped page; each window is (re)created through
+// GuestBuffer (windows idle for a while are released) and made resident on the encoder.
+bool BindGuestPageTable(Binder& b, __strong id<MTLBuffer>* out) {
+    if (!EnsureGuestMemoryState()) return false;
+    uint64_t* table = (uint64_t*)g_gmem.table.contents;
+    for (uint32_t p : g_gmem.pages) {
+        const uint64_t base = (uint64_t)p << GCN_GUEST_PAGE_SHIFT;
+        id<MTLBuffer> mb = nil;
+        uint64_t off = 0;
+        if (!GuestBuffer(base, std::min<uint64_t>(1ull << GCN_GUEST_PAGE_SHIFT, S.ctx->mem_size - base),
+                         GuestAccess::Write, &mb, &off) || off != 0) {
+            table[p] = 0; // the next probe reports it again
+            continue;
+        }
+        table[p] = mb.gpuAddress;
+        b.Use(mb, true);
+    }
+    *out = g_gmem.table;
+    return true;
+}
+
+// Ranges of the set bits of a page bitmap of `nbits` pages of 1 << shift bytes, merged.
+std::vector<std::pair<uint64_t, uint64_t>> BitmapRanges(const uint32_t* bits, uint32_t nbits, uint32_t shift) {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    for (uint32_t w = 0; w < nbits / 32; ++w) {
+        for (uint32_t m = bits[w]; m; m &= m - 1) {
+            const uint64_t a = ((uint64_t)w * 32 + (uint32_t)__builtin_ctz(m)) << shift;
+            if (!out.empty() && out.back().first + out.back().second == a) out.back().second += 1ull << shift;
+            else out.push_back({a, 1ull << shift});
+        }
+    }
+    return out;
+}
+
+std::string GuestStatusText(uint32_t st) {
+    std::string t;
+    const auto add = [&](uint32_t bit, const char* what) {
+        if (!(st & bit)) return;
+        if (!t.empty()) t += ", ";
+        t += what;
+    };
+    add(GCN_GUEST_STATUS_UNMAPPED, "an unmapped guest page");
+    add(GCN_GUEST_STATUS_FORMAT, "a V# format other than 32-bit uint/sint/float");
+    add(GCN_GUEST_STATUS_SWIZZLE, "a swizzled V#");
+    add(GCN_GUEST_STATUS_RANGE, "an address past 40 bits");
+    add(GCN_GUEST_STATUS_UNALIGNED, "an unaligned dword");
+    return t;
+}
+
+// Runs the probes and the dispatch (encode binds and encodes one pass). False: nothing ran
+// (logged).
+bool GuestMemoryDispatch(const Shader* cs, const char* queue, const std::function<bool()>& encode) {
+    if (!EnsureGuestMemoryState()) {
+        RLog("guestmem", "%s CS 0x%llx skipped: no guest memory buffers", queue, (unsigned long long)cs->code_addr);
+        S.n_skipped++;
+        return false;
+    }
+    uint32_t* f = (uint32_t*)g_gmem.fault.contents;
+    const auto run = [&](uint32_t mode) -> bool {
+        memset(f, 0, GCN_GUEST_FAULT_DWORDS * sizeof(uint32_t));
+        f[GCN_GUEST_MODE] = mode;
+        if (!encode()) return false;
+        EndEncoders();
+        Commit();
+        WaitAll();
+        return !S.hung;
+    };
+    constexpr int kMaxProbes = 4;
+    for (int probe = 0;; ++probe) {
+        if (!run(1)) return false;
+        if (const uint32_t st = f[GCN_GUEST_STATUS] & ~GCN_GUEST_STATUS_UNMAPPED) {
+            RLog("guestmem", "%s CS 0x%llx skipped: it accesses guest memory through %s", queue,
+                 (unsigned long long)cs->code_addr, GuestStatusText(st).c_str());
+            S.n_skipped++;
+            return false;
+        }
+        const auto missing = BitmapRanges(f + GCN_GUEST_UNMAPPED, GCN_GUEST_PAGES, GCN_GUEST_PAGE_SHIFT);
+        if (missing.empty()) break;
+        if (probe + 1 == kMaxProbes) {
+            RLog("guestmem", "%s CS 0x%llx skipped: guest pages still missing after %d probes", queue,
+                 (unsigned long long)cs->code_addr, kMaxProbes);
+            S.n_skipped++;
+            return false;
+        }
+        for (auto [a, n] : missing) {
+            for (uint64_t at = a; at < a + n; at += 1ull << GCN_GUEST_PAGE_SHIFT) {
+                const uint32_t p = (uint32_t)(at >> GCN_GUEST_PAGE_SHIFT);
+                id<MTLBuffer> mb = nil;
+                uint64_t off = 0;
+                if (at < PS4_GNM_WINDOW0_BASE || at >= S.ctx->mem_size ||
+                    !GuestBuffer(at, std::min<uint64_t>(1ull << GCN_GUEST_PAGE_SHIFT, S.ctx->mem_size - at),
+                                 GuestAccess::Write, &mb, &off) || off != 0) {
+                    RLog("guestmem", "%s CS 0x%llx skipped: guest page 0x%llx (64 MiB) cannot be mapped", queue,
+                         (unsigned long long)cs->code_addr, (unsigned long long)at);
+                    S.n_skipped++;
+                    return false;
+                }
+                if (!g_gmem.mapped[p]) {
+                    g_gmem.mapped[p] = 1;
+                    g_gmem.pages.push_back(p);
+                }
+            }
+        }
+    }
+    const auto written = BitmapRanges(f + GCN_GUEST_WRITTEN, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT);
+    if (cap::g_pass) {
+        auto accessed = BitmapRanges(f + GCN_GUEST_READ, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT);
+        accessed.insert(accessed.end(), written.begin(), written.end());
+        cap::NoteGuestMemory(accessed, written);
+    }
+    if (!run(0)) return false;
+    if (const uint32_t st = f[GCN_GUEST_STATUS])
+        RLog("guestmem", "%s CS 0x%llx: accesses through %s were not made", queue, (unsigned long long)cs->code_addr,
+             GuestStatusText(st).c_str());
+    // sampled textures over the written pages are stale
+    std::vector<GpuWrite> w;
+    for (auto [a, n] : BitmapRanges(f + GCN_GUEST_WRITTEN, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT))
+        w.push_back({a, n, ++S.write_epoch});
+    if (S.tex && !w.empty()) S.tex->InvalidateWrites(w);
+    return true;
+}
 
 bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_t>& flat, Binder& b,
                const BindCtx& bc, const gcn_push_data& push, std::string* why) {
@@ -3119,6 +3301,18 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             continue;
         case GCN_BUFFER_GDS:
             mb = S.gds_buf;
+            break;
+        case GCN_BUFFER_BDA_PAGETABLE:
+            if (!BindGuestPageTable(b, &mb)) {
+                if (why) *why = "no guest memory page table";
+                return false;
+            }
+            break;
+        case GCN_BUFFER_FAULT_BUFFER:
+            if (!(mb = g_gmem.fault)) {
+                if (why) *why = "no guest memory fault buffer";
+                return false;
+            }
             break;
         case GCN_BUFFER_SHARED_MEMORY: {
             // shadPS4: lds_size = SharedMemSize * NumWorkgroups, zero filled
@@ -6146,10 +6340,15 @@ void Dispatch(GuestContext* ctx, const uint32_t* regs, uint32_t dim_x, uint32_t 
         r.queue = queue;
         r.regs.Capture(regs);
         if (cs->kjob && !cs->kjob->Done()) S.kernels_open.push_back(cs->kjob);
-        encq::Defer([rec = rp.release()] {
+        const bool guest_memory = cs->info.uses_guest_memory;
+        auto job = [rec = rp.release()] {
             DispatchEncode(*rec);
             g_dispatch_recs.Put(rec);
-        });
+        };
+        // a guest memory dispatch may write any guest memory: the CP goes on (and reads resource
+        // tables for the next draws) once it ran (GuestMemoryDispatch waits for the GPU)
+        if (guest_memory) encq::Run(job);
+        else encq::Defer(std::move(job));
     }
 }
 
@@ -6336,44 +6535,54 @@ void DispatchEncode(DispatchRec& r) {
         ResolveTextureHazards(cs, flat);
         PrepareDepthCompanions(cs, flat);
         static const bool labels = getenv("PS4_GNM_LABELS") != nullptr;
-        if (labels && S.cenc) { // profiling aid: one encoder per dispatch, named after the shader
-            [S.cenc endEncoding];
-            S.cenc = nil;
-        }
-        id<MTLComputeCommandEncoder> enc = ComputeEncoder();
-        if (labels)
-            enc.label = [NSString stringWithFormat:@"CS 0x%llx %ux%ux%u x %ux%ux%u%s", (unsigned long long)addr, dim_x,
-                                                   dim_y, dim_z, wx, wy, wz, indirect_addr ? " indirect" : ""];
-        if (!g_cstate.Tracks(enc) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)pso))
-            [enc setComputePipelineState:pso];
-        gcn_push_data push = MakePushData(regs);
-        BindCtx bc{&regs, indirect_addr ? 1024u : dim_x * dim_y * dim_z};
-        Binder b{Stage::Compute, nil, enc};
-        std::string why;
-        S.storage_bound.clear();
-        if (!BindStage(cs, ud, flat, b, bc, push, &why)) {
-            RLog("bind", "%s CS 0x%llx bind failed: %s", queue, (unsigned long long)addr, why.c_str());
-            S.n_skipped++;
-            return;
-        }
-        if (S.cenc != enc) { // hazard flush inside BindStage
-            enc = ComputeEncoder();
+        const MTLSize tg = MTLSizeMake(wx, wy, wz);
+        // binds and encodes the dispatch (once, or once per pass of a guest memory dispatch)
+        const auto encode = [&]() -> bool {
+            if (labels && S.cenc) { // profiling aid: one encoder per dispatch, named after the shader
+                [S.cenc endEncoding];
+                S.cenc = nil;
+            }
+            id<MTLComputeCommandEncoder> enc = ComputeEncoder();
+            if (labels)
+                enc.label = [NSString stringWithFormat:@"CS 0x%llx %ux%ux%u x %ux%ux%u%s", (unsigned long long)addr,
+                                                       dim_x, dim_y, dim_z, wx, wy, wz, indirect_addr ? " indirect" : ""];
             if (!g_cstate.Tracks(enc) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)pso))
                 [enc setComputePipelineState:pso];
-            Binder b2{Stage::Compute, nil, enc};
+            gcn_push_data push = MakePushData(regs);
+            BindCtx bc{&regs, indirect_addr ? 1024u : dim_x * dim_y * dim_z};
+            Binder b{Stage::Compute, nil, enc};
+            std::string why;
+            S.storage_bound.clear();
             if (cap::g_pass) cap::ForgetBindings(Stage::Compute);
-            if (!BindStage(cs, ud, flat, b2, bc, push, &why)) return;
+            if (!BindStage(cs, ud, flat, b, bc, push, &why)) {
+                RLog("bind", "%s CS 0x%llx bind failed: %s", queue, (unsigned long long)addr, why.c_str());
+                S.n_skipped++;
+                return false;
+            }
+            if (S.cenc != enc) { // hazard flush inside BindStage
+                enc = ComputeEncoder();
+                if (!g_cstate.Tracks(enc) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)pso))
+                    [enc setComputePipelineState:pso];
+                Binder b2{Stage::Compute, nil, enc};
+                if (cap::g_pass) cap::ForgetBindings(Stage::Compute);
+                if (!BindStage(cs, ud, flat, b2, bc, push, &why)) return false;
+            }
+            if (indirect_addr) {
+                id<MTLBuffer> ab;
+                uint64_t off;
+                if (!GuestBuffer(indirect_addr, 12, GuestAccess::Read, &ab, &off)) return false;
+                [enc dispatchThreadgroupsWithIndirectBuffer:ab indirectBufferOffset:off threadsPerThreadgroup:tg];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(dim_x, dim_y, dim_z) threadsPerThreadgroup:tg];
+            }
+            S.pending = true;
+            return true;
+        };
+        if (cs->info.uses_guest_memory) {
+            if (!GuestMemoryDispatch(cs, queue, encode)) return;
+        } else if (!encode()) {
+            return;
         }
-        const MTLSize tg = MTLSizeMake(wx, wy, wz);
-        if (indirect_addr) {
-            id<MTLBuffer> ab;
-            uint64_t off;
-            if (!GuestBuffer(indirect_addr, 12, GuestAccess::Read, &ab, &off)) return;
-            [enc dispatchThreadgroupsWithIndirectBuffer:ab indirectBufferOffset:off threadsPerThreadgroup:tg];
-        } else {
-            [enc dispatchThreadgroups:MTLSizeMake(dim_x, dim_y, dim_z) threadsPerThreadgroup:tg];
-        }
-        S.pending = true;
         S.n_dispatches++;
         if (cap::g_pass) cap::Encoded(indirect_addr);
         S.n_cdisp++;

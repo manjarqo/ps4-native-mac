@@ -152,9 +152,14 @@ tail -1 "$T/gnm_capture_tex.txt"
 # Pass replay through the real renderer (tools/gnm_replay): a synthetic captured dispatch is
 # translated, bound and encoded by ps4draw::Dispatch and matches its capture byte for byte; an
 # altered capture is reported at the altered byte; seeded GPU-owned textures keep their contents.
-"$R/tools/gnm_replay/build.sh" "$T/replay" "$R/tests/host/gnm_replay_test.mm" > "$T/replay_build.txt" 2>&1 \
-  || { cat "$T/replay_build.txt"; exit 1; }
+"$R/tools/gnm_replay/build.sh" "$T/replay" "$R/tests/host/gnm_replay_test.mm" "$R/tests/host/gnm_guest_memory_test.mm" \
+  > "$T/replay_build.txt" 2>&1 || { cat "$T/replay_build.txt"; exit 1; }
 "$T/replay/gnm_replay_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
+# Buffer loads and stores through V#s a compute shader loads at run time (Uncharted 4's GPU copy
+# shader, capture r13c pass 21) through the renderer: probe, guest page table, dispatch; each
+# destination gets its source's dwords, GCN's range check on loads and stores, an unimplemented
+# V# format skips the dispatch.
+"$T/replay/gnm_guest_memory_test" "$R/tests/host/data" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
 # RectList draws: a translated vertex shader drawn as rectangles (capture, barrier, expansion);
 # the colours at all 4 corners of each rectangle, with Metal API validation on.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_rectlist_test.mm" \
