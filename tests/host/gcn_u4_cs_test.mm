@@ -1,4 +1,4 @@
-// Compute shaders dumped from Uncharted 4's chapter 1 (the boat) that the shader translator
+// Shaders dumped from Uncharted 4's chapter 1 (the boat) that the shader translator
 // (3rdparty/gcn-recompiler) rejected, so their dispatches were skipped:
 //  - data/u4_cs_execlo.*  (0x1300124f00): "s_mov_b32 exec_lo, -1" / "exec_hi, -1" (32-bit writes of
 //    one EXEC half) failed with "SetDst: Unknown field 126".
@@ -8,6 +8,10 @@
 //    "ReadConst base low not from constant memory". Its wave64 ballots then read workgroup
 //    memory through a u64 view next to the u32 one, which the MSL backend dropped (undeclared
 //    shared_mem_u32): Metal rejected the shader.
+//  - data/u4_vs_fullscreen.* (0x1300000300): a vertex shader. Vertex shaders must declare their
+//    position invariant: the g-buffer pass tests depth EQUAL against a prepass drawn with other
+//    vertex shaders, and Metal computes positions identically only for invariant outputs, so
+//    Drake and the other characters failed the test and vanished.
 // Each must translate (with zeroed guest memory: the sharps' contents do not matter here) and
 // the MSL must be accepted by Metal.
 //
@@ -43,7 +47,8 @@ bool ZeroRead(void*, uint64_t, void* dst, uint64_t size) {
     return true;
 }
 
-void Run(id<MTLDevice> dev, const std::string& dir, const std::string& name) {
+void Run(id<MTLDevice> dev, const std::string& dir, const std::string& name, uint32_t hw = GCN_HW_CS,
+         uint32_t sw = GCN_SW_COMPUTE) {
     std::ifstream bin(dir + "/" + name + ".bin", std::ios::binary);
     std::vector<uint8_t> code((std::istreambuf_iterator<char>(bin)), std::istreambuf_iterator<char>());
     CHECK(code.size() >= 8, "cannot read %s/%s.bin", dir.c_str(), name.c_str());
@@ -69,12 +74,12 @@ void Run(id<MTLDevice> dev, const std::string& dir, const std::string& name) {
     gcn_profile prof;
     gcn_profile_default_metal(&prof);
     gcn_runtime_info rt;
-    gcn_runtime_info_from_regs(regs.data(), regs.size(), GCN_HW_CS, GCN_SW_COMPUTE, &prof, &rt);
+    gcn_runtime_info_from_regs(regs.data(), regs.size(), (gcn_hw_stage)hw, (gcn_sw_stage)sw, &prof, &rt);
     gcn_compile_desc d{};
-    d.hw_stage = GCN_HW_CS;
-    d.sw_stage = GCN_SW_COMPUTE;
+    d.hw_stage = (gcn_hw_stage)hw;
+    d.sw_stage = (gcn_sw_stage)sw;
     uint64_t reg_addr = 0;
-    gcn_stage_from_regs(regs.data(), regs.size(), GCN_HW_CS, &reg_addr, d.user_data);
+    gcn_stage_from_regs(regs.data(), regs.size(), (gcn_hw_stage)hw, &reg_addr, d.user_data);
     d.code_addr = code_addr;
     d.code = reinterpret_cast<const uint32_t*>(code.data());
     d.code_size = uint32_t(code.size() & ~3u);
@@ -90,9 +95,12 @@ void Run(id<MTLDevice> dev, const std::string& dir, const std::string& name) {
     if (!sh) return;
     const char* msl = gcn_shader_msl(sh);
     CHECK(msl, "%s: no MSL", name.c_str());
+    if (msl && hw == GCN_HW_VS)
+        CHECK(std::strstr(msl, "[[position, invariant]]"), "%s: the position output is not invariant", name.c_str());
     if (msl) {
         NSError* e = nil;
         MTLCompileOptions* o = [MTLCompileOptions new];
+        o.preserveInvariance = YES;
         o.languageVersion = MTLLanguageVersion2_3;
         id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:msl] options:o error:&e];
         CHECK(lib && [lib newFunctionWithName:@"main0"], "%s: Metal rejects the MSL: %s", name.c_str(),
@@ -116,6 +124,7 @@ int main(int argc, char** argv) {
         }
         Run(dev, argv[1], "u4_cs_execlo");
         Run(dev, argv[1], "u4_cs_spill");
+        Run(dev, argv[1], "u4_vs_fullscreen", GCN_HW_VS, GCN_SW_VERTEX);
         if (g_fail) {
             std::fprintf(stderr, "gcn_u4_cs_test: %d failure(s)\n", g_fail);
             return 1;
