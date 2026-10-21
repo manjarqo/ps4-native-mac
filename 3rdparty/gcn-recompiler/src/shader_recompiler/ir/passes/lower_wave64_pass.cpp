@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <unordered_map>
+#include <unordered_set>
 #include "common/logging/classes.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -240,6 +241,29 @@ static void DropRedundantReadFirstLaneExec(IR::Program& program) {
     }
 }
 
+// PS4Recomp: whether `value` is computed (through any chain of instructions) from one of `insts`.
+static bool ReachesAny(const IR::Value& value, const std::unordered_set<const IR::Inst*>& insts) {
+    if (value.IsImmediate()) {
+        return false;
+    }
+    std::unordered_set<const IR::Inst*> visited{value.Inst()};
+    std::vector<const IR::Inst*> pending{value.Inst()};
+    while (!pending.empty()) {
+        const IR::Inst* const inst = pending.back();
+        pending.pop_back();
+        if (insts.contains(inst)) {
+            return true;
+        }
+        for (size_t i = 0; i < inst->NumArgs(); ++i) {
+            const IR::Value arg = inst->Arg(i);
+            if (!arg.IsImmediate() && visited.insert(arg.Inst()).second) {
+                pending.push_back(arg.Inst());
+            }
+        }
+    }
+    return false;
+}
+
 // PS4Recomp: GCN lane of this invocation (0..63). A wave64 compute shader on a smaller subgroup
 // runs each wave as several subgroups, and its GCN lane is the local invocation index modulo 64.
 static IR::U32 GcnLane(IR::IREmitter& ir, bool split) {
@@ -283,6 +307,9 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
     std::vector<IR::Inst*> write_lanes;
     std::vector<IR::Inst*> inverse_ballots;
     std::vector<IR::Inst*> worklist;
+    // ballots left to each subgroup (non-uniform control flow): their bits are in the
+    // subgroup's own layout, lanes 32-63 in the low word
+    std::unordered_set<const IR::Inst*> subgroup_ballots;
     const auto uniform_blocks = split ? FindUniformBlocks(program) : std::vector<IR::Block*>{};
     for (IR::Block* block : program.blocks) {
         const bool is_uniform = std::ranges::contains(uniform_blocks, block);
@@ -292,6 +319,9 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
             } else {
                 LOG_WARNING(Render_Recompiler, "{} instruction in non uniform control flow",
                             inst.GetOpcode());
+                if (inst.GetOpcode() == IR::Opcode::Ballot) {
+                    subgroup_ballots.insert(&inst);
+                }
             }
         };
         for (IR::Inst& inst : block->Instructions()) {
@@ -341,6 +371,12 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
         inst->ReplaceUsesWithAndRemove(ir.Select(is_lane, inst->Arg(1), inst->Arg(0)));
     }
     for (IR::Inst* inst : inverse_ballots) {
+        // A mask built from a ballot left to each subgroup keeps the subgroup's own bit (the
+        // layout it was made in): testing the wave lane's bit there reads 0 in lanes 32-63, and
+        // loops waiting for their bit never ended (Uncharted 4 async CS with spilled V#s).
+        if (!subgroup_ballots.empty() && ReachesAny(inst->Arg(0), subgroup_ballots)) {
+            continue;
+        }
         // a 64-bit mask applied per lane: this lane's bit, from the half holding the lane
         IR::IREmitter ir{*inst->GetParent(), IR::Block::InstructionList::s_iterator_to(*inst)};
         const IR::U32 lane = GcnLane(ir, true);
@@ -351,6 +387,16 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
         const IR::U32 bit =
             ir.BitFieldExtract(word, ir.BitwiseAnd(lane, ir.Imm32(31u)), ir.Imm32(1u));
         inst->ReplaceUsesWithAndRemove(ir.INotEqual(bit, ir.Imm32(0u)));
+    }
+    // A lane index or mask computed from a ballot left to each subgroup is in the subgroup's own
+    // layout: the subgroup operation that matches it stays.
+    if (!subgroup_ballots.empty()) {
+        std::erase_if(worklist, [&](const IR::Inst* inst) {
+            return (inst->GetOpcode() == IR::Opcode::ReadLane &&
+                    ReachesAny(inst->Arg(1), subgroup_ballots)) ||
+                   (inst->GetOpcode() == IR::Opcode::MaskedBitCount32 &&
+                    ReachesAny(inst->Arg(0), subgroup_ballots));
+        });
     }
     if (worklist.empty()) {
         return;

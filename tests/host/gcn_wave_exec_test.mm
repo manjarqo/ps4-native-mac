@@ -350,6 +350,13 @@ void TestWave64Masks(id<MTLDevice> dev) {
     std::vector<uint32_t> out = RunWave64(dev, "mask condition", 0x5CA1AB1E0000000BULL,
                     {0xBE8C038F, 0xBE8D03FF, 0x0F000000, 0xD2000003, 0x00310280, kStoreV3, kStoreV3b});
     ExpectLanes("mask condition", out, [](uint32_t l) { return l < 4 || (l >= 56 && l < 60) ? 1u : 0u; });
+    // A loop on a mask computed from vcc (shifted by user data s2 = 0): the ballot stays in the
+    // loop, in each subgroup's own layout, and lanes 32-63 must keep testing their bit there
+    // (they read 0 in the wave layout, so a loop waiting for its bit never ended).
+    // v1 = 0; do { v1 += 1; vcc = (5 > v1) << s2; } while (vccnz); out[l] = v1
+    out = RunWave64(dev, "vcc loop", 0x5CA1AB1E00000010ULL,
+                    {0x7E020280, 0x4A020281, 0x7D880285, 0x8FEA026A, 0xBF87FFFC, kStoreV3, 0x80010102});
+    ExpectLanes("vcc loop", out, [](uint32_t) { return 5u; });
     // exec = lanes 5-63; v3 = v_mbcnt_hi(exec_hi, v_mbcnt_lo(exec_lo, 0)): active lanes below
     out = RunWave64(dev, "mbcnt", 0x5CA1AB1E0000000CULL,
                     {OPEN_SCOPE, kExecLoLit, 0xFFFFFFE0, 0xD2460003, 0x0001007E, 0xD2480003, 0x0002067F, kStoreV3, kStoreV3b});
