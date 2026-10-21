@@ -107,6 +107,9 @@ bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, 
              uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done);
 
 void Shutdown();
+// Quit (ps4_host_quit): a frame capture whose frame has not presented writes its manifest.
+// Called with the CP lock held.
+void CaptureAtQuit();
 
 } // namespace ps4draw
 

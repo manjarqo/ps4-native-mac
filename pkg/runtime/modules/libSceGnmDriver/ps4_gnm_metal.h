@@ -14,6 +14,8 @@
 
 #ifdef __cplusplus
 extern "C" {
+// ps4_host_quit: writes a frame capture in progress (waits up to timeout_s for the CP lock).
+void ps4_gnm_capture_save_for_quit(double timeout_s);
 #endif
 
 // Initialize the Metal Command Processor subsystem

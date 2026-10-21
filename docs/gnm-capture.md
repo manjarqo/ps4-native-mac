@@ -23,9 +23,9 @@ PS4_GNM_SYNC_ENCODE=1 PS4_GNM_CAPTURE_FRAME=<present index> PS4_GNM_CAPTURE_DIR=
 Every captured pass commits the command buffer and waits for the GPU before and after it, so the
 captured frame takes seconds to minutes and has one render pass per draw.
 
-The manifest is written when the frame presents. If the game shuts down normally before that, the
-passes recorded so far are written at shutdown (the log says "did not present"); a killed process
-writes no manifest. Guest memory snapshots cover only readable pages: estimated ranges (fetch
+The manifest is written when the frame presents. If the game quits through the normal quit path
+before that (window close, the guest's exit, `PS4_GNM_QUIT_AFTER_S`), the passes recorded so far
+are written at the quit (the log says "did not present"); a killed process writes no manifest. Guest memory snapshots cover only readable pages: estimated ranges (fetch
 shaders, image sizes) that reach into unmapped or PROT_NONE pages are cut there.
 
 ## Layout of `frame_<n>/`

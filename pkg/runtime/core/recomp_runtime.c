@@ -2006,9 +2006,13 @@ uint64_t ps4_hitch_take_ns(int kind) {
 // Mach-O static links cannot leave a weak reference undefined, so the default is an empty weak
 // definition; the pipeline archive module provides the strong one.
 __attribute__((weak)) void ps4_gnm_pso_archive_save_for_quit(double timeout_s) { (void)timeout_s; }
+// A GNM frame capture in progress (PS4_GNM_CAPTURE_FRAME) writes what it recorded; the Metal
+// driver provides the strong definition.
+__attribute__((weak)) void ps4_gnm_capture_save_for_quit(double timeout_s) { (void)timeout_s; }
 
 void ps4_host_quit(int code) {
   ps4_gnm_pso_archive_save_for_quit(2.0);
+  ps4_gnm_capture_save_for_quit(2.0);
   fflush(NULL);
   ps4_log_drain_sync(1.0);
   _exit(code);

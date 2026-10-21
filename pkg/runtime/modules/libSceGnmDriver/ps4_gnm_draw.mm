@@ -6680,6 +6680,8 @@ void Shutdown() {
     cap::AtShutdown();
 }
 
+void CaptureAtQuit() { cap::AtShutdown(); }
+
 } // namespace ps4draw
 
 extern "C" void ps4_gnm_guest_remapped(uint64_t addr, uint64_t size) {

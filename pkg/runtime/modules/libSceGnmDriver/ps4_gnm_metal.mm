@@ -1435,6 +1435,21 @@ void ps4_gnm_metal_wait_gpu_idle(void) {
     ps4draw::Flush(true);
 }
 
+// ps4_host_quit: the capture is written under the CP lock (no pass is then half recorded). The
+// lock is waited for at most timeout_s: a queue stuck holding it must not block the quit.
+extern "C" void ps4_gnm_capture_save_for_quit(double timeout_s) {
+    const double t0 = CFAbsoluteTimeGetCurrent();
+    while (!g_state.mutex.try_lock()) {
+        if (CFAbsoluteTimeGetCurrent() - t0 > timeout_s) {
+            fprintf(stderr, "[gnm-capture] quit: CP lock busy for %.1f s; capture not written\n", timeout_s);
+            return;
+        }
+        usleep(1000);
+    }
+    ps4draw::CaptureAtQuit();
+    g_state.mutex.unlock();
+}
+
 void ps4_gnm_metal_destroy(void) {
     std::scoped_lock lock(g_state.mutex);
     ps4draw::Shutdown();

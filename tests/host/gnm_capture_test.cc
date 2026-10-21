@@ -151,14 +151,22 @@ static void TestWriteFailures(const std::string& dir) {
     CHECK(w.Snapshot(mem.data(), 0x4000, kPage).file.empty(), "blob written into a read-only directory");
     CHECK(w.SavePng(0, "t0_color0", t, raw, 0, &mode).empty(), "png written into a read-only directory");
     CHECK(w.SaveTexture(0, "t0_color0", "post", raw, &h).empty(), "raw written into a read-only directory");
-    CHECK(w.Failures() == 4, "write failures counted: %llu", (unsigned long long)w.Failures());
+    RawBudget budget;
+    TextureRec pre;
+    pre.role = "t0_color0";
+    pre.id = t;
+    w.SavePre(0, &pre, raw, &budget);
+    CHECK(pre.pre_file.empty() && budget.used == 0, "a failed pre write uses no budget (%llu)", (unsigned long long)budget.used);
+    w.SavePost(0, true, &pre, raw, &budget, 0);
+    CHECK(pre.post_file.empty() && budget.used == 0, "a failed post write uses no budget (%llu)", (unsigned long long)budget.used);
+    CHECK(w.Failures() == 7, "write failures counted: %llu", (unsigned long long)w.Failures());
     for (const char* sub : {"/regs", "/blobs", "/png", "/tex"}) chmod((dir + sub).c_str(), 0755);
     const std::string rf = w.SaveRegs(regs.data(), &h);
     CHECK(!rf.empty(), "a failed register file is not cached");
     const BlobRef b = w.Snapshot(mem.data(), 0x4000, kPage);
     std::vector<uint8_t> back;
     CHECK(!b.file.empty() && ReadFile(dir + "/" + b.file, &back) && back.size() == kPage, "a failed blob is not cached");
-    CHECK(w.Failures() == 4, "no new failures: %llu", (unsigned long long)w.Failures());
+    CHECK(w.Failures() == 7, "no new failures: %llu", (unsigned long long)w.Failures());
 }
 
 // The raw budget gates the raw files only: a written texture over the budget still gets its view

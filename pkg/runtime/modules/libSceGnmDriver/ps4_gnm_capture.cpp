@@ -258,16 +258,16 @@ void Writer::SavePre(uint32_t pass, TextureRec* t, const std::vector<uint8_t>& r
         t->readback = kReadbackBudget;
         return;
     }
-    budget->used += raw.size();
     t->pre_file = SaveTexture(pass, t->role, "pre", raw, &t->pre_hash);
+    if (!t->pre_file.empty()) budget->used += raw.size(); // a failed write (Failures) uses nothing
 }
 
 void Writer::SavePost(uint32_t pass, bool replayable, TextureRec* t, const std::vector<uint8_t>& raw,
                       RawBudget* budget, uint32_t thumb) {
     if (replayable) {
         if (budget->Fits(raw.size())) {
-            budget->used += raw.size();
             t->post_file = SaveTexture(pass, t->role, "post", raw, &t->post_hash);
+            if (!t->post_file.empty()) budget->used += raw.size();
         } else {
             t->readback = kReadbackBudget;
         }
