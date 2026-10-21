@@ -24,8 +24,10 @@
 #include <stdint.h>
 
 #include <functional>
+#include <vector>
 
 #include "recomp_runtime.h"
+#include "ps4_gnm_capture.h"
 
 namespace ps4draw {
 
@@ -105,6 +107,17 @@ bool GpuDma(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, bool
 // `on_done` is not called.
 bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
              uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done);
+
+// ---- Pass replay (tools/gnm_replay, docs/gnm-capture.md). Call after Init, like Draw. ----
+// A GPU-owned texture-cache entry with the captured identity (created if missing), filled with
+// `raw` (ps4gnm_capture::RawSize layout) when given.
+bool ReplayAdoptTexture(const ps4gnm_capture::GpuTextureId& gid, const std::vector<uint8_t>* raw);
+// Contents of the entry with that identity; false if the renderer has none.
+bool ReplayReadTexture(const ps4gnm_capture::GpuTextureId& gid, std::vector<uint8_t>* raw);
+// The fast clear of the CMASK/HTILE at this address is pending (as the captured pass found it).
+void ReplaySetMetaCleared(uint64_t cmask_address);
+// Draws and dispatches skipped so far (a replayed pass must not add one).
+uint64_t SkippedCount();
 
 void Shutdown();
 // Quit (ps4_host_quit): a frame capture whose frame has not presented writes its manifest.

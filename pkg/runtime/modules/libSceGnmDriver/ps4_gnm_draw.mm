@@ -6674,6 +6674,30 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
     }
 }
 
+bool ReplayAdoptTexture(const ps4gnm_capture::GpuTextureId& gid, const std::vector<uint8_t>* raw) {
+    if (!S.enabled || !S.tex) return false;
+    id<MTLTexture> t = S.tex->FindGpuTexture(gid, true);
+    return t && (!raw || S.tex->WriteRaw(t, *raw));
+}
+
+bool ReplayReadTexture(const ps4gnm_capture::GpuTextureId& gid, std::vector<uint8_t>* raw) {
+    if (!S.enabled || !S.tex) return false;
+    id<MTLTexture> t = S.tex->FindGpuTexture(gid, false);
+    return t && S.tex->ReadRaw(t, raw);
+}
+
+void ReplaySetMetaCleared(uint64_t cmask_address) {
+    if (!S.enabled) return;
+    // S.meta belongs to the encoder (NotifyGuestWriteImpl): set it there, behind queued work
+    encq::Run([=] {
+        MetaState& m = S.meta[cmask_address];
+        m.cleared = true;
+        m.cleared_seq = S.committed_seq + 1;
+    });
+}
+
+uint64_t SkippedCount() { return S.n_skipped.load(); }
+
 void Shutdown() {
     if (!S.enabled) return;
     Flush(true);

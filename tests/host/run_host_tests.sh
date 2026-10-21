@@ -149,6 +149,12 @@ clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 
   "$T/membudget.o" -framework Metal -framework Foundation -lz -o "$T/gnm_capture_tex_test"
 "$T/gnm_capture_tex_test" > "$T/gnm_capture_tex.txt" 2>&1 || { cat "$T/gnm_capture_tex.txt"; exit 1; }
 tail -1 "$T/gnm_capture_tex.txt"
+# Pass replay through the real renderer (tools/gnm_replay): a synthetic captured dispatch is
+# translated, bound and encoded by ps4draw::Dispatch and matches its capture byte for byte; an
+# altered capture is reported at the altered byte; seeded GPU-owned textures keep their contents.
+"$R/tools/gnm_replay/build.sh" "$T/replay" "$R/tests/host/gnm_replay_test.mm" > "$T/replay_build.txt" 2>&1 \
+  || { cat "$T/replay_build.txt"; exit 1; }
+"$T/replay/gnm_replay_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
 # RectList draws: a translated vertex shader drawn as rectangles (capture, barrier, expansion);
 # the colours at all 4 corners of each rectangle, with Metal API validation on.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_rectlist_test.mm" \

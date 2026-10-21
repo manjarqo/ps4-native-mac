@@ -90,7 +90,12 @@ One- and two-channel formats show R (and G). Multisampled textures have no view.
   state and output views.
 - `tools/gnm_replay/build.sh <out> tools/gnm_replay/gnm_replay.mm`, then
   `<out>/gnm_replay <frame_dir> <pass> [--out <dir>]`: replays a replayable pass through
-  ps4draw::Draw / Dispatch and prints MATCH / DIFF per output (exit 0 when all match).
+  ps4draw::Draw / Dispatch and prints MATCH / DIFF per output. Exit status 0: every output is
+  byte-exact; 1: a mismatch; 2: not replayed (the reason is printed: not stored replayable,
+  contents over the raw budget, skipped by the renderer, ...) or nothing to compare (the capture
+  records no output the pass writes). `--out <dir>` writes the replayed outputs (`.raw`, `.png`,
+  `.bin`). The replay runs the renderer with `PS4_GNM_SYNC_ENCODE`, `PS4_GNM_SYNC_COMPILE` and no
+  shader cache, PSO archive or library store, so it reads and writes nothing outside its process.
 - `tools/gnm_capture_extract.py <frame_dir> <pass> <out>`: one pass as a minimal frame for a
   host test (`tests/host/data/replay/`), at most 4 MiB.
 - `tools/refcompare.py <frame.png> <reference.png>`: 4x4-region mean colour and luminance and a
