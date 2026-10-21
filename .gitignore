@@ -1,4 +1,11 @@
 tools/
+!/tools/
+/tools/*
+!/tools/gnm_capture_view.py
+!/tools/gnm_capture_extract.py
+!/tools/refcompare.py
+!/tools/tests/
+!/tools/gnm_replay/
 !/3rdparty/gcn-recompiler/tools/
 *.DS_Store
 .DS_Store
