@@ -64,6 +64,7 @@
 #include "ps4_gnm_shader_cache.h"
 #include "ps4_gnm_pipeline_archive.h"
 #include "ps4_gnm_library_store.h"
+#include "ps4_gnm_capture.h"
 #include "ps4_gnm_kernel_compile.h"
 #include "ps4_metal_screen.h"
 #include "ps4_hitch.h"
@@ -82,6 +83,7 @@ extern "C" volatile int g_ps4_gnm_dump_request;
 volatile int g_ps4_gnm_dump_request;
 
 extern "C" void ps4_host_quit(int code) __attribute__((noreturn));
+extern "C" int32_t sceKernelIsNeoMode(void);
 
 namespace ps4draw {
 using namespace ps4gnm;
@@ -2495,6 +2497,445 @@ void BuildFlat(const Shader* s, const uint32_t ud[16], std::vector<uint32_t>* fl
     g_trace_reads = false;
 }
 
+uint64_t ApproxImageBytes(const ImageDesc& img);
+
+// =====================================================================================
+// Frame capture (ps4_gnm_capture.h). PS4_GNM_CAPTURE_FRAME=<present index> records every draw
+// and dispatch of that frame. Needs PS4_GNM_SYNC_ENCODE=1 (the CP side and the encoder side of
+// a pass then run on one thread, back to back). Every captured pass commits and waits before and
+// after its encoding, so its inputs and outputs can be read; nothing here runs when the
+// variable is unset (cap::g_writer stays null, cap::g_pass stays null).
+// PS4_GNM_CAPTURE_DIR=<dir>      default ./gnm_captures; the frame goes to <dir>/frame_<n>
+// PS4_GNM_CAPTURE_REPLAY=<a>-<b>[,<c>-<d>...] | all   passes stored replayable (guest inputs,
+//                                raw texture contents before and after); default none
+// PS4_GNM_CAPTURE_RAW_MB=<n>     budget of raw texture bytes (default 8192); later passes are
+//                                recorded without raw contents ("budget")
+// PS4_GNM_CAPTURE_THUMB=<px>     width of the view PNGs of passes that are not replayable
+//                                (default 480; replayable passes get full size)
+// =====================================================================================
+namespace cap {
+using namespace ps4gnm_capture;
+
+// Every MtlFormat value of ps4_gnm_capture.h is the MTLPixelFormat of the same name.
+constexpr bool SameFormat(uint32_t a, MTLPixelFormat b) { return a == (uint32_t)b; }
+static_assert(SameFormat(kR8Unorm, MTLPixelFormatR8Unorm) &&
+              SameFormat(kR8Snorm, MTLPixelFormatR8Snorm) &&
+              SameFormat(kR8Uint, MTLPixelFormatR8Uint) &&
+              SameFormat(kR8Sint, MTLPixelFormatR8Sint) &&
+              SameFormat(kR16Unorm, MTLPixelFormatR16Unorm) &&
+              SameFormat(kR16Snorm, MTLPixelFormatR16Snorm) &&
+              SameFormat(kR16Uint, MTLPixelFormatR16Uint) &&
+              SameFormat(kR16Sint, MTLPixelFormatR16Sint) &&
+              SameFormat(kR16Float, MTLPixelFormatR16Float) &&
+              SameFormat(kRG8Unorm, MTLPixelFormatRG8Unorm) &&
+              SameFormat(kRG8Snorm, MTLPixelFormatRG8Snorm) &&
+              SameFormat(kRG8Uint, MTLPixelFormatRG8Uint) &&
+              SameFormat(kR32Uint, MTLPixelFormatR32Uint) &&
+              SameFormat(kR32Sint, MTLPixelFormatR32Sint) &&
+              SameFormat(kR32Float, MTLPixelFormatR32Float) &&
+              SameFormat(kRG16Unorm, MTLPixelFormatRG16Unorm) &&
+              SameFormat(kRG16Snorm, MTLPixelFormatRG16Snorm) &&
+              SameFormat(kRG16Uint, MTLPixelFormatRG16Uint) &&
+              SameFormat(kRG16Float, MTLPixelFormatRG16Float) &&
+              SameFormat(kRGBA8Unorm, MTLPixelFormatRGBA8Unorm) &&
+              SameFormat(kRGBA8Unorm_sRGB, MTLPixelFormatRGBA8Unorm_sRGB) &&
+              SameFormat(kRGBA8Snorm, MTLPixelFormatRGBA8Snorm) &&
+              SameFormat(kRGBA8Uint, MTLPixelFormatRGBA8Uint) &&
+              SameFormat(kBGRA8Unorm, MTLPixelFormatBGRA8Unorm) &&
+              SameFormat(kBGRA8Unorm_sRGB, MTLPixelFormatBGRA8Unorm_sRGB) &&
+              SameFormat(kRGB10A2Unorm, MTLPixelFormatRGB10A2Unorm) &&
+              SameFormat(kRG11B10Float, MTLPixelFormatRG11B10Float) &&
+              SameFormat(kRGB9E5Float, MTLPixelFormatRGB9E5Float) &&
+              SameFormat(kRG32Uint, MTLPixelFormatRG32Uint) &&
+              SameFormat(kRG32Float, MTLPixelFormatRG32Float) &&
+              SameFormat(kRGBA16Unorm, MTLPixelFormatRGBA16Unorm) &&
+              SameFormat(kRGBA16Snorm, MTLPixelFormatRGBA16Snorm) &&
+              SameFormat(kRGBA16Uint, MTLPixelFormatRGBA16Uint) &&
+              SameFormat(kRGBA16Float, MTLPixelFormatRGBA16Float) &&
+              SameFormat(kRGBA32Uint, MTLPixelFormatRGBA32Uint) &&
+              SameFormat(kRGBA32Float, MTLPixelFormatRGBA32Float) &&
+              SameFormat(kDepth16Unorm, MTLPixelFormatDepth16Unorm) &&
+              SameFormat(kDepth32Float, MTLPixelFormatDepth32Float) &&
+              SameFormat(kStencil8, MTLPixelFormatStencil8) &&
+              SameFormat(kDepth32Float_Stencil8, MTLPixelFormatDepth32Float_Stencil8) &&
+              SameFormat(kX32_Stencil8, MTLPixelFormatX32_Stencil8),
+              "ps4_gnm_capture.h MtlFormat values differ from Metal's");
+
+std::unique_ptr<Writer> g_writer;
+std::vector<std::pair<uint32_t, uint32_t>> g_replay; // pass index ranges stored replayable
+bool g_replay_all = false;
+uint64_t g_raw_budget = 8192ull << 20, g_raw_bytes = 0;
+uint32_t g_thumb = 480;
+PassRec* g_pass = nullptr;                          // the pass being recorded
+bool g_encoded = false;                             // g_pass reached its draw / dispatch call
+std::vector<std::pair<uint64_t, uint64_t>> g_reads; // guest ranges g_pass reads
+std::vector<id<MTLTexture>> g_tex;                  // texture of g_pass->textures[i]
+std::vector<id<MTLTexture>> g_storage;              // storage textures g_pass binds (BindStage)
+uint32_t g_next = 0;
+
+bool InFrame() { return g_writer && S.present_idx == g_writer->Frame(); }
+
+const char* StageName(Stage st) { return st == Stage::Vertex ? "vs" : st == Stage::Fragment ? "ps" : "cs"; }
+
+// Guest reads of the recompiler's SRT walks and fetches, recorded (not the direct path).
+bool RecordRead(void*, uint64_t addr, void* dst, uint64_t size) {
+    if (!ReadGuest(S.ctx, addr, dst, size)) return false;
+    g_reads.push_back({addr, size});
+    return true;
+}
+
+void Setup(uint64_t frame, uint64_t mem_size) {
+    if (!getenv("PS4_GNM_SYNC_ENCODE")) {
+        fprintf(stderr, "[gnm-capture] PS4_GNM_CAPTURE_FRAME needs PS4_GNM_SYNC_ENCODE=1; capture disabled\n");
+        return;
+    }
+    const char* dir = getenv("PS4_GNM_CAPTURE_DIR");
+    const std::string base = dir && *dir ? dir : "gnm_captures";
+    if (const char* r = getenv("PS4_GNM_CAPTURE_REPLAY")) {
+        if (!strcmp(r, "all")) g_replay_all = true;
+        for (const char* c = r; *c && !g_replay_all;) {
+            char* e = nullptr;
+            const uint32_t a = (uint32_t)strtoul(c, &e, 10);
+            const uint32_t b = (e && *e == '-') ? (uint32_t)strtoul(e + 1, &e, 10) : a;
+            g_replay.push_back({a, b});
+            c = (e && *e == ',') ? e + 1 : "";
+        }
+    }
+    if (const char* mb = getenv("PS4_GNM_CAPTURE_RAW_MB")) g_raw_budget = strtoull(mb, nullptr, 10) << 20;
+    if (const char* t = getenv("PS4_GNM_CAPTURE_THUMB")) g_thumb = (uint32_t)strtoul(t, nullptr, 10);
+    mkdir(base.c_str(), 0755);
+    auto w = std::make_unique<Writer>(base + "/frame_" + std::to_string(frame), frame, mem_size,
+                                      sceKernelIsNeoMode() != 0, gcn_shader_cache_id());
+    std::string err;
+    if (!w->Begin(&err)) {
+        fprintf(stderr, "[gnm-capture] %s; capture disabled\n", err.c_str());
+        return;
+    }
+    fprintf(stderr, "[gnm-capture] capturing frame %llu into %s\n", (unsigned long long)frame, w->Dir().c_str());
+    g_writer = std::move(w);
+}
+
+bool Replayable(uint32_t idx) {
+    if (g_replay_all) return true;
+    for (auto& r : g_replay)
+        if (idx >= r.first && idx <= r.second) return true;
+    return false;
+}
+
+// CP thread, start of Draw / Dispatch (a pass of the captured frame).
+void Begin(const char* type, const char* queue, const char* name, const uint32_t* regs) {
+    g_pass = new PassRec();
+    g_pass->index = g_next++;
+    g_pass->replayable = Replayable(g_pass->index);
+    g_pass->type = type;
+    g_pass->queue = queue;
+    g_pass->name = name;
+    g_pass->regs_file = g_writer->SaveRegs(regs, &g_pass->regs_hash);
+    g_encoded = false;
+    g_reads.clear();
+    g_tex.clear();
+    g_storage.clear();
+}
+
+void SetSkipped(const char* why) {
+    if (g_pass && g_pass->skipped.empty()) g_pass->skipped = why;
+}
+
+// CP thread: a stage's shader, the guest memory its translation and resource tables read.
+void NoteStage(const char* stage, const Shader* s, const uint32_t ud[16]) {
+    StageRec r;
+    r.stage = stage;
+    r.code_addr = s->code_addr;
+    r.code_size = s->info.code_size;
+    r.pgm_hash = s->info.pgm_hash;
+    r.msl_hash = s->msl_hash;
+    memcpy(r.user_data, ud, sizeof(r.user_data));
+    g_pass->stages.push_back(r);
+    g_reads.push_back({s->code_addr, std::max<uint32_t>(s->info.code_size, 4)});
+    if (s->info.has_fetch_shader && s->info.fetch_shader_sgpr_base < 15) {
+        const uint64_t fs = ((uint64_t)ud[s->info.fetch_shader_sgpr_base + 1] << 32 | ud[s->info.fetch_shader_sgpr_base]) &
+                            ((1ull << 40) - 1);
+        g_reads.push_back({fs, 4096}); // fetch shaders are a few dozen dwords; their length is not recorded
+    }
+    std::vector<uint32_t> flat(std::max<uint32_t>(s->info.flatbuf_size_dw, 16));
+    gcn_shader_build_flatbuf(s->sh, ud, RecordRead, nullptr, flat.data(), flat.size());
+    for (uint32_t i = 0; i < s->attrs.size(); ++i) {
+        uint32_t v[4] = {};
+        gcn_shader_fetch_vertex_attrib_sharp(s->sh, i, ud, RecordRead, nullptr, v);
+        BufferDesc bd;
+        DecodeBuffer(v, &bd);
+        if (bd.address && bd.size) g_reads.push_back({bd.address, bd.size});
+    }
+}
+
+// CP thread: the draw's arguments and the index / argument memory it reads.
+void NoteDraw(const DrawArgs& a) {
+    PassRec& p = *g_pass;
+    p.indexed = a.indexed;
+    p.index_base = a.index_base;
+    p.index_type = a.index_type;
+    p.index_offset = a.index_offset;
+    p.count = a.count;
+    p.max_index = a.max_index;
+    p.num_instances = a.num_instances;
+    p.base_vertex_ud = a.base_vertex_ud;
+    p.start_instance_ud = a.start_instance_ud;
+    const uint64_t isz = a.index_type == 1 ? 4 : 2;
+    if (a.indexed && a.index_base)
+        g_reads.push_back(a.indirect_addr ? std::make_pair(a.index_base, (uint64_t)a.max_index * isz)
+                                          : std::make_pair(a.index_base + a.index_offset * isz, (uint64_t)a.count * isz));
+    if (a.indirect_addr) g_reads.push_back({a.indirect_addr, 20});
+}
+
+void NoteDispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect_addr) {
+    g_pass->dim[0] = x;
+    g_pass->dim[1] = y;
+    g_pass->dim[2] = z;
+    if (indirect_addr) g_reads.push_back({indirect_addr, 12});
+}
+
+// Raw contents of a texture of the pass, within the budget.
+bool ReadForPass(id<MTLTexture> t, TextureRec* tr, std::vector<uint8_t>* raw) {
+    if (t.sampleCount > 1) return tr->readback = "msaa", false;
+    if (!BytesPerTexel((uint32_t)t.pixelFormat)) return tr->readback = "format", false;
+    if (!S.tex->ReadRaw(t, raw)) return tr->readback = "readback failed", false;
+    return true;
+}
+
+// The GPU-owned entry `gid` (texture t) used by the pass; its contents before the pass when the
+// pass is replayable. Returns its index in g_pass->textures.
+int AddTexture(const GpuTextureId& gid, id<MTLTexture> t, const char* role, bool written) {
+    for (size_t i = 0; i < g_tex.size(); ++i)
+        if (g_tex[i] == t) {
+            g_pass->textures[i].written |= written;
+            return (int)i;
+        }
+    TextureRec tr;
+    tr.role = "t" + std::to_string(g_tex.size()) + "_" + role;
+    tr.written = written;
+    tr.id = gid;
+    if (g_pass->replayable) {
+        std::vector<uint8_t> raw;
+        if (g_raw_bytes > g_raw_budget) tr.readback = "budget";
+        else if (ReadForPass(t, &tr, &raw)) {
+            g_raw_bytes += raw.size();
+            tr.pre_file = g_writer->SaveTexture(g_pass->index, tr.role, "pre", raw, &tr.pre_hash);
+        }
+    }
+    g_pass->textures.push_back(std::move(tr));
+    g_tex.push_back(t);
+    return (int)g_tex.size() - 1;
+}
+
+// Encoder thread, top of DrawEncode / DispatchEncode: everything before the pass has completed.
+void StartEncode() {
+    Commit();
+    WaitAll();
+}
+
+// DrawEncode, after the targets are chosen and before anything of the pass is encoded.
+void NoteTargets(const PassKey& key, const RenderState& rs) {
+    Commit(); // e.g. the slice copy of a grown depth array (encoded above) is part of the "before"
+    WaitAll();
+    for (int i = 0; i < 8; ++i) {
+        if (!key.color[i]) continue;
+        GpuTextureId gid;
+        if (S.tex->DescribeGpuTexture(key.color[i], &gid)) {
+            AddTexture(gid, key.color[i], ("color" + std::to_string(i)).c_str(), true);
+        } else {
+            TextureRec tr; // an EQAA twin: not a cache entry, so not replayable
+            tr.role = "t" + std::to_string(g_tex.size()) + "_color" + std::to_string(i);
+            tr.written = true;
+            tr.readback = "not a texture-cache entry (EQAA twin)";
+            g_pass->textures.push_back(tr);
+            g_tex.push_back(key.color[i]);
+        }
+    }
+    if (key.depth) {
+        GpuTextureId gid;
+        if (S.tex->DescribeGpuTexture(key.depth, &gid)) AddTexture(gid, key.depth, "depth", rs.ds.depth_write || rs.ds.stencil_test);
+    }
+    for (int i = 0; i < 8; ++i) g_pass->cb_extent[i] = rs.color[i].extent_width | rs.color[i].extent_height << 16;
+    g_pass->db_extent = rs.depth.extent_width | rs.depth.extent_height << 16;
+    StateRec& s = g_pass->state;
+    s.prim = (uint32_t)rs.raster.prim;
+    s.color_mode = rs.color_mode;
+    for (int i = 0; i < 8; ++i) {
+        s.blend_enable[i] = rs.blend[i].enable;
+        s.blend_raw[i] = rs.blend[i].raw;
+        s.write_mask[i] = rs.color[i].mtl_write_mask;
+    }
+    s.depth_test = rs.ds.depth_test;
+    s.depth_write = rs.ds.depth_write;
+    s.depth_compare = rs.ds.depth_compare;
+    s.stencil_test = rs.ds.stencil_test;
+    s.stencil_ref_front = rs.ds.front.reference;
+    s.stencil_ref_back = rs.ds.back.reference;
+    const Viewport& vp = rs.viewports[0];
+    const double v[6] = {vp.origin_x, vp.origin_y, vp.width, vp.height, vp.znear, vp.zfar};
+    memcpy(s.viewport, v, sizeof(v));
+    s.scissor[0] = rs.scissor.x;
+    s.scissor[1] = rs.scissor.y;
+    s.scissor[2] = rs.scissor.width;
+    s.scissor[3] = rs.scissor.height;
+}
+
+// BindStage: a guest buffer as bound (base aligned down, bound_bytes covering the V#).
+void NoteBuffer(Stage st, uint32_t index, const uint32_t v[4], uint64_t base, uint32_t bound_bytes, uint32_t stride,
+                bool written) {
+    BufferRec b;
+    b.stage = StageName(st);
+    b.index = index;
+    b.addr = base;
+    b.size = bound_bytes;
+    b.stride = stride;
+    b.written = written;
+    memcpy(b.vsharp, v, sizeof(b.vsharp));
+    g_pass->buffers.push_back(b);
+    g_reads.push_back({base, bound_bytes});
+}
+
+// BindStage: an image before the renderer resolves it to a texture.
+void NoteImage(Stage st, uint32_t index, const ImageDesc& img, bool storage, bool depth_image) {
+    ImageRec r;
+    r.stage = StageName(st);
+    r.index = index;
+    r.addr = img.address;
+    memcpy(r.tsharp, img.raw, sizeof(r.tsharp));
+    r.dfmt = img.raw_dfmt;
+    r.nfmt = img.raw_nfmt;
+    r.width = img.width;
+    r.height = img.height;
+    r.depth = img.depth;
+    r.levels = img.num_levels;
+    r.layers = img.num_layers;
+    r.type = (uint32_t)img.type;
+    r.tile_mode = (uint32_t)img.tile_mode;
+    r.storage = storage;
+    r.depth_image = depth_image;
+    std::vector<GpuTextureId> ids;
+    S.tex->DescribeGpuTextures(img.address, &ids);
+    for (const GpuTextureId& gid : ids) {
+        id<MTLTexture> t = S.tex->FindGpuTexture(gid, false);
+        if (t) r.textures.push_back(AddTexture(gid, t, storage ? "storage" : "sampled", storage));
+    }
+    if (ids.empty()) { // read from guest memory (or created there by GetStorageTexture)
+        r.guest_bytes = ApproxImageBytes(img);
+        g_reads.push_back({img.address, r.guest_bytes});
+    }
+    g_pass->images.push_back(std::move(r));
+}
+
+// BindStage: the GPU-owned texture a storage image resolved to (it may have been created from
+// guest memory just now; S.storage_bound is consumed by SyncStorageToDepth before the pass ends).
+void NoteStorage(id<MTLTexture> t) { g_storage.push_back(t); }
+
+// DispatchEncode binds a stage again after a hazard flush: the first binding's records go.
+void ForgetBindings(Stage st) {
+    const std::string name = StageName(st);
+    auto drop = [&](auto& v) {
+        v.erase(std::remove_if(v.begin(), v.end(), [&](const auto& r) { return r.stage == name; }), v.end());
+    };
+    drop(g_pass->buffers);
+    drop(g_pass->images);
+    drop(g_pass->samplers);
+}
+
+void NoteSampler(Stage st, uint32_t index, const uint32_t ss[4]) {
+    SamplerRec r;
+    r.stage = StageName(st);
+    r.index = index;
+    memcpy(r.ssharp, ss, sizeof(r.ssharp));
+    g_pass->samplers.push_back(r);
+}
+
+// Next to the draw / dispatch call of DrawEncode / DispatchEncode.
+void Encoded(uint64_t indirect_addr) {
+    g_encoded = true;
+    g_pass->indirect_addr = indirect_addr;
+    if (indirect_addr) ReadGuest(S.ctx, indirect_addr, g_pass->indirect_args, sizeof(g_pass->indirect_args));
+}
+
+// End of the pass: inputs (before the GPU runs it), then its outputs once it completed.
+void Finish() {
+    PassRec* p = g_pass;
+    g_pass = nullptr;
+    if (!g_encoded && p->skipped.empty()) p->skipped = "not encoded (see the [gnm-draw] log)";
+    // storage images created by this pass (GetStorageTexture with no entry before)
+    for (id<MTLTexture> t : g_storage) {
+        GpuTextureId gid;
+        bool known = false;
+        for (id<MTLTexture> k : g_tex) known |= k == t;
+        if (!known && S.tex->DescribeGpuTexture(t, &gid)) {
+            TextureRec tr;
+            tr.role = "t" + std::to_string(g_tex.size()) + "_storage";
+            tr.written = true;
+            tr.id = gid;
+            p->textures.push_back(std::move(tr)); // pre_file "": created from guest memory
+            g_tex.push_back(t);
+        }
+    }
+    if (p->replayable)
+        for (auto& [a, n] : CoalescePages(g_reads, S.ctx->mem_size)) p->inputs.push_back(g_writer->Snapshot(S.ctx->mem_base, a, n));
+    Commit();
+    WaitAll();
+    if (p->replayable)
+        for (const BufferRec& b : p->buffers)
+            if (b.written) p->outputs.push_back(g_writer->Snapshot(S.ctx->mem_base, b.addr, b.size));
+    for (size_t i = 0; i < p->textures.size(); ++i) {
+        TextureRec& tr = p->textures[i];
+        if (!tr.written || !tr.readback.empty()) continue;
+        std::vector<uint8_t> raw;
+        if (!ReadForPass(g_tex[i], &tr, &raw)) continue;
+        if (p->replayable && g_raw_bytes <= g_raw_budget) {
+            g_raw_bytes += raw.size();
+            tr.post_file = g_writer->SaveTexture(p->index, tr.role, "post", raw, &tr.post_hash);
+        }
+        tr.png_file = g_writer->SavePng(p->index, tr.role, tr.id, raw, p->replayable ? 0 : g_thumb, &tr.png_mode);
+    }
+    g_writer->AddPass(std::move(*p));
+    delete p;
+    g_tex.clear();
+    g_reads.clear();
+    g_storage.clear();
+}
+
+// PresentImpl, before S.present_idx moves past the captured frame.
+void EndFrame() {
+    if (!g_writer || S.present_idx != g_writer->Frame()) return;
+    std::string err;
+    if (g_writer->Finish(&err))
+        fprintf(stderr, "[gnm-capture] frame %llu: %zu passes written to %s (%llu MiB raw)\n",
+                (unsigned long long)g_writer->Frame(), g_writer->NumPasses(), g_writer->Dir().c_str(),
+                (unsigned long long)(g_raw_bytes >> 20));
+    else
+        fprintf(stderr, "[gnm-capture] %s\n", err.c_str());
+    g_writer.reset();
+}
+
+// Draw / Dispatch: records a pass of the captured frame; finishes it if it never reached the
+// encoder (skipped on the CP thread).
+struct CpScope {
+    bool on;
+    CpScope(const char* type, const char* queue, const char* name, const uint32_t* regs) : on(InFrame()) {
+        if (on) Begin(type, queue, name, regs);
+    }
+    ~CpScope() {
+        if (on && g_pass) Finish();
+    }
+};
+// DrawEncode / DispatchEncode: the pass ends with the function, on every return path.
+struct EncodeScope {
+    bool on;
+    EncodeScope() : on(g_pass != nullptr) {
+        if (on) StartEncode();
+    }
+    ~EncodeScope() {
+        if (on && g_pass) Finish();
+    }
+};
+} // namespace cap
+
 bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_t>& flat, Binder& b,
                const BindCtx& bc, const gcn_push_data& push, std::string* why) {
     (void)ud;
@@ -2565,6 +3006,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                 off = 0;
                 break;
             }
+            if (cap::g_pass) cap::NoteBuffer(b.stage, i, v, base, bound_bytes, bd.stride, bb.is_written);
             if (ShouldTrace()) {
                 fprintf(stderr, "[gnm-trace]    buf[%u] 0x%llx size %u stride %u%s\n", i, (unsigned long long)base,
                         bd.size_bytes, bd.stride, bb.is_written ? " written" : "");
@@ -2655,6 +3097,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
         id<MTLTexture> tex = nil;
         ImageDesc img;
         const bool have = StageImage(s, flat, i, &img) && img.valid && img.address && img.address < S.ctx->mem_size;
+        if (cap::g_pass && have) cap::NoteImage(b.stage, i, img, ib.is_storage, ib.is_depth);
         if (have) {
             if (ib.is_depth) {
                 tex = S.tex->FindDepthTarget(img.address);
@@ -2667,6 +3110,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                 if (tex) {
                     // storage writes go to a GPU-owned texture
                     S.storage_bound.emplace_back(img.address, tex);
+                    if (cap::g_pass) cap::NoteStorage(tex);
                 } else {
                     RLog("storage-tex", "storage image unsupported (fmt %u/%u %ux%u type %u)",
                          img.raw_dfmt, img.raw_nfmt, img.width, img.height, (uint32_t)img.type);
@@ -2741,6 +3185,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
         const gcn_sampler_binding& sb = s->samps[i];
         uint32_t ss[4] = {};
         gcn_shader_fetch_sampler_sharp(s->sh, i, flat.data(), ss);
+        if (cap::g_pass) cap::NoteSampler(b.stage, i, ss);
         b.Sampler(GetSampler(ss, sb.is_depth), sb.msl_sampler);
     }
 
@@ -3792,6 +4237,7 @@ bool TakeMetaCleared(uint64_t addr, uint64_t* seq = nullptr) {
     auto it = S.meta.find(addr);
     if (it == S.meta.end() || !it->second.cleared) return false;
     it->second.cleared = false;
+    if (cap::g_pass) cap::g_pass->meta_cleared.push_back(addr); // replay re-arms the fast clear
     if (seq) *seq = it->second.cleared_seq;
     return true;
 }
@@ -4209,20 +4655,15 @@ void DumpTargets(uint64_t present_idx) {
             const size_t w = t.width, h = t.height;
             const bool d16 = t.pixelFormat == MTLPixelFormatDepth16Unorm;
             const size_t bpp = d16 ? 2 : 4;
-            id<MTLBuffer> b = [S.dev newBufferWithLength:w * h * bpp options:MTLResourceStorageModeShared];
-            id<MTLCommandBuffer> cb = [S.queue commandBuffer];
-            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-            [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                     sourceSize:MTLSizeMake(w, h, 1) toBuffer:b destinationOffset:0 destinationBytesPerRow:w * bpp
-                destinationBytesPerImage:w * h * bpp
-                         options:t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? MTLBlitOptionDepthFromDepthStencil
-                                                                                       : MTLBlitOptionNone];
-            [bl endEncoding];
-            [cb commit];
-            [cb waitUntilCompleted];
+            std::vector<uint8_t> raw; // level 0 / slice 0 of the depth plane come first (ReadRaw)
+            if (!tc->ReadRaw(t, &raw) || raw.size() < w * h * bpp) {
+                fprintf(stderr, "[gnm-draw] dump: cannot read depth 0x%llx fmt %lu\n", (unsigned long long)addr,
+                        (unsigned long)t.pixelFormat);
+                return;
+            }
             std::vector<float> v(w * h);
             for (size_t i = 0; i < w * h; ++i)
-                v[i] = d16 ? ((const uint16_t*)b.contents)[i] / 65535.f : ((const float*)b.contents)[i];
+                v[i] = d16 ? ((const uint16_t*)raw.data())[i] / 65535.f : ((const float*)raw.data())[i];
             float lo = 1e30f, hi = -1e30f;
             size_t n1 = 0, n0 = 0;
             for (float f : v) {
@@ -4274,19 +4715,16 @@ void DumpTargets(uint64_t present_idx) {
                 return;
             }
             const size_t w = t.width, h = t.height;
-            id<MTLBuffer> b = [S.dev newBufferWithLength:w * h * bpp options:MTLResourceStorageModeShared];
-            id<MTLCommandBuffer> cb = [S.queue commandBuffer];
-            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-            [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
-                       toBuffer:b destinationOffset:0 destinationBytesPerRow:w * bpp destinationBytesPerImage:w * h * bpp];
-            [bl endEncoding];
-            [cb commit];
-            [cb waitUntilCompleted];
+            std::vector<uint8_t> raw; // level 0 / slice 0 come first in ReadRaw's layout
+            if (!tc->ReadRaw(t, &raw) || raw.size() < w * h * bpp) {
+                fprintf(stderr, "[gnm-draw] dump: cannot read 0x%llx fmt %lu\n", (unsigned long long)addr, (unsigned long)t.pixelFormat);
+                return;
+            }
             char path[1024];
             snprintf(path, sizeof(path), "%s/rt_%llu_%llx_f%lu_%zux%zu_%zu.raw", dir, (unsigned long long)present_idx,
                      (unsigned long long)addr, (unsigned long)t.pixelFormat, w, h, bpp);
             if (FILE* f = fopen(path, "wb")) {
-                fwrite(b.contents, 1, w * h * bpp, f);
+                fwrite(raw.data(), 1, w * h * bpp, f);
                 fclose(f);
             }
             return;
@@ -4409,6 +4847,7 @@ bool Init(GuestContext* ctx) {
         gcn_msl_options_default(&S.msl);
         ps4gnm_shader_cache::Start(S.profile, S.msl);
         gcn_set_log_level(4);
+        if (const char* cf = getenv("PS4_GNM_CAPTURE_FRAME"); cf && *cf) cap::Setup(strtoull(cf, nullptr, 0), proc->mem_size);
         if (const char* t = getenv("PS4_GNM_TRACE")) {
             // "<count>", "<first_submit>:<count>" or "p<first_present>:<count>" (present indices)
             if (t[0] == 'p') {
@@ -4831,9 +5270,15 @@ bool GuestRangeOk(uint64_t addr, uint64_t size) {
     return ctx && addr && size && addr < ctx->mem_size && size <= ctx->mem_size - addr;
 }
 
+// Frame capture: an indirect draw the GPU path cannot take; the caller reads its arguments and
+// issues it again as a direct draw (the next pass of the capture).
+constexpr const char* kCapIndirectFallback = "indirect draw replaced by a direct draw (next pass)";
+
 bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
     if (!Init(ctx) || S.hung) return true;
     @autoreleasepool {
+        cap::CpScope cap_scope("draw", "gfx", args.name, regs);
+        if (cap::g_pass) cap::NoteDraw(args);
         std::unique_ptr<DrawRec, RecPool<DrawRec>::Back> rp(g_draw_recs.Get(), {&g_draw_recs});
         DrawRec& r = *rp;
         r.args = args;
@@ -4856,6 +5301,7 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
                     (unsigned long long)rs.color[1].address, rs.color[1].pitch, rs.color[1].height,
                     rs.color[1].num_samples);
         if (rs.color_mode == 2 || rs.color_mode == 5) { // EliminateFastClear / FmaskDecompress
+            cap::SetSkipped("fast-clear elimination / FMASK decompress (renderer operation, not a shader pass)");
             encq::Defer([rec = rp.release()] {
                 EliminateFastClear(rec->rs);
                 g_draw_recs.Put(rec);
@@ -4863,6 +5309,7 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
             return true;
         }
         if (rs.color_mode == 3) {
+            cap::SetSkipped("MSAA resolve (renderer operation, not a shader pass)");
             encq::Defer([rec = rp.release()] {
                 ResolvePass(rec->rs);
                 g_draw_recs.Put(rec);
@@ -4915,8 +5362,10 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
             if ((args.base_vertex_ud >= 0 && (!in.has_fetch_shader || args.base_vertex_ud != in.vertex_offset_sgpr)) ||
                 (args.start_instance_ud >= 0 &&
                  (!in.has_fetch_shader || args.start_instance_ud != in.instance_offset_sgpr)) ||
-                regs[0xA102] != 0 || (args.indexed && !args.max_index))
+                regs[0xA102] != 0 || (args.indexed && !args.max_index)) {
+                cap::SetSkipped(kCapIndirectFallback);
                 return false;
+            }
         }
         if (rs.raster.prim == PrimitiveType::RectList && !indirect) {
             bool pending = false;
@@ -4958,11 +5407,15 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
             // what the encoder's GuestBuffer calls need (CPU fallback otherwise)
             const uint64_t isz = args.index_type == 1 ? 4 : 2;
             if (rs.raster.needs_emulation || !GuestRangeOk(args.indirect_addr, args.indexed ? 20 : 16) ||
-                (args.indirect_addr & 3))
+                (args.indirect_addr & 3)) {
+                cap::SetSkipped(kCapIndirectFallback);
                 return false;
+            }
             if (args.indexed && (!args.index_base || !GuestRangeOk(args.index_base, (uint64_t)args.max_index * isz) ||
-                                 (args.index_base & 3)))
+                                 (args.index_base & 3))) {
+                cap::SetSkipped(kCapIndirectFallback);
                 return false;
+            }
         }
 
         // ---- vertex input sharps (guest memory; the encoder binds the buffers)
@@ -4999,6 +5452,10 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
         if (ps) DecodeStageImages(ps, r.ps_flat, &r.ps_img);
         r.vs = vs;
         r.ps = ps;
+        if (cap::g_pass) {
+            cap::NoteStage("vs", vs, vs_ud);
+            if (ps) cap::NoteStage("ps", ps, ps_ud);
+        }
         r.regs.Capture(regs);
         encq::Defer([rec = rp.release()] {
             DrawEncode(*rec);
@@ -5018,6 +5475,7 @@ void CommitEachForDebug() {
 void DrawEncode(DrawRec& r) {
     CommitEachForDebug();
     if (S.hung) return;
+    cap::EncodeScope cap_scope;
     DrainAsyncPsos();
     const DrawArgs& args = r.args;
     RenderState& rs = r.rs;
@@ -5382,6 +5840,7 @@ void DrawEncode(DrawRec& r) {
         // ---- encode
         std::vector<uint32_t>& vs_flat = r.vs_flat;
         std::vector<uint32_t>& ps_flat = r.ps_flat;
+        if (cap::g_pass) cap::NoteTargets(key, rs);
         ResolveTextureHazards(vs, vs_flat);
         if (ps) ResolveTextureHazards(ps, ps_flat);
         PrepareDepthCompanions(vs, vs_flat);
@@ -5502,6 +5961,7 @@ void DrawEncode(DrawRec& r) {
         }
         S.pending = true;
         S.n_draws++;
+        if (cap::g_pass) cap::Encoded(args.indirect_addr);
         {
             WorkRec wr;
             wr.what = args.name;
@@ -5582,6 +6042,8 @@ void Dispatch(GuestContext* ctx, const uint32_t* regs, uint32_t dim_x, uint32_t 
     if (!Init(ctx) || S.hung) return;
     @autoreleasepool {
         if (!indirect_addr && (dim_x == 0 || dim_y == 0 || dim_z == 0)) return;
+        cap::CpScope cap_scope("dispatch", queue, queue, regs);
+        if (cap::g_pass) cap::NoteDispatch(dim_x, dim_y, dim_z, indirect_addr);
         std::unique_ptr<DispatchRec, RecPool<DispatchRec>::Back> rp(g_dispatch_recs.Get(), {&g_dispatch_recs});
         DispatchRec& r = *rp;
         gcn_runtime_info& rt = r.rt;
@@ -5597,6 +6059,7 @@ void Dispatch(GuestContext* ctx, const uint32_t* regs, uint32_t dim_x, uint32_t 
             return;
         }
         StageFlat(2, cs, ud);
+        if (cap::g_pass) cap::NoteStage("cs", cs, ud);
         r.flat = S.flat_scratch[2];
         DecodeStageImages(cs, r.flat, &r.img);
         r.cs = cs;
@@ -5639,6 +6102,7 @@ void WaitKernelCompiles() {
 void DispatchEncode(DispatchRec& r) {
     CommitEachForDebug();
     if (S.hung) return;
+    cap::EncodeScope cap_scope;
     const RegSnap& regs = r.regs;
     const gcn_runtime_info& rt = r.rt;
     const uint64_t addr = r.addr;
@@ -5764,6 +6228,7 @@ void DispatchEncode(DispatchRec& r) {
                         S.pending = true;
                         if (kind == 2) BumpDepthVersion(dst);
                         LogWork("surface copy (compute copy shader)");
+                        cap::SetSkipped("surface copy (compute copy shader): a blit, not a shader pass");
                         if (ShouldTrace())
                             fprintf(stderr, "[gnm-trace] %s CS 0x%llx: surface copy 0x%llx -> 0x%llx (%s)\n", queue,
                                     (unsigned long long)addr, (unsigned long long)rd.base_address,
@@ -5774,6 +6239,7 @@ void DispatchEncode(DispatchRec& r) {
                     if (S.stencil_to_z.count(rd.base_address) || S.meta.count(rd.base_address)) {
                         // stencil plane (copied with its depth texture) or HTILE/CMASK metadata
                         if (S.meta.count(rd.base_address)) S.meta.emplace(wr.base_address, MetaState{});
+                        cap::SetSkipped("stencil / metadata copy (skipped by the renderer)");
                         if (ShouldTrace())
                             fprintf(stderr, "[gnm-trace] %s CS 0x%llx: stencil/meta copy 0x%llx -> 0x%llx skipped\n",
                                     queue, (unsigned long long)addr, (unsigned long long)rd.base_address,
@@ -5783,6 +6249,7 @@ void DispatchEncode(DispatchRec& r) {
                 }
             }
             if (meta_written && !reads_meta) {
+                cap::SetSkipped("CMASK/HTILE clear by a compute shader (tracked, not run)");
                 S.meta[meta_written].cleared = true;
                 if (ShouldTrace()) fprintf(stderr, "[gnm-trace] %s CS 0x%llx: meta clear of 0x%llx\n", queue,
                                            (unsigned long long)addr, (unsigned long long)meta_written);
@@ -5818,6 +6285,7 @@ void DispatchEncode(DispatchRec& r) {
             if (!g_cstate.Tracks(enc) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)pso))
                 [enc setComputePipelineState:pso];
             Binder b2{Stage::Compute, nil, enc};
+            if (cap::g_pass) cap::ForgetBindings(Stage::Compute);
             if (!BindStage(cs, ud, flat, b2, bc, push, &why)) return;
         }
         const MTLSize tg = MTLSizeMake(wx, wy, wz);
@@ -5831,6 +6299,7 @@ void DispatchEncode(DispatchRec& r) {
         }
         S.pending = true;
         S.n_dispatches++;
+        if (cap::g_pass) cap::Encoded(indirect_addr);
         S.n_cdisp++;
         WorkRec wr;
         wr.what = queue;
@@ -6135,6 +6604,7 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
         }
         static uint64_t presents = 0;
         static double last_t = CFAbsoluteTimeGetCurrent();
+        cap::EndFrame();
         S.present_idx = presents + 1;
         if ((presents + 1) % 300 == 0) {
             const double now = CFAbsoluteTimeGetCurrent();

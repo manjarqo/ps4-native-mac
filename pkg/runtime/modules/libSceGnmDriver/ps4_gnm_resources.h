@@ -39,6 +39,7 @@
 #endif
 
 #include "ps4_gnm_membudget.h"
+#include "ps4_gnm_capture.h"
 
 namespace ps4gnm {
 
@@ -316,6 +317,12 @@ struct SurfaceLayout {
 
 // Port of shadPS4 ComputeImageSize (tile.h). Returns false on unsupported parameters.
 bool ComputeSurfaceLayout(const SurfaceDesc& desc, SurfaceLayout* out);
+// Frame capture / replay (ps4_gnm_capture.h): a texture-cache entry's SurfaceDesc and SurfaceLayout
+// as kPackedSurfaceWords uint32 values (desc fields in declaration order, then array_mode, num_mips,
+// total_size, micro_tiled_mips, then offset/size/pitch/height/slices/micro_tiled of each mip).
+constexpr uint32_t kPackedSurfaceWords = 17 + 6 * kMaxMips;
+void PackSurface(const SurfaceDesc& s, const SurfaceLayout& l, std::vector<uint32_t>* out);
+bool UnpackSurface(const std::vector<uint32_t>& v, SurfaceDesc* s, SurfaceLayout* l);
 // Single-level layout from an explicit padded pitch/height/slice size (CB/DB registers).
 void MakeSingleLevelLayout(const SurfaceDesc& desc, uint32_t padded_pitch, uint32_t padded_height,
                            uint32_t slice_bytes, SurfaceLayout* out);
@@ -838,6 +845,18 @@ public:
 
     // Debugging: visit every GPU-owned texture (kind: 1 color/storage, 2 depth).
     void ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<MTLTexture> tex)) const;
+    // ---- Frame capture and pass replay (ps4_gnm_capture.h) ----
+    // Identities of the GPU-owned entries (color/storage, depth) at `address`.
+    void DescribeGpuTextures(uint64_t address, std::vector<ps4gnm_capture::GpuTextureId>* out) const;
+    // Identity of the GPU-owned entry whose texture is `tex`; false if none (views, EQAA twins).
+    bool DescribeGpuTexture(id<MTLTexture> tex, ps4gnm_capture::GpuTextureId* out) const;
+    // The GPU-owned entry with this identity; with `create`, made (empty, not loaded from guest
+    // memory) when there is none. nil if none / on failure.
+    id<MTLTexture> FindGpuTexture(const ps4gnm_capture::GpuTextureId& gid, bool create);
+    // All levels and slices in the ps4gnm_capture::RawSize layout (depth+stencil: both planes),
+    // through a blit on this cache's queue; waits. False for multisampled or unsupported formats.
+    bool ReadRaw(id<MTLTexture> tex, std::vector<uint8_t>* out);
+    bool WriteRaw(id<MTLTexture> tex, const std::vector<uint8_t>& raw);
 
     // True if [addr, addr+size) overlaps a GPU-owned (render target / storage) texture.
     bool OverlapsGpuTexture(uint64_t addr, uint64_t size) const;
@@ -903,6 +922,8 @@ private:
     // Stamps the entry's last use with the SetUse values (ExactWriteLocked: and an exactly known
     // write of guest [lo, hi), clipped to the entry).
     void TouchLocked(const Entry* e) const;
+    static void EntryId(const Entry& e, ps4gnm_capture::GpuTextureId* out);
+    static bool SameIdentity(const Entry& e, const ps4gnm_capture::GpuTextureId& gid);
     void ExactWriteLocked(const Entry* e, uint64_t lo, uint64_t hi, uint64_t seq = 0) const;
     void RetireLocked(id<MTLTexture> t);
     std::vector<id<MTLTexture>> retired_;

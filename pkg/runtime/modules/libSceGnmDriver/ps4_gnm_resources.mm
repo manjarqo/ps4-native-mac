@@ -3635,6 +3635,227 @@ void TextureCache::ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<M
     for (auto& e : v) fn(e.first, e.second.first, e.second.second);
 }
 
+// =====================================================================================
+// Frame capture and pass replay (ps4_gnm_capture.h)
+// =====================================================================================
+void PackSurface(const SurfaceDesc& s, const SurfaceLayout& l, std::vector<uint32_t>* out) {
+    out->assign({(uint32_t)s.tile_mode, s.bpp, s.num_samples, s.width, s.height, s.depth, s.pitch, s.levels,
+                 s.layers, (uint32_t)s.is_block, (uint32_t)s.is_pow2, (uint32_t)s.alt_tile, s.bank_swizzle,
+                 (uint32_t)l.array_mode, l.num_mips, l.total_size, l.micro_tiled_mips});
+    for (uint32_t m = 0; m < kMaxMips; ++m) {
+        const MipLayout& ml = l.mips[m];
+        out->insert(out->end(), {ml.offset, ml.size, ml.pitch, ml.height, ml.slices, (uint32_t)ml.micro_tiled});
+    }
+}
+
+bool UnpackSurface(const std::vector<uint32_t>& v, SurfaceDesc* s, SurfaceLayout* l) {
+    if (v.size() != 17 + 6 * kMaxMips) return false;
+    s->tile_mode = (TileMode)v[0];
+    s->bpp = v[1];
+    s->num_samples = v[2];
+    s->width = v[3];
+    s->height = v[4];
+    s->depth = v[5];
+    s->pitch = v[6];
+    s->levels = v[7];
+    s->layers = v[8];
+    s->is_block = v[9] != 0;
+    s->is_pow2 = v[10] != 0;
+    s->alt_tile = v[11] != 0;
+    s->bank_swizzle = v[12];
+    l->array_mode = (ArrayMode)v[13];
+    l->num_mips = v[14];
+    l->total_size = v[15];
+    l->micro_tiled_mips = v[16];
+    for (uint32_t m = 0; m < kMaxMips; ++m) {
+        const uint32_t* w = &v[17 + 6 * m];
+        l->mips[m] = MipLayout{w[0], w[1], w[2], w[3], w[4], w[5] != 0};
+    }
+    return true;
+}
+
+void TextureCache::EntryId(const Entry& e, ps4gnm_capture::GpuTextureId* o) {
+    o->kind = (int)e.kind;
+    o->address = e.address;
+    o->size = e.size;
+    o->entry_format = e.mtl_format;
+    o->tex_type = e.tex_type;
+    o->width = e.width;
+    o->height = e.height;
+    o->depth = e.depth;
+    o->levels = e.levels;
+    o->layers = e.layers;
+    o->samples = e.samples;
+    o->dfmt = (uint32_t)e.dfmt;
+    o->nfmt = (uint32_t)e.nfmt;
+    for (uint32_t k = 0; k < 4; ++k) {
+        o->swizzle[k] = (uint8_t)e.swizzle[k];
+        o->cb_swizzle[k] = (uint8_t)e.cb_swizzle[k];
+    }
+    id<MTLTexture> t = e.tex;
+    o->mtl_type = (uint32_t)t.textureType;
+    o->mtl_format = (uint32_t)t.pixelFormat;
+    o->mtl_width = (uint32_t)t.width;
+    o->mtl_height = (uint32_t)t.height;
+    o->mtl_depth = (uint32_t)t.depth;
+    o->mtl_levels = (uint32_t)t.mipmapLevelCount;
+    o->mtl_array = (uint32_t)t.arrayLength;
+    o->mtl_samples = (uint32_t)t.sampleCount;
+    o->usage = (uint32_t)t.usage;
+    o->storage_mode = (uint32_t)t.storageMode;
+    PackSurface(e.surf, e.layout, &o->surface);
+}
+
+bool TextureCache::SameIdentity(const Entry& e, const ps4gnm_capture::GpuTextureId& gid) {
+    return (int)e.kind == gid.kind && e.tex && e.address == gid.address && e.mtl_format == gid.entry_format &&
+           e.width == gid.width &&
+           e.height == gid.height && e.layers == gid.layers && e.samples == gid.samples &&
+           (uint32_t)e.tex.pixelFormat == gid.mtl_format && (uint32_t)e.tex.textureType == gid.mtl_type &&
+           (uint32_t)e.tex.mipmapLevelCount == gid.mtl_levels;
+}
+
+void TextureCache::DescribeGpuTextures(uint64_t address, std::vector<ps4gnm_capture::GpuTextureId>* out) const {
+    TimedLock lk(mutex_);
+    auto range = entries_.equal_range(address);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second->kind == Entry::Sampled || !it->second->tex) continue;
+        out->emplace_back();
+        EntryId(*it->second, &out->back());
+    }
+}
+
+bool TextureCache::DescribeGpuTexture(id<MTLTexture> tex, ps4gnm_capture::GpuTextureId* out) const {
+    if (!tex) return false;
+    TimedLock lk(mutex_);
+    for (const auto& kv : entries_) {
+        const Entry* e = kv.second;
+        if (e->kind != Entry::Sampled && e->tex == tex) {
+            EntryId(*e, out);
+            return true;
+        }
+    }
+    return false;
+}
+
+id<MTLTexture> TextureCache::FindGpuTexture(const ps4gnm_capture::GpuTextureId& gid, bool create) {
+    if (!device_ || (gid.kind != Entry::Color && gid.kind != Entry::Depth)) return nil;
+    TimedLock lk(mutex_);
+    auto range = entries_.equal_range(gid.address);
+    for (auto it = range.first; it != range.second; ++it)
+        if (SameIdentity(*it->second, gid)) return TouchLocked(it->second), it->second->tex;
+    if (!create) return nil;
+    Entry* e = new Entry();
+    e->kind = (Entry::Kind)gid.kind;
+    e->address = gid.address;
+    e->size = gid.size;
+    e->mtl_format = gid.entry_format;
+    e->tex_type = gid.tex_type;
+    e->width = gid.width;
+    e->height = gid.height;
+    e->depth = gid.depth;
+    e->levels = gid.levels;
+    e->layers = gid.layers;
+    e->samples = gid.samples;
+    e->dfmt = (DataFormat)gid.dfmt;
+    e->nfmt = (NumberFormat)gid.nfmt;
+    for (uint32_t k = 0; k < 4; ++k) {
+        e->swizzle[k] = (CompSwizzle)gid.swizzle[k];
+        e->cb_swizzle[k] = (CompSwizzle)gid.cb_swizzle[k];
+    }
+    if (!UnpackSurface(gid.surface, &e->surf, &e->layout)) {
+        delete e;
+        return nil;
+    }
+    MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+    td.textureType = (MTLTextureType)gid.mtl_type;
+    td.pixelFormat = (MTLPixelFormat)gid.mtl_format;
+    td.width = gid.mtl_width;
+    td.height = gid.mtl_height;
+    td.depth = gid.mtl_depth;
+    td.mipmapLevelCount = gid.mtl_levels;
+    td.arrayLength = gid.mtl_array;
+    td.sampleCount = gid.mtl_samples;
+    td.usage = (MTLTextureUsage)gid.usage;
+    td.storageMode = (MTLStorageMode)gid.storage_mode;
+    e->tex = [device_ newTextureWithDescriptor:td];
+    if (!e->tex) {
+        delete e;
+        return nil;
+    }
+    e->dirty = false;
+    e->generation = 1;
+    TouchLocked(e);
+    e->alloc_bytes = (uint64_t)e->tex.allocatedSize;
+    TrackLocked(e, +1);
+    entries_.emplace(e->address, e);
+    return e->tex;
+}
+
+namespace {
+// One blit per level / slice between `tex` and a shared buffer in the RawSize layout.
+bool RawBlit(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLTexture> tex, id<MTLBuffer> buf, bool to_texture) {
+    using namespace ps4gnm_capture;
+    const uint32_t fmt = (uint32_t)tex.pixelFormat, bpe = BytesPerTexel(fmt);
+    if (!bpe || tex.sampleCount > 1) return false;
+    const bool cube = tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray;
+    const bool is3d = tex.textureType == MTLTextureType3D;
+    const NSUInteger slices = tex.arrayLength * (cube ? 6 : 1);
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    NSUInteger off = 0;
+    const bool ds = fmt == kDepth32Float_Stencil8;
+    for (int plane = 0; plane < (ds ? 2 : 1); ++plane) {
+        const NSUInteger pb = plane ? 1 : bpe;
+        const MTLBlitOption opt = !ds ? MTLBlitOptionNone
+                                      : plane ? MTLBlitOptionStencilFromDepthStencil : MTLBlitOptionDepthFromDepthStencil;
+        for (NSUInteger l = 0; l < tex.mipmapLevelCount; ++l) {
+            const NSUInteger w = std::max<NSUInteger>(1, tex.width >> l), h = std::max<NSUInteger>(1, tex.height >> l);
+            const NSUInteger d = is3d ? std::max<NSUInteger>(1, tex.depth >> l) : 1;
+            for (NSUInteger s = 0; s < slices; ++s) {
+                if (to_texture)
+                    [bl copyFromBuffer:buf sourceOffset:off sourceBytesPerRow:w * pb sourceBytesPerImage:w * h * pb
+                            sourceSize:MTLSizeMake(w, h, d) toTexture:tex destinationSlice:s destinationLevel:l
+                     destinationOrigin:MTLOriginMake(0, 0, 0) options:opt];
+                else
+                    [bl copyFromTexture:tex sourceSlice:s sourceLevel:l sourceOrigin:MTLOriginMake(0, 0, 0)
+                             sourceSize:MTLSizeMake(w, h, d) toBuffer:buf destinationOffset:off
+                 destinationBytesPerRow:w * pb destinationBytesPerImage:w * h * pb options:opt];
+                off += w * h * d * pb;
+            }
+        }
+    }
+    [bl endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    (void)dev;
+    return cb.status == MTLCommandBufferStatusCompleted && off == buf.length;
+}
+} // namespace
+
+bool TextureCache::ReadRaw(id<MTLTexture> tex, std::vector<uint8_t>* out) {
+    if (!tex || !out || !device_) return false;
+    ps4gnm_capture::GpuTextureId gid;
+    gid.mtl_format = (uint32_t)tex.pixelFormat;
+    gid.mtl_type = (uint32_t)tex.textureType;
+    gid.mtl_width = (uint32_t)tex.width;
+    gid.mtl_height = (uint32_t)tex.height;
+    gid.mtl_depth = (uint32_t)tex.depth;
+    gid.mtl_levels = (uint32_t)tex.mipmapLevelCount;
+    gid.mtl_array = (uint32_t)tex.arrayLength;
+    const uint64_t n = ps4gnm_capture::RawSize(gid);
+    if (!n || tex.sampleCount > 1) return false;
+    id<MTLBuffer> buf = [device_ newBufferWithLength:n options:MTLResourceStorageModeShared];
+    if (!buf || !RawBlit(device_, queue_, tex, buf, false)) return false;
+    out->assign((const uint8_t*)buf.contents, (const uint8_t*)buf.contents + n);
+    return true;
+}
+
+bool TextureCache::WriteRaw(id<MTLTexture> tex, const std::vector<uint8_t>& raw) {
+    if (!tex || !device_ || raw.empty()) return false;
+    id<MTLBuffer> buf = [device_ newBufferWithBytes:raw.data() length:raw.size() options:MTLResourceStorageModeShared];
+    return buf && RawBlit(device_, queue_, tex, buf, true);
+}
+
 bool TextureCache::OverlapsGpuTexture(uint64_t addr, uint64_t size) const {
     TimedLock lk(mutex_);
     if (gpu_index_version_ != gpu_version_) {

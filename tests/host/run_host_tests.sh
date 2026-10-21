@@ -138,10 +138,17 @@ tail -1 "$T/gpu_membudget.txt"
 # Texture cache eviction: the policy and the real TextureCache on Metal (lifetime of textures used
 # by command buffers in flight, re-upload after eviction, GPU-write invalidation, GPU-owned surfaces).
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 -fsanitize=address,undefined \
-  -I "$G" -I "$R/pkg/runtime/core" "$R/tests/host/tex_evict_test.mm" "$G/ps4_gnm_resources.mm" "$T/membudget.o" \
-  -framework Metal -framework Foundation -o "$T/tex_evict_test"
+  -I "$G" -I "$R/pkg/runtime/core" "$R/tests/host/tex_evict_test.mm" "$G/ps4_gnm_resources.mm" "$G/ps4_gnm_capture.cpp" "$T/membudget.o" \
+  -framework Metal -framework Foundation -lz -o "$T/tex_evict_test"
 "$T/tex_evict_test" > "$T/tex_evict.txt" 2>&1 || { cat "$T/tex_evict.txt"; exit 1; }
 tail -1 "$T/tex_evict.txt"
+# Frame capture on the TextureCache: entry identities, an entry re-created from its identity,
+# and the raw layout of ReadRaw / WriteRaw (levels, slices, depth and stencil planes).
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 -fsanitize=address,undefined \
+  -I "$G" -I "$R/pkg/runtime/core" "$R/tests/host/gnm_capture_tex_test.mm" "$G/ps4_gnm_resources.mm" "$G/ps4_gnm_capture.cpp" \
+  "$T/membudget.o" -framework Metal -framework Foundation -lz -o "$T/gnm_capture_tex_test"
+"$T/gnm_capture_tex_test" > "$T/gnm_capture_tex.txt" 2>&1 || { cat "$T/gnm_capture_tex.txt"; exit 1; }
+tail -1 "$T/gnm_capture_tex.txt"
 # RectList draws: a translated vertex shader drawn as rectangles (capture, barrier, expansion);
 # the colours at all 4 corners of each rectangle, with Metal API validation on.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_rectlist_test.mm" \
