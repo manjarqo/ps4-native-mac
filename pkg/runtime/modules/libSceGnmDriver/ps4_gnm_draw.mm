@@ -1829,7 +1829,8 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
             hit = gcn_shader_find_compatible(list, n, ud, &rt, ReadGuest, S.ctx);
         }
         if (hit >= 0) return vec[order[hit]];
-        if (n == 8 || n == 16 || n == 32 || n == 47) {
+        static std::set<uint64_t> explained; // once per program and count
+        if ((n == 8 || n == 16 || n == 32 || n == 47) && explained.insert(key * 64 + n).second) {
             // Many permutations of one program: say why the first and the latest do not fit.
             char why0[256], why1[256];
             gcn_shader_explain_mismatch(vec[base]->sh, ud, &rt, ReadGuest, S.ctx, why0, sizeof(why0));
