@@ -14,6 +14,7 @@ import html
 import json
 import os
 import sys
+import urllib.parse
 
 
 def fmt_hex(v):
@@ -75,8 +76,9 @@ def textures_cell(p, thumb):
                                        idd.get("mtl_height", 0), idd.get("mtl_format", 0),
                                        " (written)" if t.get("written") else "")
         if t.get("png_file"):
+            url = html.escape(urllib.parse.quote(t["png_file"], safe="/"))
             out.append('<figure><a href="%s"><img src="%s" width="%d" loading="lazy"></a><figcaption>%s<br>%s'
-                       '</figcaption></figure>' % (html.escape(t["png_file"]), html.escape(t["png_file"]), thumb,
+                       '</figcaption></figure>' % (url, url, thumb,
                                                    html.escape(label), html.escape(t.get("png_mode", ""))))
         else:
             why = t.get("readback") or t.get("png_mode") or "no view"
@@ -111,7 +113,7 @@ def render(frame, thumb):
                (frame.get("frame", 0), len(passes), n_draw, n_disp, n_skip, html.escape(str(frame.get("mem_size"))),
                 html.escape(str(frame.get("neo"))), html.escape(str(frame.get("gcn_cache_id", "")))))
     table = ("<table><tr><th>#</th><th>pass</th><th>shaders</th><th>textures after the pass</th><th>bindings</th>"
-             "<th>state</th><th>guest ranges</th></tr>%s</table>" % "\n".join(rows))
+             "<th>state</th><th>inputs / outputs</th></tr>%s</table>" % "\n".join(rows))
     return head + summary + table + "\n"
 
 
@@ -128,9 +130,21 @@ def main(argv=None):
     except (OSError, ValueError) as e:
         print("gnm_capture_view: cannot read %s: %s" % (manifest, e), file=sys.stderr)
         return 2
+    if not isinstance(frame, dict):
+        print("gnm_capture_view: %s: manifest is not a JSON object" % manifest, file=sys.stderr)
+        return 2
     if frame.get("version") != 1:
         print("gnm_capture_view: manifest version %r, expected 1" % frame.get("version"), file=sys.stderr)
         return 2
+    passes = frame.get("passes", [])
+    if not isinstance(passes, list):
+        print("gnm_capture_view: %s: \"passes\" is not a list" % manifest, file=sys.stderr)
+        return 2
+    for n, p in enumerate(passes):
+        if not isinstance(p, dict) or "index" not in p or p.get("type") not in ("draw", "dispatch"):
+            print("gnm_capture_view: %s: pass #%d lacks \"index\" or has a type other than draw/dispatch" % (manifest, n),
+                  file=sys.stderr)
+            return 2
     out = a.out or os.path.join(a.frame_dir, "index.html")
     with open(out, "w", encoding="utf-8") as f:
         f.write(render(frame, a.thumb))

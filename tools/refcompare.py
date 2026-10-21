@@ -53,6 +53,11 @@ def read_png(path):
     bpp = channels * depth // 8
     stride = w * bpp
     raw = zlib.decompress(b"".join(idat))
+    if len(raw) < h * (stride + 1):
+        raise ValueError("%s: truncated image data (%d bytes, need %d)" % (path, len(raw), h * (stride + 1)))
+    if ctype == 3:
+        if not palette:
+            raise ValueError("%s: palette image without PLTE" % path)
     rows, prev = [], bytearray(stride)
     for y in range(h):
         ft = raw[y * (stride + 1)]
@@ -90,6 +95,8 @@ def read_png(path):
         elif ctype == 4:
             rgb = bytes(v for v in line[0::2] for _ in range(3))
         else:
+            if line and max(line) * 3 + 3 > len(palette):
+                raise ValueError("%s: palette index %d outside the %d-entry PLTE" % (path, max(line), len(palette) // 3))
             rgb = b"".join(palette[3 * v:3 * v + 3] for v in line)
         rows.append(rgb)
     return w, h, rows
@@ -101,6 +108,8 @@ def stats(img, crop=None):
     x0, y0, cw, ch = crop if crop else (0, 0, w, h)
     if x0 < 0 or y0 < 0 or cw <= 0 or ch <= 0 or x0 + cw > w or y0 + ch > h:
         raise ValueError("crop %r outside the %dx%d image" % (crop, w, h))
+    if cw < GRID or ch < GRID:
+        raise ValueError("compared area %dx%d is smaller than the %dx%d grid" % (cw, ch, GRID, GRID))
     sums = [[0.0, 0.0, 0.0, 0.0, 0] for _ in range(GRID * GRID)]
     hist = [0] * BINS
     for y in range(y0, y0 + ch):

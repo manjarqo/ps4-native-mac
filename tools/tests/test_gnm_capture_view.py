@@ -79,6 +79,25 @@ class CaptureViewTest(unittest.TestCase):
         finally:
             shutil.rmtree(empty)
 
+    def test_non_object_and_malformed_passes_exit_2(self):
+        for body in ([1, 2], {"version": 1, "passes": 5}, {"version": 1, "passes": [{"type": "draw"}]},
+                     {"version": 1, "passes": [{"index": 0, "type": "blit"}]}):
+            with open(os.path.join(self.dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(body, f)
+            self.assertEqual(gnm_capture_view.main([self.dir]), 2, body)
+
+    def test_png_href_is_quoted_and_escaped(self):
+        fr = synthetic_frame()
+        fr["passes"][0]["textures"][0]["png_file"] = 'png/a b&c"d.png'
+        with open(os.path.join(self.dir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(fr, f)
+        self.assertEqual(gnm_capture_view.main([self.dir]), 0)
+        with open(os.path.join(self.dir, "index.html"), encoding="utf-8") as f:
+            page = f.read()
+        self.assertIn('<a href="png/a%20b%26c%22d.png"><img src="png/a%20b%26c%22d.png"', page)
+        self.assertIn("<th>inputs / outputs</th>", page)
+        self.assertNotIn("guest ranges", page)
+
 
 if __name__ == "__main__":
     unittest.main()
