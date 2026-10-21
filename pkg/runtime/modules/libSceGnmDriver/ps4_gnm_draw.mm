@@ -277,6 +277,7 @@ inline uint64_t Fnv(const void* data, size_t n, uint64_t h = 1469598103934665603
     return h;
 }
 
+void TraceVertexStream(uint64_t addr);
 inline float AsF(uint32_t v) {
     float f;
     memcpy(&f, &v, 4);
@@ -2413,6 +2414,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             if (ShouldTrace()) {
                 fprintf(stderr, "[gnm-trace]    buf[%u] 0x%llx size %u stride %u%s\n", i, (unsigned long long)base,
                         bd.size_bytes, bd.stride, bb.is_written ? " written" : "");
+                if (bd.stride == 32 && bd.size_bytes > 4096) TraceVertexStream(bd.base_address);
                 static const bool dumpbufs = getenv("PS4_GNM_TRACE_BUFS") != nullptr;
                 if (dumpbufs && bd.size_bytes <= 512) {
                     const uint32_t* w = (const uint32_t*)(S.ctx->mem_base + base);
@@ -3971,6 +3973,14 @@ void DumpAfterWork(id<MTLTexture> rt, const char* what) {
 }
 
 // PS4_GNM_DUMP_RT=<present index>: write every GPU color target as PNG (debugging)
+// traced indirect draws: argument address and a label, printed with their final arguments
+// when the targets are dumped (after the GPU finished the frame)
+static std::vector<std::pair<uint64_t, std::string>> s_traced_indirect;
+// vertex-like streams (stride 32) bound by traced work; their first vertices are printed with
+// the dumped targets (PS4_GNM_DUMP_RT after the traced present)
+static std::set<uint64_t> s_traced_streams;
+void TraceVertexStream(uint64_t addr) { s_traced_streams.insert(addr); }
+
 void DumpTargets(uint64_t present_idx) {
     static const char* env = getenv("PS4_GNM_DUMP_RT");
     static const char* dir = getenv("PS4_SCREENSHOT_DIR");
@@ -3987,6 +3997,37 @@ void DumpTargets(uint64_t present_idx) {
     if (!dir || (present_idx != s_req_rt_present && (!env || strtoull(env, nullptr, 0) != present_idx))) return;
     Commit();
     WaitAll();
+    for (const auto& [addr, what] : s_traced_indirect) {
+        uint32_t a[5] = {};
+        ReadGuest(S.ctx, addr, a, sizeof(a));
+        fprintf(stderr, "[gnm-draw] indirect args 0x%llx %s: count %u inst %u first %u base %u start %u\n",
+                (unsigned long long)addr, what.c_str(), a[0], a[1], a[2], a[3], a[4]);
+    }
+    s_traced_indirect.clear();
+    for (uint64_t a : s_traced_streams) {
+        float f[16] = {};
+        ReadGuest(S.ctx, a, f, sizeof(f));
+        fprintf(stderr, "[gnm-draw] stream 0x%llx: v0 (%g %g %g | %g %g %g %g %g) v1 (%g %g %g | %g %g %g %g %g)\n",
+                (unsigned long long)a, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12],
+                f[13], f[14], f[15]);
+    }
+    s_traced_streams.clear();
+    // PS4_GNM_DUMP_MEM=<addr>:<bytes>[,<addr>:<bytes>...]: print guest memory as floats (debugging)
+    if (const char* dm = getenv("PS4_GNM_DUMP_MEM")) {
+        for (const char* c = dm; c && *c;) {
+            char* e = nullptr;
+            const uint64_t a = strtoull(c, &e, 0);
+            const uint64_t n = (e && *e == ':') ? strtoull(e + 1, &e, 0) : 64;
+            std::vector<uint32_t> w((n + 3) / 4);
+            ReadGuest(S.ctx, a, w.data(), w.size() * 4);
+            for (size_t k = 0; k < w.size(); k += 8) {
+                fprintf(stderr, "[gnm-mem] 0x%llx:", (unsigned long long)(a + k * 4));
+                for (size_t j = k; j < k + 8 && j < w.size(); ++j) fprintf(stderr, " %08x(%g)", w[j], AsF(w[j]));
+                fprintf(stderr, "\n");
+            }
+            c = (e && *e == ',') ? e + 1 : nullptr;
+        }
+    }
     TextureCache* tc = S.tex;
     tc->ForEachGpuTexture(^(uint64_t addr, int kind, id<MTLTexture> t) {
         if (t.sampleCount > 1) return;
@@ -4045,7 +4086,37 @@ void DumpTargets(uint64_t present_idx) {
         if (kind != 1) return;
         std::vector<uint8_t> px;
         if (!tc->ReadTextureBGRA8(t, DataFormat::FormatInvalid, NumberFormat::Unorm, CompMapping{}, &px)) {
-            fprintf(stderr, "[gnm-draw] dump: cannot read 0x%llx fmt %lu\n", (unsigned long long)addr, (unsigned long)t.pixelFormat);
+            // integer formats: write the raw texels (rt_<present>_<addr>_f<fmt>_<w>x<h>_<bpp>.raw)
+            size_t bpp = 0;
+            switch (t.pixelFormat) {
+            case MTLPixelFormatR8Uint: bpp = 1; break;
+            case MTLPixelFormatR16Uint: case MTLPixelFormatRG8Uint: bpp = 2; break;
+            case MTLPixelFormatR32Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA8Uint: bpp = 4; break;
+            case MTLPixelFormatRG32Uint: case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRG32Float: bpp = 8; break;
+            case MTLPixelFormatR32Float: bpp = 4; break;
+            case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Float: bpp = 16; break;
+            default: break;
+            }
+            if (!bpp || t.textureType != MTLTextureType2D) {
+                fprintf(stderr, "[gnm-draw] dump: cannot read 0x%llx fmt %lu\n", (unsigned long long)addr, (unsigned long)t.pixelFormat);
+                return;
+            }
+            const size_t w = t.width, h = t.height;
+            id<MTLBuffer> b = [S.dev newBufferWithLength:w * h * bpp options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> cb = [S.queue commandBuffer];
+            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+            [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                       toBuffer:b destinationOffset:0 destinationBytesPerRow:w * bpp destinationBytesPerImage:w * h * bpp];
+            [bl endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/rt_%llu_%llx_f%lu_%zux%zu_%zu.raw", dir, (unsigned long long)present_idx,
+                     (unsigned long long)addr, (unsigned long)t.pixelFormat, w, h, bpp);
+            if (FILE* f = fopen(path, "wb")) {
+                fwrite(b.contents, 1, w * h * bpp, f);
+                fclose(f);
+            }
             return;
         }
         const size_t w = t.width, h = t.height;
@@ -5250,13 +5321,23 @@ void DrawEncode(DrawRec& r) {
                      (unsigned long)sc.x, (unsigned long)sc.y, (unsigned long)sc.width, (unsigned long)sc.height,
                      clr.any() ? " CLEAR" : "", rs.raster.clip_disabled ? " clipdis" : "");
         static const bool dump_draws = getenv("PS4_GNM_DUMP_DRAWS") != nullptr;
-        if (dump_draws && key.color[0]) {
+        static const uint64_t dump_rt = getenv("PS4_GNM_DUMP_DRAWS_RT") ? strtoull(getenv("PS4_GNM_DUMP_DRAWS_RT"), nullptr, 0) : 0;
+        if (dump_draws && key.color[0] && (!dump_rt || dump_rt == rs.color[0].address)) {
             char what[64];
             snprintf(what, sizeof(what), "ps%llx_rt%llx", (unsigned long long)ps_addr, (unsigned long long)rs.color[0].address);
             DumpAfterWork(key.color[0], what);
         }
         if (trace) {
             fprintf(stderr, "[gnm-trace] %s\n", desc);
+            if (indirect) {
+                uint32_t a[5] = {};
+                ReadGuest(S.ctx, args.indirect_addr, a, sizeof(a));
+                fprintf(stderr, "[gnm-trace]    indirect 0x%llx at encode: count %u inst %u first %u base %u\n",
+                        (unsigned long long)args.indirect_addr, a[0], a[1], a[2], a[3]);
+                char what[64];
+                snprintf(what, sizeof(what), "VS=0x%llx PS=0x%llx", (unsigned long long)vs_addr, (unsigned long long)ps_addr);
+                s_traced_indirect.emplace_back(args.indirect_addr, what);
+            }
             for (int i = 0; i < 8; ++i) {
                 const ColorTarget& c = rs.color[i];
                 if (!c.bound) continue;
@@ -5518,9 +5599,15 @@ void DispatchEncode(DispatchRec& r) {
         wr.dispatch = true;
         LogWork(wr);
         if (!S.storage_bound.empty()) SyncStorageToDepth();
-        if (ShouldTrace())
+        if (ShouldTrace()) {
             fprintf(stderr, "[gnm-trace] %s dispatch CS=0x%llx groups=%ux%ux%u wg=%ux%ux%u%s\n", queue,
                     (unsigned long long)addr, dim_x, dim_y, dim_z, wx, wy, wz, indirect_addr ? " indirect" : "");
+            if (indirect_addr) {
+                char what[64];
+                snprintf(what, sizeof(what), "CS=0x%llx (dispatch)", (unsigned long long)addr);
+                s_traced_indirect.emplace_back(indirect_addr, what);
+            }
+        }
     }
 }
 
