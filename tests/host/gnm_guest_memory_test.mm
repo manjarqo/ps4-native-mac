@@ -15,7 +15,7 @@
 //  - a zeroed destination V# in the table: a no-op for that entry, the other entries still copy.
 // Hand-assembled shaders (V#s read from a table at an offset the shader computes):
 //  - buffer_load_dword / buffer_store_dword offen through stride-0 V#s (byte num_records), the
-//    source in guest page 0;
+//    source in guest page 0 with bits 40..47 of its V# base set (ignored);
 //  - buffer_load_format_xyzw with dst_sel W Z 1 X, stored with buffer_store_dwordx4;
 //  - a chained probe: a V# loaded through a run-time V# from a page not mapped yet.
 //
@@ -276,7 +276,11 @@ void TestDwordOffenStride0() {
         At(dst)[k] = kSentinel;
     }
     const uint64_t skipped0 = ps4draw::SkippedCount();
-    RunProgram(c, 0x5CA1AB1E0000D001ull, {Vsharp(src, 0, 40, 0x20024004u), Vsharp(dst, 0, 120, 0x18024004u)});
+    // bits 40..47 of the source V# base hold a value the GPU ignores (Uncharted 4's async compute
+    // V#s do)
+    std::array<uint32_t, 4> src_vsharp = Vsharp(src, 0, 40, 0x20024004u);
+    src_vsharp[1] |= 0xAB00u;
+    RunProgram(c, 0x5CA1AB1E0000D001ull, {src_vsharp, Vsharp(dst, 0, 120, 0x18024004u)});
     CHECK(ps4draw::SkippedCount() == skipped0, "the dispatch was skipped");
     for (uint32_t k = 0; k < 64; ++k) {
         const uint32_t want = k < 10 ? (0xC0000000u | k) : k < 30 ? 0u : kSentinel;

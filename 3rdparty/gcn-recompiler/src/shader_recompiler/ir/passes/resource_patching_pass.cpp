@@ -367,9 +367,9 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
     const auto field = [&](const IR::U32& dw, u32 offset, u32 count) {
         return ir.BitFieldExtract(dw, ir.Imm32(offset), ir.Imm32(count));
     };
-    // base bits 0..39 plus the 8 bits above them: an address at or past 2^40 is reported by the
-    // guest memory access (GCN_GUEST_STATUS_RANGE), not wrapped
-    const IR::U64 base = ir.PackUint2x32(ir.CompositeConstruct(dw0, ir.BitwiseAnd(dw1, ir.Imm32(0xFFFFu))));
+    // base bits 0..39: the GPU ignores bits 40..47 of the V# (games leave other values there;
+    // Uncharted 4's async compute does), as AmdGpu::Buffer::base_address does
+    const IR::U64 base = ir.PackUint2x32(ir.CompositeConstruct(dw0, ir.BitwiseAnd(dw1, ir.Imm32(0xFFu))));
     const IR::U32 stride = field(dw1, 16, 14);
     const IR::U1 swizzled = ir.INotEqual(field(dw1, 31, 1), ir.Imm32(0u));
     const IR::U32 num_records = dw2;
