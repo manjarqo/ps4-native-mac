@@ -2796,7 +2796,6 @@ struct TextureCache::Entry {
     uint64_t alias_generation = ~0ull;
     uint32_t alias_key = 0;
     uint64_t gpu_upload_epoch = 0; // sampled: contents copied on the GPU after writes < this epoch
-    uint64_t guest_newer = 0;      // color: write epoch of a buffer write over it since it was drawn
 };
 
 TextureCache::TextureCache(id<MTLDevice> device, id<MTLCommandQueue> queue, uint8_t* mem_base,
@@ -3149,13 +3148,6 @@ id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_fro
         if (e->kind == Entry::Color && e->mtl_format == cb.mtl_format && e->width == w &&
             e->height == h && e->layers == layers && e->samples == cb.num_samples) {
             e->generation++;
-            if (e->guest_newer) {
-                // drawn into again before it was sampled: the draw composes on the old GPU
-                // contents, not on what the buffer write left in memory (not reloaded here)
-                e->guest_newer = 0;
-                guest_newer_n_--;
-                stats.guest_newer_dropped++;
-            }
             stats.hits++;
             return e->tex;
         }
@@ -3289,64 +3281,6 @@ void TextureCache::InvalidateRange(uint64_t addr, uint64_t size, bool include_rt
             }
         }
     }
-}
-
-void TextureCache::NoteBufferWrite(uint64_t addr, uint64_t size, uint64_t epoch) {
-    if (!size) return;
-    TimedLock lk(mutex_);
-    const uint64_t end = addr + size;
-    for (auto& kv : entries_) {
-        Entry* e = kv.second;
-        if (e->kind == Entry::Color && e->tex && e->address < end && addr < e->address + e->size) {
-            if (!e->guest_newer) guest_newer_n_++;
-            e->guest_newer = std::max<uint64_t>(epoch, 1);
-        }
-    }
-}
-
-bool TextureCache::TakeGuestNewer(const ImageDesc& img, GpuUpload* up, bool* mismatch) {
-    *up = GpuUpload{};
-    if (mismatch) *mismatch = false;
-    TimedLock lk(mutex_);
-    auto range = entries_.equal_range(img.address);
-    for (auto it = range.first; it != range.second; ++it) {
-        Entry* e = it->second;
-        if (e->kind != Entry::Color || !e->tex || !e->guest_newer) continue;
-        if (e->mtl_format != img.pixel.mtl_format || e->width != img.width || e->height != img.height ||
-            e->layers != 1 || e->samples != 1 || img.mtl_texture_type != MTLTextureType2D) {
-            if (mismatch) *mismatch = true;
-            continue;
-        }
-        const SurfaceDesc sd = img.ToSurfaceDesc();
-        SurfaceLayout layout;
-        if (sd.bpp == 0 || !ComputeSurfaceLayout(sd, &layout) || !layout.total_size) {
-            if (mismatch) *mismatch = true;
-            continue;
-        }
-        const PixelFormatInfo pf = GetPixelFormat(e->dfmt, e->nfmt);
-        up->tex = e->tex;
-        up->surf = sd;
-        up->layout = layout;
-        up->width = e->width;
-        up->height = e->height;
-        up->depth = 1;
-        up->levels = 1;
-        up->layers = 1;
-        up->tex_type = MTLTextureType2D;
-        up->bytes_per_block = pf.bytes_per_block;
-        up->block_width = pf.block_width ? pf.block_width : 1;
-        up->block_height = pf.block_height ? pf.block_height : 1;
-        e->guest_newer = 0;
-        guest_newer_n_--;
-        e->generation++; // aliases copied from the old contents are stale
-        stats.uploads++;
-        return true;
-    }
-    return false;
-}
-
-size_t TextureCache::GuestNewerCount() const {
-    return guest_newer_n_.load(std::memory_order_relaxed);
 }
 
 void TextureCache::InvalidateWrites(std::vector<WriteRange>& w) {

@@ -29,7 +29,6 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -788,17 +787,6 @@ public:
         uint64_t addr, size, epoch;
     };
     void InvalidateWrites(std::vector<WriteRange>& writes);
-    // GPU work (a buffer store or DMA, at write epoch `epoch`) writes guest memory
-    // [addr, addr + size): render targets overlapping it no longer hold the memory's contents
-    // ("guest newer"). Any overlap counts.
-    void NoteBufferWrite(uint64_t addr, uint64_t size, uint64_t epoch);
-    // The render target at img.address is guest newer: fill `up` to copy guest memory into its
-    // texture on the GPU (behind the writing work) and clear the mark. False when there is
-    // nothing to do, or the T# does not match the target (dims, format, 2D, one level).
-    // *mismatch is set when a guest-newer target could not be refreshed for that reason.
-    bool TakeGuestNewer(const ImageDesc& img, GpuUpload* up, bool* mismatch = nullptr);
-    // Number of guest-newer render targets (cheap; tests, fast paths).
-    size_t GuestNewerCount() const;
     // Drop everything (e.g. on device reset).
     void Clear();
 
@@ -845,7 +833,7 @@ public:
 
     struct Stats {
         uint64_t uploads = 0, upload_bytes = 0, hits = 0, misses = 0, invalidations = 0,
-                 rt_created = 0, rt_aliased = 0, guest_newer_dropped = 0;
+                 rt_created = 0, rt_aliased = 0;
     };
     Stats stats;
 
@@ -862,7 +850,6 @@ private:
     uint8_t* mem_base_;
     uint64_t mem_size_;
     mutable std::mutex mutex_;
-    std::atomic<size_t> guest_newer_n_{0}; // color entries with guest_newer set
     std::unordered_multimap<uint64_t, Entry*> entries_; // keyed by guest address
     // Address ranges of GPU-owned entries sorted by start, with the running maximum of their
     // ends, for OverlapsGpuTexture. Entries are only ever added (or all cleared), so the index
