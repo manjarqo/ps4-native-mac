@@ -216,6 +216,28 @@ std::string Writer::SavePng(uint32_t pass, const std::string& role, const GpuTex
     return "";
 }
 
+void Writer::SavePre(uint32_t pass, TextureRec* t, const std::vector<uint8_t>& raw, RawBudget* budget) {
+    if (!budget->Fits(raw.size())) {
+        t->readback = kReadbackBudget;
+        return;
+    }
+    budget->used += raw.size();
+    t->pre_file = SaveTexture(pass, t->role, "pre", raw, &t->pre_hash);
+}
+
+void Writer::SavePost(uint32_t pass, bool replayable, TextureRec* t, const std::vector<uint8_t>& raw,
+                      RawBudget* budget, uint32_t thumb) {
+    if (replayable) {
+        if (budget->Fits(raw.size())) {
+            budget->used += raw.size();
+            t->post_file = SaveTexture(pass, t->role, "post", raw, &t->post_hash);
+        } else {
+            t->readback = kReadbackBudget;
+        }
+    }
+    t->png_file = SavePng(pass, t->role, t->id, raw, replayable ? 0 : thumb, &t->png_mode);
+}
+
 bool Writer::Finish(std::string* err) {
     const std::string text = WriteManifest(frame_);
     if (!WriteFile(dir_ + "/manifest.json", text.data(), text.size())) {

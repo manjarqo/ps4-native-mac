@@ -2508,8 +2508,9 @@ uint64_t ApproxImageBytes(const ImageDesc& img);
 // PS4_GNM_CAPTURE_DIR=<dir>      default ./gnm_captures; the frame goes to <dir>/frame_<n>
 // PS4_GNM_CAPTURE_REPLAY=<a>-<b>[,<c>-<d>...] | all   passes stored replayable (guest inputs,
 //                                raw texture contents before and after); default none
-// PS4_GNM_CAPTURE_RAW_MB=<n>     budget of raw texture bytes (default 8192); later passes are
-//                                recorded without raw contents ("budget")
+// PS4_GNM_CAPTURE_RAW_MB=<n>     budget of the raw texture files (default 8192); textures that do
+//                                not fit have no raw file ("budget") but keep their view PNG;
+//                                guest memory blobs are not counted
 // PS4_GNM_CAPTURE_THUMB=<px>     width of the view PNGs of passes that are not replayable
 //                                (default 480; replayable passes get full size)
 // =====================================================================================
@@ -2564,7 +2565,7 @@ static_assert(SameFormat(kR8Unorm, MTLPixelFormatR8Unorm) &&
 std::unique_ptr<Writer> g_writer;
 std::vector<std::pair<uint32_t, uint32_t>> g_replay; // pass index ranges stored replayable
 bool g_replay_all = false;
-uint64_t g_raw_budget = 8192ull << 20, g_raw_bytes = 0;
+RawBudget g_budget; // raw texture files (PS4_GNM_CAPTURE_RAW_MB)
 uint32_t g_thumb = 480;
 PassRec* g_pass = nullptr;                          // the pass being recorded
 bool g_encoded = false;                             // g_pass reached its draw / dispatch call
@@ -2601,7 +2602,7 @@ void Setup(uint64_t frame, uint64_t mem_size) {
             c = (e && *e == ',') ? e + 1 : "";
         }
     }
-    if (const char* mb = getenv("PS4_GNM_CAPTURE_RAW_MB")) g_raw_budget = strtoull(mb, nullptr, 10) << 20;
+    if (const char* mb = getenv("PS4_GNM_CAPTURE_RAW_MB")) g_budget.limit = strtoull(mb, nullptr, 10) << 20;
     if (const char* t = getenv("PS4_GNM_CAPTURE_THUMB")) g_thumb = (uint32_t)strtoul(t, nullptr, 10);
     mkdir(base.c_str(), 0755);
     auto w = std::make_unique<Writer>(base + "/frame_" + std::to_string(frame), frame, mem_size,
@@ -2716,11 +2717,8 @@ int AddTexture(const GpuTextureId& gid, id<MTLTexture> t, const char* role, bool
     tr.id = gid;
     if (g_pass->replayable) {
         std::vector<uint8_t> raw;
-        if (g_raw_bytes > g_raw_budget) tr.readback = "budget";
-        else if (ReadForPass(t, &tr, &raw)) {
-            g_raw_bytes += raw.size();
-            tr.pre_file = g_writer->SaveTexture(g_pass->index, tr.role, "pre", raw, &tr.pre_hash);
-        }
+        if (!g_budget.Fits(RawSize(gid))) tr.readback = kReadbackBudget; // not read at all
+        else if (ReadForPass(t, &tr, &raw)) g_writer->SavePre(g_pass->index, &tr, raw, &g_budget);
     }
     g_pass->textures.push_back(std::move(tr));
     g_tex.push_back(t);
@@ -2884,14 +2882,12 @@ void Finish() {
             if (b.written) p->outputs.push_back(g_writer->Snapshot(S.ctx->mem_base, b.addr, b.size));
     for (size_t i = 0; i < p->textures.size(); ++i) {
         TextureRec& tr = p->textures[i];
-        if (!tr.written || !tr.readback.empty()) continue;
+        // contents that cannot be read (msaa, format, EQAA twin) have no view either; the budget only
+        // limits the raw files: the view is always made
+        if (!tr.written || (!tr.readback.empty() && tr.readback != kReadbackBudget)) continue;
         std::vector<uint8_t> raw;
         if (!ReadForPass(g_tex[i], &tr, &raw)) continue;
-        if (p->replayable && g_raw_bytes <= g_raw_budget) {
-            g_raw_bytes += raw.size();
-            tr.post_file = g_writer->SaveTexture(p->index, tr.role, "post", raw, &tr.post_hash);
-        }
-        tr.png_file = g_writer->SavePng(p->index, tr.role, tr.id, raw, p->replayable ? 0 : g_thumb, &tr.png_mode);
+        g_writer->SavePost(p->index, p->replayable, &tr, raw, &g_budget, g_thumb);
     }
     g_writer->AddPass(std::move(*p));
     delete p;
@@ -2907,7 +2903,7 @@ void EndFrame() {
     if (g_writer->Finish(&err))
         fprintf(stderr, "[gnm-capture] frame %llu: %zu passes written to %s (%llu MiB raw, %llu write failures)\n",
                 (unsigned long long)g_writer->Frame(), g_writer->NumPasses(), g_writer->Dir().c_str(),
-                (unsigned long long)(g_raw_bytes >> 20), (unsigned long long)g_writer->Failures());
+                (unsigned long long)(g_budget.used >> 20), (unsigned long long)g_writer->Failures());
     else
         fprintf(stderr, "[gnm-capture] %s\n", err.c_str());
     g_writer.reset();

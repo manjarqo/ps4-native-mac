@@ -16,7 +16,7 @@ PS4_GNM_SYNC_ENCODE=1 PS4_GNM_CAPTURE_FRAME=<present index> PS4_GNM_CAPTURE_DIR=
 | `PS4_GNM_CAPTURE_FRAME` | present index of the frame (the frame `PS4_GNM_TRACE=p<n>:1` traces); unset: no capture and no cost |
 | `PS4_GNM_CAPTURE_DIR` | output directory (default `./gnm_captures`); the frame goes to `<dir>/frame_<n>` |
 | `PS4_GNM_CAPTURE_REPLAY` | `<a>-<b>[,<c>-<d>...]` or `all`: passes stored replayable (guest inputs, raw texture contents before and after); default none |
-| `PS4_GNM_CAPTURE_RAW_MB` | budget for raw texture contents (default 8192); passes after it are recorded with `"readback": "budget"` |
+| `PS4_GNM_CAPTURE_RAW_MB` | budget for the raw texture files `tex/*.raw` (default 8192); a texture that does not fit is recorded without its raw file and with `"readback": "budget"`, but still gets its view PNG. Guest memory blobs and PNGs are not counted |
 | `PS4_GNM_CAPTURE_THUMB` | width of the view PNGs of passes that are not replayable (default 480) |
 | `PS4_GNM_SYNC_ENCODE=1` | required: the CP and encoder sides of a pass must run back to back |
 

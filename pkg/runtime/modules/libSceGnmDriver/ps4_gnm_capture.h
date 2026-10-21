@@ -173,6 +173,16 @@ struct FrameRec {
     std::vector<PassRec> passes;
 };
 
+// TextureRec::readback of contents not stored because of PS4_GNM_CAPTURE_RAW_MB.
+constexpr const char* kReadbackBudget = "budget";
+
+// Budget of the raw texture files (tex/*.raw) of a capture, PS4_GNM_CAPTURE_RAW_MB. Guest memory
+// blobs and PNGs are not counted.
+struct RawBudget {
+    uint64_t limit = 8192ull << 20, used = 0;
+    bool Fits(uint64_t n) const { return n <= limit && used <= limit - n; }
+};
+
 uint64_t Fnv64(const void* data, size_t n, uint64_t h = 0xcbf29ce484222325ull);
 // Page-aligned cover of the ranges, sorted and merged (adjacent pages join).
 std::vector<std::pair<uint64_t, uint64_t>> CoalescePages(std::vector<std::pair<uint64_t, uint64_t>> ranges,
@@ -196,6 +206,14 @@ public:
     // most max_width wide (0: full size); returns the file name or "" (mode says why).
     std::string SavePng(uint32_t pass, const std::string& role, const GpuTextureId& id,
                         const std::vector<uint8_t>& raw, uint32_t max_width, std::string* mode);
+    // A texture's contents before a replayable pass: tex/..._pre.raw when they fit the budget,
+    // else t->readback = kReadbackBudget.
+    void SavePre(uint32_t pass, TextureRec* t, const std::vector<uint8_t>& raw, RawBudget* budget);
+    // A written texture after the pass: its view PNG always (full size for replayable passes, at
+    // most thumb px wide otherwise), and for replayable passes tex/..._post.raw when it fits the
+    // budget, else t->readback = kReadbackBudget.
+    void SavePost(uint32_t pass, bool replayable, TextureRec* t, const std::vector<uint8_t>& raw, RawBudget* budget,
+                  uint32_t thumb);
     void AddPass(PassRec&& p) { frame_.passes.push_back(std::move(p)); }
     size_t NumPasses() const { return frame_.passes.size(); }
     bool Finish(std::string* err); // writes manifest.json

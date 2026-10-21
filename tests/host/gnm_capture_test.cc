@@ -141,6 +141,53 @@ static void TestWriteFailures(const std::string& dir) {
     CHECK(w.Failures() == 4, "no new failures: %llu", (unsigned long long)w.Failures());
 }
 
+// The raw budget gates the raw files only: a written texture over the budget still gets its view
+// PNG and says why it has no post file; replayable passes get full-size views, the others thumbnails.
+static void TestBudget(const std::string& dir) {
+    Writer w(dir, 2, 1 << 20, false, "");
+    std::string err;
+    CHECK(w.Begin(&err), "Begin: %s", err.c_str());
+    GpuTextureId t;
+    t.mtl_format = kRGBA8Unorm;
+    t.mtl_type = 2;
+    t.mtl_width = 8;
+    t.mtl_height = 2;
+    const std::vector<uint8_t> raw(RawSize(t), 0x40); // 64 bytes
+    RawBudget b;
+    b.limit = 100;
+    TextureRec a;
+    a.role = "t0_color0";
+    a.id = t;
+    CHECK(b.Fits(64), "64 bytes fit a 100-byte budget");
+    w.SavePre(5, &a, raw, &b);
+    CHECK(!a.pre_file.empty() && a.readback.empty() && b.used == 64, "pre stored within the budget (%llu used)",
+          (unsigned long long)b.used);
+    w.SavePost(5, true, &a, raw, &b, 4);
+    CHECK(a.post_file.empty() && a.readback == kReadbackBudget, "post over the budget: no file, reason '%s'",
+          a.readback.c_str());
+    CHECK(b.used == 64, "a refused post does not use the budget (%llu)", (unsigned long long)b.used);
+    CHECK(a.png_file == "png/p00005_t0_color0.png" && a.png_mode == "unorm", "view PNG despite the budget: %s (%s)",
+          a.png_file.c_str(), a.png_mode.c_str());
+    TextureRec c;
+    c.role = "t1_color0";
+    c.id = t;
+    w.SavePre(6, &c, raw, &b);
+    CHECK(c.pre_file.empty() && c.readback == kReadbackBudget, "pre over the budget: reason '%s'", c.readback.c_str());
+    TextureRec n; // a pass that is not replayable: no raw file, a thumbnail at most 4 wide
+    n.role = "t0_color0";
+    n.id = t;
+    w.SavePost(7, false, &n, raw, &b, 4);
+    CHECK(n.post_file.empty() && n.readback.empty() && n.png_mode == "unorm, 1/2 scale",
+          "not replayable: thumbnail only (%s, '%s')", n.png_mode.c_str(), n.readback.c_str());
+    RawBudget big;
+    TextureRec d;
+    d.role = "t0_color0";
+    d.id = t;
+    w.SavePost(8, true, &d, raw, &big, 4);
+    CHECK(!d.post_file.empty() && d.post_hash == Fnv64(raw.data(), raw.size()) && d.png_mode == "unorm",
+          "replayable within the budget: post file and a full-size view");
+}
+
 static std::string TempDir() {
     char tmpl[] = "/tmp/gnm_capture_test.XXXXXX";
     const char* d = mkdtemp(tmpl);
@@ -259,6 +306,7 @@ static void TestWriterRoundTrip() {
     CHECK(!ParseManifest("{\"version\": 1, \"passes\": [", &bad, &err), "truncated manifest accepted");
     TestThumbnail(root + "/frame_1");
     TestWriteFailures(root + "/frame_9");
+    TestBudget(root + "/frame_2");
     const std::string cmd = "rm -rf '" + root + "'";
     CHECK(system(cmd.c_str()) == 0, "cleanup");
 }
