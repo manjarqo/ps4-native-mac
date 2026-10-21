@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "gcn_recompiler.h"
+#include "gcn_stores.h"
 #include "gnm_replay.h"
 #include "ps4_gnm_capture.h"
 #include "ps4_gnm_draw.h"
@@ -180,6 +181,217 @@ void TestTextureSeeding() {
     CHECK(!ps4draw::ReplayReadTexture(other, &back), "texture found under another identity");
 }
 
+// ---- A draw that samples an adopted texture, with and without a pending fast clear ----
+// 8x8 RGBA16Float target T (kind 1 entry, as GetColorTarget makes it) and 8x8 RGBA16Float
+// sampled texture A (a GPU-owned entry: GetTexture aliases it). The VS draws a triangle whose
+// right edge is the vertical line x = 4 (NDC 0) and that covers the whole left half; the PS
+// samples A at the centre of texel (2, 2) (point filter, level 0) and exports it. Columns 0-3
+// become A's texel (2, 2); columns 4-7 keep T's contents before the pass or, with the CMASK fast
+// clear pending (PassRec::meta_cleared), get the clear colour of CB_COLOR0_CLEAR_WORD0/1.
+constexpr uint64_t kVs = 0x110000, kPs = 0x120000, kVb = 0x130000;
+constexpr uint64_t kTarget = 0x32000000, kSampled = 0x33000000, kCmask = 0x34000000;
+constexpr uint16_t kClear[4] = {0x3400, 0x3800, 0x3A00, 0x3C00}; // 0.25 0.5 0.75 1.0
+
+std::vector<uint32_t> DrawRegs() {
+    std::vector<uint32_t> regs(kNumRegs, 0);
+    ps4draw::SetRegDefaults(regs.data());
+    regs[0x2C48] = uint32_t(kVs >> 8); // SPI_SHADER_PGM_LO_VS
+    regs[0x2C4A] = 1 | (1 << 6);       // RSRC1_VS: 8 VGPRs, 16 SGPRs
+    regs[0x2C4B] = 4 << 1;             // RSRC2_VS: 4 user SGPRs
+    uint32_t* vud = &regs[0x2C4C];     // V# of the vertices: float4, stride 16, 3 records
+    vud[0] = uint32_t(kVb);
+    vud[1] = 16u << 16;
+    vud[2] = 3;
+    vud[3] = 4 | (5 << 3) | (6 << 6) | (7 << 9) | (7 << 12) | (14 << 15);
+    regs[0x2C08] = uint32_t(kPs >> 8); // SPI_SHADER_PGM_LO_PS
+    regs[0x2C0A] = 1 | (1 << 6);
+    regs[0x2C0B] = 12 << 1; // T# s[0:7], S# s[8:11]
+    uint32_t* pud = &regs[0x2C0C];
+    pud[0] = uint32_t(kSampled >> 8);
+    pud[1] = (12u << 20) | (7u << 26);       // 16_16_16_16, float
+    pud[2] = 7 | (7u << 14);                 // 8 x 8
+    pud[3] = 4 | (5 << 3) | (6 << 6) | (7 << 9) | (8u << 20) | (9u << 28); // xyzw, linear aligned, 2D
+    pud[4] = 7u << 13;                       // pitch 8
+    // pud[8..11]: S# all zero = wrap, point filters, LOD 0
+    regs[0xA1B3] = regs[0xA1B4] = 2; // SPI_PS_INPUT_ENA / ADDR: PERSP_CENTER
+    regs[0xA1B6] = 0;                // SPI_PS_IN_CONTROL: no interpolants
+    regs[0xA1B1] = 0;                // SPI_VS_OUT_CONFIG: 1 parameter
+    regs[0xA1C3] = 4;                // SPI_SHADER_POS_FORMAT: POS0 4 components
+    regs[0xA1C5] = 9;                // SPI_SHADER_COL_FORMAT: MRT0 32_ABGR
+    regs[0xA08E] = regs[0xA08F] = 0xF; // CB_TARGET_MASK / CB_SHADER_MASK
+    regs[0xA202] = (1 << 4) | (0xCC << 16); // CB_COLOR_CONTROL: normal, copy
+    regs[0xA206] = 0x43F;                  // PA_CL_VTE_CNTL
+    const float vp[6] = {4, 4, 4, 4, 0.5f, 0.5f}; // 8 x 8 viewport, z in [0, 1]
+    memcpy(&regs[0xA10F], vp, sizeof(vp));
+    regs[0xA205] = 0;    // PA_SU_SC_MODE_CNTL: no culling
+    regs[0xC242] = 4;    // VGT_PRIMITIVE_TYPE: triangle list
+    uint32_t* cb = &regs[0xA318]; // CB_COLOR0_*
+    cb[0] = uint32_t(kTarget >> 8);
+    cb[1] = 0;                          // PITCH: 8
+    cb[2] = 0;                          // SLICE: 8 x 8
+    cb[4] = (12u << 2) | (7u << 8) | (1u << 13); // INFO: 16_16_16_16, float, FAST_CLEAR
+    cb[5] = 8;                          // ATTRIB: linear aligned
+    cb[7] = uint32_t(kCmask >> 8);      // CMASK
+    cb[11] = kClear[0] | uint32_t(kClear[1]) << 16;
+    cb[12] = kClear[2] | uint32_t(kClear[3]) << 16;
+    return regs;
+}
+
+// The identities GetColorTarget / the texture cache give T and A (ps4_gnm_resources).
+GpuTextureId TargetId(const std::vector<uint32_t>& regs) {
+    ps4gnm::ColorTarget ct;
+    ps4gnm::DecodeColorTarget(regs.data(), 0, &ct);
+    GpuTextureId g;
+    g.kind = 1;
+    g.address = ct.address;
+    g.mtl_format = g.entry_format = ct.mtl_format;
+    g.tex_type = g.mtl_type = (uint32_t)MTLTextureType2D;
+    g.width = g.mtl_width = 8;
+    g.height = g.mtl_height = 8;
+    g.dfmt = (uint32_t)ct.dfmt;
+    g.nfmt = (uint32_t)ct.nfmt;
+    for (uint32_t k = 0; k < 4; ++k) g.cb_swizzle[k] = (uint8_t)ct.swizzle[k];
+    g.usage = (uint32_t)(MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                         MTLTextureUsagePixelFormatView);
+    g.storage_mode = (uint32_t)MTLStorageModeShared;
+    ps4gnm::SurfaceDesc sd = ct.ToSurfaceDesc();
+    sd.width = 8;
+    sd.height = 8;
+    ps4gnm::SurfaceLayout l;
+    ct.GetLayout(&l);
+    g.size = l.total_size;
+    ps4gnm::PackSurface(sd, l, &g.surface);
+    return g;
+}
+
+GpuTextureId SampledId() {
+    GpuTextureId g;
+    g.kind = 1;
+    g.address = kSampled;
+    g.mtl_format = g.entry_format = kRGBA16Float;
+    g.tex_type = g.mtl_type = (uint32_t)MTLTextureType2D;
+    g.width = g.mtl_width = g.height = g.mtl_height = 8;
+    g.size = 8 * 8 * 8;
+    g.dfmt = 12;
+    g.nfmt = 7;
+    g.usage = (uint32_t)(MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget |
+                         MTLTextureUsagePixelFormatView);
+    g.storage_mode = (uint32_t)MTLStorageModeShared;
+    g.surface.assign(ps4gnm::kPackedSurfaceWords, 0);
+    return g;
+}
+
+// Writes <root>/frame_1 with the draw as pass 0; `pending`: the CMASK fast clear is pending.
+std::string WriteDrawCapture(const std::string& root, bool pending, std::vector<uint8_t>* want) {
+    uint8_t* mem = (uint8_t*)mmap(nullptr, kMemSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    // VS: buffer_load_format_xyzw v[1:4], v0, s[0:3] idxen; exp param0, pos0 done
+    const auto vs = WithFooter({0xE00C2000, 0x80000100, 0xBF8C0F70, 0xF800020F, 0x04030201, 0xF80008CF, 0x04030201,
+                                kEnd},
+                               0x5CA1AB1E000000B1ull);
+    // PS: v0 = v1 = 0.3125; image_sample_lz v[0:3], v[0:1], s[0:7], s[8:11] dmask 0xf; exp mrt0 done vm
+    const auto ps = WithFooter({0x7E0002FF, 0x3EA00000, 0x7E0202FF, 0x3EA00000, 0xF09C0F00, 0x00400000, 0xBF8C0F70,
+                                0xF800180F, 0x03020100, kEnd},
+                               0x5CA1AB1E000000B2ull);
+    memcpy(mem + kVs, vs.data(), vs.size() * 4);
+    memcpy(mem + kPs, ps.data(), ps.size() * 4);
+    const float verts[12] = {0, -3, 0.5f, 1, 0, 3, 0.5f, 1, -4, 0, 0.5f, 1};
+    memcpy(mem + kVb, verts, sizeof(verts));
+    const std::vector<uint32_t> regs = DrawRegs();
+    const GpuTextureId tid = TargetId(regs), sid = SampledId();
+    std::vector<uint8_t> tpre(RawSize(tid)), sraw(RawSize(sid));
+    for (size_t i = 0; i < tpre.size(); ++i) tpre[i] = (uint8_t)(i * 13 + 5);
+    for (size_t i = 0; i < sraw.size(); i += 2) { // finite halves: exponent bits never all ones
+        const uint16_t h = (uint16_t)(0x2000 + i * 37 % 0x3000);
+        memcpy(&sraw[i], &h, 2);
+    }
+    // what the pass must leave
+    *want = tpre;
+    for (uint32_t y = 0; y < 8; ++y)
+        for (uint32_t x = 0; x < 8; ++x) {
+            uint8_t* px = want->data() + (y * 8 + x) * 8;
+            if (x < 4) memcpy(px, &sraw[(2 * 8 + 2) * 8], 8);
+            else if (pending) memcpy(px, kClear, 8);
+        }
+    const std::string dir = root + "/frame_1";
+    Writer w(dir, 1, kMemSize, false, gcn_shader_cache_id());
+    std::string err;
+    CHECK(w.Begin(&err), "%s", err.c_str());
+    PassRec p;
+    p.index = 0;
+    p.replayable = true;
+    p.type = "draw";
+    p.queue = "gfx";
+    p.name = "DRAW_INDEX_AUTO";
+    p.count = 3;
+    p.cb_extent[0] = 8 | 8 << 16;
+    p.regs_file = w.SaveRegs(regs.data(), &p.regs_hash);
+    if (pending) p.meta_cleared.push_back(kCmask);
+    TextureRec t;
+    t.role = "t0_color0";
+    t.written = true;
+    t.id = tid;
+    t.pre_file = w.SaveTexture(0, t.role, "pre", tpre, &t.pre_hash);
+    t.post_file = w.SaveTexture(0, t.role, "post", *want, &t.post_hash);
+    p.textures.push_back(t);
+    TextureRec a;
+    a.role = "t1_sampled";
+    a.id = sid;
+    a.pre_file = w.SaveTexture(0, a.role, "pre", sraw, &a.pre_hash);
+    p.textures.push_back(a);
+    p.inputs.push_back(w.Snapshot(mem, kVs, kPage));
+    p.inputs.push_back(w.Snapshot(mem, kPs, kPage));
+    p.inputs.push_back(w.Snapshot(mem, kVb, kPage));
+    w.AddPass(std::move(p));
+    CHECK(w.Finish(&err), "%s", err.c_str());
+    munmap(mem, kMemSize);
+    return dir;
+}
+
+void TestDrawReplay(const std::string& root) {
+    for (int pending = 0; pending < 2; ++pending) {
+        ps4replay::Options o;
+        std::vector<uint8_t> want;
+        o.frame_dir = WriteDrawCapture(root + (pending ? "/draw_clear" : "/draw"), pending, &want);
+        o.keep_outputs = true;
+        const ps4replay::Result r = ps4replay::ReplayPass(o);
+        CHECK(r.ran, "draw (fast clear pending %d) not replayed: %s", pending, r.error.c_str());
+        const ps4replay::OutputResult* c = replay_props::Find(r, "_color0");
+        CHECK(c && c->compared && c->match, "draw (fast clear pending %d): %llu bytes differ, first at %llu", pending,
+              c ? (unsigned long long)c->diff_bytes : 0ull, c ? (unsigned long long)c->first_diff : 0ull);
+        if (c && c->bytes.size() == want.size() && !c->match) {
+            uint16_t got[4], exp[4];
+            memcpy(got, c->bytes.data() + (3 * 8 + 1) * 8, 8);
+            memcpy(exp, want.data() + (3 * 8 + 1) * 8, 8);
+            fprintf(stderr, "  texel (1, 3): %04x %04x %04x %04x, expected %04x %04x %04x %04x\n", got[0], got[1],
+                    got[2], got[3], exp[0], exp[1], exp[2], exp[3]);
+            memcpy(got, c->bytes.data() + (3 * 8 + 6) * 8, 8);
+            memcpy(exp, want.data() + (3 * 8 + 6) * 8, 8);
+            fprintf(stderr, "  texel (6, 3): %04x %04x %04x %04x, expected %04x %04x %04x %04x\n", got[0], got[1],
+                    got[2], got[3], exp[0], exp[1], exp[2], exp[3]);
+        }
+    }
+}
+
+// ScanGcnStores (the replay's note on passes with no recorded output) on the programs above:
+// the dispatch's buffer_store_dword is found; the pixel shader (image_sample_lz, export) and the
+// vertex shader (buffer_load_format) write no memory; an image_store is found as one.
+void TestStoreScan() {
+    const auto cs = WithFooter({0x34040082, 0x7E020300, 0xE0701000, 0x80010102, kEnd}, 1);
+    const auto ps = WithFooter({0x7E0002FF, 0x3EA00000, 0x7E0202FF, 0x3EA00000, 0xF09C0F00, 0x00400000, 0xBF8C0F70,
+                                0xF800180F, 0x03020100, kEnd}, 2);
+    const auto vs = WithFooter({0xE00C2000, 0x80000100, 0xBF8C0F70, 0xF800020F, 0x04030201, 0xF80008CF, 0x04030201,
+                                kEnd}, 3);
+    const auto st = WithFooter({0xF0200F00, 0x00000000, kEnd}, 4); // image_store v[0:3], v[0:1], s[0:7]
+    const ps4replay::GcnStores a = ps4replay::ScanGcnStores(cs.data(), cs.size());
+    const ps4replay::GcnStores b = ps4replay::ScanGcnStores(ps.data(), ps.size());
+    const ps4replay::GcnStores c = ps4replay::ScanGcnStores(vs.data(), vs.size());
+    const ps4replay::GcnStores d = ps4replay::ScanGcnStores(st.data(), st.size());
+    CHECK(a.complete && a.buffer == 1 && a.Total() == 1, "dispatch: %s", a.Describe().c_str());
+    CHECK(b.complete && b.Total() == 0, "pixel shader: %s", b.Describe().c_str());
+    CHECK(c.complete && c.Total() == 0, "vertex shader: %s", c.Describe().c_str());
+    CHECK(d.complete && d.image == 1 && d.Total() == 1, "image_store: %s", d.Describe().c_str());
+}
+
 // replay_props (the fix tests' view of replayed outputs) on a known 2x2 RGBA16Float output:
 // texel decoding, region statistics with a NaN texel left out, lookup by role suffix.
 void TestProps() {
@@ -223,8 +435,10 @@ int main() {
         const char* root = mkdtemp(tmpl);
         if (!root) return 1;
         TestDispatchReplay(root);
+        TestDrawReplay(root);
         TestTextureSeeding();
         TestProps();
+        TestStoreScan();
         const std::string cmd = std::string("rm -rf '") + root + "'";
         if (system(cmd.c_str()) != 0) g_fail++;
         if (g_fail) {
