@@ -37,7 +37,7 @@ static void test_policy_init() {
     ps4_gpumem_policy_init(&gp, 16 * GiB, NULL, NULL, NULL);
     ps4_texcache_policy p;
     ps4_texcache_policy_init(&p, &gp, NULL, NULL);
-    check(p.budget == gp.budget / 4, "default cache budget: a quarter of the GPU budget");
+    check(p.budget == gp.budget / 12, "default cache budget: a twelfth of the GPU budget");
     check(p.low_water == p.budget / 10 * 9, "evicts down to 90% of the cache budget");
     check(p.keep_ns == 2000 * MS, "textures used within 2 s are kept");
     check(p.press_ns == gp.press_ns, "GPU budget pressure keeps the windows' 250 ms");
@@ -47,7 +47,7 @@ static void test_policy_init() {
     check(p.budget == UINT64_MAX, "PS4_GNM_TEX_CACHE_MB=0: no cache budget");
     check(p.keep_ns == 100 * MS, "keep time clamped to 100 ms");
     ps4_texcache_policy_init(&p, &gp, "x1", "junk");
-    check(p.budget == gp.budget / 4 && p.keep_ns == 2000 * MS, "junk values keep the defaults");
+    check(p.budget == gp.budget / 12 && p.keep_ns == 2000 * MS, "junk values keep the defaults");
     ps4_gpumem_policy_init(&gp, 0, NULL, NULL, NULL);
     ps4_texcache_policy_init(&p, &gp, NULL, NULL);
     check(p.budget == UINT64_MAX, "no GPU budget (unknown RAM): no cache budget");
@@ -255,17 +255,47 @@ static void test_cache(id<MTLDevice> dev) {
 
     // GPU-owned surfaces are never evicted, and the range index sees surfaces added after an eviction
     const uint64_t C1 = 0x100000, C2 = 0x200000;
-    id<MTLTexture> rt1 = tc.GetColorTarget(Rt(C1), false);
-    check(rt1 != nil && tc.GetMemStats().gpu_count == 1, "render target created");
-    check(tc.OverlapsGpuTexture(C1, 16) && !tc.OverlapsGpuTexture(C2, 16), "range index: C1 only");
-    // entries: sampled B + RT C1 = 2; evict B, then add C2: the count is 2 again
-    tc.SetUse(6, 30000 * MS);
-    r = tc.EvictSampled(p, true, 60000 * MS, 5);
-    check(r.count == 1 && tc.GetMemStats().gpu_count == 1, "GPU budget pressure evicts the sampled texture, not the RT");
-    id<MTLTexture> rt2 = tc.GetColorTarget(Rt(C2), false);
-    check(rt2 != nil, "second render target created");
-    check(tc.OverlapsGpuTexture(C2, 16), "range index rebuilt for a render target added after an eviction");
-    check(tc.FindColorTarget(C1) == rt1, "render target kept");
+    __weak id<MTLTexture> weak_rt1 = nil;
+    @autoreleasepool { // returned textures may be autoreleased: the freed check below runs after the pool
+        id<MTLTexture> rt1 = tc.GetColorTarget(Rt(C1), false);
+        check(rt1 != nil && tc.GetMemStats().gpu_count == 1, "render target created");
+        check(tc.OverlapsGpuTexture(C1, 16) && !tc.OverlapsGpuTexture(C2, 16), "range index: C1 only");
+        // entries: sampled B + RT C1 = 2; evict B, then add C2: the count is 2 again
+        tc.SetUse(6, 30000 * MS);
+        r = tc.EvictSampled(p, true, 60000 * MS, 5);
+        check(r.count == 1 && tc.GetMemStats().gpu_count == 1, "GPU budget pressure evicts the sampled texture, not the RT");
+        id<MTLTexture> rt2 = tc.GetColorTarget(Rt(C2), false);
+        check(rt2 != nil, "second render target created");
+        check(tc.OverlapsGpuTexture(C2, 16), "range index rebuilt for a render target added after an eviction");
+        check(tc.FindColorTarget(C1) == rt1, "render target kept");
+        // GPU-owned telemetry: a newer surface over part of C1's memory supersedes C1
+        TextureCache::GpuOwnedStats go = tc.GetGpuOwnedStats(1000 * MS);
+        check(go.superseded_count == 0, "no GPU-owned surface superseded yet");
+        tc.SetUse(7, 40000 * MS);
+        check(tc.GetColorTarget(Rt(C1 + 0x1000), false) != nil, "overlapping newer render target created");
+        tc.FindColorTarget(C1 + 0x1000);
+        go = tc.GetGpuOwnedStats(1000 * MS);
+        check(go.superseded_count == 1, "the older overlapped render target counts as superseded");
+        check(go.idle_count == 2, "C1 and C2, last looked up at 30 s, are idle at 40 s; the new one is not");
+        // superseded GPU-owned eviction: C1 (last used by command buffer 6) once that has completed
+        const uint64_t gpu_before = tc.GetMemStats().gpu_count;
+        std::vector<id<MTLTexture>> gone;
+        TextureCache::EvictResult gr = tc.EvictSuperseded(1000 * MS, 40500 * MS, 5, &gone);
+        check(gr.count == 0 && gone.empty(), "superseded surface of a command buffer in flight kept");
+        gr = tc.EvictSuperseded(20000 * MS, 40500 * MS, 7, &gone);
+        check(gr.count == 0, "superseded surface used within the idle time kept");
+        weak_rt1 = rt1;
+        rt1 = nil;
+        gr = tc.EvictSuperseded(1000 * MS, 40500 * MS, 7, &gone);
+        check(gr.count == 1 && gone.size() == 1 && gone[0] == weak_rt1, "idle superseded render target evicted and handed back");
+        check(tc.GetMemStats().gpu_count == gpu_before - 1 && tc.EvictedGpuCount() == 1, "GPU-owned accounting removed");
+        check(tc.FindColorTarget(C1) == nil && tc.FindColorTarget(C2) == rt2 && tc.FindColorTarget(C1 + 0x1000) != nil,
+              "only the superseded surface went (not the idle unsuperseded one, not the newer one)");
+        check(!tc.OverlapsGpuTexture(C1, 16) && tc.OverlapsGpuTexture(C1 + 0x1000, 16),
+              "range index rebuilt after a GPU-owned eviction");
+        gone.clear();
+    }
+    check(weak_rt1 == nil, "evicted render target freed once the renderer dropped it");
     munmap(g.base, g.size);
 }
 

@@ -101,10 +101,17 @@ the sampled bytes, the cache budget and the evictions so far.
   upload command buffer or in one in flight is never evicted. A candidate must also have been idle for at least
   100 ms, so a texture looked up for a draw but not yet bound (a commit can fall in between) is never one either.
   Command buffers retain what they use, so the Metal object of an evicted texture lives until they are done.
-- **Cache budget**: sampled textures may use a quarter of the GPU budget (1638 MiB on 16 GB;
+- **Cache budget**: sampled textures may use a twelfth of the GPU budget (546 MiB on 16 GB;
   `PS4_GNM_TEX_CACHE_MB`, 0 = no cache budget). Above it, at most every 100 ms at a commit, the least recently
   used candidates not used for 2 s (`PS4_GNM_TEX_KEEP_MS`) are evicted until the sampled bytes are at 90% of the
-  budget. A working set larger than the budget therefore stays: the cache does not thrash.
+  budget. A working set larger than the budget therefore stays: the cache does not thrash. Measured: without a
+  budget, U4 chapter 1 grows its sampled textures from 240 MiB to 1.5 GiB in 5 minutes and keeps growing; at
+  512 MiB it holds about 470 MiB with no fps cost; at 256 MiB re-uploads of still-used textures cost long frames.
+  TLOU's courtyard needs about 400 MiB in all.
+- **Not evicted: GPU-owned surfaces.** They grow too (U4 chapter 1: 300 MiB to 1.2 GiB in 4 minutes). The
+  `[gnm-mem] GPU-owned surfaces:` line reports how many overlap a surface created after them (the game reused
+  their memory) and how many were not looked up for 10 s. Evicting them needs the renderer's caches that are
+  keyed by texture pointer (depth companions, EQAA twins) to drop their entries first.
 - **GPU budget pressure**: when the over-budget sweep purges the transient caches (with its back-off), every
   candidate not used for 250 ms is evicted as well.
 - **GPU writes**: an evicted entry takes its GPU-upload epoch with it. A re-created texture is uploaded from guest

@@ -861,9 +861,24 @@ public:
         uint64_t count = 0, bytes = 0;
     };
     EvictResult EvictSampled(const ps4_texcache_policy& p, bool gpu_over, uint64_t now_ns, uint64_t completed_seq);
+    // GPU-owned surfaces (never evicted): how many overlap the guest memory of a surface created
+    // after them (the game reused that memory, so their contents are dead on the PS4 too), and how
+    // many were not looked up for idle_ns. Takes the lock and walks the GPU-owned entries.
+    struct GpuOwnedStats {
+        uint64_t superseded_count = 0, superseded_bytes = 0, idle_count = 0, idle_bytes = 0;
+    };
+    GpuOwnedStats GetGpuOwnedStats(uint64_t idle_ns) const;
+    // Evicts superseded GPU-owned surfaces: ones whose guest memory a surface created after them
+    // overlaps (the game reused it; on the PS4 their contents are gone), that were not looked up
+    // for idle_ns and whose last command buffer has completed. Their textures are appended to
+    // *evicted so the renderer can drop state it keys by texture pointer before they are freed.
+    EvictResult EvictSuperseded(uint64_t idle_ns, uint64_t now_ns, uint64_t completed_seq,
+                                std::vector<id<MTLTexture>>* evicted);
     // Totals since start (any thread).
     uint64_t EvictedCount() const { return evicted_count_.load(std::memory_order_relaxed); }
     uint64_t EvictedBytes() const { return evicted_bytes_.load(std::memory_order_relaxed); }
+    uint64_t EvictedGpuCount() const { return evicted_gpu_count_.load(std::memory_order_relaxed); }
+    uint64_t EvictedGpuBytes() const { return evicted_gpu_bytes_.load(std::memory_order_relaxed); }
 
 private:
     struct Entry;
@@ -874,6 +889,9 @@ private:
     void WaitIdleLocked();
     // Adds (sign +1) or removes (sign -1) an entry's texture in the MemStats counters.
     void TrackLocked(const Entry* e, int sign);
+    // Stamps the entry's last use with the SetUse values.
+    void TouchLocked(const Entry* e) const;
+    uint64_t create_clock_ = 0;
 
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
@@ -890,7 +908,9 @@ private:
     uint64_t gpu_version_ = 0;
     mutable uint64_t gpu_index_version_ = ~0ull;
     std::atomic<uint64_t> sampled_count_{0}, sampled_bytes_{0}, gpu_count_{0}, gpu_bytes_{0};
-    std::atomic<uint64_t> evicted_count_{0}, evicted_bytes_{0};
+    std::atomic<uint64_t> evicted_count_{0}, evicted_bytes_{0}, evicted_gpu_count_{0}, evicted_gpu_bytes_{0};
+    // GPU-owned entries sorted by address, with their superseded flags (SupersededLocked)
+    void SupersededLocked(std::vector<Entry*>* v, std::vector<char>* sup) const;
     // last use stamped on lookups (SetUse); before the first commit, command buffer 1
     std::atomic<uint64_t> use_seq_{1}, use_ns_{0};
     // EvictSampled scratch, kept to avoid allocations per pass

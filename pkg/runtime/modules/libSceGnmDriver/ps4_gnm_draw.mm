@@ -700,8 +700,10 @@ struct GpuMem {
     std::atomic<uint64_t> released{0}, released_bytes{0}, purges{0}, large{0};
     // Texture cache eviction (EvictTextures, encoder thread)
     ps4_texcache_policy texpol{};
-    uint64_t last_tex_evict = 0;
+    uint64_t last_tex_evict = 0, last_gpu_evict = 0;
     bool tex_purge = false; // the over-budget sweep purged: evict idle sampled textures too
+    // time Commit spends in SweepGuestWindows + EvictTextures (encoder thread writes, sampler reads)
+    std::atomic<uint64_t> sweep_ns{0}, sweep_max_ns{0};
     std::atomic<uint64_t> refused_large{0}, refused_holes{0}, refused_written{0}, copies{0}, copy_bytes{0};
 };
 GpuMem g_mem;
@@ -780,14 +782,25 @@ void StartGpuMemSampler(uint64_t mem_size) {
                         (unsigned long long)(g_mem.copy_bytes.load() >> 20), budget.over ? "; OVER BUDGET" : "");
                 if (tc) {
                     fprintf(stderr, "[gnm-mem] texture cache at %llu s: sampled %llu (%llu MiB, peak %llu MiB, budget %llu MiB), "
-                                    "GPU-owned %llu (%llu MiB); evicted %llu (%llu MiB)\n",
+                                    "GPU-owned %llu (%llu MiB); evicted %llu (%llu MiB), superseded GPU-owned %llu (%llu MiB)\n",
                             (unsigned long long)((s.t_ns - t_start) / 1000000000ull),
                             (unsigned long long)ts.sampled_count, (unsigned long long)(ts.sampled_bytes >> 20),
                             (unsigned long long)(peak_tex >> 20),
                             (unsigned long long)(g_mem.texpol.budget == UINT64_MAX ? 0 : g_mem.texpol.budget >> 20),
                             (unsigned long long)ts.gpu_count, (unsigned long long)(ts.gpu_bytes >> 20),
-                            (unsigned long long)tc->EvictedCount(), (unsigned long long)(tc->EvictedBytes() >> 20));
+                            (unsigned long long)tc->EvictedCount(), (unsigned long long)(tc->EvictedBytes() >> 20),
+                            (unsigned long long)tc->EvictedGpuCount(), (unsigned long long)(tc->EvictedGpuBytes() >> 20));
                 }
+                if (tc) {
+                    const TextureCache::GpuOwnedStats go = tc->GetGpuOwnedStats(10000000000ull);
+                    fprintf(stderr, "[gnm-mem] GPU-owned surfaces: %llu (%llu MiB) overlapped by newer surfaces, %llu (%llu MiB) "
+                                    "unused for 10 s\n",
+                            (unsigned long long)go.superseded_count, (unsigned long long)(go.superseded_bytes >> 20),
+                            (unsigned long long)go.idle_count, (unsigned long long)(go.idle_bytes >> 20));
+                }
+                fprintf(stderr, "[gnm-mem] sweeps: %.1f ms total, longest %.2f ms since the last line\n",
+                        g_mem.sweep_ns.exchange(0, std::memory_order_relaxed) / 1e6,
+                        g_mem.sweep_max_ns.exchange(0, std::memory_order_relaxed) / 1e6);
             }
             usleep(1000000);
         }
@@ -900,6 +913,29 @@ void EvictTextures() {
     const bool gpu_purge = g_mem.tex_purge;
     g_mem.tex_purge = false;
     const uint64_t now = g_mem.tick;
+    // superseded GPU-owned surfaces: once a second (with the purge too), idle 10 s (2 s over budget)
+    if (gpu_purge || now - g_mem.last_gpu_evict >= 1000000000ull) {
+        g_mem.last_gpu_evict = now;
+        std::vector<id<MTLTexture>> gone;
+        const TextureCache::EvictResult gr =
+            tc->EvictSuperseded(gpu_purge ? 2000000000ull : 10000000000ull, now, CompletedSeq(), &gone);
+        // renderer state keyed by texture pointer must not outlive the texture (a new texture
+        // can get the same address)
+        for (id<MTLTexture> t : gone) {
+            void* key = (__bridge void*)t;
+            S.depth_comp.erase(key);
+            S.depth_version.erase(key);
+            S.depth_last_write.erase(key);
+            auto tw = S.eqaa_twin.find(key);
+            if (tw != S.eqaa_twin.end()) {
+                S.eqaa_orig.erase((__bridge void*)tw->second);
+                S.eqaa_twin.erase(tw);
+            }
+        }
+        if (gr.count)
+            RLog("tex-evict-gpu", "[gnm-mem] evicted %llu superseded GPU-owned surfaces (%llu MiB)",
+                 (unsigned long long)gr.count, (unsigned long long)(gr.bytes >> 20));
+    }
     if (!gpu_purge && (now - g_mem.last_tex_evict < 100000000ull ||
                        !ps4_texcache_evict_due(&g_mem.texpol, tc->GetMemStats().sampled_bytes, 0)))
         return;
@@ -1169,6 +1205,11 @@ void Commit() {
     g_mem.tick = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     SweepGuestWindows();
     EvictTextures();
+    {
+        const uint64_t d = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_mem.tick;
+        g_mem.sweep_ns.fetch_add(d, std::memory_order_relaxed);
+        if (d > g_mem.sweep_max_ns.load(std::memory_order_relaxed)) g_mem.sweep_max_ns.store(d, std::memory_order_relaxed);
+    }
     if (S.upload_cmd) {
         // texture copies used by the work of S.cmd: same queue, committed first
         [S.upload_cmd commit];

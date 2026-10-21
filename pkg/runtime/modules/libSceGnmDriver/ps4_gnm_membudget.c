@@ -59,7 +59,7 @@ void ps4_texcache_policy_init(ps4_texcache_policy *p, const ps4_gpumem_policy *g
     const int mb_zero = tex_mb && tex_mb[0] == '0' && tex_mb[1] == 0;
     if (mb_zero) p->budget = UINT64_MAX;
     else if (mb && mb <= (UINT64_MAX >> 20)) p->budget = mb << 20;
-    else p->budget = gp->budget == UINT64_MAX ? UINT64_MAX : gp->budget / 4;
+    else p->budget = gp->budget == UINT64_MAX ? UINT64_MAX : gp->budget / 12;
     p->low_water = p->budget == UINT64_MAX ? UINT64_MAX : p->budget / 10 * 9;
     uint64_t keep = keep_ms ? parse_u64(keep_ms) : 2000;
     if (!keep) keep = 2000;

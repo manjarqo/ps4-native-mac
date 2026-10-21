@@ -2794,8 +2794,81 @@ struct TextureCache::Entry {
     uint32_t alias_key = 0;
     uint64_t gpu_upload_epoch = 0; // sampled: contents copied on the GPU after writes < this epoch
     uint64_t alloc_bytes = 0;      // tex.allocatedSize, as counted in MemStats
-    uint64_t last_seq = 0, last_ns = 0; // last use (SetUse values at the last lookup)
+    mutable uint64_t last_seq = 0, last_ns = 0; // last use (SetUse values at the last lookup)
+    uint64_t created = 0;          // creation order (TrackLocked), for GpuOwnedStats
 };
+
+void TextureCache::TouchLocked(const Entry* e) const {
+    e->last_seq = use_seq_.load(std::memory_order_relaxed);
+    e->last_ns = use_ns_.load(std::memory_order_relaxed);
+}
+
+void TextureCache::SupersededLocked(std::vector<Entry*>* v, std::vector<char>* sup) const {
+    v->clear();
+    for (const auto& kv : entries_)
+        if (kv.second->kind != Entry::Sampled) v->push_back(kv.second);
+    std::sort(v->begin(), v->end(), [](const Entry* a, const Entry* b) { return a->address < b->address; });
+    sup->assign(v->size(), 0);
+    auto end_of = [](const Entry* e) { return e->address + std::max<uint64_t>(e->size, 1); };
+    for (size_t i = 0; i < v->size(); ++i) {
+        const Entry* e = (*v)[i];
+        bool s = false;
+        // entries starting inside this one, and earlier ones reaching into it
+        for (size_t j = i + 1; j < v->size() && (*v)[j]->address < end_of(e) && !s; ++j) s = (*v)[j]->created > e->created;
+        for (size_t j = i; j-- > 0 && !s;)
+            if (end_of((*v)[j]) > e->address) s = (*v)[j]->created > e->created;
+        (*sup)[i] = s;
+    }
+}
+
+TextureCache::GpuOwnedStats TextureCache::GetGpuOwnedStats(uint64_t idle_ns) const {
+    GpuOwnedStats g;
+    TimedLock lk(mutex_);
+    std::vector<Entry*> v;
+    std::vector<char> sup;
+    SupersededLocked(&v, &sup);
+    const uint64_t now = use_ns_.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (sup[i]) {
+            g.superseded_count++;
+            g.superseded_bytes += v[i]->alloc_bytes;
+        }
+        if (now > v[i]->last_ns && now - v[i]->last_ns >= idle_ns) {
+            g.idle_count++;
+            g.idle_bytes += v[i]->alloc_bytes;
+        }
+    }
+    return g;
+}
+
+TextureCache::EvictResult TextureCache::EvictSuperseded(uint64_t idle_ns, uint64_t now_ns, uint64_t completed_seq,
+                                                        std::vector<id<MTLTexture>>* evicted) {
+    EvictResult r;
+    TimedLock lk(mutex_);
+    std::vector<Entry*> v;
+    std::vector<char> sup;
+    SupersededLocked(&v, &sup);
+    for (size_t i = 0; i < v.size(); ++i) {
+        Entry* e = v[i];
+        if (!sup[i] || e->last_seq > completed_seq || now_ns < e->last_ns || now_ns - e->last_ns < idle_ns) continue;
+        auto range = entries_.equal_range(e->address);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second != e) continue;
+            if (evicted && e->tex) evicted->push_back(e->tex);
+            r.count++;
+            r.bytes += e->alloc_bytes;
+            TrackLocked(e, -1); // also marks the GPU range index stale
+            delete e;
+            entries_.erase(it);
+            break;
+        }
+    }
+    if (r.count) {
+        evicted_gpu_count_.fetch_add(r.count, std::memory_order_relaxed);
+        evicted_gpu_bytes_.fetch_add(r.bytes, std::memory_order_relaxed);
+    }
+    return r;
+}
 
 TextureCache::TextureCache(id<MTLDevice> device, id<MTLCommandQueue> queue, uint8_t* mem_base,
                            uint64_t mem_size)
@@ -2817,6 +2890,7 @@ void TextureCache::Clear() {
 void TextureCache::TrackLocked(const Entry* e, int sign) {
     const bool sampled = e->kind == Entry::Sampled;
     if (!sampled) ++gpu_version_;
+    if (sign > 0) const_cast<Entry*>(e)->created = ++create_clock_;
     std::atomic<uint64_t>& count = sampled ? sampled_count_ : gpu_count_;
     std::atomic<uint64_t>& bytes = sampled ? sampled_bytes_ : gpu_bytes_;
     if (sign > 0) {
@@ -3065,7 +3139,7 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
                                                          swizzle:swz];
                 e->alias_key = key;
             }
-            return e->alias;
+            return TouchLocked(e), e->alias;
         }
         // different dimensions: copy the overlapping region into a sampled texture
         if (!e->alias || e->alias_generation != e->generation || e->alias.width != width ||
@@ -3098,7 +3172,7 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
             e->alias_generation = e->generation;
             e->alias_key = 0;
         }
-        return e->alias;
+        return TouchLocked(e), e->alias;
     }
 
     // GPU upload request: hand the entry to the caller instead of reading guest memory
@@ -3217,7 +3291,7 @@ id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_fro
             e->height == h && e->layers == layers && e->samples == cb.num_samples) {
             e->generation++;
             stats.hits++;
-            return e->tex;
+            return TouchLocked(e), e->tex;
         }
     }
     Entry* e = new Entry();
@@ -3267,7 +3341,7 @@ id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_fro
     e->alloc_bytes = (uint64_t)e->tex.allocatedSize;
     TrackLocked(e, +1);
     entries_.emplace(e->address, e);
-    return e->tex;
+    return TouchLocked(e), e->tex;
 }
 
 id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from) {
@@ -3303,7 +3377,7 @@ id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture
                 TrackLocked(e, +1); // also marks the GPU range index stale
             }
             e->generation++;
-            return e->tex;
+            return TouchLocked(e), e->tex;
         }
     }
     Entry* e = new Entry();
@@ -3335,7 +3409,7 @@ id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture
     e->alloc_bytes = (uint64_t)e->tex.allocatedSize;
     TrackLocked(e, +1);
     entries_.emplace(addr, e);
-    return e->tex;
+    return TouchLocked(e), e->tex;
 }
 
 void TextureCache::InvalidateRange(uint64_t addr, uint64_t size, bool include_rts, uint64_t write_epoch) {
@@ -3396,7 +3470,7 @@ id<MTLTexture> TextureCache::FindColorTarget(uint64_t address) const {
     TimedLock lk(mutex_);
     auto range = entries_.equal_range(address);
     for (auto it = range.first; it != range.second; ++it)
-        if (it->second->kind == Entry::Color) return it->second->tex;
+        if (it->second->kind == Entry::Color) return TouchLocked(it->second), it->second->tex;
     return nil;
 }
 
@@ -3405,7 +3479,7 @@ id<MTLTexture> TextureCache::FindColorTarget(uint64_t address, uint32_t width, u
     auto range = entries_.equal_range(address);
     for (auto it = range.first; it != range.second; ++it) {
         const Entry* e = it->second;
-        if (e->kind == Entry::Color && e->tex && e->tex.width == width && e->tex.height == height) return e->tex;
+        if (e->kind == Entry::Color && e->tex && e->tex.width == width && e->tex.height == height) return TouchLocked(e), e->tex;
     }
     return nil;
 }
@@ -3419,7 +3493,7 @@ id<MTLTexture> TextureCache::FindDepthSibling(const DepthTarget& db, id<MTLTextu
         const Entry* e = it->second;
         if (e->kind == Entry::Depth && e->tex && e->tex != self && e->mtl_format == (uint32_t)self.pixelFormat &&
             e->tex.width == self.width && e->tex.height == self.height && e->tex.sampleCount != self.sampleCount)
-            return e->tex;
+            return TouchLocked(e), e->tex;
     }
     return nil;
 }
@@ -3428,7 +3502,7 @@ id<MTLTexture> TextureCache::FindDepthTarget(uint64_t address) const {
     TimedLock lk(mutex_);
     auto range = entries_.equal_range(address);
     for (auto it = range.first; it != range.second; ++it)
-        if (it->second->kind == Entry::Depth) return it->second->tex;
+        if (it->second->kind == Entry::Depth) return TouchLocked(it->second), it->second->tex;
     return nil;
 }
 
@@ -3485,6 +3559,8 @@ bool TextureCache::CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, id<MTLT
     d->generation++;
     *src_out = s->tex;
     *dst_out = d->tex;
+    TouchLocked(s);
+    TouchLocked(d);
     if (kind_out) *kind_out = s->kind == Entry::Depth ? 2 : 1;
     return true;
 }
@@ -3541,9 +3617,9 @@ id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img) {
         if (rtpf.bytes_per_block != img.pixel.bytes_per_block) continue;
         if (e->width < width || e->height < height || e->layers < layers) continue;
         e->generation++;
-        if (e->mtl_format == img.pixel.mtl_format) return e->tex;
+        if (e->mtl_format == img.pixel.mtl_format) return TouchLocked(e), e->tex;
         id<MTLTexture> v = [e->tex newTextureViewWithPixelFormat:(MTLPixelFormat)img.pixel.mtl_format];
-        if (v) return v;
+        if (v) return TouchLocked(e), v;
     }
     Entry* e = new Entry();
     e->kind = Entry::Color;
@@ -3587,7 +3663,7 @@ id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img) {
     e->alloc_bytes = (uint64_t)e->tex.allocatedSize;
     TrackLocked(e, +1);
     entries_.emplace(e->address, e);
-    return e->tex;
+    return TouchLocked(e), e->tex;
 }
 
 static bool ReadTextureBytes(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLTexture> tex,

@@ -145,7 +145,8 @@ typedef struct ps4_texcache_policy {
     uint64_t press_ns; // GPU memory over budget: textures used within press_ns stay, all others go
 } ps4_texcache_policy;
 // tex_mb: PS4_GNM_TEX_CACHE_MB (NULL when unset; "0" = no cache budget, only GPU budget
-// pressure evicts). Default: a quarter of the GPU budget gp->budget (UINT64_MAX stays unlimited).
+// pressure evicts). Default: a twelfth of the GPU budget gp->budget, 546 MiB on 16 GB (U4 chapter 1
+// keeps its 2 s working set under 512 MiB without an fps cost; 256 MiB thrashes). UINT64_MAX stays unlimited.
 // keep_ms: PS4_GNM_TEX_KEEP_MS (default 2000). Both ages are at least 100 ms: a texture just
 // looked up for the open command buffer is never a candidate, even before it is bound.
 void ps4_texcache_policy_init(ps4_texcache_policy *p, const ps4_gpumem_policy *gp, const char *tex_mb,
