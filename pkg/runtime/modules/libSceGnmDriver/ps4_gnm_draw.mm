@@ -2571,7 +2571,8 @@ PassRec* g_pass = nullptr;                          // the pass being recorded
 bool g_encoded = false;                             // g_pass reached its draw / dispatch call
 std::vector<std::pair<uint64_t, uint64_t>> g_reads; // guest ranges g_pass reads
 std::vector<id<MTLTexture>> g_tex;                  // texture of g_pass->textures[i]
-std::vector<id<MTLTexture>> g_storage;              // storage textures g_pass binds (BindStage)
+// storage textures g_pass binds (BindStage): index of their ImageRec in g_pass->images, texture
+std::vector<std::pair<size_t, id<MTLTexture>>> g_storage;
 uint32_t g_next = 0;
 
 bool InFrame() { return g_writer && S.present_idx == g_writer->Frame(); }
@@ -2823,7 +2824,8 @@ void NoteImage(Stage st, uint32_t index, const ImageDesc& img, bool storage, boo
     S.tex->DescribeGpuTextures(img.address, &ids);
     for (const GpuTextureId& gid : ids) {
         id<MTLTexture> t = S.tex->FindGpuTexture(gid, false);
-        if (t) r.textures.push_back(AddTexture(gid, t, storage ? "storage" : "sampled", storage));
+        // written: only the entry the renderer binds as the storage image (NoteStorage, Finish)
+        if (t) r.textures.push_back(AddTexture(gid, t, storage ? "storage" : "sampled", false));
     }
     if (ids.empty()) { // read from guest memory (or created there by GetStorageTexture)
         r.guest_bytes = ApproxImageBytes(img);
@@ -2832,9 +2834,12 @@ void NoteImage(Stage st, uint32_t index, const ImageDesc& img, bool storage, boo
     g_pass->images.push_back(std::move(r));
 }
 
-// BindStage: the GPU-owned texture a storage image resolved to (it may have been created from
-// guest memory just now; S.storage_bound is consumed by SyncStorageToDepth before the pass ends).
-void NoteStorage(id<MTLTexture> t) { g_storage.push_back(t); }
+// BindStage, right after NoteImage of the same image: the GPU-owned texture the storage image
+// resolved to (it may have been created from guest memory just now; S.storage_bound is consumed
+// by SyncStorageToDepth before the pass ends).
+void NoteStorage(id<MTLTexture> t) {
+    if (!g_pass->images.empty()) g_storage.push_back({g_pass->images.size() - 1, t});
+}
 
 // DispatchEncode binds a stage again after a hazard flush: the first binding's records go.
 void ForgetBindings(Stage st) {
@@ -2845,6 +2850,7 @@ void ForgetBindings(Stage st) {
     drop(g_pass->buffers);
     drop(g_pass->images);
     drop(g_pass->samplers);
+    if (st == Stage::Compute) g_storage.clear(); // the rebind notes them again (image indices changed)
 }
 
 void NoteSampler(Stage st, uint32_t index, const uint32_t ss[4]) {
@@ -2867,18 +2873,26 @@ void Finish() {
     PassRec* p = g_pass;
     g_pass = nullptr;
     if (!g_encoded && p->skipped.empty()) p->skipped = "not encoded (see the [gnm-draw] log)";
-    // storage images created by this pass (GetStorageTexture with no entry before)
-    for (id<MTLTexture> t : g_storage) {
+    // the textures storage images resolved to are written; ones this pass created
+    // (GetStorageTexture with no entry before) are added, and linked from their image
+    for (auto& [ii, t] : g_storage) {
+        int k = -1;
+        for (size_t i = 0; i < g_tex.size(); ++i)
+            if (g_tex[i] == t) k = (int)i;
         GpuTextureId gid;
-        bool known = false;
-        for (id<MTLTexture> k : g_tex) known |= k == t;
-        if (!known && S.tex->DescribeGpuTexture(t, &gid)) {
+        if (k < 0 && S.tex->DescribeGpuTexture(t, &gid)) {
             TextureRec tr;
             tr.role = "t" + std::to_string(g_tex.size()) + "_storage";
-            tr.written = true;
             tr.id = gid;
             p->textures.push_back(std::move(tr)); // pre_file "": created from guest memory
             g_tex.push_back(t);
+            k = (int)g_tex.size() - 1;
+        }
+        if (k < 0) continue;
+        p->textures[k].written = true;
+        if (ii < p->images.size()) {
+            std::vector<int>& links = p->images[ii].textures;
+            if (std::find(links.begin(), links.end(), k) == links.end()) links.push_back(k);
         }
     }
     // estimated lengths (fetch shaders, ApproxImageBytes) may reach into guard pages: only readable
@@ -2915,6 +2929,23 @@ void EndFrame() {
     std::string err;
     if (g_writer->Finish(&err))
         fprintf(stderr, "[gnm-capture] frame %llu: %zu passes written to %s (%llu MiB raw, %llu write failures)\n",
+                (unsigned long long)g_writer->Frame(), g_writer->NumPasses(), g_writer->Dir().c_str(),
+                (unsigned long long)(g_budget.used >> 20), (unsigned long long)g_writer->Failures());
+    else
+        fprintf(stderr, "[gnm-capture] %s\n", err.c_str());
+    g_writer.reset();
+}
+
+// Shutdown: the captured frame never presented (the game quit during it); what was recorded is
+// written. A pass in progress is dropped.
+void AtShutdown() {
+    if (!g_writer) return;
+    delete g_pass;
+    g_pass = nullptr;
+    std::string err;
+    if (g_writer->Finish(&err))
+        fprintf(stderr, "[gnm-capture] frame %llu did not present: %zu passes written to %s at shutdown (%llu MiB raw, "
+                        "%llu write failures)\n",
                 (unsigned long long)g_writer->Frame(), g_writer->NumPasses(), g_writer->Dir().c_str(),
                 (unsigned long long)(g_budget.used >> 20), (unsigned long long)g_writer->Failures());
     else
@@ -6646,6 +6677,7 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
 void Shutdown() {
     if (!S.enabled) return;
     Flush(true);
+    cap::AtShutdown();
 }
 
 } // namespace ps4draw
