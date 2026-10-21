@@ -2732,26 +2732,34 @@ void StartEncode() {
 }
 
 // DrawEncode, after the targets are chosen and before anything of the pass is encoded.
-void NoteTargets(const PassKey& key, const RenderState& rs) {
+// An EQAA twin (a multisampled stand-in the renderer draws into): not a cache entry, not replayable.
+void AddTwin(id<MTLTexture> t, const std::string& role, bool written) {
+    TextureRec tr;
+    tr.role = "t" + std::to_string(g_tex.size()) + "_" + role;
+    tr.written = written;
+    tr.readback = "not a texture-cache entry (EQAA twin)";
+    g_pass->textures.push_back(tr);
+    g_tex.push_back(t);
+}
+
+void NoteTargets(const PassKey& key, const RenderState& rs, bool clear_depth, bool clear_stencil) {
     Commit(); // e.g. the slice copy of a grown depth array (encoded above) is part of the "before"
     WaitAll();
     for (int i = 0; i < 8; ++i) {
         if (!key.color[i]) continue;
         GpuTextureId gid;
-        if (S.tex->DescribeGpuTexture(key.color[i], &gid)) {
+        if (S.tex->DescribeGpuTexture(key.color[i], &gid))
             AddTexture(gid, key.color[i], ("color" + std::to_string(i)).c_str(), true);
-        } else {
-            TextureRec tr; // an EQAA twin: not a cache entry, so not replayable
-            tr.role = "t" + std::to_string(g_tex.size()) + "_color" + std::to_string(i);
-            tr.written = true;
-            tr.readback = "not a texture-cache entry (EQAA twin)";
-            g_pass->textures.push_back(tr);
-            g_tex.push_back(key.color[i]);
-        }
+        else
+            AddTwin(key.color[i], "color" + std::to_string(i), true);
     }
     if (key.depth) {
+        const bool written = DepthTargetWritten(rs.ds.depth_write, rs.ds.stencil_test, clear_depth, clear_stencil);
         GpuTextureId gid;
-        if (S.tex->DescribeGpuTexture(key.depth, &gid)) AddTexture(gid, key.depth, "depth", rs.ds.depth_write || rs.ds.stencil_test);
+        if (S.tex->DescribeGpuTexture(key.depth, &gid))
+            AddTexture(gid, key.depth, "depth", written);
+        else
+            AddTwin(key.depth, "depth", written);
     }
     for (int i = 0; i < 8; ++i) g_pass->cb_extent[i] = rs.color[i].extent_width | rs.color[i].extent_height << 16;
     g_pass->db_extent = rs.depth.extent_width | rs.depth.extent_height << 16;
@@ -5836,7 +5844,7 @@ void DrawEncode(DrawRec& r) {
         // ---- encode
         std::vector<uint32_t>& vs_flat = r.vs_flat;
         std::vector<uint32_t>& ps_flat = r.ps_flat;
-        if (cap::g_pass) cap::NoteTargets(key, rs);
+        if (cap::g_pass) cap::NoteTargets(key, rs, clr.depth, clr.stencil);
         ResolveTextureHazards(vs, vs_flat);
         if (ps) ResolveTextureHazards(ps, ps_flat);
         PrepareDepthCompanions(vs, vs_flat);

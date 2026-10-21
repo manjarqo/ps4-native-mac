@@ -183,6 +183,13 @@ struct RawBudget {
     bool Fits(uint64_t n) const { return n <= limit && used <= limit - n; }
 };
 
+// Whether a draw writes its depth target: it writes depth, tests stencil (whose ops may write),
+// or its load action clears depth (register or HTILE fast clear) or stencil. The renderer bumps
+// the depth version under the same condition.
+constexpr bool DepthTargetWritten(bool depth_write, bool stencil_test, bool clear_depth, bool clear_stencil) {
+    return depth_write || stencil_test || clear_depth || clear_stencil;
+}
+
 uint64_t Fnv64(const void* data, size_t n, uint64_t h = 0xcbf29ce484222325ull);
 // Page-aligned cover of the ranges, sorted and merged (adjacent pages join).
 std::vector<std::pair<uint64_t, uint64_t>> CoalescePages(std::vector<std::pair<uint64_t, uint64_t>> ranges,

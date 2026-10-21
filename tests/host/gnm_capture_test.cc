@@ -188,6 +188,15 @@ static void TestBudget(const std::string& dir) {
           "replayable within the budget: post file and a full-size view");
 }
 
+// A depth target cleared by the load action is written even with depth writes and stencil off.
+static void TestDepthWritten() {
+    CHECK(!DepthTargetWritten(false, false, false, false), "a depth test only reads");
+    CHECK(DepthTargetWritten(true, false, false, false), "depth writes");
+    CHECK(DepthTargetWritten(false, true, false, false), "stencil test");
+    CHECK(DepthTargetWritten(false, false, true, false), "HTILE / register depth clear with writes off");
+    CHECK(DepthTargetWritten(false, false, false, true), "stencil clear");
+}
+
 static std::string TempDir() {
     char tmpl[] = "/tmp/gnm_capture_test.XXXXXX";
     const char* d = mkdtemp(tmpl);
@@ -315,6 +324,7 @@ int main() {
     TestCoalesce();
     TestRawSize();
     TestViews();
+    TestDepthWritten();
     TestWriterRoundTrip();
     if (g_fail) {
         fprintf(stderr, "gnm_capture_test: %d failure(s)\n", g_fail);
