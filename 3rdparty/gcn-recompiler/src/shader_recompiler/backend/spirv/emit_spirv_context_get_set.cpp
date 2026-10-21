@@ -403,11 +403,11 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     boost::container::static_vector<Id, N> ids;
     if (spv_buffer.misalign != 0) {
         // PS4Recomp: the buffer is bound at the dword below its base address; dword i of the
-        // guest buffer spans bound dwords i and i+1 (GCN reads it unaligned). The binding
-        // rounds up to the dword holding the last guest bytes, so the bound has one dword more
-        // than the guest buffer: guest dword i exists iff i + 1 < bound size.
+        // guest buffer spans bound dwords i and i+1 (GCN reads it unaligned). Guest dword i
+        // exists iff it lies wholly inside the guest buffer (i < guest_dwords; GCN returns 0
+        // for a dword crossing the end).
         const u32 shift = spv_buffer.misalign * 8;
-        const Id guest_size = ctx.OpISub(ctx.U32[1], size, ctx.ConstU32(1u));
+        const Id guest_size = spv_buffer.guest_dwords;
         const auto as_u32 = [&](Id v) { return alias == PointerType::U32 ? v : ctx.OpBitcast(ctx.U32[1], v); };
         Id lo = as_u32(load_dword(address));
         for (u32 i = 0; i < N; i++) {
@@ -531,7 +531,7 @@ static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, I
         const auto [scope, semantics] = std::pair{ctx.ConstU32(static_cast<u32>(spv::Scope::Device)),
                                                   ctx.u32_zero_value};
         const auto [uid, u32_ptr] = spv_buffer.Alias(PointerType::U32);
-        const Id guest_size = ctx.OpISub(ctx.U32[1], size, ctx.ConstU32(1u));
+        const Id guest_size = spv_buffer.guest_dwords;
         for (u32 i = 0; i < N; i++) {
             const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
             Id value_i = N == 1 ? value : ctx.OpCompositeExtract(data_types[1], value, i);

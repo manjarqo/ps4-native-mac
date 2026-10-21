@@ -396,6 +396,9 @@ public:
         u32 misalign = 0;
         std::array<Id, u32(PointerSize::NumClass)> offsets;
         std::array<Id, u32(PointerSize::NumClass)> sizes; // PS4Recomp: elements, for bounds checks
+        // PS4Recomp, misaligned buffers: whole guest dwords (the pushed size is the guest size
+        // plus misalign; sizes[B32] counts the bound dwords, which cover the partial last one)
+        Id guest_dwords{};
         std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
 
         template <class Self>

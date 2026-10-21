@@ -255,8 +255,17 @@ void EmitContext::DefineBufferProperties() {
                     OpShiftRightLogical(U32[1], size_bytes, ConstU32(1U));
             }
             if (True(desc.used_types & (IR::Type::U32 | IR::Type::F32))) {
-                buffer.Size(PointerSize::B32) =
-                    OpShiftRightLogical(U32[1], size_bytes, ConstU32(2U));
+                if (buffer.misalign != 0) {
+                    // size_bytes = guest size + misalign: the bound dwords round it up, the
+                    // guest dwords are those wholly inside the guest buffer
+                    buffer.Size(PointerSize::B32) = OpShiftRightLogical(
+                        U32[1], OpIAdd(U32[1], size_bytes, ConstU32(3U)), ConstU32(2U));
+                    buffer.guest_dwords = OpShiftRightLogical(
+                        U32[1], OpISub(U32[1], size_bytes, ConstU32(buffer.misalign)), ConstU32(2U));
+                } else {
+                    buffer.Size(PointerSize::B32) =
+                        OpShiftRightLogical(U32[1], size_bytes, ConstU32(2U));
+                }
             }
             if (True(desc.used_types & IR::Type::U64)) {
                 buffer.Size(PointerSize::B64) =

@@ -2426,7 +2426,8 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                 }
             }
             if (bb.buffer_slot < GCN_MAX_BUFFERS) {
-                uint32_t lim = bound_bytes;
+                // the exact guest bytes from the bound base (the shader derives its dword limits)
+                uint32_t lim = bd.size_bytes + (uint32_t)(bd.base_address - base);
                 if (bounds_off) lim = 0xffffffffu;
                 else if (bounds_mode && !strcmp(bounds_mode, "raw") && bd.stride != 0) lim = 64u << 20;
                 pd.buf_sizes[bb.buffer_slot] = lim;
