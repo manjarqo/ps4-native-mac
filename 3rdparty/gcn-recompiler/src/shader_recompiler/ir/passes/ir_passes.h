@@ -7,6 +7,10 @@
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
 
+namespace Shader::IR {
+class IREmitter;
+}
+
 namespace Shader {
 struct Profile;
 void InjectClipDistanceAttributes(IR::Program& program, RuntimeInfo& runtime_info);
@@ -25,6 +29,10 @@ void PhiSimplificationPass(IR::Program& program);
 void InverseBallotEliminationPass(IR::Program& program);
 void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
                       const Profile& profile);
+// PS4Recomp (lower_wave64_pass.cpp): the GCN lane (0..63) of a compute invocation. A compute wave
+// is 64 consecutive local invocations; the host subgroup lane differs from it when a wave64 runs
+// as two 32-wide subgroups.
+IR::U32 ComputeWaveLane(IR::IREmitter& ir);
 void LowerHardwareIntrinsics(IR::Program& program);
 void LowerPhisToRegsPass(IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);

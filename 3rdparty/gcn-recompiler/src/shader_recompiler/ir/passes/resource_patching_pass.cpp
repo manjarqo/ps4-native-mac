@@ -271,13 +271,6 @@ static bool IsFlattenedSharp(const SharpReference& sharp) {
 // unaligned dword or an address past 40 bits is reported to the renderer through the fault
 // buffer and that access is not made. Accesses that cannot be lowered (8/16/64-bit, atomics, a
 // tbuffer format other than 32-bit) fail the translation.
-// PS4Recomp: the thread id of a buffer V#'s ADD_TID_ENABLE, thread_id[5:0] of the wave. Only
-// compute shaders use it, and a compute wave is 64 consecutive local invocations; the host
-// subgroup lane differs from it when a wave64 runs as two 32-wide subgroups.
-static IR::U32 GcnLaneId(IR::IREmitter& ir) {
-    return ir.BitwiseAnd(ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex), ir.Imm32(63u));
-}
-
 static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
     namespace G = GuestMemory;
     const IR::Opcode op = inst.GetOpcode();
@@ -390,8 +383,9 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
         offset = ir.ShiftLeftLogical(ir.UConvert(64, IR::U32{inst.Arg(1)}), ir.Imm32(2u));
     } else {
         IR::U32 index = flags.index_enable ? IR::GetBufferIndexArg(&inst) : ir.Imm32(0u);
+        // ADD_TID_ENABLE: thread_id[5:0] of the wave (compute only, see ComputeWaveLane)
         const IR::U1 add_tid = ir.INotEqual(field(dw3, 23, 1), ir.Imm32(0u));
-        index = ir.IAdd(index, IR::U32{ir.Select(add_tid, GcnLaneId(ir), ir.Imm32(0u))});
+        index = ir.IAdd(index, IR::U32{ir.Select(add_tid, ComputeWaveLane(ir), ir.Imm32(0u))});
         IR::U32 voffset = ir.IAdd(ir.Imm32(u32(flags.inst_offset.Value())), IR::GetBufferSOffsetArg(&inst));
         if (flags.voffset_enable) {
             voffset = ir.IAdd(voffset, IR::GetBufferVOffsetArg(&inst));
@@ -917,7 +911,7 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
                    "stride {} num_records {:#x} dword3 {:#010x}).",
                    u64(buffer.base_address), buffer.GetStride(), buffer.num_records,
                    reinterpret_cast<const u32*>(&buffer)[3]);
-        const IR::U32 thread_id{GcnLaneId(ir)};
+        const IR::U32 thread_id{ComputeWaveLane(ir)};
         index = ir.IAdd(index, thread_id);
     }
     // offset = (inst_offen ? vgpr_offset : 0) + inst_offset

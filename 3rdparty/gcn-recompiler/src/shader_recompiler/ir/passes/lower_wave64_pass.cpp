@@ -14,101 +14,16 @@
 
 namespace Shader::Optimization {
 
-static bool IsDivergentCondition(const IR::U1& condition) {
-    if (condition.IsImmediate()) {
-        return false;
-    }
-    const IR::Inst* const condition_inst = condition.Inst();
-    return IR::BreadthFirstSearch(condition_inst,
-                                  [](const IR::Inst* inst) -> std::optional<bool> {
-                                      switch (inst->GetOpcode()) {
-                                      case IR::Opcode::LaneId:
-                                          return true;
-                                      case IR::Opcode::GetAttributeU32:
-                                          if (inst->Arg(0).Attribute() ==
-                                              IR::Attribute::LocalInvocationId) {
-                                              return true;
-                                          }
-                                          break;
-                                      default:
-                                          break;
-                                      }
-                                      return std::nullopt;
-                                  })
-        .value_or(false);
-}
-
-static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
-    using Type = IR::AbstractSyntaxNode::Type;
-
-    struct ConditionalScope {
-        const IR::Block* merge;
-        bool divergent;
-    };
-
-    std::vector<IR::Block*> blocks;
-    std::vector<ConditionalScope> conditionals;
-    std::vector<const IR::Block*> loops;
-    u32 divergence_depth{};
-    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
-        switch (node.type) {
-        case Type::If: {
-            const bool divergent = IsDivergentCondition(node.data.if_node.cond);
-            conditionals.push_back({node.data.if_node.merge, divergent});
-            divergence_depth += static_cast<u32>(divergent);
-            break;
-        }
-        case Type::EndIf:
-            ASSERT(!conditionals.empty() && conditionals.back().merge == node.data.end_if.merge);
-            divergence_depth -= static_cast<u32>(conditionals.back().divergent);
-            conditionals.pop_back();
-            break;
-        case Type::Loop:
-            loops.push_back(node.data.loop.merge);
-            break;
-        case Type::Repeat:
-            if (loops.empty() || loops.back() != node.data.repeat.merge) {
-                return {};
-            }
-            loops.pop_back();
-            break;
-        case Type::Block:
-            if (divergence_depth == 0 && loops.empty()) {
-                blocks.push_back(node.data.block);
-            }
-            break;
-        default:
-            break;
-        }
-    }
-    if (!conditionals.empty() || !loops.empty()) {
-        return {};
-    }
-    return blocks;
-}
-
-static IR::Inst* FindBallotForMaskedBitCount(const IR::Inst& mbcnt) {
-    IR::Value value = mbcnt.Arg(0);
-    if (value.IsImmediate()) {
-        return nullptr;
-    }
-    IR::Inst* inst = value.Inst();
-    if (inst->GetOpcode() != IR::Opcode::CompositeExtractU32x2 || inst->Arg(0).IsImmediate()) {
-        return nullptr;
-    }
-    inst = inst->Arg(0).Inst();
-    if (inst->GetOpcode() != IR::Opcode::UnpackUint2x32 || inst->Arg(0).IsImmediate()) {
-        return nullptr;
-    }
-    inst = inst->Arg(0).Inst();
-    return inst->GetOpcode() == IR::Opcode::Ballot ? inst : nullptr;
-}
-
 // PS4Recomp: whether every lane of a wave holds the same value. Conservative: a value is uniform
-// only when nothing it is computed from can differ between lanes (lane and invocation ids,
-// per-lane attributes, phis, cross-lane operations, workgroup memory, atomics).
+// only when nothing it is computed from can differ between lanes: lane and invocation ids,
+// per-lane attributes, phis, cross-lane operations (including per-lane tests of 64-bit masks,
+// i.e. EXEC), and memory other lanes may write (workgroup memory, guest memory, images, buffers
+// the shader writes, atomics). Constant memory, user data and read-only buffers are uniform when
+// their address is.
 class WaveUniformity {
 public:
+    explicit WaveUniformity(const Info& info_) : info{info_} {}
+
     bool IsUniform(const IR::Value& value) {
         if (value.IsImmediate()) {
             return true;
@@ -163,11 +78,57 @@ private:
     };
 
     // Uniformity decided by the instruction itself, or nullopt when its arguments decide it.
-    static std::optional<bool> OwnUniformity(const IR::Inst& inst) {
+    std::optional<bool> OwnUniformity(const IR::Inst& inst) const {
         if (inst.MayHaveSideEffects()) {
             return false;
         }
         switch (inst.GetOpcode()) {
+        case IR::Opcode::LoadBufferU8:
+        case IR::Opcode::LoadBufferU16:
+        case IR::Opcode::LoadBufferU32:
+        case IR::Opcode::LoadBufferU32x2:
+        case IR::Opcode::LoadBufferU32x3:
+        case IR::Opcode::LoadBufferU32x4:
+        case IR::Opcode::LoadBufferU64:
+        case IR::Opcode::LoadBufferF32:
+        case IR::Opcode::LoadBufferF32x2:
+        case IR::Opcode::LoadBufferF32x3:
+        case IR::Opcode::LoadBufferF32x4:
+        case IR::Opcode::LoadBufferFormatF32: {
+            // a buffer this shader does not write: decided by the address
+            const IR::Value binding = inst.Arg(0);
+            if (binding.IsImmediate() && binding.U32() < info.buffers.size() &&
+                !info.buffers[binding.U32()].is_written) {
+                return std::nullopt;
+            }
+            return false;
+        }
+        case IR::Opcode::LoadGuestU32:
+        case IR::Opcode::ImageSampleRaw:
+        case IR::Opcode::ImageSampleImplicitLod:
+        case IR::Opcode::ImageSampleExplicitLod:
+        case IR::Opcode::ImageSampleDrefImplicitLod:
+        case IR::Opcode::ImageSampleDrefExplicitLod:
+        case IR::Opcode::ImageGather:
+        case IR::Opcode::ImageGatherDref:
+        case IR::Opcode::ImageQueryDimensions:
+        case IR::Opcode::ImageQueryLod:
+        case IR::Opcode::ImageGradient:
+        case IR::Opcode::ImageRead:
+        case IR::Opcode::GetAttributeU1:
+        case IR::Opcode::GetScc:
+        case IR::Opcode::GetExec:
+        case IR::Opcode::GetVcc:
+        case IR::Opcode::GetVccLo:
+        case IR::Opcode::GetVccHi:
+        case IR::Opcode::GetM0:
+        case IR::Opcode::GetScalarRegister:
+        case IR::Opcode::GetVectorRegister:
+        case IR::Opcode::GetVirtualRegister:
+        case IR::Opcode::GetGotoVariable:
+        case IR::Opcode::GetPatch:
+        case IR::Opcode::GetTessGenericAttribute:
+        case IR::Opcode::ReadTcsGenericOuputAttribute:
         case IR::Opcode::Phi:
         case IR::Opcode::LaneId:
         case IR::Opcode::WarpId:
@@ -198,9 +159,87 @@ private:
         }
     }
 
+    const Info& info;
     std::unordered_map<IR::Inst*, bool> known;
     std::vector<Frame> stack;
 };
+
+// Blocks that every invocation of the workgroup runs: outside loops and outside ifs whose
+// condition can differ between lanes. PS4Recomp: an EXEC scope's condition is the lane's EXEC bit,
+// which is divergent unless it is wave-uniform (e.g. all ones); an exchange through workgroup
+// memory there could have a barrier that only one of the wave's subgroups reaches.
+static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program,
+                                                 WaveUniformity& uniformity) {
+    using Type = IR::AbstractSyntaxNode::Type;
+
+    struct ConditionalScope {
+        const IR::Block* merge;
+        bool divergent;
+    };
+
+    std::vector<IR::Block*> blocks;
+    std::vector<ConditionalScope> conditionals;
+    std::vector<const IR::Block*> loops;
+    u32 divergence_depth{};
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        switch (node.type) {
+        case Type::If: {
+            IR::Value cond = node.data.if_node.cond;
+            if (const IR::Inst* ref = cond.TryInst();
+                ref && ref->GetOpcode() == IR::Opcode::ConditionRef) {
+                cond = ref->Arg(0);
+            }
+            const bool divergent = !uniformity.IsUniform(cond);
+            conditionals.push_back({node.data.if_node.merge, divergent});
+            divergence_depth += static_cast<u32>(divergent);
+            break;
+        }
+        case Type::EndIf:
+            ASSERT(!conditionals.empty() && conditionals.back().merge == node.data.end_if.merge);
+            divergence_depth -= static_cast<u32>(conditionals.back().divergent);
+            conditionals.pop_back();
+            break;
+        case Type::Loop:
+            loops.push_back(node.data.loop.merge);
+            break;
+        case Type::Repeat:
+            if (loops.empty() || loops.back() != node.data.repeat.merge) {
+                return {};
+            }
+            loops.pop_back();
+            break;
+        case Type::Block:
+            if (divergence_depth == 0 && loops.empty()) {
+                blocks.push_back(node.data.block);
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    if (!conditionals.empty() || !loops.empty()) {
+        return {};
+    }
+    return blocks;
+}
+
+static IR::Inst* FindBallotForMaskedBitCount(const IR::Inst& mbcnt) {
+    IR::Value value = mbcnt.Arg(0);
+    if (value.IsImmediate()) {
+        return nullptr;
+    }
+    IR::Inst* inst = value.Inst();
+    if (inst->GetOpcode() != IR::Opcode::CompositeExtractU32x2 || inst->Arg(0).IsImmediate()) {
+        return nullptr;
+    }
+    inst = inst->Arg(0).Inst();
+    if (inst->GetOpcode() != IR::Opcode::UnpackUint2x32 || inst->Arg(0).IsImmediate()) {
+        return nullptr;
+    }
+    inst = inst->Arg(0).Inst();
+    return inst->GetOpcode() == IR::Opcode::Ballot ? inst : nullptr;
+}
+
 
 // PS4Recomp: v_readfirstlane carries EXEC (it ignores the EXEC scope, so it can run where some
 // executing lanes are outside EXEC). Inside a scope whose condition is that same EXEC value, the
@@ -266,12 +305,10 @@ static bool ReachesAny(const IR::Value& value, const std::unordered_set<const IR
 
 // PS4Recomp: GCN lane of this invocation (0..63). A wave64 compute shader on a smaller subgroup
 // runs each wave as several subgroups, and its GCN lane is the local invocation index modulo 64.
-static IR::U32 GcnLane(IR::IREmitter& ir, bool split) {
-    if (split) {
-        return ir.BitwiseAnd(ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex), ir.Imm32(63u));
-    }
-    return ir.LaneId();
+IR::U32 ComputeWaveLane(IR::IREmitter& ir) {
+    return ir.BitwiseAnd(ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex), ir.Imm32(63u));
 }
+
 
 // Cross-lane operations whose result depends on the GCN wave layout. All stages: v_readfirstlane
 // drops EXEC where it is implied. Wave64 compute
@@ -289,7 +326,7 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
     if (split) {
         // A value that is the same in every lane needs no exchange: any lane reads it. Code that
         // only fed such reads (e.g. a ballot picking the lane) is dead afterwards.
-        WaveUniformity uniformity;
+        WaveUniformity uniformity{program.info};
         for (IR::Block* block : program.blocks) {
             for (IR::Inst& inst : block->Instructions()) {
                 if ((inst.GetOpcode() == IR::Opcode::ReadLane ||
@@ -309,7 +346,9 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
     // ballots left to each subgroup (non-uniform control flow): their bits are in the
     // subgroup's own layout, lanes 32-63 in the low word
     std::unordered_set<const IR::Inst*> subgroup_ballots;
-    const auto uniform_blocks = split ? FindUniformBlocks(program) : std::vector<IR::Block*>{};
+    WaveUniformity cond_uniformity{program.info};
+    const auto uniform_blocks =
+        split ? FindUniformBlocks(program, cond_uniformity) : std::vector<IR::Block*>{};
     for (IR::Block* block : program.blocks) {
         const bool is_uniform = std::ranges::contains(uniform_blocks, block);
         const auto push_worklist = [&](IR::Inst& inst) {
@@ -367,7 +406,7 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
         }
         // a 64-bit mask applied per lane: this lane's bit, from the half holding the lane
         IR::IREmitter ir{*inst->GetParent(), IR::Block::InstructionList::s_iterator_to(*inst)};
-        const IR::U32 lane = GcnLane(ir, true);
+        const IR::U32 lane = ComputeWaveLane(ir);
         const IR::Value halves = ir.UnpackUint2x32(IR::U64{inst->Arg(0)});
         const IR::U32 word = IR::U32{ir.Select(ir.ILessThan(lane, ir.Imm32(32u), false),
                                                ir.CompositeExtract(halves, 0),
@@ -452,6 +491,10 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
             inst->ReplaceUsesWithAndRemove(value);
         } else if (inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
             // v_readfirstlane: the first lane in EXEC across both halves, lane 0 when EXEC is 0.
+            // EXEC 0 in the whole wave: neither half publishes an EXEC lane, the lower subgroup
+            // publishes its lane 0's value (subgroup ReadFirstLane with no EXEC lane) and that is
+            // the result, GCN lane 0. This is reached by both subgroups because the block is
+            // uniform (FindUniformBlocks): no EXEC scope around it can leave a subgroup out.
             // Each subgroup publishes the value of its first EXEC lane (of its lane 0 without
             // one) and its half of EXEC. When EXEC is the executing lanes (true here), a lower
             // subgroup running this has the wave's first EXEC lane, and its value is the result.

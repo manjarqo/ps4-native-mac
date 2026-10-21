@@ -821,6 +821,7 @@ GCN_API void gcn_shader_get_info(const gcn_shader* s, gcn_shader_info* o) {
     o->uses_dma = info.uses_dma;
     o->uses_guest_memory = info.uses_guest_memory;
     o->null_image_reads = info.null_image_reads;
+    o->zeroed_write_lanes = info.zeroed_write_lanes;
     o->translation_failed = info.translation_failed;
     if (info.hw_stage == HwStage::Compute) {
         o->shared_memory_size =

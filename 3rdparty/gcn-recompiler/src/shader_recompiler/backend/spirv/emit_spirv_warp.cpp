@@ -48,6 +48,13 @@ Id EmitReadLane(EmitContext& ctx, Id value, Id lane) {
     return ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value, lane);
 }
 
+// PS4Recomp: KNOWN GAP. v_writelane should give `write_value` in lane `lane` and `value` in the
+// others; this emits 0 for the whole register (shadPS4's behaviour). The correct per-lane select
+// (PS4Recomp commit 180a0fe) made Uncharted 4's boat-level async compute CS with spilled V#s and
+// pointers run past the GPU watchdog, and rendering stopped (black screen); reverted in 157e7c7.
+// The cause needs that dispatch's real inputs (a boat-frame capture); see the Task 2.5 report of
+// the U4 graphics plan (2026-10-21). Uses that reach this emitter are
+// counted in Info::zeroed_write_lanes, logged by the translator and by the renderer per shader.
 Id EmitWriteLane(EmitContext& ctx, Id value, Id write_value, u32 lane) {
     return ctx.u32_zero_value;
 }

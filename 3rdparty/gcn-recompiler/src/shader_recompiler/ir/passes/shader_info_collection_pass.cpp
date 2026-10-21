@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging/classes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
@@ -142,9 +143,14 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::ShuffleXor:
         info.uses_group_shuffle = true;
         break;
+    case IR::Opcode::WriteLane:
+        // PS4Recomp: the emitter writes 0 for it (see EmitWriteLane); counted and logged so the
+        // gap stays visible, also for shaders loaded from the cache
+        info.zeroed_write_lanes++;
+        LOG_WARNING(Render_Recompiler, "v_writelane result emitted as 0 (known gap, EmitWriteLane)");
+        [[fallthrough]];
     case IR::Opcode::ReadLane:
     case IR::Opcode::ReadFirstLane:
-    case IR::Opcode::WriteLane:
         info.uses_group_ballot = true;
         break;
     case IR::Opcode::Discard:

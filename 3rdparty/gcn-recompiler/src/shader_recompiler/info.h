@@ -66,6 +66,8 @@ struct InfoPersistent {
     bool uses_guest_memory{};
     // PS4Recomp: image reads through a T# loaded at run time that read the null image
     u32 null_image_reads{};
+    // PS4Recomp: v_writelane results the emitter replaces with 0 (EmitWriteLane, a known gap)
+    u32 zeroed_write_lanes{};
 
     InfoPersistent() = default;
     InfoPersistent(HwStage hw_stage_, SwStage sw_stage_, u64 pgm_hash_)

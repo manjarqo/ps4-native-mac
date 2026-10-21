@@ -84,6 +84,8 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             return S_ASHR_I64(inst);
         case Opcode::S_BFM_B32:
             return S_BFM_B32(inst);
+        case Opcode::S_BFM_B64:
+            return S_BFM_B64(inst);
         case Opcode::S_MUL_I32:
             return S_MUL_I32(inst);
         case Opcode::S_BFE_I32:
@@ -440,6 +442,14 @@ void Translator::S_BFM_B32(const GcnInst& inst) {
     const IR::U32 src1{ir.BitwiseAnd(GetSrc(inst.src[1]), ir.Imm32(0x1F))};
     const IR::U32 mask{ir.ISub(ir.ShiftLeftLogical(ir.Imm32(1u), src0), ir.Imm32(1))};
     SetDst(inst.dst[0], ir.ShiftLeftLogical(mask, src1));
+}
+
+// PS4Recomp: D = ((1 << S0[5:0]) - 1) << S1[5:0], 64 bits (e.g. an EXEC half: s_bfm_b64 exec, 32, 32)
+void Translator::S_BFM_B64(const GcnInst& inst) {
+    const IR::U32 src0{ir.BitwiseAnd(GetSrc(inst.src[0]), ir.Imm32(0x3F))};
+    const IR::U32 src1{ir.BitwiseAnd(GetSrc(inst.src[1]), ir.Imm32(0x3F))};
+    const IR::U64 mask{ir.ISub(ir.ShiftLeftLogical(ir.Imm64(u64{1}), src0), ir.Imm64(u64{1}))};
+    SetDst64(inst.dst[0], ir.ShiftLeftLogical(mask, src1));
 }
 
 void Translator::S_MUL_I32(const GcnInst& inst) {
