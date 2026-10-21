@@ -1345,7 +1345,8 @@ void EmitContext::DefineGuestMemoryFunctions() {
     // page; the blocks of the failed checks end with `fail` (a return).
     const auto checked_page = [&](Id address, u32 track_base, auto&& fail) {
         const Id page64 = OpShiftRightLogical(U64, address, ConstU32(G::PageShift));
-        const Id in_space = OpULessThan(U1[1], page64, Constant(U64, u64(G::NumPages)));
+        const Id in_space = OpLogicalAnd(U1[1], OpULessThan(U1[1], page64, Constant(U64, u64(G::NumPages))),
+                                         OpUGreaterThanEqual(U1[1], address, Constant(U64, G::FirstMappedAddress)));
         const Id range_label = OpLabel();
         const Id ok_label = OpLabel();
         OpSelectionMerge(ok_label, spv::SelectionControlMask::MaskNone);

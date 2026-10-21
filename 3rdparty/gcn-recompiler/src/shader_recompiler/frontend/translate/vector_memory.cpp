@@ -465,6 +465,7 @@ void Translator::IMAGE_LOAD(bool has_mip, const GcnInst& inst) {
     const IR::Value body = ImageAddressBody(addr_reg, mimg.a16);
 
     IR::TextureInstInfo info{};
+    info.pc.Assign(pc); // PS4Recomp: error messages name the instruction
     info.has_lod.Assign(has_mip);
     info.is_array.Assign(mimg.da);
     info.is_r128.Assign(mimg.r128);
@@ -522,6 +523,7 @@ void Translator::IMAGE_STORE(bool has_mip, const GcnInst& inst) {
     const IR::Value body = ImageAddressBody(addr_reg, mimg.a16);
 
     IR::TextureInstInfo info{};
+    info.pc.Assign(pc); // PS4Recomp: error messages name the instruction
     info.has_lod.Assign(has_mip);
     info.is_array.Assign(mimg.da);
     info.is_r128.Assign(mimg.r128);
@@ -556,6 +558,7 @@ void Translator::IMAGE_GET_RESINFO(const GcnInst& inst) {
                                                               ir.GetScalarReg(tsharp_reg + 7));
 
     IR::TextureInstInfo info{};
+    info.pc.Assign(pc); // PS4Recomp: error messages name the instruction
     info.is_array.Assign(mimg.da);
     info.is_r128.Assign(mimg.r128);
 
@@ -583,6 +586,7 @@ void Translator::IMAGE_ATOMIC(AtomicOp op, const GcnInst& inst) {
     const IR::ScalarReg tsharp_reg{inst.src[2].code * 4};
 
     IR::TextureInstInfo info{};
+    info.pc.Assign(pc); // PS4Recomp: error messages name the instruction
     info.is_array.Assign(mimg.da);
     info.is_r128.Assign(mimg.r128);
 
@@ -777,6 +781,7 @@ void Translator::IMAGE_GET_LOD(const GcnInst& inst) {
     const IR::ScalarReg tsharp_reg{inst.src[2].code * 4};
 
     IR::TextureInstInfo info{};
+    info.pc.Assign(pc); // PS4Recomp: error messages name the instruction
     info.is_array.Assign(mimg.da);
     info.is_r128.Assign(mimg.r128);
 

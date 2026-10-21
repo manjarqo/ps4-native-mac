@@ -64,6 +64,8 @@ struct InfoPersistent {
     // PS4Recomp: buffer accesses through V#s loaded at run time read and write guest memory
     // through the guest page table (GCN_BUFFER_BDA_PAGETABLE) and report to the fault buffer
     bool uses_guest_memory{};
+    // PS4Recomp: image reads through a T# loaded at run time that read the null image
+    u32 null_image_reads{};
 
     InfoPersistent() = default;
     InfoPersistent(HwStage hw_stage_, SwStage sw_stage_, u64 pgm_hash_)

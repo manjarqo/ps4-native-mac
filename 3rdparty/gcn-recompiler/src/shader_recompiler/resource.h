@@ -25,6 +25,9 @@ namespace GuestMemory {
 constexpr u32 PageShift = 26;
 constexpr u32 NumPages = 1u << (40 - PageShift);
 // read / written pages are tracked at 1 MiB
+// Guest addresses below this are never mapped (the host's NULL guard area); page 0's table
+// entry is the GPU address its host memory would have at guest address 0.
+constexpr u64 FirstMappedAddress = 0x10000;
 constexpr u32 TrackShift = 20;
 constexpr u32 NumTrackPages = 1u << (40 - TrackShift);
 // BufferType::FaultBuffer dwords
@@ -37,7 +40,7 @@ constexpr u32 FaultDwords = WrittenDword + NumTrackPages / 32;
 constexpr u32 StatusUnmapped = 1u << 0; // an access outside a probe hit an unmapped page (skipped)
 constexpr u32 StatusFormat = 1u << 1;   // a V# with a data/number format the shader cannot convert
 constexpr u32 StatusSwizzle = 1u << 2;  // a swizzled V# (swizzle_enable)
-constexpr u32 StatusRange = 1u << 3;    // an address at or above 2^40
+constexpr u32 StatusRange = 1u << 3;    // an address at or above 2^40, or below FirstMappedAddress
 constexpr u32 StatusUnaligned = 1u << 4; // a dword access at an address that is not 4-aligned
 } // namespace GuestMemory
 

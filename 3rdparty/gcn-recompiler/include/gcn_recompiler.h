@@ -329,6 +329,8 @@ typedef struct gcn_shader_info {
     bool uses_dma;                    /* always false with the Metal profile */
     bool uses_guest_memory;           /* buffer accesses through V#s loaded at run time: see
                                          GCN_GUEST_* (bind the page table and fault buffer) */
+    uint32_t null_image_reads;        /* image reads through a T# loaded at run time: they read the
+                                         null image (no binding can stand for that T#) */
     bool translation_failed;          /* some instructions were unknown (shader may be wrong) */
     uint32_t shared_memory_size;      /* CS: bytes of threadgroup memory used (incl. scratch) */
     uint32_t workgroup_size[3];
@@ -387,6 +389,10 @@ typedef enum gcn_buffer_type { /* Shader::BufferType */
  *   GCN_GUEST_STATUS: GCN_GUEST_STATUS_* bits; every flagged access was not made. */
 #define GCN_GUEST_PAGE_SHIFT 26u
 #define GCN_GUEST_PAGES (1u << (40u - GCN_GUEST_PAGE_SHIFT))
+/* guest addresses below this are never accessed (reported unmapped); the entry of page 0 is the
+ * GPU address of guest address 0, though only [GCN_GUEST_FIRST_MAPPED, 64 MiB) is mapped; an
+ * address below it is reported as GCN_GUEST_STATUS_RANGE */
+#define GCN_GUEST_FIRST_MAPPED 0x10000ull
 #define GCN_GUEST_TRACK_SHIFT 20u
 #define GCN_GUEST_TRACK_PAGES (1u << (40u - GCN_GUEST_TRACK_SHIFT))
 #define GCN_GUEST_MODE 0u
@@ -398,7 +404,7 @@ typedef enum gcn_buffer_type { /* Shader::BufferType */
 #define GCN_GUEST_STATUS_UNMAPPED 0x1u  /* mode 0: an access hit an unmapped page             */
 #define GCN_GUEST_STATUS_FORMAT 0x2u    /* a V# data/number format other than 32-bit u/s/float */
 #define GCN_GUEST_STATUS_SWIZZLE 0x4u   /* a swizzled V# (swizzle_enable)                     */
-#define GCN_GUEST_STATUS_RANGE 0x8u     /* an address at or above 2^40                        */
+#define GCN_GUEST_STATUS_RANGE 0x8u     /* an address at or above 2^40 or below GCN_GUEST_FIRST_MAPPED */
 #define GCN_GUEST_STATUS_UNALIGNED 0x10u /* a dword at an address that is not 4-byte aligned  */
 
 enum { /* used_types bits (Shader::IR::Type subset) */
@@ -505,6 +511,7 @@ GCN_API bool gcn_shader_fetch_buffer_sharp(const gcn_shader* s, uint32_t index,
                                            uint32_t out_vsharp[4]);
 GCN_API bool gcn_shader_fetch_image_sharp(const gcn_shader* s, uint32_t index,
                                           const uint32_t* flatbuf, uint32_t out_tsharp[8]);
+/* false (out zeroed) for an S# the shader loads at run time (no sharp to fetch) or an invalid one */
 GCN_API bool gcn_shader_fetch_sampler_sharp(const gcn_shader* s, uint32_t index,
                                             const uint32_t* flatbuf, uint32_t out_ssharp[4]);
 GCN_API bool gcn_shader_fetch_vertex_attrib_sharp(const gcn_shader* s, uint32_t index,

@@ -345,15 +345,25 @@ IR::Inst* FindSharpSource(IR::Inst* handle) {
     return handle;
 }
 
-void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
+// what: "V#", "T#" or "S#"; inst: the instruction using the sharp (error messages)
+void MarkReadConstBufferSharpSources(const SharpReference& sharp, const char* what, const IR::Inst& inst,
+                                     u32 pc) {
     // In cases of bindless sharp fetches mark all producer instructions
     // so the extended userdata flattening pass will include them.
     for (size_t i = 0; i < sharp.num_dwords; i++) {
         IR::Inst* source = sharp.dwords[i].TryInst();
-        if (!source || !IsSharpSource(source)) {
-            // PS4Recomp: a dword the shader computes; the resource patching pass decides whether
-            // the access can use it (buffers: guest memory access, LowerDynamicBufferAccess)
+        if (!source) {
             continue;
+        }
+        if (!IsSharpSource(source)) {
+            // PS4Recomp: a dword the shader computes. A V# is then reached through guest memory
+            // (resource patching, LowerDynamicBufferAccess); a T# or S# cannot be bound.
+            if (what[0] == 'V') {
+                continue;
+            }
+            UNREACHABLE_MSG("{} at pc {:#x}: {} dword {} of {} produced by {} (computed in the shader)",
+                            IR::NameOf(inst.GetOpcode()), pc, what, i, sharp.num_dwords,
+                            IR::NameOf(source->GetOpcode()));
         }
         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {
             auto flags = source->Flags<IR::BufferInstInfo>();
@@ -397,7 +407,7 @@ void DiscoverBufferSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList
         vsharp.dwords[2] = dword2;
     }
 
-    MarkReadConstBufferSharpSources(vsharp);
+    MarkReadConstBufferSharpSources(vsharp, "V#", inst, u32(inst.Flags<IR::BufferInstInfo>().pc.Value()));
 }
 
 void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList& resources) {
@@ -425,7 +435,7 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
         tsharp.dwords[4] = tsharp_dw4;
     }
 
-    MarkReadConstBufferSharpSources(tsharp);
+    MarkReadConstBufferSharpSources(tsharp, "T#", inst, u32(inst.Flags<IR::TextureInstInfo>().pc.Value()));
 
     if (inst.GetOpcode() != IR::Opcode::ImageSampleRaw) {
         return;
@@ -455,7 +465,7 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
         ssharp.dwords[0] = ssharp_dw0;
     }
 
-    MarkReadConstBufferSharpSources(ssharp);
+    MarkReadConstBufferSharpSources(ssharp, "S#", inst, u32(inst.Flags<IR::TextureInstInfo>().pc.Value()));
 }
 
 ResourceDiscoveryList ResourceDiscoverPass(IR::Program& program, const Profile& profile) {

@@ -38,6 +38,7 @@ using namespace Shader;
 static_assert(GCN_GUEST_PAGE_SHIFT == Shader::GuestMemory::PageShift);
 static_assert(GCN_GUEST_PAGES == Shader::GuestMemory::NumPages);
 static_assert(GCN_GUEST_TRACK_SHIFT == Shader::GuestMemory::TrackShift);
+static_assert(GCN_GUEST_FIRST_MAPPED == Shader::GuestMemory::FirstMappedAddress);
 static_assert(GCN_GUEST_MODE == Shader::GuestMemory::ModeDword);
 static_assert(GCN_GUEST_STATUS == Shader::GuestMemory::StatusDword);
 static_assert(GCN_GUEST_UNMAPPED == Shader::GuestMemory::UnmappedDword);
@@ -819,6 +820,7 @@ GCN_API void gcn_shader_get_info(const gcn_shader* s, gcn_shader_info* o) {
     o->has_discard = info.has_discard;
     o->uses_dma = info.uses_dma;
     o->uses_guest_memory = info.uses_guest_memory;
+    o->null_image_reads = info.null_image_reads;
     o->translation_failed = info.translation_failed;
     if (info.hw_stage == HwStage::Compute) {
         o->shared_memory_size =
@@ -1003,6 +1005,11 @@ GCN_API bool gcn_shader_fetch_image_sharp(const gcn_shader* s, uint32_t index,
 GCN_API bool gcn_shader_fetch_sampler_sharp(const gcn_shader* s, uint32_t index,
                                             const uint32_t* flatbuf, uint32_t out[4]) {
     if (!s || !flatbuf || !out || index >= s->info.samplers.size()) {
+        return false;
+    }
+    if (s->info.samplers[index].sharp_fetch.summary == SharpFetch<AmdGpu::Sampler>::Summary::Invalid) {
+        // PS4Recomp: an S# the shader loads at run time: there is no sharp to fetch
+        std::memset(out, 0, 16);
         return false;
     }
     const FlatView v{{flatbuf, s->info.srt_info.flattened_bufsize_dw}, 0};

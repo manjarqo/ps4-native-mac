@@ -367,7 +367,9 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
     const auto field = [&](const IR::U32& dw, u32 offset, u32 count) {
         return ir.BitFieldExtract(dw, ir.Imm32(offset), ir.Imm32(count));
     };
-    const IR::U64 base = ir.PackUint2x32(ir.CompositeConstruct(dw0, ir.BitwiseAnd(dw1, ir.Imm32(0xFFu))));
+    // base bits 0..39 plus the 8 bits above them: an address at or past 2^40 is reported by the
+    // guest memory access (GCN_GUEST_STATUS_RANGE), not wrapped
+    const IR::U64 base = ir.PackUint2x32(ir.CompositeConstruct(dw0, ir.BitwiseAnd(dw1, ir.Imm32(0xFFFFu))));
     const IR::U32 stride = field(dw1, 16, 14);
     const IR::U1 swizzled = ir.INotEqual(field(dw1, 31, 1), ir.Imm32(0u));
     const IR::U32 num_records = dw2;
@@ -375,10 +377,10 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
     const IR::U64 size = IR::U64{ir.Select(ir.IEqual(stride, ir.Imm32(0u)), ir.UConvert(64, num_records),
                                            ir.IMul(ir.UConvert(64, stride), ir.UConvert(64, num_records)))};
 
-    // byte offset of the access in the buffer
-    IR::U32 offset;
+    // byte offset of the access in the buffer, in 64 bits (index * stride does not wrap)
+    IR::U64 offset;
     if (op == IR::Opcode::ReadConstBuffer) {
-        offset = ir.ShiftLeftLogical(IR::U32{inst.Arg(1)}, ir.Imm32(2u));
+        offset = ir.ShiftLeftLogical(ir.UConvert(64, IR::U32{inst.Arg(1)}), ir.Imm32(2u));
     } else {
         IR::U32 index = flags.index_enable ? IR::GetBufferIndexArg(&inst) : ir.Imm32(0u);
         const IR::U1 add_tid = ir.INotEqual(field(dw3, 23, 1), ir.Imm32(0u));
@@ -387,11 +389,18 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
         if (flags.voffset_enable) {
             voffset = ir.IAdd(voffset, IR::GetBufferVOffsetArg(&inst));
         }
-        offset = ir.IAdd(ir.IMul(index, stride), voffset);
+        offset = ir.IAdd(ir.IMul(ir.UConvert(64, index), ir.UConvert(64, stride)), ir.UConvert(64, voffset));
     }
-    const IR::U1 unaligned = ir.INotEqual(ir.BitwiseAnd(offset, ir.Imm32(3u)), ir.Imm32(0u));
-    ir.GuestReportStatus(swizzled, G::StatusSwizzle);
-    ir.GuestReportStatus(ir.LogicalAnd(is_buffer, unaligned), G::StatusUnaligned);
+    const auto in_range = [&](const IR::U64& byte) {
+        return ir.ILessThanEqual(ir.IAdd(byte, ir.Imm64(u64(4))), size, false);
+    };
+    // Reports only for an access that reaches the buffer: through a null V# (num_records 0, as
+    // in a zeroed copy table entry) or past its end an access is a no-op, as on GCN.
+    const IR::U1 reaches = ir.LogicalAnd(is_buffer, in_range(offset));
+    const IR::U1 unaligned =
+        ir.INotEqual(ir.BitwiseAnd(IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(offset), 0)}, ir.Imm32(3u)), ir.Imm32(0u));
+    ir.GuestReportStatus(ir.LogicalAnd(reaches, swizzled), G::StatusSwizzle);
+    ir.GuestReportStatus(ir.LogicalAnd(reaches, unaligned), G::StatusUnaligned);
     IR::U1 usable = ir.LogicalAnd(is_buffer, ir.LogicalNot(ir.LogicalOr(swizzled, unaligned)));
 
     // data and number format of a formatted access, dst_sel
@@ -420,7 +429,7 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
                 bad = ir.LogicalOr(bad, ir.LogicalAnd(stored, ir.INotEqual(dst_sel[c], ir.Imm32(4u + c))));
             }
         }
-        ir.GuestReportStatus(ir.LogicalAnd(is_buffer, bad), G::StatusFormat);
+        ir.GuestReportStatus(ir.LogicalAnd(reaches, bad), G::StatusFormat);
         usable = ir.LogicalAnd(usable, ir.LogicalNot(bad));
     } else if (inst_typed) {
         components = ir.Imm32(inst_components);
@@ -430,12 +439,10 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
 
     // dword c of the access: its guest address and whether it is accessed
     const auto dword_addr = [&](u32 c) {
-        const IR::U32 byte = c == 0 ? offset : IR::U32{ir.IAdd(offset, ir.Imm32(4u * c))};
-        const IR::U64 byte64 = ir.UConvert(64, byte);
-        const IR::U1 in_range = ir.ILessThanEqual(ir.IAdd(byte64, ir.Imm64(u64(4))), size, false);
-        const IR::U1 enable = ir.LogicalAnd(ir.LogicalAnd(usable, in_range),
+        const IR::U64 byte = c == 0 ? offset : IR::U64{ir.IAdd(offset, ir.Imm64(u64(4 * c)))};
+        const IR::U1 enable = ir.LogicalAnd(ir.LogicalAnd(usable, in_range(byte)),
                                             ir.ILessThan(ir.Imm32(c), components, false));
-        return std::pair{IR::U64{ir.IAdd(base, byte64)}, enable};
+        return std::pair{IR::U64{ir.IAdd(base, byte)}, enable};
     };
 
     info.uses_guest_memory = true;
@@ -530,17 +537,44 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     if (image_res.sharp_fetch.summary == SharpFetch<AmdGpu::Image>::Summary::Invalid) {
         // PS4Recomp: a T# the shader loads at run time has no binding. A write or atomic through
-        // it would be dropped: the translation fails. A read gets the null image (reads 0), as
-        // before; it is logged, not silent.
-        if (is_written) {
-            UNREACHABLE_MSG("{} at pc {:#x}: image store or atomic through a T# loaded at run time "
-                            "is not implemented ({})",
+        // it would be dropped: the translation fails. A read of a T# loaded with s_buffer_load
+        // through a V# the SRT walker cannot follow (or one loaded at run time) gets the null
+        // image (reads 0), as before:
+        // logged here and counted (Info::null_image_reads, logged by the renderer per shader).
+        // Any other source fails the translation.
+        const IR::Inst* handle = inst.Arg(0).Inst();
+        bool from_buffer_loads = true;
+        u32 k = 0;
+        for (u32 part = 0; part < 2 && from_buffer_loads; ++part) {
+            const IR::Inst* dwords = handle->Arg(part).TryInst();
+            if (!dwords) {
+                continue;
+            }
+            for (size_t i = 0; i < dwords->NumArgs(); ++i, ++k) {
+                if (k < resource.sharps[0].num_dwords && IsFlattenedSharpDword(resource.sharps[0].dwords[k])) {
+                    continue;
+                }
+                // s_buffer_load through a V# the walker cannot follow, kept as a buffer read or
+                // lowered to guest memory loads (a V# loaded at run time)
+                const IR::Value v = dwords->Arg(i);
+                if (v.IsImmediate() || (v.Inst()->GetOpcode() != IR::Opcode::ReadConstBuffer &&
+                                        v.Inst()->GetOpcode() != IR::Opcode::LoadGuestU32)) {
+                    from_buffer_loads = false;
+                    break;
+                }
+            }
+        }
+        if (is_written || !from_buffer_loads) {
+            UNREACHABLE_MSG("{} at pc {:#x}: image {} through a T# loaded at run time is not "
+                            "implemented ({})",
                             IR::NameOf(inst.GetOpcode()), u32(inst_info.pc.Value()),
+                            is_written ? "store or atomic" : "read of a T# not loaded by s_buffer_load",
                             DescribeUnflattened(resource.sharps[0]));
         }
         LOG_ERROR(Render_Recompiler,
                   "{} at pc {:#x}: image read through a T# loaded at run time reads the null image ({})",
                   IR::NameOf(inst.GetOpcode()), u32(inst_info.pc.Value()), DescribeUnflattened(resource.sharps[0]));
+        info.null_image_reads++;
     }
     auto image = image_res.GetSharp(info);
     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
