@@ -11,7 +11,7 @@
 // right; the same MSL shares one job (one compile); a failed compile reports Metal's error, stays
 // failed and is not compiled again; several threads waiting for one job all get its kernel; a
 // wait on a finished job does not block; no more than the limit compile at once and queued jobs
-// start in the order they were asked for; the destructor waits for queued and running compiles.
+// start in the order they were asked for; the destructor waits for running compiles and fails queued ones.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -276,9 +276,10 @@ int main(int argc, char** argv) {
             for (unsigned k = 0; k < 4; ++k) CHECK(RunAndCheck(dev, q, d[k]->Wait(), 400 + k, nonce));
             for (int t = 0; t < 100 && calls.load() < 5; ++t) usleep(10000);
             CHECK(calls.load() == 5); // once per started job (the promotion call passed none)
+            CHECK(one.Started(C::kDraw) == 4 && one.Started(C::kDispatch) == 1 && one.Started() == 5);
             CHECK(lib_ok.load());
         }
-        // ---- the destructor waits for compiles still queued or running ----
+        // ---- the destructor waits for running compiles and fails the queued ones ----
         {
             std::shared_ptr<ps4gnm_kernels::Job> last;
             {
@@ -290,6 +291,9 @@ int main(int argc, char** argv) {
                 CHECK(!last->Done());
             }
             CHECK(last->Done());
+            // it was still queued: not compiled, finished as failed instead
+            CHECK(last->Error() == "compile queue shut down");
+            CHECK(last->Wait() == nil);
         }
     }
     if (g_fail) {

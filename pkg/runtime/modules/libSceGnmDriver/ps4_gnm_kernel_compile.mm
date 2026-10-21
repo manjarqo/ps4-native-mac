@@ -54,7 +54,14 @@ Compiler::Compiler(id<MTLDevice> dev, MTLCompileOptions* (*make_options)(), unsi
 
 Compiler::~Compiler() {
     std::unique_lock<std::mutex> lk(mu_);
-    idle_.wait(lk, [this] { return running_ == 0 && queued_[0].empty() && queued_[1].empty(); });
+    for (auto& q : queued_) {
+        for (Queued& item : q) {
+            in_flight_.fetch_sub(1, std::memory_order_relaxed);
+            item.job->Finish(nil, nil, "compile queue shut down", 0);
+        }
+        q.clear();
+    }
+    idle_.wait(lk, [this] { return running_ == 0; });
 }
 
 std::shared_ptr<Job> Compiler::Find(uint64_t mh) const {
@@ -83,9 +90,10 @@ std::shared_ptr<Job> Compiler::Start(uint64_t mh, const std::string& msl, bool* 
     }
     slot = std::make_shared<Job>(mh);
     if (started) *started = true;
-    started_.fetch_add(1, std::memory_order_relaxed);
+    const Priority p = pri == kDraw ? kDraw : kDispatch;
+    started_[p].fetch_add(1, std::memory_order_relaxed);
     in_flight_.fetch_add(1, std::memory_order_relaxed);
-    queued_[pri == kDraw ? kDraw : kDispatch].push_back({slot, std::make_shared<std::string>(msl), std::move(on_done)});
+    queued_[p].push_back({slot, std::make_shared<std::string>(msl), std::move(on_done), p});
     StartQueued();
     return slot;
 }
@@ -118,9 +126,9 @@ void Compiler::Run(Queued q) {
         std::string err;
         if (!fn) {
             err = e ? e.localizedDescription.UTF8String : lib ? "no main0" : "unknown error";
-            failed_.fetch_add(1, std::memory_order_relaxed);
+            failed_[q.pri].fetch_add(1, std::memory_order_relaxed);
         }
-        compile_us_.fetch_add((uint64_t)(ms * 1000.0), std::memory_order_relaxed);
+        compile_us_[q.pri].fetch_add((uint64_t)(ms * 1000.0), std::memory_order_relaxed);
         in_flight_.fetch_sub(1, std::memory_order_relaxed);
         q.job->Finish(lib, fn, err, ms);
         if (q.on_done) q.on_done(*q.job);

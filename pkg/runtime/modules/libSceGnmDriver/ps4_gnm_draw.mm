@@ -649,12 +649,15 @@ void PrintCompileStats() {
         char w[96], cw[96];
         c(g_compile.kernel_wait, w, sizeof(w));
         c(g_compile.kernel_cp_wait, cw, sizeof(cw));
-        fprintf(stderr, "[gnm-compile] session: compute kernels compiled in the background %llu (%.0f ms, %llu at once at most, "
-                        "%llu failed), %llu ready at their first dispatch, waited for by the encoder %s, "
-                        "by the CP at the end of a submission %s\n",
-                (unsigned long long)S.kernels->Started(), S.kernels->CompileMsTotal(),
-                (unsigned long long)S.kernels->PeakRunning(), (unsigned long long)S.kernels->Failed(),
-                (unsigned long long)g_compile.kernel_ready.load(), w, cw);
+        using KC = ps4gnm_kernels::Compiler;
+        fprintf(stderr, "[gnm-compile] session: compute kernels compiled in the background %llu (%.0f ms, %llu failed), "
+                        "%llu ready at their first dispatch, waited for by the encoder %s, by the CP at the end of a "
+                        "submission %s; draw shaders through the same queue %llu (%.0f ms, %llu failed); %llu compiles "
+                        "at once at most\n",
+                (unsigned long long)S.kernels->Started(KC::kDispatch), S.kernels->CompileMs(KC::kDispatch),
+                (unsigned long long)S.kernels->Failed(KC::kDispatch), (unsigned long long)g_compile.kernel_ready.load(), w,
+                cw, (unsigned long long)S.kernels->Started(KC::kDraw), S.kernels->CompileMs(KC::kDraw),
+                (unsigned long long)S.kernels->Failed(KC::kDraw), (unsigned long long)S.kernels->PeakRunning());
     }
     ps4gnm_lib_store::PrintStats();
 }
@@ -1746,7 +1749,13 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
                 // compiled before in this session (a failed library is not cached in S.libs):
                 // the waiters take that result (the job of an MSL is never in flight here,
                 // libs_pending holds its waiters until it is done)
-                if (!started && job->Done()) done(job->Library(), job->Library() ? nil : @(job->Error().c_str()));
+                if (!started && job->Done()) {
+                    done(job->Library(), job->Library() ? nil : @(job->Error().c_str()));
+                } else if (!started) {
+                    // not expected (see above); its draws would wait for a callback that never comes
+                    RLog("msl-fail", "shader MSL %016llx: compile job of another caller still in flight; draws skipped",
+                         (unsigned long long)mh);
+                }
             } else {
                 [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
                                     options:CompileOptions()

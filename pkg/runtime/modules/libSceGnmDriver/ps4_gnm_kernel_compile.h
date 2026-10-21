@@ -79,7 +79,8 @@ public:
     // threads). The compiles run on a concurrent queue at user-interactive QoS: the frame waits
     // for them.
     Compiler(id<MTLDevice> dev, MTLCompileOptions* (*make_options)(), unsigned max_parallel);
-    // Waits for the queued and running compiles.
+    // Waits for the running compiles; queued ones finish as failed ("compile queue shut down")
+    // without compiling (an exit, e.g. from a fatal-signal handler, must not sit through a burst).
     ~Compiler();
     Compiler(const Compiler&) = delete;
     Compiler& operator=(const Compiler&) = delete;
@@ -93,20 +94,25 @@ public:
                                Priority pri = kDispatch, Done on_done = nullptr);
     // The job of this MSL, null if none was started.
     std::shared_ptr<Job> Find(uint64_t mh) const;
-    // Session counters.
-    uint64_t Started() const { return started_.load(std::memory_order_relaxed); }
-    uint64_t Failed() const { return failed_.load(std::memory_order_relaxed); }
+    // Session counters, all priorities or one (jobs count under the priority they were started
+    // with).
+    uint64_t Started() const { return Started(kDispatch) + Started(kDraw); }
+    uint64_t Failed() const { return Failed(kDispatch) + Failed(kDraw); }
+    uint64_t Started(Priority p) const { return started_[p].load(std::memory_order_relaxed); }
+    uint64_t Failed(Priority p) const { return failed_[p].load(std::memory_order_relaxed); }
+    double CompileMs(Priority p) const { return compile_us_[p].load(std::memory_order_relaxed) / 1000.0; }
     // Jobs not finished yet (queued or compiling).
     uint64_t Unfinished() const { return in_flight_.load(std::memory_order_relaxed); }
     // Largest number of compiles that ran at the same time (at most max_parallel).
     uint64_t PeakRunning() const { return peak_.load(std::memory_order_relaxed); }
-    double CompileMsTotal() const { return compile_us_.load(std::memory_order_relaxed) / 1000.0; }
+    double CompileMsTotal() const { return CompileMs(kDispatch) + CompileMs(kDraw); }
 
 private:
     struct Queued {
         std::shared_ptr<Job> job;
         std::shared_ptr<std::string> msl;
         Done on_done;
+        Priority pri = kDispatch;
     };
     void Run(Queued q);
     void StartQueued(); // with mu_ held
@@ -119,7 +125,8 @@ private:
     const unsigned max_parallel_;
     unsigned running_ = 0;
     std::condition_variable idle_;
-    std::atomic<uint64_t> started_{0}, failed_{0}, in_flight_{0}, peak_{0}, compile_us_{0};
+    std::atomic<uint64_t> started_[2] = {}, failed_[2] = {}, compile_us_[2] = {};
+    std::atomic<uint64_t> in_flight_{0}, peak_{0};
 };
 
 } // namespace ps4gnm_kernels

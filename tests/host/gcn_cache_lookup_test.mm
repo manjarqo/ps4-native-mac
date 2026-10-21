@@ -9,6 +9,10 @@
 //          the number of permutations (the program's bucket holds all n).
 //        gcn_cache_lookup_test write <dir> <n>   translates and stores n permutations, waits for
 //          the files
+//        gcn_cache_lookup_test odd <dir> <n>  a bucket with n permutations plus one entry of another
+//          resource layout (a program without buffers, stored under the same key): a draw no
+//          permutation fits finds that entry through the path that checks such entries one by
+//          one, and gcn_shader_matches_draw_spec agrees with gcn_shader_is_compatible for it.
 //        gcn_cache_lookup_test restart <dir> <n> a new process on that cache: lookups issued
 //          while the startup loader runs return at once (hit or miss, never waiting for the
 //          disk); once it finished, every permutation is found.
@@ -64,6 +68,20 @@ void PutProgram() {
     const uint64_t hash = 0x5eed1234abcdull;
     memcpy(bi + 16, &hash, 8);
     memcpy(g_mem.data() + kCode + sizeof(cs), bi, sizeof(bi));
+}
+
+// A second program at kCode2: no resources (another resource layout).
+constexpr uint64_t kCode2 = 0x3000;
+void PutProgram2() {
+    const uint32_t cs[] = {0xBF800000u, 0xBF800000u, 0xBF800000u, 0xBF810000u}; // s_nop x3, s_endpgm
+    memcpy(g_mem.data() + kCode2, cs, sizeof(cs));
+    uint8_t bi[28] = {};
+    memcpy(bi, "OrbShdr", 7);
+    const uint32_t bits = (uint32_t)sizeof(cs) << 8;
+    memcpy(bi + 8, &bits, 4);
+    const uint64_t hash = 0x0dd0dd0dd0ull;
+    memcpy(bi + 16, &hash, 8);
+    memcpy(g_mem.data() + kCode2 + sizeof(cs), bi, sizeof(bi));
 }
 
 gcn_runtime_info Runtime() {
@@ -124,14 +142,14 @@ size_t CountFiles(const std::string& dir, bool remove) {
     return n;
 }
 
-bool Translate(uint32_t i, sc::Key* key, gcn_shader** out) {
+bool Translate(uint32_t i, sc::Key* key, gcn_shader** out, uint64_t code = kCode) {
     const gcn_runtime_info rt = Runtime();
     uint32_t ud[16];
     UserData(i, ud);
     gcn_compile_desc d{};
     d.hw_stage = GCN_HW_CS;
     d.sw_stage = GCN_SW_COMPUTE;
-    d.code_addr = kCode;
+    d.code_addr = code;
     memcpy(d.user_data, ud, 64);
     d.runtime = &rt;
     d.profile = &g_profile;
@@ -144,7 +162,7 @@ bool Translate(uint32_t i, sc::Key* key, gcn_shader** out) {
         fprintf(stderr, "gcn_cache_lookup_test: translation %u failed: %s\n", i, err);
         return false;
     }
-    return sc::MakeKey(GCN_HW_CS, GCN_SW_COMPUTE, rt, kCode, Read, nullptr, key);
+    return sc::MakeKey(GCN_HW_CS, GCN_SW_COMPUTE, rt, code, Read, nullptr, key);
 }
 
 // Stores n permutations; returns their key (all equal: one program, one runtime state).
@@ -263,6 +281,51 @@ int main(int argc, char** argv) {
             CHECK(worst < 10.0);
             CHECK(miss_ms < 10.0);
             CHECK(mean < 4.0 * small_mean + 0.05);
+        } else if (mode == "odd") {
+            PutProgram2();
+            StartCache(dir);
+            sc::Key key = StoreAll(n);
+            sc::Key key2;
+            gcn_shader* other = nullptr;
+            CHECK(Translate(0, &key2, &other, kCode2));
+            gcn_shader* base = nullptr;
+            sc::Key k0;
+            CHECK(Translate(0, &k0, &base));
+            const gcn_runtime_info rt = Runtime();
+            uint32_t ud[16];
+            UserData(n + 50, ud); // no stored permutation of the program has this stride
+            // the API: for an entry of another layout, the match is the full compatibility check
+            CHECK(!gcn_shader_same_resource_layout(other, base));
+            CHECK(gcn_shader_same_resource_layout(base, base));
+            gcn_draw_spec* ds = gcn_draw_spec_create(base, ud, &rt, Read, nullptr);
+            CHECK(ds != nullptr);
+            CHECK(gcn_shader_matches_draw_spec(other, ds, ud, &rt, Read, nullptr) ==
+                  gcn_shader_is_compatible(other, ud, &rt, Read, nullptr));
+            CHECK(gcn_shader_matches_draw_spec(other, ds, ud, &rt, Read, nullptr)); // no resources: fits any draw
+            CHECK(!gcn_shader_matches_draw_spec(base, ds, ud, &rt, Read, nullptr)); // other stride
+            CHECK(gcn_shader_matches_draw_spec(base, ds, ud, &rt, Read, nullptr) ==
+                  gcn_shader_is_compatible(base, ud, &rt, Read, nullptr));
+            gcn_draw_spec_destroy(ds);
+            // the cache: before the odd entry the draw misses; after it the draw finds it
+            double t0 = Now();
+            gcn_shader* miss = sc::Lookup(key, kCode, ud, Read, nullptr);
+            CHECK(miss == nullptr);
+            sc::Store(key, other); // under the first program's key: an entry of another layout
+            gcn_shader* hit = sc::Lookup(key, kCode, ud, Read, nullptr);
+            const double ms = Now() - t0;
+            CHECK(hit != nullptr);
+            if (hit) {
+                gcn_shader_info info;
+                gcn_shader_get_info(hit, &info);
+                CHECK(info.num_buffers == 0); // the odd entry, not a permutation of the program
+                gcn_shader_destroy(hit);
+            }
+            // a stored stride still finds its own permutation (first in insertion order)
+            double ms2 = 0;
+            CHECK(Find(key, n / 2, &ms2));
+            fprintf(stderr, "gcn_cache_lookup_test: odd entry found by a draw no permutation fits (%.3f ms)\n", ms);
+            gcn_shader_destroy(other);
+            gcn_shader_destroy(base);
         } else if (mode == "write") {
             StartCache(dir);
             StoreAll(n);

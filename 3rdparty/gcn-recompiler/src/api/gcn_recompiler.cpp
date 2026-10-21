@@ -1197,12 +1197,6 @@ u64 SpecHash(const Shader::StageSpecialization& sp, const u64 mask[2]) {
     for (const auto& sa : sp.samplers) HashMix(h, (u64(sa.force_unnormalized) << 1) | sa.force_degamma);
     return h;
 }
-bool SameLayout(const Shader::Info& a, const Shader::Info& b) {
-    return a.sw_stage == b.sw_stage && a.buffers.size() == b.buffers.size() &&
-           a.images.size() == b.images.size() && a.fmasks.size() == b.fmasks.size() &&
-           a.samplers.size() == b.samplers.size() && a.flattened_ud_buf.size() == b.flattened_ud_buf.size() &&
-           a.srt_info.flattened_bufsize_dw == b.srt_info.flattened_bufsize_dw;
-}
 } // namespace
 
 extern "C" {
@@ -1257,7 +1251,7 @@ GCN_API uint64_t gcn_shader_spec_hash(const gcn_shader* s, const uint64_t mask[2
 
 GCN_API bool gcn_shader_same_resource_layout(const gcn_shader* a, const gcn_shader* b) {
     return a && b && a->runtime.hw_stage != HwStage::Geometry && b->runtime.hw_stage != HwStage::Geometry &&
-           SameLayout(a->info, b->info);
+           SameResourceLayout(a->info, b->info); // the one comparison gcn_shader_find_compatible uses
 }
 
 GCN_API bool gcn_shader_matches_draw_spec(const gcn_shader* s, const gcn_draw_spec* spec,

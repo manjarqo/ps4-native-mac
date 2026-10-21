@@ -174,8 +174,10 @@ GC="$R/3rdparty/gcn-recompiler"
 clang++ -std=c++17 -fobjc-arc -O2 -Wall -Werror -I "$G" -I "$GC/include" "$R/tests/host/gcn_cache_lookup_test.mm" \
   "$G/ps4_gnm_shader_cache.mm" "$GC/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" \
   -framework Foundation -o "$T/gcn_cache_lookup_test"
-mkdir -p "$T/gcnl_s" "$T/gcnl_r"
+mkdir -p "$T/gcnl_s" "$T/gcnl_r" "$T/gcnl_o"
 "$T/gcn_cache_lookup_test" session "$T/gcnl_s" 3000 2>&1 | grep '^gcn_cache_lookup_test'
 "$T/gcn_cache_lookup_test" write "$T/gcnl_r" 3000 2>&1 | grep '^gcn_cache_lookup_test'
 "$T/gcn_cache_lookup_test" restart "$T/gcnl_r" 3000 2>&1 | grep '^gcn_cache_lookup_test'
+# an entry of another resource layout in the bucket: found through the one-by-one path
+"$T/gcn_cache_lookup_test" odd "$T/gcnl_o" 500 2>&1 | grep '^gcn_cache_lookup_test'
 rm -rf "$T"
