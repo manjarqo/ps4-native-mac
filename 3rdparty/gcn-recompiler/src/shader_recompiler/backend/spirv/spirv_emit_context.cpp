@@ -908,19 +908,14 @@ void EmitContext::DefineBuffers() {
                 if ((spv_buffer.misalign & 1) == 0) {
                     spv_buffer.Offset(PointerSize::B16) = ConstU32(spv_buffer.misalign >> 1);
                 }
-                if (desc.is_written) {
-                    LOG_WARNING(Render_Recompiler,
-                                "Buffer {} written at a base that is not dword aligned (+{}): stores land "
-                                "at the dword below",
-                                spv_buffer.binding, spv_buffer.misalign);
-                }
             }
         }
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
                 DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);
         }
-        if (True(desc.used_types & IR::Type::U32)) {
+        // (misaligned stores go through the U32 alias with atomics, whatever the data type)
+        if (True(desc.used_types & IR::Type::U32) || (spv_buffer.misalign != 0 && desc.is_written)) {
             spv_buffer.Alias(PointerType::U32) =
                 DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1]);
         }

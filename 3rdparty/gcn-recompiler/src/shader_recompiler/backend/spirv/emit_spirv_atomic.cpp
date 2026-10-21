@@ -74,6 +74,8 @@ template <bool is_float = false>
 Id BufferAtomicU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
                    Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id)) {
     const auto& buffer = ctx.buffers[handle];
+    if (buffer.misalign != 0) // PS4Recomp: never touch the bytes below the buffer
+        UNREACHABLE_MSG("buffer atomic at a base that is not dword aligned (+{})", buffer.misalign);
     const Id type = is_float ? ctx.F32[1] : ctx.U32[1];
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
@@ -90,6 +92,8 @@ Id BufferAtomicU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id 
 Id BufferAtomicU32IncDec(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address,
                          Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id)) {
     const auto& buffer = ctx.buffers[handle];
+    if (buffer.misalign != 0) // PS4Recomp: never touch the bytes below the buffer
+        UNREACHABLE_MSG("buffer atomic at a base that is not dword aligned (+{})", buffer.misalign);
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -106,6 +110,8 @@ Id BufferAtomicU32CmpSwap(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
                           Id cmp_value,
                           Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id, Id, Id)) {
     const auto& buffer = ctx.buffers[handle];
+    if (buffer.misalign != 0) // PS4Recomp: never touch the bytes below the buffer
+        UNREACHABLE_MSG("buffer atomic at a base that is not dword aligned (+{})", buffer.misalign);
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
@@ -122,6 +128,8 @@ Id BufferAtomicU32CmpSwap(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 Id BufferAtomicU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
                    Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id)) {
     const auto& buffer = ctx.buffers[handle];
+    if (buffer.misalign != 0) // PS4Recomp: never touch the bytes below the buffer
+        UNREACHABLE_MSG("buffer atomic at a base that is not dword aligned (+{})", buffer.misalign);
     if (const Id offset = buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }

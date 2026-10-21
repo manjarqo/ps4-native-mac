@@ -2397,7 +2397,12 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                 // bounds limit below includes the bytes below the base.
                 base &= ~3ull;
             }
-            if (!GuestBuffer(base, bd.size_bytes + (uint32_t)(bd.base_address - base), bb.is_written ? GuestAccess::Write : GuestAccess::Read, &mb, &off)) {
+            // misaligned: the binding also covers the partial dword holding the buffer's last
+            // bytes (the shader reads guest dword i from bound dwords i and i+1)
+            const uint32_t bound_bytes = base == bd.base_address
+                                             ? bd.size_bytes
+                                             : (bd.size_bytes + (uint32_t)(bd.base_address - base) + 3) & ~3u;
+            if (!GuestBuffer(base, bound_bytes, bb.is_written ? GuestAccess::Write : GuestAccess::Read, &mb, &off)) {
                 RLog("buf-range", "shader 0x%llx: buffer %u out of range (0x%llx+0x%x)",
                      (unsigned long long)s->code_addr, i, (unsigned long long)base, bd.size_bytes);
                 mb = S.dummy;
@@ -2418,7 +2423,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                 }
             }
             if (bb.buffer_slot < GCN_MAX_BUFFERS) {
-                uint32_t lim = bd.size_bytes + (uint32_t)(bd.base_address - base);
+                uint32_t lim = bound_bytes;
                 if (bounds_off) lim = 0xffffffffu;
                 else if (bounds_mode && !strcmp(bounds_mode, "raw") && bd.stride != 0) lim = 64u << 20;
                 pd.buf_sizes[bb.buffer_slot] = lim;

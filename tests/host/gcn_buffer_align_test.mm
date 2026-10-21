@@ -10,6 +10,11 @@
 //  3. buffer_load_ubyte,
 // each at base + 1, + 2 and + 3, and the aligned case unchanged. A permutation translated for one
 // alignment is not compatible with a draw at another.
+// Also at + 1..3:
+//  4. the last dword of a buffer (it lost its top base & 3 bytes: the binding ended at the dword
+//     below and the shader's bounds check zeroed the rest);
+//  5. buffer_store_dword into such a buffer: the guest's bytes are written and the bytes around
+//     the buffer are not (stores used to land base & 3 bytes early, over other data).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -118,7 +123,7 @@ gcn_shader* Compile(Guest& g, uint64_t code, const uint32_t ud[16]) {
 }
 
 // Binds like the renderer's BindStage: a guest buffer at the dword below its base, with
-// buf_sizes = size + (base & 3).
+// buf_sizes = size + (base & 3) rounded up to dwords.
 bool Run(id<MTLDevice> dev, Guest& g, const gcn_shader* sh, const uint32_t ud[16]) {
     gcn_shader_info info;
     gcn_shader_get_info(sh, &info);
@@ -155,7 +160,9 @@ bool Run(id<MTLDevice> dev, Guest& g, const gcn_shader* sh, const uint32_t ud[16
             gcn_decode_buffer(v, &d);
             const uint64_t base = d.base_address & ~3ull;
             [enc setBuffer:g.buf offset:base - kGuestBase atIndex:b.msl_buffers[k]];
-            if (b.buffer_slot < GCN_MAX_BUFFERS) pd->buf_sizes[b.buffer_slot] = d.size_bytes + uint32_t(d.base_address - base);
+            if (b.buffer_slot < GCN_MAX_BUFFERS)
+                pd->buf_sizes[b.buffer_slot] =
+                    base == d.base_address ? d.size_bytes : (d.size_bytes + uint32_t(d.base_address - base) + 3) & ~3u;
         }
     }
     if (info.msl_push_constant_buffer >= 0) [enc setBytes:push length:sizeof(push) atIndex:(NSUInteger)info.msl_push_constant_buffer];
@@ -220,6 +227,53 @@ void TestCase(id<MTLDevice> dev, const Case& c, uint32_t misalign) {
     gcn_shader_destroy(sh);
 }
 
+// 4: buffer_load_dwordx2 of an 8-byte buffer: the second dword is the buffer's last.
+void TestTail(id<MTLDevice> dev, uint32_t misalign) {
+    Guest g{[dev newBufferWithLength:kGuestSize options:MTLResourceStorageModeShared]};
+    std::memset(g.buf.contents, 0, kGuestSize);
+    const uint64_t code = kGuestBase, out = kGuestBase + 0x1000, src = kGuestBase + 0x2000 + misalign;
+    const auto prog = Program(kLoadDwordx2, 0x5CA1A2EAD5300000ULL + misalign);
+    std::memcpy(g.p(code), prog.data(), prog.size() * 4);
+    for (uint32_t i = 0; i < 64; i++) g.p(kGuestBase + 0x2000)[i] = uint8_t(0x10 + i);
+    uint32_t ud[16] = {};
+    VSharp(&ud[4], out, 64, 0);
+    VSharp(&ud[8], src, 8, 0);
+    gcn_shader* sh = Compile(g, code, ud);
+    if (!sh) return;
+    CHECK(Run(dev, g, sh, ud), "last dword +%u: did not run", misalign);
+    uint32_t r[2];
+    std::memcpy(r, g.p(out), 8);
+    const uint8_t* s = g.p(src);
+    CHECK(r[0] == Le32(s) && r[1] == Le32(s + 4), "last dword +%u: read %08x %08x, guest has %08x %08x", misalign,
+          r[0], r[1], Le32(s), Le32(s + 4));
+    gcn_shader_destroy(sh);
+}
+
+// 5: the same program stores its two dwords into an 8-byte buffer at out + misalign.
+void TestStore(id<MTLDevice> dev, uint32_t misalign) {
+    Guest g{[dev newBufferWithLength:kGuestSize options:MTLResourceStorageModeShared]};
+    std::memset(g.buf.contents, 0, kGuestSize);
+    const uint64_t code = kGuestBase, out = kGuestBase + 0x1000 + misalign, src = kGuestBase + 0x2000;
+    const auto prog = Program(kLoadDwordx2, 0x5CA1A2EAD5400000ULL + misalign);
+    std::memcpy(g.p(code), prog.data(), prog.size() * 4);
+    for (uint32_t i = 0; i < 64; i++) g.p(src)[i] = uint8_t(0x10 + i);
+    std::memset(g.p(kGuestBase + 0x1000), 0xEE, 16);
+    uint32_t ud[16] = {};
+    VSharp(&ud[4], out, 8, 0);
+    VSharp(&ud[8], src, 16, 0);
+    gcn_shader* sh = Compile(g, code, ud);
+    if (!sh) return;
+    CHECK(Run(dev, g, sh, ud), "store +%u: did not run", misalign);
+    const uint8_t* o = g.p(kGuestBase + 0x1000);
+    for (uint32_t i = 0; i < 16; i++) {
+        const bool inside = i >= misalign && i < misalign + 8;
+        const uint8_t want = inside ? uint8_t(0x10 + i - misalign) : 0xEE;
+        CHECK(o[i] == want, "store +%u: byte %u is 0x%02x, expected 0x%02x (%s the buffer)", misalign, i, o[i], want,
+              inside ? "inside" : "outside");
+    }
+    gcn_shader_destroy(sh);
+}
+
 } // namespace
 
 int main() {
@@ -236,6 +290,10 @@ int main() {
         };
         for (const Case& c : cases)
             for (uint32_t m = 0; m < 4; m++) TestCase(dev, c, m);
+        for (uint32_t m = 0; m < 4; m++) {
+            TestTail(dev, m);
+            TestStore(dev, m);
+        }
         if (g_fail) {
             std::fprintf(stderr, "gcn_buffer_align_test: %d failure(s)\n", g_fail);
             return 1;
