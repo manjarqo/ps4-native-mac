@@ -144,10 +144,9 @@ void Visit(Info& info, const IR::Inst& inst) {
         info.uses_group_shuffle = true;
         break;
     case IR::Opcode::WriteLane:
-        // PS4Recomp: the emitter writes 0 for it (see EmitWriteLane); counted and logged so the
-        // gap stays visible, also for shaders loaded from the cache
+        // PS4Recomp: the emitter writes 0 for it (see EmitWriteLane); counted, and logged once per
+        // shader (CollectShaderInfoPass, and by the renderer also for shaders from the cache)
         info.zeroed_write_lanes++;
-        LOG_WARNING(Render_Recompiler, "v_writelane result emitted as 0 (known gap, EmitWriteLane)");
         [[fallthrough]];
     case IR::Opcode::ReadLane:
     case IR::Opcode::ReadFirstLane:
@@ -221,6 +220,11 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         for (IR::Inst& inst : block->Instructions()) {
             Visit(info, inst);
         }
+    }
+    if (info.zeroed_write_lanes) {
+        LOG_WARNING(Render_Recompiler,
+                    "shader {:#x}: {} v_writelane result(s) emitted as 0 (known gap, EmitWriteLane)",
+                    info.pgm_hash, info.zeroed_write_lanes);
     }
 
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {

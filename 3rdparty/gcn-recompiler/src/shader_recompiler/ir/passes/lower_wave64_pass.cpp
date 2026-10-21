@@ -181,8 +181,18 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program,
     std::vector<ConditionalScope> conditionals;
     std::vector<const IR::Block*> loops;
     u32 divergence_depth{};
+    // PS4Recomp: a Return or Unreachable in divergent control flow (a divergent if or a loop)
+    // can end some lanes, e.g. one subgroup at an s_endpgm inside an EXEC scope. Every later block
+    // may then run without them: an exchange barrier there could wait for a subgroup that ended.
+    bool lanes_may_have_ended = false;
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
+        case Type::Return:
+        case Type::Unreachable:
+            if (divergence_depth > 0 || !loops.empty()) {
+                lanes_may_have_ended = true;
+            }
+            break;
         case Type::If: {
             IR::Value cond = node.data.if_node.cond;
             if (const IR::Inst* ref = cond.TryInst();
@@ -209,7 +219,7 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program,
             loops.pop_back();
             break;
         case Type::Block:
-            if (divergence_depth == 0 && loops.empty()) {
+            if (divergence_depth == 0 && loops.empty() && !lanes_may_have_ended) {
                 blocks.push_back(node.data.block);
             }
             break;

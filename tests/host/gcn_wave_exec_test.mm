@@ -265,6 +265,25 @@ void ExpectLanes(const char* name, const std::vector<uint32_t>& out, F want, uin
     CHECK(bad == 0, "%s: %d of %u lanes wrong", name, bad, lanes);
 }
 
+// A known limitation: out must differ from the GCN result want(l) (XFAIL, printed), and match
+// it in lanes 0-31 (the subgroup that holds the wave's first lanes). Matching everywhere is an
+// XPASS: the limitation is gone and the case must become a normal check.
+template <typename F>
+void ExpectKnownGap(const char* name, const std::vector<uint32_t>& out, F want) {
+    if (out.size() < 64) return;
+    int wrong = 0, wrong_lo = 0;
+    for (uint32_t l = 0; l < 64; l++) {
+        wrong += out[l] != want(l);
+        wrong_lo += l < 32 && out[l] != want(l);
+    }
+    CHECK(wrong_lo == 0, "%s: %d of lanes 0-31 wrong", name, wrong_lo);
+    if (wrong == 0)
+        CHECK(false, "%s: XPASS, the known limitation is gone: make this case a normal check", name);
+    else
+        std::printf("gcn_wave_exec_test: XFAIL %s: %d of 64 lanes differ from GCN (known limitation: per "
+                    "subgroup inside EXEC scopes)\n", name, wrong);
+}
+
 //  D. v_readfirstlane in a wave64: the first lane active in EXEC across both halves, not each
 //     simdgroup's own first lane (lanes 32-63 read lane 32's value before).
 void TestReadFirstLane(id<MTLDevice> dev) {
@@ -281,7 +300,7 @@ void TestReadFirstLane(id<MTLDevice> dev) {
     // GCN gives 105 everywhere; that needs predicated execution of EXEC scopes (not done yet).
     out = RunWave64(dev, "readfirstlane in scope", 0x5CA1AB1E00000006ULL,
                     {OPEN_SCOPE, kExecLoLit, 0xFFFFFFE0, 0x7E080280, kRflS10, kMovV3S10, kStoreV3, kStoreV3b});
-    ExpectLanes("readfirstlane in scope", out, [](uint32_t l) { return l < 5 ? 0u : l < 32 ? 105u : 132u; });
+    ExpectKnownGap("readfirstlane in scope", out, [](uint32_t l) { return l < 5 ? 0u : 105u; });
     // only lanes 40-47 active: lane 40
     out = RunWave64(dev, "readfirstlane upper half", 0x5CA1AB1E00000007ULL,
                     {OPEN_SCOPE, 0xBEFE0380, kExecHiLit, 0xFF00, kRflS10, kMovV3S10, kStoreV3, kStoreV3b});
@@ -304,6 +323,17 @@ void TestReadFirstLane(id<MTLDevice> dev) {
     ExpectLanes("readfirstlane lower-half scope", out, [](uint32_t l) { return l < 32 ? 100u : 0u; });
     CHECK(!out.empty() && scope_msl.find("threadgroup_barrier") == std::string::npos,
           "readfirstlane lower-half scope: a barrier in a scope one subgroup skips");
+    // s_endpgm inside an EXEC scope that only lanes 0-31 enter (they end there; the translator
+    // ends them per lane), then v_readfirstlane after the scope: the block after it is no longer
+    // run by every subgroup, so it must not exchange (a barrier there waited for ended lanes).
+    // vcc = 32 > v0; s[12:13] = saveexec(vcc); if (exec) { v4 = 0; s_endpgm } exec = s[12:13]
+    out = RunWave64(dev, "readfirstlane after a divergent return", 0x5CA1AB1E00000016ULL,
+                    {0x7D8800A0, 0xBE8C246A, 0xBF880002, 0x7E080280, kEnd, 0xBEFE040C, kRflS10, kMovV3S10,
+                     kStoreV3, kStoreV3b},
+                    64, {}, 64, &scope_msl);
+    ExpectLanes("readfirstlane after a divergent return", out, [](uint32_t l) { return l < 32 ? 0u : 132u; });
+    CHECK(!out.empty() && scope_msl.find("threadgroup_barrier") == std::string::npos,
+          "readfirstlane after a divergent return: a barrier after lanes may have ended");
     // Cost: a value that is the same in every lane (v7 = user data s2) needs no exchange through
     // workgroup memory, and a 32-thread workgroup (one subgroup) keeps the subgroup broadcast.
     std::string msl;
@@ -396,7 +426,7 @@ void TestWave64Masks(id<MTLDevice> dev) {
     // subgroup, so lanes 32-63 count only the active lanes of their own half (GCN: l - 5).
     out = RunWave64(dev, "mbcnt", 0x5CA1AB1E0000000CULL,
                     {OPEN_SCOPE, kExecLoLit, 0xFFFFFFE0, 0xD2460003, 0x0001007E, 0xD2480003, 0x0002067F, kStoreV3, kStoreV3b});
-    ExpectLanes("mbcnt", out, [](uint32_t l) { return l < 5 ? 0u : l < 32 ? l - 5 : l - 32; });
+    ExpectKnownGap("mbcnt", out, [](uint32_t l) { return l < 5 ? 0u : l - 5; });
     // every lane active (no scope): mbcnt of EXEC is the lane id in both halves
     out = RunWave64(dev, "mbcnt all lanes", 0x5CA1AB1E00000015ULL,
                     {0xD2460003, 0x0001007E, 0xD2480003, 0x0002067F, kStoreV3, kStoreV3b});
