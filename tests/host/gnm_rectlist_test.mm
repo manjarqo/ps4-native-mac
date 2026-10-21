@@ -10,7 +10,8 @@
 // from vertex 0, non-indexed from a later vertex, indexed (16-bit indices, base vertex),
 // instanced, and with back faces culled (a rectangle is drawn whole or not at all).
 // It also runs the renderer's background compile of the two RectList shaders
-// (ps4gnm_rect::CompileLibrary) from a stack frame that is gone before Metal completes.
+// (ps4gnm_rect::CompileLibrary) from a stack frame that is gone before Metal completes, and
+// their compile on the calling thread (ps4gnm_rect::CompileLibraryNow, PS4_GNM_SYNC_COMPILE=1).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -408,6 +409,25 @@ void CheckBackgroundCompile(Fixture& f) {
     }
 }
 
+// PS4_GNM_SYNC_COMPILE=1 (pass replay, debugging): the renderer compiles the RectList shaders
+// with ps4gnm_rect::CompileLibraryNow, and the draw that made them is drawn, not skipped. When it
+// returns, the library is done: function set (or the status failed for a source Metal rejects),
+// not pending, and the compile no longer counted.
+void CheckSyncCompile(Fixture& f) {
+    auto* r = new BgRect();
+    ps4gnm_rect::CompileLibraryNow(f.dev, Uncached(ps4gnm_rect::PrepareMsl(f.rect.capture_msl, false), 100),
+                                   &r->capture.fn, &r->capture.pending, r, f.code_addr, false);
+    CHECK(r->compiling.load(std::memory_order_acquire) == 1, "sync compile: %d compiles still counted after one",
+          r->compiling.load(std::memory_order_acquire));
+    CHECK(r->capture.fn && r->capture.fn.functionType == MTLFunctionTypeVertex && !r->capture.pending,
+          "sync compile: no capture vertex function on return");
+    ps4gnm_rect::CompileLibraryNow(f.dev, "this is not MSL", &r->expand.fn, &r->expand.pending, r, f.code_addr, true);
+    CHECK(r->compiling.load(std::memory_order_acquire) == 0 && r->failed.load(std::memory_order_relaxed) &&
+              !r->expand.fn && !r->expand.pending,
+          "sync compile: a rejected source is not reported on return");
+    delete r;
+}
+
 } // namespace
 
 int main() {
@@ -434,6 +454,7 @@ int main() {
         };
         for (const DrawCase& c : cases) CheckRects(c, Render(f, c));
         CheckBackgroundCompile(f);
+        CheckSyncCompile(f);
         gcn_rectlist_msl_free(&f.rect);
         gcn_shader_destroy(f.vs);
         if (g_fail) return 1;

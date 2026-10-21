@@ -105,35 +105,57 @@ inline std::string PrepareMsl(const char* src, bool expand) {
     return msl;
 }
 
-// Starts compiling `msl` (the capture or, if `expand`, the expansion shader of the guest vertex
-// shader at code_addr) and returns at once. When Metal is done, on one of its threads, *fn holds
-// the library's main0 (nil if Metal rejected it: logged and status->failed set), *pending is false,
+// The end of a RectList library compile (CompileLibrary, CompileLibraryNow): *fn holds the
+// library's main0 (nil if Metal rejected it: logged and status->failed set), *pending is false,
 // and then status->compiling drops by one (release: who reads it at 0 sees *fn).
-//
-// The completion runs after this function and its caller have returned, so the block captures
-// only the values passed here, by value: fn, pending and status must point into objects that live
-// until the compile is done (the caller's heap objects), never into a stack frame.
-inline void CompileLibrary(id<MTLDevice> dev, const std::string& msl, __strong id<MTLFunction>* fn, bool* pending,
-                           LibraryStatus* status, uint64_t code_addr, bool expand) {
+inline void LibraryDone(id<MTLLibrary> lib, NSError* e, __strong id<MTLFunction>* fn, bool* pending,
+                        LibraryStatus* status, uint64_t code_addr, bool expand) {
+    *fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
+    if (!*fn) {
+        std::fprintf(stderr, "[gnm-draw] VS 0x%llx: Metal rejected its RectList %s shader: %s\n",
+                     (unsigned long long)code_addr, expand ? "expansion" : "capture",
+                     e ? e.localizedDescription.UTF8String : "no main0");
+        status->failed.store(true, std::memory_order_relaxed);
+    }
+    *pending = false;
+    status->compiling.fetch_sub(1, std::memory_order_release);
+}
+
+inline MTLCompileOptions* LibraryOptions() {
     MTLCompileOptions* opt = [MTLCompileOptions new];
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     opt.fastMathEnabled = NO;
 #pragma clang diagnostic pop
     if (@available(macOS 11.0, *)) opt.preserveInvariance = YES;
+    return opt;
+}
+
+// Starts compiling `msl` (the capture or, if `expand`, the expansion shader of the guest vertex
+// shader at code_addr) and returns at once. When Metal is done, on one of its threads, the
+// library is finished as LibraryDone describes.
+//
+// The completion runs after this function and its caller have returned, so the block captures
+// only the values passed here, by value: fn, pending and status must point into objects that live
+// until the compile is done (the caller's heap objects), never into a stack frame.
+inline void CompileLibrary(id<MTLDevice> dev, const std::string& msl, __strong id<MTLFunction>* fn, bool* pending,
+                           LibraryStatus* status, uint64_t code_addr, bool expand) {
     [dev newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()]
-                      options:opt
+                      options:LibraryOptions()
             completionHandler:^(id<MTLLibrary> lib, NSError* e) {
-                *fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
-                if (!*fn) {
-                    std::fprintf(stderr, "[gnm-draw] VS 0x%llx: Metal rejected its RectList %s shader: %s\n",
-                                 (unsigned long long)code_addr, expand ? "expansion" : "capture",
-                                 e ? e.localizedDescription.UTF8String : "no main0");
-                    status->failed.store(true, std::memory_order_relaxed);
-                }
-                *pending = false;
-                status->compiling.fetch_sub(1, std::memory_order_release);
+                LibraryDone(lib, e, fn, pending, status, code_addr, expand);
             }];
+}
+
+// The same compile on the calling thread (PS4_GNM_SYNC_COMPILE=1, which builds everything
+// inline): the library is finished as LibraryDone describes when this returns.
+inline void CompileLibraryNow(id<MTLDevice> dev, const std::string& msl, __strong id<MTLFunction>* fn, bool* pending,
+                              LibraryStatus* status, uint64_t code_addr, bool expand) {
+    NSError* e = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()]
+                                           options:LibraryOptions()
+                                             error:&e];
+    LibraryDone(lib, e, fn, pending, status, code_addr, expand);
 }
 
 } // namespace ps4gnm_rect

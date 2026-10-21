@@ -2176,47 +2176,50 @@ static Shader* StartRectListShader(Shader::RectList* r, uint64_t code_addr, cons
     s->msl_hash = Fnv(msl.data(), msl.size());
     s->pending = true;
     DumpMsl(s, msl.c_str());
-    ps4gnm_rect::CompileLibrary(S.dev, msl, &s->fn, &s->pending, r, code_addr, expand);
+    if (S.async_compile)
+        ps4gnm_rect::CompileLibrary(S.dev, msl, &s->fn, &s->pending, r, code_addr, expand);
+    else
+        ps4gnm_rect::CompileLibraryNow(S.dev, msl, &s->fn, &s->pending, r, code_addr, expand);
     return s;
 }
 
 // The RectList vertex shaders of `vs` (gcn_shader_rectlist_msl), made once per shader on the CP
 // thread. Their Metal libraries compile in the background like any new shader's (a synchronous
-// compile stalls the CP thread for tens of ms); draws are skipped until both are ready.
+// compile stalls the CP thread for tens of ms); draws are skipped until both are ready. With
+// PS4_GNM_SYNC_COMPILE=1 they compile here and the first draw is not skipped.
 // Returns nullptr (logged once per shader) if the shader cannot be expanded, and sets *pending
 // while the libraries compile.
 Shader::RectList* RectListShaders(Shader* vs, bool* pending) {
     *pending = false;
     if (vs->rect_failed) return nullptr;
-    if (Shader::RectList* r = vs->rect) {
-        if (r->compiling.load(std::memory_order_acquire) > 0) {
-            *pending = true;
-            return nullptr;
-        }
-        if (r->failed.load(std::memory_order_relaxed)) {
-            RLog("rect-fail", "VS 0x%llx: Metal rejected its RectList shaders", (unsigned long long)vs->code_addr);
+    if (!vs->rect) {
+        gcn_rectlist_msl m{};
+        char err[512] = {0};
+        if (gcn_shader_rectlist_msl(vs->sh, &S.msl, &m, err, sizeof(err)) != GCN_OK) {
+            RLog("rect-fail", "VS 0x%llx: no RectList variant: %s", (unsigned long long)vs->code_addr, err);
             vs->rect_failed = true;
             return nullptr;
         }
-        return r;
+        auto* r = new Shader::RectList();
+        r->vertex_stride = m.vertex_stride;
+        r->capture_slot = m.capture_buffer;
+        r->params_slot = m.params_buffer;
+        r->capture = StartRectListShader(r, vs->code_addr, m.capture_msl, false);
+        r->expand = StartRectListShader(r, vs->code_addr, m.expand_msl, true);
+        gcn_rectlist_msl_free(&m);
+        vs->rect = r;
     }
-    gcn_rectlist_msl m{};
-    char err[512] = {0};
-    if (gcn_shader_rectlist_msl(vs->sh, &S.msl, &m, err, sizeof(err)) != GCN_OK) {
-        RLog("rect-fail", "VS 0x%llx: no RectList variant: %s", (unsigned long long)vs->code_addr, err);
+    Shader::RectList* r = vs->rect;
+    if (r->compiling.load(std::memory_order_acquire) > 0) {
+        *pending = true;
+        return nullptr;
+    }
+    if (r->failed.load(std::memory_order_relaxed)) {
+        RLog("rect-fail", "VS 0x%llx: Metal rejected its RectList shaders", (unsigned long long)vs->code_addr);
         vs->rect_failed = true;
         return nullptr;
     }
-    auto* r = new Shader::RectList();
-    r->vertex_stride = m.vertex_stride;
-    r->capture_slot = m.capture_buffer;
-    r->params_slot = m.params_buffer;
-    r->capture = StartRectListShader(r, vs->code_addr, m.capture_msl, false);
-    r->expand = StartRectListShader(r, vs->code_addr, m.expand_msl, true);
-    gcn_rectlist_msl_free(&m);
-    vs->rect = r;
-    *pending = true;
-    return nullptr;
+    return r;
 }
 
 // =====================================================================================
