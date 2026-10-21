@@ -148,6 +148,12 @@ clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_u4_cs_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
 "$T/gcn_u4_cs_test" "$R/tests/host/data" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
+# Wave-level instructions executed on Metal: EXEC half writes in a wave64, V# dwords spilled to
+# VGPR lanes, a wave64 compare read from both halves.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_wave_exec_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gcn_wave_exec_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+"$T/gcn_wave_exec_test" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
 # Fast-clear colours of integer/snorm targets.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/gnm_clear_color_test.mm" -framework Metal \
   -framework Foundation -o "$T/gnm_clear_color_test"

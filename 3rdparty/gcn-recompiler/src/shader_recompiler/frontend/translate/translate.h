@@ -397,6 +397,8 @@ private:
 private:
     IR::IREmitter ir;
     Info& info;
+    IR::U32 Lane64();
+
     const RuntimeInfo& runtime_info;
     const Profile& profile;
     u32 next_vgpr_num;
