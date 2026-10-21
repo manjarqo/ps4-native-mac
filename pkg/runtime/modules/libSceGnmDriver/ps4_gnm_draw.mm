@@ -364,6 +364,7 @@ struct PassKey {
 
 struct MetaState {
     bool cleared = false;
+    uint64_t cleared_seq = 0; // command buffer the clear (CMASK/HTILE fill) belongs to
 };
 
 // Compact record of the work encoded into a command buffer, printed when it fails or hangs
@@ -537,7 +538,9 @@ struct State {
     uint32_t cb_extent[8] = {};
     uint32_t db_extent = 0;
 
-    // depth surfaces read as color (R32F companions) and depth-copy tracking
+    // depth surfaces read as color (R32F companions) and depth-copy tracking. The maps keyed by a
+    // texture pointer here (depth_comp, depth_version, depth_last_write, eqaa_twin, eqaa_orig) are
+    // erased by ForgetTexture when the texture cache drops the texture: add any new one there.
     struct Companion {
         id<MTLTexture> tex;
         uint64_t version = ~0ull;
@@ -730,9 +733,17 @@ struct GpuMem {
     };
     std::unordered_map<uint64_t, Copy> copies_open;
     std::atomic<uint64_t> released{0}, released_bytes{0}, purges{0}, large{0};
+    // Texture cache eviction (EvictTextures, encoder thread)
+    ps4_texcache_policy texpol{};
+    uint64_t last_tex_evict = 0, last_gpu_evict = 0;
+    bool tex_purge = false; // the over-budget sweep purged: evict idle sampled textures too
+    // time Commit spends in SweepGuestWindows + EvictTextures (encoder thread writes, sampler reads)
+    std::atomic<uint64_t> sweep_ns{0}, sweep_max_ns{0};
     std::atomic<uint64_t> refused_large{0}, refused_holes{0}, refused_written{0}, copies{0}, copy_bytes{0};
 };
 GpuMem g_mem;
+// The texture cache as seen by the sampler thread (set once the cache exists).
+std::atomic<TextureCache*> g_mem_tex{nullptr};
 
 // Window span of a guest_bufs key (base | windows << 48).
 inline void KeyWindows(uint64_t key, uint64_t* first, uint64_t* n) {
@@ -753,6 +764,7 @@ void StartGpuMemSampler(uint64_t mem_size) {
     // the policy is needed by GuestBuffer even if the accounting below cannot start
     ps4_gpumem_policy_init(&g_mem.policy, ps4_gpumem_mem_total(), getenv("PS4_GNM_GPU_BUDGET_PCT"),
                            getenv("PS4_GNM_GPU_BUDGET_MB"), getenv("PS4_GNM_GPU_WINDOW_IDLE_S"));
+    ps4_texcache_policy_init(&g_mem.texpol, &g_mem.policy, getenv("PS4_GNM_TEX_CACHE_MB"), getenv("PS4_GNM_TEX_KEEP_MS"));
     if (!ps4_gpumem_windows_init(&g_mem.wins, mem_size, kWindow)) return;
     g_mem.wired_base = ps4_gpumem_wired_bytes();
     g_mem.on = true;
@@ -762,7 +774,8 @@ void StartGpuMemSampler(uint64_t mem_size) {
         pthread_setname_np("gnm-mem");
         ps4_gpumem_log_state log{};
         ps4_gpumem_budget_state budget{};
-        uint64_t peak_charged = 0, peak_wired = 0;
+        uint64_t peak_charged = 0, peak_wired = 0, peak_tex = 0;
+        const uint64_t t_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         for (;;) {
             ps4_gpumem_sample s;
             @autoreleasepool {
@@ -771,6 +784,9 @@ void StartGpuMemSampler(uint64_t mem_size) {
             const uint64_t charged = ps4_gpumem_charged(&s);
             peak_charged = std::max(peak_charged, charged);
             peak_wired = std::max(peak_wired, s.wired);
+            TextureCache* tc = g_mem_tex.load(std::memory_order_acquire);
+            const TextureCache::MemStats ts = tc ? tc->GetMemStats() : TextureCache::MemStats{};
+            peak_tex = std::max(peak_tex, ts.sampled_bytes);
             char line[512];
             const int change = ps4_gpumem_budget_update(&budget, &g_mem.policy, charged);
             g_mem.charged.store(charged, std::memory_order_relaxed);
@@ -799,6 +815,27 @@ void StartGpuMemSampler(uint64_t mem_size) {
                         (unsigned long long)g_mem.refused_large.load(), (unsigned long long)g_mem.refused_holes.load(),
                         (unsigned long long)g_mem.refused_written.load(), (unsigned long long)g_mem.copies.load(),
                         (unsigned long long)(g_mem.copy_bytes.load() >> 20), budget.over ? "; OVER BUDGET" : "");
+                if (tc) {
+                    fprintf(stderr, "[gnm-mem] texture cache at %llu s: sampled %llu (%llu MiB, peak %llu MiB, budget %llu MiB), "
+                                    "GPU-owned %llu (%llu MiB); evicted %llu (%llu MiB), superseded GPU-owned %llu (%llu MiB)\n",
+                            (unsigned long long)((s.t_ns - t_start) / 1000000000ull),
+                            (unsigned long long)ts.sampled_count, (unsigned long long)(ts.sampled_bytes >> 20),
+                            (unsigned long long)(peak_tex >> 20),
+                            (unsigned long long)(g_mem.texpol.budget == UINT64_MAX ? 0 : g_mem.texpol.budget >> 20),
+                            (unsigned long long)ts.gpu_count, (unsigned long long)(ts.gpu_bytes >> 20),
+                            (unsigned long long)tc->EvictedCount(), (unsigned long long)(tc->EvictedBytes() >> 20),
+                            (unsigned long long)tc->EvictedGpuCount(), (unsigned long long)(tc->EvictedGpuBytes() >> 20));
+                }
+                if (tc) {
+                    const TextureCache::GpuOwnedStats go = tc->GetGpuOwnedStats(10000000000ull);
+                    fprintf(stderr, "[gnm-mem] GPU-owned surfaces: %llu (%llu MiB) overlapped by newer surfaces, %llu (%llu MiB) "
+                                    "unused for 10 s\n",
+                            (unsigned long long)go.superseded_count, (unsigned long long)(go.superseded_bytes >> 20),
+                            (unsigned long long)go.idle_count, (unsigned long long)(go.idle_bytes >> 20));
+                }
+                fprintf(stderr, "[gnm-mem] sweeps: %.1f ms total, longest %.2f ms since the last line\n",
+                        g_mem.sweep_ns.exchange(0, std::memory_order_relaxed) / 1e6,
+                        g_mem.sweep_max_ns.exchange(0, std::memory_order_relaxed) / 1e6);
             }
             usleep(1000000);
         }
@@ -892,11 +929,65 @@ void SweepGuestWindows() {
         std::lock_guard<std::mutex> lk(S.arena.free_mu);
         S.arena.free_list.clear();
         g_mem.purges.fetch_add(1, std::memory_order_relaxed);
+        g_mem.tex_purge = true;
     } else if (over && g_mem.purge.futile == 10) {
         RLog("gpumem-futile", "[gnm-mem] purging does not lower the charged total (%llu MiB): the memory over "
                               "budget is the device's own (textures); purges paused",
              (unsigned long long)(g_mem.charged.load() >> 20));
     }
+}
+
+// Texture cache eviction (encoder thread, from Commit, after SweepGuestWindows): while the
+// sampled textures exceed their budget, at most every 100 ms, least recently used first among
+// those not used for texpol.keep_ns; when the over-budget sweep purged the transient caches (with
+// its back-off), every sampled texture not used for texpol.press_ns. Only textures whose last
+// command buffer has completed are evicted (TextureCache::EvictSampled).
+// Renderer state keyed by a texture pointer must not outlive the texture: a new texture can get
+// the same address. Every such map is erased here (keep this list complete when adding one).
+void ForgetTexture(void* key) {
+    S.depth_comp.erase(key);
+    S.depth_version.erase(key);
+    S.depth_last_write.erase(key);
+    auto tw = S.eqaa_twin.find(key);
+    if (tw != S.eqaa_twin.end()) {
+        S.eqaa_orig.erase((__bridge void*)tw->second);
+        S.eqaa_twin.erase(tw);
+    }
+}
+
+// Textures the cache dropped (superseded evictions, grown depth arrays): forget them, then let
+// them go (command buffers that still use them keep them alive).
+void ForgetRetiredTextures(TextureCache* tc) {
+    std::vector<id<MTLTexture>> gone;
+    tc->TakeRetired(&gone);
+    for (id<MTLTexture> t : gone) ForgetTexture((__bridge void*)t);
+}
+
+void EvictTextures() {
+    TextureCache* tc = S.tex;
+    if (!tc) return;
+    ForgetRetiredTextures(tc);
+    const bool gpu_purge = g_mem.tex_purge;
+    g_mem.tex_purge = false;
+    const uint64_t now = g_mem.tick;
+    // superseded GPU-owned surfaces: once a second (with the purge too), idle 10 s (2 s over budget)
+    if (gpu_purge || now - g_mem.last_gpu_evict >= 1000000000ull) {
+        g_mem.last_gpu_evict = now;
+        const TextureCache::EvictResult gr =
+            tc->EvictSuperseded(gpu_purge ? 2000000000ull : 10000000000ull, now, CompletedSeq());
+        if (gr.count)
+            RLog("tex-evict-gpu", "[gnm-mem] evicted %llu superseded GPU-owned surfaces (%llu MiB)",
+                 (unsigned long long)gr.count, (unsigned long long)(gr.bytes >> 20));
+        ForgetRetiredTextures(tc);
+    }
+    if (!gpu_purge && (now - g_mem.last_tex_evict < 100000000ull ||
+                       !ps4_texcache_evict_due(&g_mem.texpol, tc->GetMemStats().sampled_bytes, 0)))
+        return;
+    g_mem.last_tex_evict = now;
+    const TextureCache::EvictResult r = tc->EvictSampled(g_mem.texpol, gpu_purge, now, CompletedSeq());
+    if (r.count)
+        RLog("tex-evict", "[gnm-mem] evicted %llu sampled textures (%llu MiB)%s", (unsigned long long)r.count,
+             (unsigned long long)(r.bytes >> 20), gpu_purge ? " (over the GPU budget)" : " (over the cache budget)");
 }
 
 // How a binding uses guest memory. A GPU-written binding must be the guest memory itself: a copy
@@ -1157,12 +1248,23 @@ void Commit() {
     EndEncoders();
     g_mem.tick = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     SweepGuestWindows();
+    EvictTextures();
+    {
+        const uint64_t d = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_mem.tick;
+        g_mem.sweep_ns.fetch_add(d, std::memory_order_relaxed);
+        if (d > g_mem.sweep_max_ns.load(std::memory_order_relaxed)) g_mem.sweep_max_ns.store(d, std::memory_order_relaxed);
+    }
     if (S.upload_cmd) {
         // texture copies used by the work of S.cmd: same queue, committed first
         [S.upload_cmd commit];
         S.upload_cmd = nil;
     }
-    if (!S.cmd) return;
+    if (!S.cmd) {
+        // later lookups belong to the next command buffer (an upload_cmd committed just now
+        // completes before it: same queue)
+        if (S.tex) S.tex->SetUse(S.committed_seq + 1, g_mem.tick);
+        return;
+    }
     id<MTLCommandBuffer> cb = S.cmd;
     S.cmd = nil;
     S.cmd_start_epoch = S.write_epoch + 1; // writes noted from now on belong to the next command buffer
@@ -1179,6 +1281,8 @@ void Commit() {
         std::lock_guard<std::mutex> lk(S.fence_mu);
         seq = ++S.committed_seq;
     }
+    // textures looked up from now on are used by the next command buffer
+    if (S.tex) S.tex->SetUse(seq + 1, g_mem.tick);
     // Guest memory written by this command buffer: sampled textures created from it are stale
     // once the GPU is done (TextureCache is thread-safe).
     std::shared_ptr<std::vector<GpuWrite>> written;
@@ -2382,7 +2486,10 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             if (bb.is_written) {
                 NoteGpuWrite(base, bd.size_bytes);
                 auto mit = S.meta.find(base);
-                if (mit != S.meta.end() && b.stage == Stage::Compute) mit->second.cleared = true;
+                if (mit != S.meta.end() && b.stage == Stage::Compute) {
+                    mit->second.cleared = true;
+                    mit->second.cleared_seq = S.committed_seq + 1;
+                }
             }
             break;
         }
@@ -3648,10 +3755,12 @@ void RegisterMeta(uint64_t addr) {
     if (addr) S.meta.emplace(addr, MetaState{});
 }
 
-bool TakeMetaCleared(uint64_t addr) {
+// seq (optional): the command buffer the clear belongs to.
+bool TakeMetaCleared(uint64_t addr, uint64_t* seq = nullptr) {
     auto it = S.meta.find(addr);
     if (it == S.meta.end() || !it->second.cleared) return false;
     it->second.cleared = false;
+    if (seq) *seq = it->second.cleared_seq;
     return true;
 }
 
@@ -3888,10 +3997,21 @@ bool BuildQuadListIndices(const DrawArgs& a, uint32_t count, __strong id<MTLBuff
 // =====================================================================================
 // Fast clear elimination / resolve passes (shadPS4 Rasterizer::FilterDraw)
 // =====================================================================================
+// A clear writes every byte of the cleared slices of a color target: an exactly known write
+// (TextureCache::NoteExactWrite). Only the first slice of the view (base_slice) is credited, which
+// is always a subset of what the PS4 clears.
+// seq: the command buffer of the CMASK clear, which can precede the draw that resolves it.
+void NoteClearedColor(const ColorTarget& c, id<MTLTexture> t, uint64_t seq) {
+    if (!c.slice_bytes || !seq) return;
+    const uint64_t lo = c.address + (uint64_t)c.base_slice * c.slice_bytes;
+    S.tex->NoteExactWrite(c.address, t, lo, lo + c.slice_bytes, seq);
+}
+
 void EliminateFastClear(const RenderState& rs) {
     const ColorTarget& c = rs.color[0];
     if (!c.bound || !c.fast_clear) return;
-    if (!TakeMetaCleared(c.cmask_address)) return;
+    uint64_t clear_seq = 0;
+    if (!TakeMetaCleared(c.cmask_address, &clear_seq)) return;
     id<MTLTexture> t = S.tex->GetColorTarget(c);
     if (!t) return;
     ClearReq clr;
@@ -3900,6 +4020,7 @@ void EliminateFastClear(const RenderState& rs) {
         return;
     }
     clr.color[0] = true;
+    NoteClearedColor(c, t, clear_seq);
     PassKey k;
     k.color[0] = t;
     id<MTLTexture> hold[9] = {t};
@@ -4152,6 +4273,7 @@ bool Init(GuestContext* ctx) {
         S.queue = [S.dev newCommandQueueWithMaxCommandBufferCount:64];
         S.queue.label = @"gnm";
         S.tex = new TextureCache(S.dev, S.queue, proc->mem_base, proc->mem_size);
+        g_mem_tex.store(S.tex, std::memory_order_release);
         S.dummy = [S.dev newBufferWithLength:65536 options:MTLResourceStorageModeShared];
         S.gds = (uint8_t*)mmap(nullptr, 0x10000, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
         if (S.gds == MAP_FAILED) S.gds = nullptr;
@@ -4523,7 +4645,10 @@ void NotifyGuestWriteImpl(uint64_t addr, uint64_t size, bool is_fill, uint32_t f
     (void)fill_value;
     if (is_fill) {
         auto it = S.meta.find(addr);
-        if (it != S.meta.end()) it->second.cleared = true;
+        if (it != S.meta.end()) {
+            it->second.cleared = true;
+            it->second.cleared_seq = S.committed_seq + 1;
+        }
     }
     if (S.tex) S.tex->InvalidateRange(addr, size, false);
 }
@@ -4823,9 +4948,12 @@ void DrawEncode(DrawRec& r) {
             rt_w = std::min<uint32_t>(rt_w, (uint32_t)t.width);
             rt_h = std::min<uint32_t>(rt_h, (uint32_t)t.height);
             any_rt = true;
-            if (c.fast_clear && TakeMetaCleared(c.cmask_address)) {
-                if (ClearColorFor(t.pixelFormat, c.clear_word0, c.clear_word1, &clr.color_value[i]))
+            uint64_t clear_seq = 0;
+            if (c.fast_clear && TakeMetaCleared(c.cmask_address, &clear_seq)) {
+                if (ClearColorFor(t.pixelFormat, c.clear_word0, c.clear_word1, &clr.color_value[i])) {
                     clr.color[i] = true;
+                    NoteClearedColor(c, t, clear_seq);
+                }
             }
         }
         uint32_t depth_fmt = 0;
@@ -4881,10 +5009,20 @@ void DrawEncode(DrawRec& r) {
                 const bool depth_enable = (dc >> 1) & 1, depth_write = (dc >> 2) & 1;
                 if (depth_write || rs.ds.stencil_test || db.depth_clear_enable || db.stencil_clear_enable)
                     BumpDepthVersion(t);
-                const bool htile_clear = db.htile_enable && TakeMetaCleared(db.htile_address);
+                uint64_t htile_seq = 0;
+                const bool htile_clear = db.htile_enable && TakeMetaCleared(db.htile_address, &htile_seq);
                 if ((db.depth_clear_enable && depth_enable && depth_write) || htile_clear) {
                     clr.depth = true;
                     clr.depth_value = db.depth_clear;
+                    // a clear writes every depth byte of the bound slice (the stencil plane is its
+                    // own surface on the PS4); only that slice is credited
+                    const uint64_t za = db.z_read_address ? db.z_read_address : db.stencil_read_address;
+                    // the register clear belongs to this draw; an HTILE clear to its fill
+                    const uint64_t seq = (db.depth_clear_enable && depth_enable && depth_write) ? S.committed_seq + 1
+                                                                                                 : htile_seq;
+                    if (db.z_read_address && db.slice_bytes && seq)
+                        S.tex->NoteExactWrite(za, t, za + (uint64_t)db.base_slice * db.slice_bytes,
+                                              za + (uint64_t)(db.base_slice + 1) * db.slice_bytes, seq);
                 }
                 if (db.stencil_clear_enable && HasStencil(t.pixelFormat)) {
                     clr.stencil = true;
@@ -5419,7 +5557,7 @@ void DispatchEncode(DispatchRec& r) {
                     wr.base_address && rd.size_bytes > 4096) {
                     id<MTLTexture> src = nil, dst = nil;
                     int kind = 0;
-                    if (S.tex->CloneGpuTexture(rd.base_address, wr.base_address, &src, &dst, &kind)) {
+                    if (S.tex->CloneGpuTexture(rd.base_address, wr.base_address, wr.size_bytes, &src, &dst, &kind)) {
                         EndEncoders();
                         EnsureCmd();
                         id<MTLBlitCommandEncoder> bl = [S.cmd blitCommandEncoder];

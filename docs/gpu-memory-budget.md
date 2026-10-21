@@ -82,5 +82,63 @@ commit in the middle of a draw can still release a window that the draw is about
 creates a second buffer over the same range, and for that short time both are counted; this is correct
 accounting, not a leak.
 
-Not covered: the texture cache never evicts (`TextureCache` entries are only added or cleared as a whole). Its
-memory is part of the charged total, and over budget it is reported but not reduced.
+## Texture cache eviction
+
+Code: `ps4_texcache_*` in `ps4_gnm_membudget.c` (policy), `TextureCache::EvictSampled` / `SetUse` in
+`ps4_gnm_resources.mm`, `EvictTextures` in `ps4_gnm_draw.mm`. Test: `tests/host/tex_evict_test.mm`.
+
+The cache holds two kinds of textures. **Sampled** textures are detiled copies of guest memory: an evicted one
+is created and uploaded again (CPU or GPU detile, as for a first use) the next time a T# needs it. **GPU-owned**
+surfaces (render targets, depth, storage images and their copies) hold the only copy of what the GPU wrote; they
+are evicted only once other surfaces overwrote all of their memory (see below). The `[gnm-mem] texture cache:` line reports both (count, `allocatedSize` bytes), the peak of
+the sampled bytes, the cache budget and the evictions so far.
+
+- **Last use**: at every commit the renderer tells the cache the sequence number of the command buffer that
+  work encoded from now on belongs to, and the commit time (`SetUse`). Every lookup that returns a texture
+  stamps its entry with both. That is one store pair on the hit path.
+- **In flight**: an entry is a candidate only once its command buffer has completed (`completed_seq` from the
+  completion handlers, as for released windows), so a texture bound in the open command buffer, in the texture
+  upload command buffer or in one in flight is never evicted. A candidate must also have been idle for at least
+  100 ms, so a texture looked up for a draw but not yet bound (a commit can fall in between) is never one either.
+  Command buffers retain what they use, so the Metal object of an evicted texture lives until they are done.
+- **Cache budget**: sampled textures may use a twelfth of the GPU budget (546 MiB on 16 GB;
+  `PS4_GNM_TEX_CACHE_MB`, 0 = no cache budget). Above it, at most every 100 ms at a commit, the least recently
+  used candidates not used for 2 s (`PS4_GNM_TEX_KEEP_MS`) are evicted until the sampled bytes are at 90% of the
+  budget. A working set larger than the budget therefore stays: the cache does not thrash. Measured: without a
+  budget, U4 chapter 1 grows its sampled textures from 240 MiB to 1.5 GiB in 5 minutes and keeps growing; at
+  512 MiB it holds about 470 MiB with no fps cost; at 256 MiB re-uploads of still-used textures cost long frames.
+  TLOU's courtyard needs about 400 MiB in all.
+- **GPU-owned surfaces** hold the only copy of what the GPU wrote, so they are evicted only when superseded: the
+  whole guest range of the surface was covered by **exactly known writes** of other GPU-owned surfaces, made by
+  command buffers after its last use. On the PS4 every byte was then overwritten, so its contents are dead.
+  - Only these writes count, and only for the guest bytes they certainly write:
+    - a clear: a CMASK fast clear resolved by a draw or by fast-clear elimination, or a depth clear (register or
+      HTILE). It is credited with the first slice of the view (`base_slice`) and the command buffer of the clear
+      itself (`TextureCache::NoteExactWrite`, `NoteClearedColor` in draw.mm);
+    - a recognised compute surface copy, credited with the bytes the copy writes (`CloneGpuTexture`'s
+      `written_bytes`).
+  - These never count: draws (which pixels they write is unknown), storage-image stores, writes in the same
+    command buffer as the surface's last use, and a newer surface that was only created or read. Partial cover
+    keeps the surface, and so does a cover with a gap. The covers are merged as a union, so a byte covered
+    twice does not count twice.
+  - The surface must also not have been looked up for 10 s (2 s while the over-budget sweep purges), and its
+    last command buffer must have completed (`TextureCache::EvictSuperseded`, once a second).
+  - The cache hands every texture it drops to the renderer: superseded ones, and depth arrays replaced when they
+    grow (`TakeRetired`). The renderer then erases the state it keys by texture pointer (`ForgetTexture`: depth
+    companions, depth versions, depth write order, EQAA twins) before the texture is freed, so a new texture at
+    the same address never inherits that state.
+  - U4 chapter 1 without this: GPU-owned surfaces grew from 300 MiB to 1.2 GiB in 4 minutes. The
+    `[gnm-mem] GPU-owned surfaces:` line reports the superseded and the 10 s idle surfaces still cached.
+- **GPU budget pressure**: when the over-budget sweep purges the transient caches (with its back-off), every
+  candidate not used for 250 ms is evicted as well.
+- **GPU writes**: an evicted entry takes its GPU-upload epoch with it. A re-created texture is uploaded from guest
+  memory at its first use; when GPU work that writes that memory is still pending, the hazard path
+  (`ResolveTextureHazards`) copies it on the GPU behind that work, as for any new texture. A write retired after
+  the re-creation marks the new entry stale once (one extra upload, never stale contents).
+- The GPU-owned range index (`OverlapsGpuTexture`) is rebuilt when a GPU-owned entry was added, removed or
+  resized (a version counter); the entry count no longer works as that signal once entries are evicted.
+- `[gnm-mem] sweeps:` gives the time `Commit` spent in the window sweep and the eviction since the previous
+  line, and the longest single call.
+- A re-created texture reads the guest memory as it is now. The cache does not see every CPU write to guest
+  memory (only the notified ones), so a texture the game rewrote without such a notification can show its new
+  contents after an eviction where the never-evicting cache kept showing the old ones.

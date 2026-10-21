@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -36,6 +37,8 @@
 #ifdef __OBJC__
 #import <Metal/Metal.h>
 #endif
+
+#include "ps4_gnm_membudget.h"
 
 namespace ps4gnm {
 
@@ -773,7 +776,14 @@ public:
     id<MTLTexture> GetColorTarget(const ColorTarget& cb, bool load_from_guest = true);
     // One texture per depth surface: views of later slices grow it to a larger 2D array, and the
     // texture it replaced is returned in *grown_from so the caller can copy its slices over.
+    // The replaced texture is also queued for TakeRetired.
     id<MTLTexture> GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from = nullptr);
+    // The GPU-owned surface `tex` at `address` gets every byte of guest [lo, hi) written by the open
+    // command buffer (a clear of that range). Only such exactly known writes let a surface supersede
+    // older ones (EvictSuperseded); a draw's pixels, or a storage image's stores, are not known.
+    // The range is clipped to the entry. Returns false if no such entry exists.
+    // seq: the command buffer the write belongs to (0 = the open one, the SetUse value).
+    bool NoteExactWrite(uint64_t address, id<MTLTexture> tex, uint64_t lo, uint64_t hi, uint64_t seq = 0);
 
     // CPU wrote [addr, addr+size): sampled textures overlapping are re-uploaded on next use.
     // Render-target textures are not touched (GPU owns them) unless include_render_targets.
@@ -821,9 +831,10 @@ public:
     // GPU-side copies of whole surfaces (e.g. a compute shader copying a depth buffer through
     // buffer loads/stores, shadPS4 Rasterizer::IsComputeImageCopy): find the GPU-owned texture at
     // src_addr and find/create one with the same description at dst_addr. The caller encodes the
-    // blit. kind_out: 1 color, 2 depth.
-    bool CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, id<MTLTexture>* src, id<MTLTexture>* dst,
-                         int* kind_out);
+    // blit. kind_out: 1 color, 2 depth. written_bytes: the guest bytes the copy writes from
+    // dst_addr (an exactly known write, see NoteExactWrite).
+    bool CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, uint64_t written_bytes, id<MTLTexture>* src,
+                         id<MTLTexture>* dst, int* kind_out);
 
     // Debugging: visit every GPU-owned texture (kind: 1 color/storage, 2 depth).
     void ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<MTLTexture> tex)) const;
@@ -837,6 +848,49 @@ public:
     };
     Stats stats;
 
+    // Memory held by the cache's own textures (MTLResource.allocatedSize when created), by kind.
+    // Readable from any thread (e.g. the GPU memory sampler) without the cache lock.
+    struct MemStats {
+        uint64_t sampled_count = 0, sampled_bytes = 0; // detiled from guest memory (re-creatable)
+        uint64_t gpu_count = 0, gpu_bytes = 0;         // render targets, depth, storage (GPU-owned)
+    };
+    MemStats GetMemStats() const;
+
+    // Eviction of sampled textures (docs/gpu-memory-budget.md). Every lookup that returns a
+    // texture stamps its entry with the command buffer sequence number and time set here: the
+    // renderer calls SetUse at each commit with the number of the command buffer that work
+    // encoded from now on belongs to.
+    void SetUse(uint64_t seq, uint64_t now_ns);
+    // Evicts sampled textures chosen by ps4_texcache_select: only entries whose last command
+    // buffer has completed (completed_seq), least recently used first. GPU-owned surfaces are
+    // never evicted here (see EvictSuperseded). An evicted texture still referenced by a command buffer lives until that
+    // command buffer is done; its next lookup creates and uploads it again.
+    struct EvictResult {
+        uint64_t count = 0, bytes = 0;
+    };
+    EvictResult EvictSampled(const ps4_texcache_policy& p, bool gpu_over, uint64_t now_ns, uint64_t completed_seq);
+    // GPU-owned surfaces: how many are superseded (see EvictSuperseded) and how many were not
+    // looked up for idle_ns. Takes the lock and walks the GPU-owned entries.
+    struct GpuOwnedStats {
+        uint64_t superseded_count = 0, superseded_bytes = 0, idle_count = 0, idle_bytes = 0;
+    };
+    GpuOwnedStats GetGpuOwnedStats(uint64_t idle_ns) const;
+    // Evicts superseded GPU-owned surfaces: ones whose whole guest range exactly known writes of
+    // other GPU-owned surfaces (NoteExactWrite, compute copies) covered after this one's last use
+    // (on the PS4 their bytes are overwritten), not looked up for idle_ns and whose last command
+    // buffer has completed. Partial cover, draws, storage stores, or a newer surface that was only
+    // created or read keep the surface: GPU-only contents are never dropped.
+    EvictResult EvictSuperseded(uint64_t idle_ns, uint64_t now_ns, uint64_t completed_seq);
+    // GPU-owned textures the cache dropped (superseded evictions, depth arrays replaced when they
+    // grew), handed to the renderer so it forgets state keyed by their pointers before they are
+    // freed; the cache keeps them alive until taken. Cheap when there are none.
+    void TakeRetired(std::vector<id<MTLTexture>>* out);
+    // Totals since start (any thread).
+    uint64_t EvictedCount() const { return evicted_count_.load(std::memory_order_relaxed); }
+    uint64_t EvictedBytes() const { return evicted_bytes_.load(std::memory_order_relaxed); }
+    uint64_t EvictedGpuCount() const { return evicted_gpu_count_.load(std::memory_order_relaxed); }
+    uint64_t EvictedGpuBytes() const { return evicted_gpu_bytes_.load(std::memory_order_relaxed); }
+
 private:
     struct Entry;
     bool UploadLocked(Entry* e);
@@ -844,6 +898,15 @@ private:
     id<MTLTexture> GetTextureImpl(const ImageDesc& img, const uint64_t* gpu_epochs, GpuUpload* up,
                                   uint64_t refresh_min_bytes = 0);
     void WaitIdleLocked();
+    // Adds (sign +1) or removes (sign -1) an entry's texture in the MemStats counters.
+    void TrackLocked(const Entry* e, int sign);
+    // Stamps the entry's last use with the SetUse values (ExactWriteLocked: and an exactly known
+    // write of guest [lo, hi), clipped to the entry).
+    void TouchLocked(const Entry* e) const;
+    void ExactWriteLocked(const Entry* e, uint64_t lo, uint64_t hi, uint64_t seq = 0) const;
+    void RetireLocked(id<MTLTexture> t);
+    std::vector<id<MTLTexture>> retired_;
+    std::atomic<bool> retired_pending_{false};
 
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
@@ -852,11 +915,22 @@ private:
     mutable std::mutex mutex_;
     std::unordered_multimap<uint64_t, Entry*> entries_; // keyed by guest address
     // Address ranges of GPU-owned entries sorted by start, with the running maximum of their
-    // ends, for OverlapsGpuTexture. Entries are only ever added (or all cleared), so the index
-    // is rebuilt whenever entries_ has grown.
+    // ends, for OverlapsGpuTexture. gpu_version_ changes whenever a GPU-owned entry is added,
+    // removed or resized (TrackLocked); the index is rebuilt when it was built for another
+    // version. (The entry count is no such signal: sampled entries are evicted.)
     mutable std::vector<std::pair<uint64_t, uint64_t>> gpu_ranges_;
     mutable std::vector<uint64_t> gpu_max_end_;
-    mutable size_t gpu_index_entries_ = ~size_t(0);
+    uint64_t gpu_version_ = 0;
+    mutable uint64_t gpu_index_version_ = ~0ull;
+    std::atomic<uint64_t> sampled_count_{0}, sampled_bytes_{0}, gpu_count_{0}, gpu_bytes_{0};
+    std::atomic<uint64_t> evicted_count_{0}, evicted_bytes_{0}, evicted_gpu_count_{0}, evicted_gpu_bytes_{0};
+    // GPU-owned entries sorted by address, with their superseded flags (SupersededLocked)
+    void SupersededLocked(std::vector<Entry*>* v, std::vector<char>* sup) const;
+    // last use stamped on lookups (SetUse); before the first commit, command buffer 1
+    std::atomic<uint64_t> use_seq_{1}, use_ns_{0};
+    // EvictSampled scratch, kept to avoid allocations per pass
+    std::vector<ps4_texcache_item> evict_items_;
+    std::vector<std::unordered_multimap<uint64_t, Entry*>::iterator> evict_its_;
 };
 #endif
 

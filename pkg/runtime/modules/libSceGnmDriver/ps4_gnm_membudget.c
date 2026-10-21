@@ -52,6 +52,53 @@ void ps4_gpumem_policy_init(ps4_gpumem_policy *p, uint64_t mem_total, const char
     p->press_ns = 250000000ull;
 }
 
+void ps4_texcache_policy_init(ps4_texcache_policy *p, const ps4_gpumem_policy *gp, const char *tex_mb,
+                              const char *keep_ms) {
+    memset(p, 0, sizeof(*p));
+    const uint64_t mb = parse_u64(tex_mb);
+    const int mb_zero = tex_mb && tex_mb[0] == '0' && tex_mb[1] == 0;
+    if (mb_zero) p->budget = UINT64_MAX;
+    else if (mb && mb <= (UINT64_MAX >> 20)) p->budget = mb << 20;
+    else p->budget = gp->budget == UINT64_MAX ? UINT64_MAX : gp->budget / 12;
+    p->low_water = p->budget == UINT64_MAX ? UINT64_MAX : p->budget / 10 * 9;
+    uint64_t keep = keep_ms ? parse_u64(keep_ms) : 2000;
+    if (!keep) keep = 2000;
+    if (keep < 100) keep = 100;
+    p->keep_ns = keep * 1000000ull;
+    p->press_ns = gp->press_ns < 100000000ull ? 100000000ull : gp->press_ns;
+}
+
+int ps4_texcache_evict_due(const ps4_texcache_policy *p, uint64_t sampled_bytes, int gpu_over) {
+    return gpu_over || sampled_bytes > p->budget;
+}
+
+static int texcache_lru_cmp(const void *a, const void *b) {
+    const ps4_texcache_item *x = (const ps4_texcache_item *)a, *y = (const ps4_texcache_item *)b;
+    if (x->last_ns != y->last_ns) return x->last_ns < y->last_ns ? -1 : 1;
+    if (x->last_seq != y->last_seq) return x->last_seq < y->last_seq ? -1 : 1;
+    return x->id < y->id ? -1 : x->id > y->id;
+}
+
+uint64_t ps4_texcache_select(ps4_texcache_item *items, uint64_t n, uint64_t total, const ps4_texcache_policy *p,
+                             int gpu_over, uint64_t now_ns, uint64_t completed_seq, uint64_t *freed) {
+    *freed = 0;
+    if (!ps4_texcache_evict_due(p, total, gpu_over)) return 0;
+    const uint64_t min_age = gpu_over ? p->press_ns : p->keep_ns;
+    // candidates to the front
+    uint64_t m = 0;
+    for (uint64_t i = 0; i < n; ++i) {
+        const ps4_texcache_item it = items[i];
+        if (it.last_seq > completed_seq) continue;            // a command buffer may still use it
+        if (now_ns < it.last_ns || now_ns - it.last_ns < min_age) continue; // used recently
+        items[i] = items[m];
+        items[m++] = it;
+    }
+    qsort(items, (size_t)m, sizeof(*items), texcache_lru_cmp);
+    uint64_t k = 0;
+    while (k < m && (gpu_over || (*freed < total && total - *freed > p->low_water))) *freed += items[k++].bytes;
+    return k;
+}
+
 enum ps4_gpumem_admit ps4_gpumem_admit_nocopy(const ps4_gpumem_policy *p, uint64_t length, int has_holes) {
     if (length > p->nocopy_max) return PS4_GPUMEM_REFUSE_TOO_LARGE;
     if (has_holes) return PS4_GPUMEM_REFUSE_HOLES;

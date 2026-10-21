@@ -134,6 +134,44 @@ int ps4_gpumem_range_has_holes(const void *p, uint64_t len);
 uint64_t ps4_gpumem_for_each_readable(const void *p, uint64_t len,
                                       void (*fn)(void *ctx, uint64_t offset, uint64_t n), void *ctx);
 
+// ---- Texture cache eviction ----
+// Sampled textures are detiled copies of guest memory: an evicted one is created and uploaded
+// again on its next use. GPU-owned surfaces (render targets, depth, storage images) hold the only
+// copy of what the GPU wrote; the cache evicts them only when superseded
+// (TextureCache::EvictSuperseded), never by this policy.
+typedef struct ps4_texcache_policy {
+    uint64_t budget;   // sampled texture bytes kept; above it the cache evicts down to low_water
+    uint64_t low_water;// 90% of budget
+    uint64_t keep_ns;  // cache over its budget: textures used within keep_ns stay
+    uint64_t press_ns; // GPU memory over budget: textures used within press_ns stay, all others go
+} ps4_texcache_policy;
+// tex_mb: PS4_GNM_TEX_CACHE_MB (NULL when unset; "0" = no cache budget, only GPU budget
+// pressure evicts). Default: a twelfth of the GPU budget gp->budget, 546 MiB on 16 GB (U4 chapter 1
+// keeps its 2 s working set under 512 MiB without an fps cost; 256 MiB thrashes). UINT64_MAX stays unlimited.
+// keep_ms: PS4_GNM_TEX_KEEP_MS (default 2000). Both ages are at least 100 ms: a texture just
+// looked up for the open command buffer is never a candidate, even before it is bound.
+void ps4_texcache_policy_init(ps4_texcache_policy *p, const ps4_gpumem_policy *gp, const char *tex_mb,
+                              const char *keep_ms);
+
+// 1 when an eviction pass is worth running: GPU memory over budget, or the sampled bytes over
+// the cache budget.
+int ps4_texcache_evict_due(const ps4_texcache_policy *p, uint64_t sampled_bytes, int gpu_over);
+
+typedef struct ps4_texcache_item {
+    uint64_t last_ns;  // time of the last lookup (the commit time it was stamped with)
+    uint64_t last_seq; // sequence number of the command buffer that last used it
+    uint64_t bytes;
+    uint64_t id;       // caller's handle
+} ps4_texcache_item;
+// Chooses the textures to evict out of items[0..n), whose bytes sum to `total`: it reorders
+// items so that the victims come first and returns their count (their bytes in *freed).
+// A texture is a candidate only when every command buffer that may use it has completed
+// (last_seq <= completed_seq) and it was not used within keep_ns (press_ns when gpu_over).
+// Least recently used candidates go first, until total - freed <= low_water; with gpu_over,
+// every candidate goes.
+uint64_t ps4_texcache_select(ps4_texcache_item *items, uint64_t n, uint64_t total, const ps4_texcache_policy *p,
+                             int gpu_over, uint64_t now_ns, uint64_t completed_seq, uint64_t *freed);
+
 // System inputs of a sample: wired (system-wide), phys_footprint, hw.memsize.
 uint64_t ps4_gpumem_wired_bytes(void);
 uint64_t ps4_gpumem_footprint_bytes(void);
