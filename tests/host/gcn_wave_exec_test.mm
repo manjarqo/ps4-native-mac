@@ -313,6 +313,16 @@ void TestReadWriteLane(id<MTLDevice> dev) {
     out = RunWave64(dev, "writelane", 0x5CA1AB1E00000009ULL,
                     {0xBE8C0387, 0xD2040001, 0x0001060C, 0xD2040001, 0x0001500C, kStoreV3, 0x80010102});
     ExpectLanes("writelane", out, [](uint32_t l) { return l == 3 || l == 40 ? 7u : 100u + l; });
+    // An SGPR spilled to lane 40 and read back in a loop on vcc (non-uniform control flow, where
+    // the halves cannot exchange): every lane must read the spilled value. User data: s2 = 77
+    // (the value), s3 = s8 = 40 (write and read lanes), s9 = 0 (vcc shift).
+    // v_writelane v3, s2, s3; v5 = 0; v1 = 0;
+    // do { s10 = v_readlane(v3, s8); v5 += s10; v1 += 1; vcc = (3 > v1) << s9; } while (vccnz)
+    out = RunWave64(dev, "spill read in loop", 0x5CA1AB1E00000011ULL,
+                    {0xD2040003, 0x00000602, 0x7E0A0280, 0x7E020280, 0xD202000A, 0x00001103, 0x4A0A0A0A, 0x4A020281,
+                     0x7D880283, 0x8FEA096A, 0xBF87FFF9, kStoreV3, 0x80010502},
+                    64, {{2, 77}, {3, 40}, {8, 40}, {9, 0}});
+    ExpectLanes("spill read in loop", out, [](uint32_t) { return 3u * 77u; });
 }
 
 //  F. Scalar instructions on EXEC and on 64-bit masks with only upper-half bits, and a mask

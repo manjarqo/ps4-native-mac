@@ -264,6 +264,104 @@ static bool ReachesAny(const IR::Value& value, const std::unordered_set<const IR
     return false;
 }
 
+// PS4Recomp: v_readlane of a register built by v_writelane (SGPRs spilled to VGPR lanes) in a
+// wave64 that runs as two 32-wide subgroups. A lane of the other half lives in the other
+// subgroup, which non-uniform control flow cannot reach. Each subgroup keeps both halves of such
+// a register instead: the register value (its own half) and a shadow with the other half, which
+// v_writelane to a lane of the other half updates. v_readlane picks the half holding its lane and
+// reads it in the subgroup, with no exchange, in any control flow. Values not built by
+// v_writelane have no shadow: their other half reads as this subgroup's (as before).
+static void LowerSpilledLaneReads(IR::Program& program,
+                                  std::unordered_set<const IR::Inst*>& local_reads) {
+    std::unordered_set<IR::Inst*> built; // v_writelane results and phis of them
+    std::vector<IR::Inst*> phis;
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::WriteLane) {
+                built.insert(&inst);
+            }
+        }
+    }
+    if (built.empty()) {
+        return;
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (IR::Block* block : program.blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                if (inst.GetOpcode() != IR::Opcode::Phi || built.contains(&inst)) {
+                    continue;
+                }
+                for (size_t i = 0; i < inst.NumArgs(); ++i) {
+                    const IR::Value arg = inst.Arg(i);
+                    if (!arg.IsImmediate() && built.contains(arg.Inst())) {
+                        built.insert(&inst);
+                        phis.push_back(&inst);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    std::unordered_map<const IR::Inst*, IR::Value> other;
+    const auto other_of = [&](const IR::Value& value) {
+        if (!value.IsImmediate()) {
+            if (const auto it = other.find(value.Inst()); it != other.end()) {
+                return it->second;
+            }
+        }
+        return value;
+    };
+    const auto own_half = [](IR::IREmitter& ir) {
+        return ir.BitwiseAnd(
+            ir.ShiftRightLogical(ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex), ir.Imm32(5u)),
+            ir.Imm32(1u));
+    };
+    for (IR::Inst* phi : phis) {
+        IR::Block* const block = phi->GetParent();
+        IR::Inst* const shadow =
+            &*block->PrependNewInst(IR::Block::InstructionList::s_iterator_to(*phi), IR::Opcode::Phi);
+        shadow->SetFlags(IR::Type::U32);
+        other[phi] = IR::Value{shadow};
+    }
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::WriteLane) {
+                continue;
+            }
+            IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+            const IR::U32 lane = ir.BitwiseAnd(IR::U32{inst.Arg(2)}, ir.Imm32(63u));
+            const IR::U32 index = ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex);
+            const IR::U1 is_lane = ir.LogicalAnd(
+                ir.IEqual(ir.BitwiseAnd(index, ir.Imm32(31u)), ir.BitwiseAnd(lane, ir.Imm32(31u))),
+                ir.INotEqual(ir.ShiftRightLogical(lane, ir.Imm32(5u)), own_half(ir)));
+            other[&inst] = ir.Select(is_lane, inst.Arg(1), other_of(inst.Arg(0)));
+        }
+    }
+    for (IR::Inst* phi : phis) {
+        IR::Inst* const shadow = other.at(phi).Inst();
+        for (size_t i = 0; i < phi->NumArgs(); ++i) {
+            shadow->AddPhiOperand(phi->PhiBlock(i), other_of(phi->Arg(i)));
+        }
+    }
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::ReadLane || inst.Arg(0).IsImmediate() ||
+                !built.contains(inst.Arg(0).Inst())) {
+                continue;
+            }
+            IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+            const IR::U32 lane = ir.BitwiseAnd(IR::U32{inst.Arg(1)}, ir.Imm32(63u));
+            const IR::U1 own = ir.IEqual(ir.ShiftRightLogical(lane, ir.Imm32(5u)), own_half(ir));
+            const IR::U32 value{ir.Select(own, inst.Arg(0), other_of(inst.Arg(0)))};
+            const IR::U32 read = ir.ReadLane(value, ir.BitwiseAnd(lane, ir.Imm32(31u)));
+            local_reads.insert(read.Inst());
+            inst.ReplaceUsesWithAndRemove(read);
+        }
+    }
+}
+
 // PS4Recomp: GCN lane of this invocation (0..63). A wave64 compute shader on a smaller subgroup
 // runs each wave as several subgroups, and its GCN lane is the local invocation index modulo 64.
 static IR::U32 GcnLane(IR::IREmitter& ir, bool split) {
@@ -302,6 +400,11 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
         DeadCodeEliminationPass(program);
     }
 
+    std::unordered_set<const IR::Inst*> local_reads;
+    if (split) {
+        LowerSpilledLaneReads(program, local_reads);
+    }
+
     // A workgroup whose last wave has 32 lanes or fewer: that wave has no upper half.
     const bool last_wave_half = num_threads % 64 != 0 && num_threads % 64 <= 32;
     std::vector<IR::Inst*> write_lanes;
@@ -336,7 +439,9 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
             if (op == IR::Opcode::InverseBallot) {
                 inverse_ballots.push_back(&inst);
             } else if (op == IR::Opcode::ReadLane || op == IR::Opcode::ReadFirstLane) {
-                push_worklist(inst);
+                if (!local_reads.contains(&inst)) {
+                    push_worklist(inst);
+                }
             } else if (op == IR::Opcode::Ballot) {
                 const IR::Value bit = inst.Arg(0);
                 if (is_uniform && bit.IsImmediate() && bit.U1()) {
