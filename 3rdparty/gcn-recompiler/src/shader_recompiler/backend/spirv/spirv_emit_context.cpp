@@ -72,7 +72,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma) {
+    if (info.uses_dma || info.uses_guest_memory) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -173,7 +173,7 @@ void EmitContext::DefineArithmeticTypes() {
     if (info.uses_fp64) {
         frexp_result_f64 = Name(TypeStruct(F64[1], S32[1]), "frexp_result_f64");
     }
-    if (info.uses_dma) {
+    if (info.uses_dma || info.uses_guest_memory) {
         physical_pointer_type_u32 = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[1]);
     }
 }
@@ -1306,6 +1306,115 @@ Id EmitContext::DefineGetBdaPointer() {
     return func;
 }
 
+// PS4Recomp: guest memory through the page table (GuestMemory in resource.h). Each function
+// checks the 40-bit address, records the 1 MiB page it reads or writes, and records an unmapped
+// 64 MiB page instead of accessing it. In a probe (mode word 1) stores do nothing else.
+void EmitContext::DefineGuestMemoryFunctions() {
+    namespace G = GuestMemory;
+    const auto& fault_buffer{buffers[fault_buffer_index]};
+    const auto [fault_id, fault_ptr_type] = fault_buffer.Alias(PointerType::U32);
+    const auto& pt_buffer{buffers[bda_pagetable_index]};
+    const auto [pt_id, pt_ptr_type] = pt_buffer.Alias(PointerType::U64);
+    const Id scope = ConstU32(static_cast<u32>(spv::Scope::Device));
+    const Id semantics = u32_zero_value;
+    const auto fault_word = [&](Id index) {
+        return OpAccessChain(fault_ptr_type, fault_id, u32_zero_value, index);
+    };
+    // fault[base + (bit >> 5)] |= 1 << (bit & 31), with the atomic only when the bit is clear
+    const auto set_bit = [&](u32 base, Id bit) {
+        const Id ptr = fault_word(OpIAdd(U32[1], ConstU32(base), OpShiftRightLogical(U32[1], bit, ConstU32(5U))));
+        const Id mask = OpShiftLeftLogical(U32[1], u32_one_value, OpBitwiseAnd(U32[1], bit, ConstU32(31U)));
+        const Id is_clear =
+            OpIEqual(U1[1], OpBitwiseAnd(U32[1], OpLoad(U32[1], ptr), mask), u32_zero_value);
+        const Id set_label = OpLabel();
+        const Id merge_label = OpLabel();
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(is_clear, set_label, merge_label);
+        AddLabel(set_label);
+        OpAtomicOr(U32[1], ptr, scope, semantics, mask);
+        OpBranch(merge_label);
+        AddLabel(merge_label);
+    };
+    const auto is_probe = [&] {
+        return OpINotEqual(U1[1], OpLoad(U32[1], fault_word(ConstU32(G::ModeDword))), u32_zero_value);
+    };
+    const auto report = [&](Id bits) {
+        OpAtomicOr(U32[1], fault_word(ConstU32(G::StatusDword)), scope, semantics, bits);
+    };
+    // Emits the checks shared by loads and stores and returns the host pointer of a mapped
+    // page; the blocks of the failed checks end with `fail` (a return).
+    const auto checked_page = [&](Id address, u32 track_base, auto&& fail) {
+        const Id page64 = OpShiftRightLogical(U64, address, ConstU32(G::PageShift));
+        const Id in_space = OpULessThan(U1[1], page64, Constant(U64, u64(G::NumPages)));
+        const Id range_label = OpLabel();
+        const Id ok_label = OpLabel();
+        OpSelectionMerge(ok_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(in_space, ok_label, range_label);
+        AddLabel(range_label);
+        report(ConstU32(G::StatusRange));
+        fail();
+        AddLabel(ok_label);
+        const Id page = OpUConvert(U32[1], page64);
+        set_bit(track_base, OpUConvert(U32[1], OpShiftRightLogical(U64, address, ConstU32(G::TrackShift))));
+        const Id entry = OpLoad(U64, OpAccessChain(pt_ptr_type, pt_id, u32_zero_value, page));
+        const Id unmapped_label = OpLabel();
+        const Id mapped_label = OpLabel();
+        OpSelectionMerge(mapped_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(OpIEqual(U1[1], entry, u64_zero_value), unmapped_label, mapped_label);
+        AddLabel(unmapped_label);
+        set_bit(G::UnmappedDword, page);
+        report(OpSelect(U32[1], is_probe(), u32_zero_value, ConstU32(G::StatusUnmapped)));
+        fail();
+        AddLabel(mapped_label);
+        const Id offset = OpBitwiseAnd(U64, address, Constant(U64, (u64(1) << G::PageShift) - 1));
+        return OpConvertUToPtr(physical_pointer_type_u32, OpIAdd(U64, entry, offset));
+    };
+    {
+        guest_not_probe = OpFunction(U1[1], spv::FunctionControlMask::MaskNone, TypeFunction(U1[1]));
+        Name(guest_not_probe, "guest_not_probe");
+        AddLabel();
+        OpReturnValue(OpLogicalNot(U1[1], is_probe()));
+        OpFunctionEnd();
+    }
+    {
+        guest_report = OpFunction(void_id, spv::FunctionControlMask::MaskNone, TypeFunction(void_id, U32[1]));
+        const Id bits = OpFunctionParameter(U32[1]);
+        Name(guest_report, "guest_report");
+        AddLabel();
+        report(bits);
+        OpReturn();
+        OpFunctionEnd();
+    }
+    {
+        guest_load = OpFunction(U32[1], spv::FunctionControlMask::MaskNone, TypeFunction(U32[1], U64));
+        const Id address = OpFunctionParameter(U64);
+        Name(guest_load, "guest_load");
+        AddLabel();
+        const Id ptr = checked_page(address, G::ReadDword, [&] { OpReturnValue(u32_zero_value); });
+        OpReturnValue(OpLoad(U32[1], ptr, spv::MemoryAccessMask::Aligned, 4u));
+        OpFunctionEnd();
+    }
+    {
+        guest_store =
+            OpFunction(void_id, spv::FunctionControlMask::MaskNone, TypeFunction(void_id, U64, U32[1]));
+        const Id address = OpFunctionParameter(U64);
+        const Id value = OpFunctionParameter(U32[1]);
+        Name(guest_store, "guest_store");
+        AddLabel();
+        const Id ptr = checked_page(address, G::WrittenDword, [&] { OpReturn(); });
+        const Id store_label = OpLabel();
+        const Id merge_label = OpLabel();
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(is_probe(), merge_label, store_label);
+        AddLabel(store_label);
+        OpStore(ptr, value, spv::MemoryAccessMask::Aligned, 4u);
+        OpBranch(merge_label);
+        AddLabel(merge_label);
+        OpReturn();
+        OpFunctionEnd();
+    }
+}
+
 Id EmitContext::DefineReadConst(bool dynamic) {
     const auto func_type{!dynamic ? TypeFunction(U32[1], U32[2], U32[1], U32[1])
                                   : TypeFunction(U32[1], U32[2], U32[1])};
@@ -1347,6 +1456,9 @@ void EmitContext::DefineFunctions() {
     }
     if (info.uses_dma) {
         get_bda_pointer = DefineGetBdaPointer();
+    }
+    if (info.uses_guest_memory) {
+        DefineGuestMemoryFunctions();
     }
 
     if (True(info.readconst_types & Info::ReadConstType::Immediate)) {

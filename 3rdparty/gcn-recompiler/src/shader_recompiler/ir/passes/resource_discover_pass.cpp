@@ -350,11 +350,11 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
     // so the extended userdata flattening pass will include them.
     for (size_t i = 0; i < sharp.num_dwords; i++) {
         IR::Inst* source = sharp.dwords[i].TryInst();
-        if (!source) {
+        if (!source || !IsSharpSource(source)) {
+            // PS4Recomp: a dword the shader computes; the resource patching pass decides whether
+            // the access can use it (buffers: guest memory access, LowerDynamicBufferAccess)
             continue;
         }
-        ASSERT_MSG(IsSharpSource(source), "Sharp dword {} of {} produced by {}", i, sharp.num_dwords,
-                   IR::NameOf(source->GetOpcode()));
         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {
             auto flags = source->Flags<IR::BufferInstInfo>();
             flags.sharp_source.Assign(1u);

@@ -17,6 +17,30 @@ static constexpr u32 NUM_BUFFERS = 56;
 static constexpr u32 NUM_SAMPLERS = 16;
 static constexpr u32 NUM_FMASKS = 8;
 
+// PS4Recomp: guest memory reached by buffer accesses through V#s the shader loads at run time
+// (Info::uses_guest_memory). Mirrored as GCN_GUEST_* in include/gcn_recompiler.h.
+namespace GuestMemory {
+// BufferType::BdaPagetable: one u64 per 64 MiB page of the 40-bit guest address space, the GPU
+// address of host memory holding that page (0: not mapped)
+constexpr u32 PageShift = 26;
+constexpr u32 NumPages = 1u << (40 - PageShift);
+// read / written pages are tracked at 1 MiB
+constexpr u32 TrackShift = 20;
+constexpr u32 NumTrackPages = 1u << (40 - TrackShift);
+// BufferType::FaultBuffer dwords
+constexpr u32 ModeDword = 0;     // 1: probe (nothing is written), 0: the real dispatch
+constexpr u32 StatusDword = 1;   // Status* bits
+constexpr u32 UnmappedDword = 4; // bit p: page p was accessed while its page table entry was 0
+constexpr u32 ReadDword = UnmappedDword + NumPages / 32;       // bit t: 1 MiB page t was read
+constexpr u32 WrittenDword = ReadDword + NumTrackPages / 32;   // bit t: ... written (or would be)
+constexpr u32 FaultDwords = WrittenDword + NumTrackPages / 32;
+constexpr u32 StatusUnmapped = 1u << 0; // an access outside a probe hit an unmapped page (skipped)
+constexpr u32 StatusFormat = 1u << 1;   // a V# with a data/number format the shader cannot convert
+constexpr u32 StatusSwizzle = 1u << 2;  // a swizzled V# (swizzle_enable)
+constexpr u32 StatusRange = 1u << 3;    // an address at or above 2^40
+constexpr u32 StatusUnaligned = 1u << 4; // a dword access at an address that is not 4-aligned
+} // namespace GuestMemory
+
 using SharpLocation = u16;
 
 constexpr SharpLocation UNKNOWN_LOCATION = std::numeric_limits<u16>::max();

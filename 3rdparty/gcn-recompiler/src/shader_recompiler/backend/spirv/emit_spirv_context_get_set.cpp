@@ -536,7 +536,7 @@ static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, I
             const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
             Id value_i = N == 1 ? value : ctx.OpCompositeExtract(data_types[1], value, i);
             if (alias != PointerType::U32) value_i = ctx.OpBitcast(ctx.U32[1], value_i);
-            ctx.EmitBoundsCheckedStore(index_i, guest_size, [&] {
+            ctx.EmitBoundsCheckedStore(spv_buffer.buffer_type, index_i, guest_size, [&] {
                 const Id p0 = ctx.OpAccessChain(u32_ptr, uid, ctx.u32_zero_value, index_i);
                 const Id p1 = ctx.OpAccessChain(u32_ptr, uid, ctx.u32_zero_value,
                                                 ctx.OpIAdd(ctx.U32[1], index_i, ctx.ConstU32(1u)));
@@ -553,7 +553,7 @@ static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, I
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
         const Id value_i = N == 1 ? value : ctx.OpCompositeExtract(data_types[1], value, i);
-        ctx.EmitBoundsCheckedStore(index_i, size, [&] {
+        ctx.EmitBoundsCheckedStore(spv_buffer.buffer_type, index_i, size, [&] {
             const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
             ctx.OpStore(ptr_i, value_i);
         });
@@ -566,7 +566,7 @@ void EmitStoreBufferU8(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id v
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
-    ctx.EmitBoundsCheckedStore(address, spv_buffer.Size(PointerSize::B8), [&] {
+    ctx.EmitBoundsCheckedStore(spv_buffer.buffer_type, address, spv_buffer.Size(PointerSize::B8), [&] {
         const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
         ctx.OpStore(ptr, value);
     });
@@ -580,7 +580,7 @@ void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id 
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
-    ctx.EmitBoundsCheckedStore(address, spv_buffer.Size(PointerSize::B16), [&] {
+    ctx.EmitBoundsCheckedStore(spv_buffer.buffer_type, address, spv_buffer.Size(PointerSize::B16), [&] {
         const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
         ctx.OpStore(ptr, value);
     });
@@ -610,7 +610,7 @@ void EmitStoreBufferU64(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id 
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U64);
-    ctx.EmitBoundsCheckedStore(address, spv_buffer.Size(PointerSize::B64), [&] {
+    ctx.EmitBoundsCheckedStore(spv_buffer.buffer_type, address, spv_buffer.Size(PointerSize::B64), [&] {
         const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u64_zero_value, address)};
         ctx.OpStore(ptr, value);
     });
@@ -634,6 +634,42 @@ void EmitStoreBufferF32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 
 void EmitStoreBufferFormatF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
     UNREACHABLE_MSG("SPIR-V instruction");
+}
+
+// PS4Recomp: guest memory through the page table (EmitContext::DefineGuestMemoryFunctions).
+Id EmitLoadGuestU32(EmitContext& ctx, Id address, Id enable) {
+    const Id load_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    const Id entry_label = ctx.last_label;
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(enable, load_label, merge_label);
+    ctx.AddLabel(load_label);
+    const Id value = ctx.OpFunctionCall(ctx.U32[1], ctx.guest_load, address);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+    return ctx.OpPhi(ctx.U32[1], value, load_label, ctx.u32_zero_value, entry_label);
+}
+
+void EmitStoreGuestU32(EmitContext& ctx, Id address, Id enable, Id value) {
+    const Id store_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(enable, store_label, merge_label);
+    ctx.AddLabel(store_label);
+    ctx.OpFunctionCall(ctx.void_id, ctx.guest_store, address, value);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
+void EmitGuestReportStatus(EmitContext& ctx, Id condition, Id bits) {
+    const Id report_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(condition, report_label, merge_label);
+    ctx.AddLabel(report_label);
+    ctx.OpFunctionCall(ctx.void_id, ctx.guest_report, bits);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
 }
 
 void EmitGetScalarRegister(EmitContext&) {

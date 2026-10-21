@@ -148,12 +148,12 @@ public:
     // loads (shadPS4 gets this from Vulkan robustBufferAccess; Metal has no such feature).
     // `size` is the buffer size in elements of the accessed width (invalid Id = unchecked).
     template <typename F>
-    void EmitBoundsCheckedStore(Id index, Id size, F&& emit_store) {
-        if (!Sirit::ValidId(size)) {
+    void EmitBoundsCheckedStore(BufferType type, Id index, Id size, F&& emit_store) {
+        if (!Sirit::ValidId(size) && !ProbeGuarded(type)) {
             emit_store();
             return;
         }
-        const Id in_bounds = OpULessThan(U1[1], index, size);
+        const Id in_bounds = WriteAllowed(type, Sirit::ValidId(size) ? OpULessThan(U1[1], index, size) : true_value);
         const Id store_label = OpLabel();
         const Id merge_label = OpLabel();
         OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
@@ -166,11 +166,12 @@ public:
 
     // Like EmitBoundsCheckedStore, but the access produces a value (atomics): 0 when OOB.
     template <typename F>
-    Id EmitBoundsCheckedValue(Id type, Id zero, Id index, Id size, F&& emit_access) {
-        if (!Sirit::ValidId(size)) {
+    Id EmitBoundsCheckedValue(BufferType buffer_type, Id type, Id zero, Id index, Id size, F&& emit_access) {
+        if (!Sirit::ValidId(size) && !ProbeGuarded(buffer_type)) {
             return emit_access();
         }
-        const Id in_bounds = OpULessThan(U1[1], index, size);
+        const Id in_bounds =
+            WriteAllowed(buffer_type, Sirit::ValidId(size) ? OpULessThan(U1[1], index, size) : true_value);
         const Id access_label = OpLabel();
         const Id merge_label = OpLabel();
         const Id entry_label = last_label;
@@ -182,6 +183,55 @@ public:
         OpBranch(merge_label);
         AddLabel(merge_label);
         return OpPhi(type, result, access_last, zero, entry_label);
+    }
+
+    // PS4Recomp: a shader with guest memory accesses (Info::uses_guest_memory) first runs as a
+    // probe (fault buffer mode word 1) that only finds the guest pages it needs: none of its
+    // stores, atomics or image writes may take effect then (workgroup memory spilled to a
+    // storage buffer is the dispatch's own scratch: written as usual).
+    bool ProbeGuarded(BufferType type) const {
+        return info.uses_guest_memory && type != BufferType::SharedMemory;
+    }
+    // `cond` and "not a probe"
+    Id WriteAllowed(BufferType type, Id cond) {
+        if (!ProbeGuarded(type)) {
+            return cond;
+        }
+        return OpLogicalAnd(U1[1], cond, OpFunctionCall(U1[1], guest_not_probe));
+    }
+
+    // Image writes and atomics: emitted only outside a probe (atomics return `zero` there).
+    template <typename F>
+    void EmitUnlessProbe(F&& emit) {
+        if (!info.uses_guest_memory) {
+            emit();
+            return;
+        }
+        const Id run_label = OpLabel();
+        const Id merge_label = OpLabel();
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(OpFunctionCall(U1[1], guest_not_probe), run_label, merge_label);
+        AddLabel(run_label);
+        emit();
+        OpBranch(merge_label);
+        AddLabel(merge_label);
+    }
+    template <typename F>
+    Id EmitValueUnlessProbe(Id type, Id zero, F&& emit) {
+        if (!info.uses_guest_memory) {
+            return emit();
+        }
+        const Id run_label = OpLabel();
+        const Id merge_label = OpLabel();
+        const Id entry_label = last_label;
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(OpFunctionCall(U1[1], guest_not_probe), run_label, merge_label);
+        AddLabel(run_label);
+        const Id result = emit();
+        const Id run_last = last_label;
+        OpBranch(merge_label);
+        AddLabel(merge_label);
+        return OpPhi(type, result, run_last, zero, entry_label);
     }
 
     // Loads: clamp the index to 0 when out of range (keeps the access inside the bound
@@ -456,6 +506,11 @@ public:
     Id f32_to_uf10{};
 
     Id get_bda_pointer{};
+    // PS4Recomp guest memory (DefineGuestMemoryFunctions)
+    Id guest_not_probe{};    // bool(): the fault buffer's mode word is not "probe"
+    Id guest_load{};         // uint(ulong address)
+    Id guest_store{};        // void(ulong address, uint value)
+    Id guest_report{};       // void(uint status bits)
 
     Id read_const{};
     Id read_const_dynamic{};
@@ -482,6 +537,7 @@ private:
     Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);
 
     Id DefineGetBdaPointer();
+    void DefineGuestMemoryFunctions();
 
     Id DefineReadConst(bool dynamic);
 

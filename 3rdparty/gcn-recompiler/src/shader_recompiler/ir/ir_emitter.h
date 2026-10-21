@@ -137,6 +137,9 @@ public:
                         const Value& data, BufferInstInfo info);
     void StoreBufferFormat(const Value& handle, const Value& address, const Value& data,
                            BufferInstInfo info);
+    [[nodiscard]] U32 LoadGuestU32(const U64& address, const U1& enable);
+    void StoreGuestU32(const U64& address, const U1& enable, const U32& value);
+    void GuestReportStatus(const U1& condition, u32 status_bits);
 
     [[nodiscard]] Value BufferAtomicIAdd(const Value& handle, const Value& address,
                                          const Value& value, BufferInstInfo info);

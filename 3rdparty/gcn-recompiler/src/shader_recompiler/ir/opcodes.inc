@@ -133,6 +133,13 @@ OPCODE(StoreBufferF32x3,                                    Void,           Opaq
 OPCODE(StoreBufferF32x4,                                    Void,           Opaque,         Opaque,         F32x4,                                          )
 OPCODE(StoreBufferFormatF32,                                Void,           Opaque,         Opaque,         F32x4,                                          )
 
+// Guest memory addressed by a 40-bit guest address computed in the shader (buffer accesses through
+// a V# loaded at run time): address, enable (false: the load returns 0, the store does nothing)
+OPCODE(LoadGuestU32,                                        U32,            U64,            U1,                                                             )
+OPCODE(StoreGuestU32,                                       Void,           U64,            U1,             U32,                                            )
+// Sets GCN_GUEST_STATUS_* bits in the fault buffer when the condition holds
+OPCODE(GuestReportStatus,                                   Void,           U1,             U32,                                                            )
+
 // Buffer atomic operations
 OPCODE(BufferAtomicIAdd32,                                  U32,            Opaque,         Opaque,         U32                                             )
 OPCODE(BufferAtomicIAdd64,                                  U64,            Opaque,         Opaque,         U64                                             )

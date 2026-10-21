@@ -87,6 +87,9 @@ void EmitStoreBufferF32x2(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 void EmitStoreBufferF32x3(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
 void EmitStoreBufferF32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
 void EmitStoreBufferFormatF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
+Id EmitLoadGuestU32(EmitContext& ctx, Id address, Id enable);
+void EmitStoreGuestU32(EmitContext& ctx, Id address, Id enable, Id value);
+void EmitGuestReportStatus(EmitContext& ctx, Id condition, Id bits);
 Id EmitBufferAtomicIAdd32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
 Id EmitBufferAtomicIAdd64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);
 Id EmitBufferAtomicISub32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value);

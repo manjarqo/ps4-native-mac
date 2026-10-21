@@ -234,6 +234,18 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
             .is_written = true,
         });
         LOG_ERROR(Render, "Enabling DMA for shader {:#x}", info.pgm_hash);
+    } else if (info.uses_guest_memory) {
+        // PS4Recomp: LowerDynamicBufferAccess (resource patching); see GuestMemory in resource.h
+        info.buffers.push_back({
+            .used_types = IR::Type::U64,
+            .buffer_type = BufferType::BdaPagetable,
+            .is_written = false,
+        });
+        info.buffers.push_back({
+            .used_types = IR::Type::U32,
+            .buffer_type = BufferType::FaultBuffer,
+            .is_written = true,
+        });
     }
 }
 

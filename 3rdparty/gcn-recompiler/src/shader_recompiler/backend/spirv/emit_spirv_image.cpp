@@ -367,7 +367,7 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
     }
     const Id image = ctx.OpLoad(texture.image_type, image_ptr);
     const Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;
-    ctx.OpImageWrite(image, fixed_coords, texel, operands.mask, operands.operands);
+    ctx.EmitUnlessProbe([&] { ctx.OpImageWrite(image, fixed_coords, texel, operands.mask, operands.operands); });
 }
 
 static Id SelectCubeResult(EmitContext& ctx, Id x, Id y, Id z, Id x_res, Id y_res, Id z_res) {

@@ -30,8 +30,8 @@ namespace {
 
 constexpr u32 kMagic = 0x534E4347; // "GCNS"
 // Bump when the serialized layout below changes without a source change elsewhere.
-#define GCN_SHADER_CACHE_FORMAT "1"
-constexpr u32 kFormatVersion = 1;
+#define GCN_SHADER_CACHE_FORMAT "2"
+constexpr u32 kFormatVersion = 2; // 2: Info::uses_guest_memory
 constexpr char kCacheId[] = GCN_BUILD_ID "-f" GCN_SHADER_CACHE_FORMAT;
 
 // Tripwires: a new member in one of these types must be added to Write()/Read() below.
@@ -191,6 +191,7 @@ void WriteInfo(Writer& w, const Info& info) {
     w.Pod(info.has_fetch_shader);
     w.Pod(info.has_bitwise_xor);
     w.Pod(info.uses_dma);
+    w.Pod(info.uses_guest_memory);
     // Info. user_data and flattened_ud_buf belong to the compiling draw and pgm_base to the
     // code address; they are re-established on read.
     w.Seq(info.srt_info.program);
@@ -249,6 +250,7 @@ void ReadInfo(Reader& r, Info& info) {
     r.Pod(info.has_fetch_shader);
     r.Pod(info.has_bitwise_xor);
     r.Pod(info.uses_dma);
+    r.Pod(info.uses_guest_memory);
     r.Seq(info.srt_info.program);
     r.Pod(info.srt_info.flattened_bufsize_dw);
     r.Pod(info.loads);

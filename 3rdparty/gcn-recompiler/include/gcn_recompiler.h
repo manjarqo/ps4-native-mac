@@ -327,6 +327,8 @@ typedef struct gcn_shader_info {
     uint32_t mrt_mask;                /* PS: render targets exported (bit n = MRTn => [[color(n)]]) */
     bool has_discard;
     bool uses_dma;                    /* always false with the Metal profile */
+    bool uses_guest_memory;           /* buffer accesses through V#s loaded at run time: see
+                                         GCN_GUEST_* (bind the page table and fault buffer) */
     bool translation_failed;          /* some instructions were unknown (shader may be wrong) */
     uint32_t shared_memory_size;      /* CS: bytes of threadgroup memory used (incl. scratch) */
     uint32_t workgroup_size[3];
@@ -362,13 +364,42 @@ typedef struct gcn_sharp_fetch {
 typedef enum gcn_buffer_type { /* Shader::BufferType */
     GCN_BUFFER_GUEST = 0,          /* guest memory described by the V#                    */
     GCN_BUFFER_FLATBUF = 1,        /* bind gcn_shader_build_flatbuf() contents (read-only) */
-    GCN_BUFFER_BDA_PAGETABLE = 2,  /* DMA only - not produced with the Metal profile      */
-    GCN_BUFFER_FAULT_BUFFER = 3,   /* DMA only                                             */
+    GCN_BUFFER_BDA_PAGETABLE = 2,  /* guest memory page table (GCN_GUEST_*), read-only     */
+    GCN_BUFFER_FAULT_BUFFER = 3,   /* guest memory fault buffer (GCN_GUEST_*), written     */
     GCN_BUFFER_GDS = 4,            /* global data share (64 KiB, shared by all draws)     */
     GCN_BUFFER_SHARED_MEMORY = 5,  /* CS LDS spilled to a storage buffer: size =
                                       runtime.cs.shared_memory_size * num_workgroups, zeroed */
     GCN_BUFFER_CLIP_PLANES = 6,    /* float4[6] from PA_CL_UCP_n_X..W                       */
 } gcn_buffer_type;
+
+/* Guest memory (gcn_shader_info.uses_guest_memory). A buffer access through a V# the shader
+ * loads at run time cannot be bound before the dispatch: the shader reads and writes guest
+ * memory through a page table instead (compute shaders only; others fail to translate).
+ * - GCN_BUFFER_BDA_PAGETABLE: GCN_GUEST_PAGES uint64 entries, one per 64 MiB page of the 40-bit
+ *   guest address space: the GPU address (MTLBuffer.gpuAddress + offset) of host memory holding
+ *   guest [p << GCN_GUEST_PAGE_SHIFT, (p + 1) << GCN_GUEST_PAGE_SHIFT), or 0 if not mapped. Make
+ *   every buffer it points into resident (useResource:usage:, read and write).
+ * - GCN_BUFFER_FAULT_BUFFER: GCN_GUEST_FAULT_DWORDS uint32, zero before a dispatch except the
+ *   mode dword. With mode 1 (a probe) the shader writes nothing (no guest, buffer or image
+ *   store, no atomic) but records the pages it would access: run it, map the pages of the
+ *   GCN_GUEST_UNMAPPED bitmap, repeat until that bitmap stays empty, then run with mode 0.
+ *   GCN_GUEST_READ / GCN_GUEST_WRITTEN: 1 MiB pages read / written (also in a probe).
+ *   GCN_GUEST_STATUS: GCN_GUEST_STATUS_* bits; every flagged access was not made. */
+#define GCN_GUEST_PAGE_SHIFT 26u
+#define GCN_GUEST_PAGES (1u << (40u - GCN_GUEST_PAGE_SHIFT))
+#define GCN_GUEST_TRACK_SHIFT 20u
+#define GCN_GUEST_TRACK_PAGES (1u << (40u - GCN_GUEST_TRACK_SHIFT))
+#define GCN_GUEST_MODE 0u
+#define GCN_GUEST_STATUS 1u
+#define GCN_GUEST_UNMAPPED 4u
+#define GCN_GUEST_READ (GCN_GUEST_UNMAPPED + GCN_GUEST_PAGES / 32u)
+#define GCN_GUEST_WRITTEN (GCN_GUEST_READ + GCN_GUEST_TRACK_PAGES / 32u)
+#define GCN_GUEST_FAULT_DWORDS (GCN_GUEST_WRITTEN + GCN_GUEST_TRACK_PAGES / 32u)
+#define GCN_GUEST_STATUS_UNMAPPED 0x1u  /* mode 0: an access hit an unmapped page             */
+#define GCN_GUEST_STATUS_FORMAT 0x2u    /* a V# data/number format other than 32-bit u/s/float */
+#define GCN_GUEST_STATUS_SWIZZLE 0x4u   /* a swizzled V# (swizzle_enable)                     */
+#define GCN_GUEST_STATUS_RANGE 0x8u     /* an address at or above 2^40                        */
+#define GCN_GUEST_STATUS_UNALIGNED 0x10u /* a dword at an address that is not 4-byte aligned  */
 
 enum { /* used_types bits (Shader::IR::Type subset) */
     GCN_USES_U8 = 1u << 0, GCN_USES_U16 = 1u << 1, GCN_USES_U32 = 1u << 2,

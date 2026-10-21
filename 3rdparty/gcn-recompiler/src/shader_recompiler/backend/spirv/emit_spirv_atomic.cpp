@@ -83,7 +83,7 @@ Id BufferAtomicU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id 
     const auto [id, pointer_type] = buffer.Alias(is_float ? PointerType::F32 : PointerType::U32);
     const auto [scope, semantics]{AtomicArgs(ctx)};
     const Id zero = is_float ? ctx.ConstF32(0.0f) : ctx.u32_zero_value;
-    return ctx.EmitBoundsCheckedValue(type, zero, address, buffer.Size(PointerSize::B32), [&] {
+    return ctx.EmitBoundsCheckedValue(buffer.buffer_type, type, zero, address, buffer.Size(PointerSize::B32), [&] {
         const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
         return (ctx.*atomic_func)(type, ptr, scope, semantics, value);
     });
@@ -100,7 +100,7 @@ Id BufferAtomicU32IncDec(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addres
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
     const auto [scope, semantics]{AtomicArgs(ctx)};
     return ctx.EmitBoundsCheckedValue(
-        ctx.U32[1], ctx.u32_zero_value, address, buffer.Size(PointerSize::B32), [&] {
+        buffer.buffer_type, ctx.U32[1], ctx.u32_zero_value, address, buffer.Size(PointerSize::B32), [&] {
             const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
             return (ctx.*atomic_func)(ctx.U32[1], ptr, scope, semantics);
         });
@@ -118,7 +118,7 @@ Id BufferAtomicU32CmpSwap(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
     const auto [scope, semantics]{AtomicArgs(ctx)};
     return ctx.EmitBoundsCheckedValue(
-        ctx.U32[1], ctx.u32_zero_value, address, buffer.Size(PointerSize::B32), [&] {
+        buffer.buffer_type, ctx.U32[1], ctx.u32_zero_value, address, buffer.Size(PointerSize::B32), [&] {
             const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
             return (ctx.*atomic_func)(ctx.U32[1], ptr, scope, semantics, semantics, value,
                                       cmp_value);
@@ -136,7 +136,7 @@ Id BufferAtomicU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id 
     const auto [id, pointer_type] = buffer.Alias(PointerType::U64);
     const auto [scope, semantics]{AtomicArgs(ctx)};
     return ctx.EmitBoundsCheckedValue(
-        ctx.U64, ctx.u64_zero_value, address, buffer.Size(PointerSize::B64), [&] {
+        buffer.buffer_type, ctx.U64, ctx.u64_zero_value, address, buffer.Size(PointerSize::B64), [&] {
             const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
             return (ctx.*atomic_func)(ctx.U64, ptr, scope, semantics, value);
         });
@@ -167,7 +167,9 @@ Id ImageAtomicU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id va
     const Id pointer{
         ctx.OpImageTexelPointer(ctx.image_u32, texture.id, fixed_coords, ctx.ConstU32(0U))};
     const auto [scope, semantics]{AtomicArgs(ctx)};
-    return (ctx.*atomic_func)(ctx.U32[1], pointer, scope, semantics, value);
+    return ctx.EmitValueUnlessProbe(ctx.U32[1], ctx.u32_zero_value, [&] {
+        return (ctx.*atomic_func)(ctx.U32[1], pointer, scope, semantics, value);
+    });
 }
 
 Id ImageAtomicF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id value,
@@ -177,7 +179,9 @@ Id ImageAtomicF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id va
     const Id pointer{
         ctx.OpImageTexelPointer(ctx.image_f32, texture.id, fixed_coords, ctx.ConstU32(0U))};
     const auto [scope, semantics]{AtomicArgs(ctx)};
-    return (ctx.*atomic_func)(ctx.F32[1], pointer, scope, semantics, value);
+    return ctx.EmitValueUnlessProbe(ctx.F32[1], ctx.ConstF32(0.0f), [&] {
+        return (ctx.*atomic_func)(ctx.F32[1], pointer, scope, semantics, value);
+    });
 }
 
 Id ImageAtomicU32CmpSwap(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id value,
@@ -188,7 +192,9 @@ Id ImageAtomicU32CmpSwap(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords
     const Id pointer{
         ctx.OpImageTexelPointer(ctx.image_u32, texture.id, fixed_coords, ctx.ConstU32(0U))};
     const auto [scope, semantics]{AtomicArgs(ctx)};
-    return (ctx.*atomic_func)(ctx.U32[1], pointer, scope, semantics, semantics, value, cmp_value);
+    return ctx.EmitValueUnlessProbe(ctx.U32[1], ctx.u32_zero_value, [&] {
+        return (ctx.*atomic_func)(ctx.U32[1], pointer, scope, semantics, semantics, value, cmp_value);
+    });
 }
 } // Anonymous namespace
 

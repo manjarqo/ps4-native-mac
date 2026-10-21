@@ -540,6 +540,18 @@ void IREmitter::StoreBufferFormat(const Value& handle, const Value& address, con
     Inst(Opcode::StoreBufferFormatF32, Flags{info}, handle, address, data);
 }
 
+U32 IREmitter::LoadGuestU32(const U64& address, const U1& enable) {
+    return Inst<U32>(Opcode::LoadGuestU32, address, enable);
+}
+
+void IREmitter::StoreGuestU32(const U64& address, const U1& enable, const U32& value) {
+    Inst(Opcode::StoreGuestU32, address, enable, value);
+}
+
+void IREmitter::GuestReportStatus(const U1& condition, u32 status_bits) {
+    Inst(Opcode::GuestReportStatus, condition, Imm32(status_bits));
+}
+
 Value IREmitter::BufferAtomicIAdd(const Value& handle, const Value& address, const Value& value,
                                   BufferInstInfo info) {
     switch (value.Type()) {

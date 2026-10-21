@@ -164,6 +164,11 @@ using SharpSources = boost::container::small_vector<const IR::Inst*, 4>;
 
 SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
     SharpLocation location{};
+    if (inst->GetOpcode() != IR::Opcode::GetUserData && inst->GetOpcode() != IR::Opcode::ReadConst &&
+        inst->GetOpcode() != IR::Opcode::ReadConstBuffer) {
+        // PS4Recomp: a value the shader computes (its flags are not a flatbuf offset)
+        return UNKNOWN_LOCATION;
+    }
     if (inst->GetOpcode() == IR::Opcode::GetUserData) {
         return static_cast<SharpLocation>(inst->Arg(0).ScalarReg());
     } else if (inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
@@ -204,6 +209,280 @@ SharpFetch<T> ConstructSharpFetch(const SharpReference& sharp) {
         sharp_fetch.summary = Summary::SingleLoad;
     }
     return sharp_fetch;
+}
+
+// PS4Recomp: true if the V# dword is an immediate or is read from the flattened user data (the
+// renderer then fetches the sharp before the draw); false for a value only the shader knows: a
+// V# loaded at an offset computed in the shader (s_load_dwordx4 s[4:7], s[0:1], s2 in a loop),
+// or computed from such a load.
+static bool IsFlattenedSharpDword(const IR::Value& dword) {
+    if (dword.IsImmediate()) {
+        return true;
+    }
+    const IR::Inst* inst = dword.Inst();
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::GetUserData:
+        return true;
+    case IR::Opcode::ReadConst:
+        return inst->Flags<u16>() != 0;
+    case IR::Opcode::ReadConstBuffer: {
+        const auto f = inst->Flags<IR::BufferInstInfo>();
+        return f.sharp_source != 0 && f.flatbuf_off_dw != 0;
+    }
+    default:
+        return false;
+    }
+}
+
+// "dword i: producer" for the dwords of a sharp that are not flattened (error messages)
+static std::string DescribeUnflattened(const SharpReference& sharp) {
+    std::string out;
+    for (u32 i = 0; i < sharp.num_dwords; ++i) {
+        if (IsFlattenedSharpDword(sharp.dwords[i])) {
+            continue;
+        }
+        const IR::Inst* inst = sharp.dwords[i].Inst();
+        out += fmt::format("{}dword {}: {}", out.empty() ? "" : ", ", i, IR::NameOf(inst->GetOpcode()));
+        if (inst->GetOpcode() == IR::Opcode::ReadConst || inst->GetOpcode() == IR::Opcode::Void) {
+            out += fmt::format(" (offset {})", inst->GetOpcode() == IR::Opcode::ReadConst && inst->Arg(1).IsImmediate()
+                                                   ? fmt::format("{}", inst->Arg(1).U32())
+                                                   : std::string("computed"));
+        }
+    }
+    return out;
+}
+
+static bool IsFlattenedSharp(const SharpReference& sharp) {
+    for (u32 i = 0; i < sharp.num_dwords; ++i) {
+        if (!IsFlattenedSharpDword(sharp.dwords[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// PS4Recomp: a buffer access through a V# the shader loads at run time (IsFlattenedSharp false).
+// No binding can stand for it: it becomes guest memory loads and stores (LoadGuestU32 /
+// StoreGuestU32) addressed from the V# dwords as the shader holds them, with GCN's addressing
+// and range check (address = base + index * stride + offset; a dword is accessed only when it
+// lies below stride * num_records bytes, num_records bytes when stride is 0, and the V# type is
+// 0). Formatted accesses convert 32-bit data formats (no conversion: the dwords are moved as they
+// are) with dst_sel applied to loads; a V# with another data or number format, a swizzled V#, an
+// unaligned dword or an address past 40 bits is reported to the renderer through the fault
+// buffer and that access is not made. Accesses that cannot be lowered (8/16/64-bit, atomics, a
+// tbuffer format other than 32-bit) fail the translation.
+static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
+    namespace G = GuestMemory;
+    const IR::Opcode op = inst.GetOpcode();
+    const auto flags = inst.Flags<IR::BufferInstInfo>();
+    const u32 pc = static_cast<u32>(flags.pc.Value());
+    if (info.sw_stage != SwStage::Compute) {
+        UNREACHABLE_MSG("{} at pc {:#x}: buffer access through a V# loaded at run time in a "
+                        "non-compute shader (guest memory access is only implemented for compute)",
+                        IR::NameOf(op), pc);
+    }
+
+    bool is_store = false;
+    bool is_format = false;
+    u32 num_dwords = 1;
+    bool f32_data = false;
+    switch (op) {
+    case IR::Opcode::ReadConstBuffer:
+    case IR::Opcode::LoadBufferU32:
+        break;
+    case IR::Opcode::LoadBufferU32x2:
+        num_dwords = 2;
+        break;
+    case IR::Opcode::LoadBufferU32x3:
+        num_dwords = 3;
+        break;
+    case IR::Opcode::LoadBufferU32x4:
+        num_dwords = 4;
+        break;
+    case IR::Opcode::LoadBufferF32:
+    case IR::Opcode::LoadBufferF32x2:
+    case IR::Opcode::LoadBufferF32x3:
+    case IR::Opcode::LoadBufferF32x4:
+        num_dwords = 1 + u32(op) - u32(IR::Opcode::LoadBufferF32);
+        f32_data = true;
+        break;
+    case IR::Opcode::StoreBufferU32:
+    case IR::Opcode::StoreBufferU32x2:
+    case IR::Opcode::StoreBufferU32x3:
+    case IR::Opcode::StoreBufferU32x4:
+        num_dwords = 1 + u32(op) - u32(IR::Opcode::StoreBufferU32);
+        is_store = true;
+        break;
+    case IR::Opcode::StoreBufferF32:
+    case IR::Opcode::StoreBufferF32x2:
+    case IR::Opcode::StoreBufferF32x3:
+    case IR::Opcode::StoreBufferF32x4:
+        num_dwords = 1 + u32(op) - u32(IR::Opcode::StoreBufferF32);
+        is_store = true;
+        f32_data = true;
+        break;
+    case IR::Opcode::LoadBufferFormatF32:
+        is_format = true;
+        num_dwords = 4;
+        break;
+    case IR::Opcode::StoreBufferFormatF32:
+        is_format = true;
+        is_store = true;
+        num_dwords = 4;
+        break;
+    default:
+        UNREACHABLE_MSG("{} at pc {:#x}: buffer access through a V# loaded at run time is not "
+                        "implemented for this operation",
+                        IR::NameOf(op), pc);
+    }
+    static_assert(u32(IR::Opcode::LoadBufferF32x4) - u32(IR::Opcode::LoadBufferF32) == 3);
+    static_assert(u32(IR::Opcode::StoreBufferU32x4) - u32(IR::Opcode::StoreBufferU32) == 3);
+    static_assert(u32(IR::Opcode::StoreBufferF32x4) - u32(IR::Opcode::StoreBufferF32) == 3);
+
+    const bool inst_typed = is_format && flags.inst_data_fmt != AmdGpu::DataFormat::FormatInvalid;
+    u32 inst_components = 0;
+    if (inst_typed) {
+        const auto dfmt = flags.inst_data_fmt.Value();
+        const auto nfmt = flags.inst_num_fmt.Value();
+        const bool fmt_ok = dfmt == AmdGpu::DataFormat::Format32 || dfmt == AmdGpu::DataFormat::Format32_32 ||
+                            dfmt == AmdGpu::DataFormat::Format32_32_32 ||
+                            dfmt == AmdGpu::DataFormat::Format32_32_32_32;
+        const bool nfmt_ok = nfmt == AmdGpu::NumberFormat::Uint || nfmt == AmdGpu::NumberFormat::Sint ||
+                             nfmt == AmdGpu::NumberFormat::Float;
+        if (!fmt_ok || !nfmt_ok) {
+            UNREACHABLE_MSG("{} at pc {:#x}: tbuffer format {}/{} through a V# loaded at run time "
+                            "(only 32-bit uint/sint/float formats are implemented)",
+                            IR::NameOf(op), pc, dfmt, nfmt);
+        }
+        inst_components = AmdGpu::NumComponents(dfmt);
+    }
+
+    IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
+    IR::Inst* handle = inst.Arg(0).Inst();
+    ASSERT_MSG(handle->NumArgs() == 4, "V# of {} with {} dwords", IR::NameOf(op), handle->NumArgs());
+    const IR::U32 dw0{handle->Arg(0)};
+    const IR::U32 dw1{handle->Arg(1)};
+    const IR::U32 dw2{handle->Arg(2)};
+    const IR::U32 dw3{handle->Arg(3)};
+    const auto field = [&](const IR::U32& dw, u32 offset, u32 count) {
+        return ir.BitFieldExtract(dw, ir.Imm32(offset), ir.Imm32(count));
+    };
+    const IR::U64 base = ir.PackUint2x32(ir.CompositeConstruct(dw0, ir.BitwiseAnd(dw1, ir.Imm32(0xFFu))));
+    const IR::U32 stride = field(dw1, 16, 14);
+    const IR::U1 swizzled = ir.INotEqual(field(dw1, 31, 1), ir.Imm32(0u));
+    const IR::U32 num_records = dw2;
+    const IR::U1 is_buffer = ir.IEqual(field(dw3, 30, 2), ir.Imm32(0u));
+    const IR::U64 size = IR::U64{ir.Select(ir.IEqual(stride, ir.Imm32(0u)), ir.UConvert(64, num_records),
+                                           ir.IMul(ir.UConvert(64, stride), ir.UConvert(64, num_records)))};
+
+    // byte offset of the access in the buffer
+    IR::U32 offset;
+    if (op == IR::Opcode::ReadConstBuffer) {
+        offset = ir.ShiftLeftLogical(IR::U32{inst.Arg(1)}, ir.Imm32(2u));
+    } else {
+        IR::U32 index = flags.index_enable ? IR::GetBufferIndexArg(&inst) : ir.Imm32(0u);
+        const IR::U1 add_tid = ir.INotEqual(field(dw3, 23, 1), ir.Imm32(0u));
+        index = ir.IAdd(index, IR::U32{ir.Select(add_tid, ir.LaneId(), ir.Imm32(0u))});
+        IR::U32 voffset = ir.IAdd(ir.Imm32(u32(flags.inst_offset.Value())), IR::GetBufferSOffsetArg(&inst));
+        if (flags.voffset_enable) {
+            voffset = ir.IAdd(voffset, IR::GetBufferVOffsetArg(&inst));
+        }
+        offset = ir.IAdd(ir.IMul(index, stride), voffset);
+    }
+    const IR::U1 unaligned = ir.INotEqual(ir.BitwiseAnd(offset, ir.Imm32(3u)), ir.Imm32(0u));
+    ir.GuestReportStatus(swizzled, G::StatusSwizzle);
+    ir.GuestReportStatus(ir.LogicalAnd(is_buffer, unaligned), G::StatusUnaligned);
+    IR::U1 usable = ir.LogicalAnd(is_buffer, ir.LogicalNot(ir.LogicalOr(swizzled, unaligned)));
+
+    // data and number format of a formatted access, dst_sel
+    IR::U32 components = ir.Imm32(num_dwords); // dwords accessed
+    IR::U1 int_format = ir.Imm1(false);
+    std::array<IR::U32, 4> dst_sel{};
+    if (is_format && !inst_typed) {
+        const IR::U32 dfmt = field(dw3, 15, 4);
+        const IR::U32 nfmt = field(dw3, 12, 3);
+        const auto eq = [&](const IR::U32& v, u32 k) { return ir.IEqual(v, ir.Imm32(k)); };
+        components = IR::U32{ir.Select(eq(dfmt, u32(AmdGpu::DataFormat::Format32)), ir.Imm32(1u),
+            ir.Select(eq(dfmt, u32(AmdGpu::DataFormat::Format32_32)), ir.Imm32(2u),
+            ir.Select(eq(dfmt, u32(AmdGpu::DataFormat::Format32_32_32)), ir.Imm32(3u),
+            ir.Select(eq(dfmt, u32(AmdGpu::DataFormat::Format32_32_32_32)), ir.Imm32(4u), ir.Imm32(0u)))))};
+        int_format = ir.LogicalOr(eq(nfmt, u32(AmdGpu::NumberFormat::Uint)), eq(nfmt, u32(AmdGpu::NumberFormat::Sint)));
+        const IR::U1 fmt_ok = ir.LogicalAnd(ir.INotEqual(components, ir.Imm32(0u)),
+                                            ir.LogicalOr(int_format, eq(nfmt, u32(AmdGpu::NumberFormat::Float))));
+        for (u32 i = 0; i < 4; ++i) {
+            dst_sel[i] = field(dw3, 3 * i, 3);
+        }
+        IR::U1 bad = ir.LogicalNot(fmt_ok);
+        if (is_store) {
+            // stores move the components as they are: dst_sel must be the identity for them
+            for (u32 c = 0; c < 4; ++c) {
+                const IR::U1 stored = ir.ILessThan(ir.Imm32(c), components, false);
+                bad = ir.LogicalOr(bad, ir.LogicalAnd(stored, ir.INotEqual(dst_sel[c], ir.Imm32(4u + c))));
+            }
+        }
+        ir.GuestReportStatus(ir.LogicalAnd(is_buffer, bad), G::StatusFormat);
+        usable = ir.LogicalAnd(usable, ir.LogicalNot(bad));
+    } else if (inst_typed) {
+        components = ir.Imm32(inst_components);
+        const auto nfmt = flags.inst_num_fmt.Value();
+        int_format = ir.Imm1(nfmt == AmdGpu::NumberFormat::Uint || nfmt == AmdGpu::NumberFormat::Sint);
+    }
+
+    // dword c of the access: its guest address and whether it is accessed
+    const auto dword_addr = [&](u32 c) {
+        const IR::U32 byte = c == 0 ? offset : IR::U32{ir.IAdd(offset, ir.Imm32(4u * c))};
+        const IR::U64 byte64 = ir.UConvert(64, byte);
+        const IR::U1 in_range = ir.ILessThanEqual(ir.IAdd(byte64, ir.Imm64(u64(4))), size, false);
+        const IR::U1 enable = ir.LogicalAnd(ir.LogicalAnd(usable, in_range),
+                                            ir.ILessThan(ir.Imm32(c), components, false));
+        return std::pair{IR::U64{ir.IAdd(base, byte64)}, enable};
+    };
+
+    info.uses_guest_memory = true;
+    if (is_store) {
+        const IR::Value data = inst.Arg(2);
+        for (u32 c = 0; c < num_dwords; ++c) {
+            IR::Value v = num_dwords == 1 ? data : ir.CompositeExtract(data, c);
+            const IR::U32 value = (f32_data || is_format) ? ir.BitCast<IR::U32>(IR::F32{v}) : IR::U32{v};
+            const auto [addr, enable] = dword_addr(c);
+            ir.StoreGuestU32(addr, enable, value);
+        }
+        inst.Invalidate();
+        return;
+    }
+    std::array<IR::U32, 4> loaded{};
+    for (u32 c = 0; c < num_dwords; ++c) {
+        const auto [addr, enable] = dword_addr(c);
+        loaded[c] = ir.LoadGuestU32(addr, enable);
+    }
+    IR::Value result;
+    if (is_format) {
+        std::array<IR::F32, 4> out;
+        const IR::U32 one = IR::U32{ir.Select(int_format, ir.Imm32(1u), ir.Imm32(0x3F800000u))};
+        for (u32 i = 0; i < 4; ++i) {
+            IR::U32 v = loaded[i];
+            if (!inst_typed) {
+                // dst_sel: 0 zero, 1 one, 4..7 component x..w
+                const IR::U32& sel = dst_sel[i];
+                v = ir.Imm32(0u);
+                v = IR::U32{ir.Select(ir.IEqual(sel, ir.Imm32(1u)), one, v)};
+                for (u32 c = 0; c < 4; ++c) {
+                    v = IR::U32{ir.Select(ir.IEqual(sel, ir.Imm32(4u + c)), loaded[c], v)};
+                }
+            }
+            out[i] = ir.BitCast<IR::F32>(v);
+        }
+        result = ir.CompositeConstruct(out[0], out[1], out[2], out[3]);
+    } else if (num_dwords == 1) {
+        result = f32_data ? IR::Value{ir.BitCast<IR::F32>(loaded[0])} : IR::Value{loaded[0]};
+    } else {
+        boost::container::static_vector<IR::Value, 4> parts;
+        for (u32 c = 0; c < num_dwords; ++c) {
+            parts.push_back(f32_data ? IR::Value{ir.BitCast<IR::F32>(loaded[c])} : IR::Value{loaded[c]});
+        }
+        result = ir.CompositeConstruct(parts);
+    }
+    inst.ReplaceUsesWithAndRemove(result);
 }
 
 void PatchBufferSharp(const ResourceDiscovery& resource, Info& info, Descriptors& descriptors,
@@ -249,6 +528,20 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         .post_op = resource.sharps[0].post_op,
     };
 
+    if (image_res.sharp_fetch.summary == SharpFetch<AmdGpu::Image>::Summary::Invalid) {
+        // PS4Recomp: a T# the shader loads at run time has no binding. A write or atomic through
+        // it would be dropped: the translation fails. A read gets the null image (reads 0), as
+        // before; it is logged, not silent.
+        if (is_written) {
+            UNREACHABLE_MSG("{} at pc {:#x}: image store or atomic through a T# loaded at run time "
+                            "is not implemented ({})",
+                            IR::NameOf(inst.GetOpcode()), u32(inst_info.pc.Value()),
+                            DescribeUnflattened(resource.sharps[0]));
+        }
+        LOG_ERROR(Render_Recompiler,
+                  "{} at pc {:#x}: image read through a T# loaded at run time reads the null image ({})",
+                  IR::NameOf(inst.GetOpcode()), u32(inst_info.pc.Value()), DescribeUnflattened(resource.sharps[0]));
+    }
     auto image = image_res.GetSharp(info);
     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
 
@@ -944,9 +1237,17 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
     // Iterate over discovered resources and patch them after finding the sharp.
     // Pass 1: Track resource sharps
     Descriptors descriptors{info};
-    for (const auto& usage : resources) {
+    // PS4Recomp: accesses through V#s loaded at run time become guest memory accesses
+    boost::container::small_vector<bool, 32> lowered(resources.size(), false);
+    for (size_t i = 0; i < resources.size(); ++i) {
+        const auto& usage = resources[i];
         IR::Inst& inst = *usage.user;
         if (IsBufferInstruction(inst)) {
+            if (!IsFlattenedSharp(usage.sharps[0])) {
+                LowerDynamicBufferAccess(inst, info);
+                lowered[i] = true;
+                continue;
+            }
             PatchBufferSharp(usage, info, descriptors, profile);
         } else if (IsImageInstruction(inst)) {
             PatchImageSharp(usage, info, descriptors, profile);
@@ -954,8 +1255,12 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
     }
 
     // Pass 2: Patch instruction args
-    for (const auto& usage : resources) {
+    for (size_t i = 0; i < resources.size(); ++i) {
+        const auto& usage = resources[i];
         IR::Inst& inst = *usage.user;
+        if (lowered[i]) {
+            continue;
+        }
         if (IsBufferInstruction(inst)) {
             PatchBufferArgs(inst, info);
         } else if (IsImageInstruction(inst)) {

@@ -34,6 +34,22 @@
 
 using namespace Shader;
 
+// The public GCN_GUEST_* values are the translator's (resource.h).
+static_assert(GCN_GUEST_PAGE_SHIFT == Shader::GuestMemory::PageShift);
+static_assert(GCN_GUEST_PAGES == Shader::GuestMemory::NumPages);
+static_assert(GCN_GUEST_TRACK_SHIFT == Shader::GuestMemory::TrackShift);
+static_assert(GCN_GUEST_MODE == Shader::GuestMemory::ModeDword);
+static_assert(GCN_GUEST_STATUS == Shader::GuestMemory::StatusDword);
+static_assert(GCN_GUEST_UNMAPPED == Shader::GuestMemory::UnmappedDword);
+static_assert(GCN_GUEST_READ == Shader::GuestMemory::ReadDword);
+static_assert(GCN_GUEST_WRITTEN == Shader::GuestMemory::WrittenDword);
+static_assert(GCN_GUEST_FAULT_DWORDS == Shader::GuestMemory::FaultDwords);
+static_assert(GCN_GUEST_STATUS_UNMAPPED == Shader::GuestMemory::StatusUnmapped);
+static_assert(GCN_GUEST_STATUS_FORMAT == Shader::GuestMemory::StatusFormat);
+static_assert(GCN_GUEST_STATUS_SWIZZLE == Shader::GuestMemory::StatusSwizzle);
+static_assert(GCN_GUEST_STATUS_RANGE == Shader::GuestMemory::StatusRange);
+static_assert(GCN_GUEST_STATUS_UNALIGNED == Shader::GuestMemory::StatusUnaligned);
+
 namespace {
 
 void CopyErr(char* err, size_t err_size, const std::string& msg) {
@@ -802,6 +818,7 @@ GCN_API void gcn_shader_get_info(const gcn_shader* s, gcn_shader_info* o) {
     o->mrt_mask = info.mrt_mask;
     o->has_discard = info.has_discard;
     o->uses_dma = info.uses_dma;
+    o->uses_guest_memory = info.uses_guest_memory;
     o->translation_failed = info.translation_failed;
     if (info.hw_stage == HwStage::Compute) {
         o->shared_memory_size =
