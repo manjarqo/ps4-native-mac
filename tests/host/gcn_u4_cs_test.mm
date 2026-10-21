@@ -8,10 +8,10 @@
 //    "ReadConst base low not from constant memory". Its wave64 ballots then read workgroup
 //    memory through a u64 view next to the u32 one, which the MSL backend dropped (undeclared
 //    shared_mem_u32): Metal rejected the shader.
-//  - data/u4_vs_fullscreen.* (0x1300000300): a vertex shader. Vertex shaders must declare their
-//    position invariant: the g-buffer pass tests depth EQUAL against a prepass drawn with other
-//    vertex shaders, and Metal computes positions identically only for invariant outputs, so
-//    Drake and the other characters failed the test and vanished.
+//  - data/u4_vs_fullscreen.* (0x1300000300): a vertex shader. The library declares the position
+//    invariant itself (passes with depth func EQUAL after a prepass rely on equal positions).
+//    The renderer already rewrote the MSL to [[position, invariant]], so this is not the cause
+//    of the characters missing in U4's chapter 1; the check keeps the library's output right.
 // Each must translate (with zeroed guest memory: the sharps' contents do not matter here) and
 // the MSL must be accepted by Metal.
 //
