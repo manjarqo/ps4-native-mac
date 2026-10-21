@@ -1787,6 +1787,14 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
     s->code_addr = code_addr;
     s->uid = S.next_uid++;
     gcn_shader_get_info(sh, &s->info);
+    if (s->info.null_image_reads) {
+        // translated now or loaded from the shader cache: the translator's own log line is not
+        // repeated for a cached shader
+        char k[64];
+        snprintf(k, sizeof(k), "null-image-%llx-%u", (unsigned long long)code_addr, (unsigned)hw);
+        RLog(k, "shader 0x%llx (hw %u): %u image read(s) through a T# loaded at run time read the null image",
+             (unsigned long long)code_addr, (unsigned)hw, s->info.null_image_reads);
+    }
     s->bufs.resize(s->info.num_buffers);
     for (uint32_t i = 0; i < s->info.num_buffers; ++i) gcn_shader_get_buffer(sh, i, &s->bufs[i]);
     s->imgs.resize(s->info.num_images);
@@ -3040,9 +3048,14 @@ struct EncodeScope {
 struct GuestMemoryState {
     id<MTLBuffer> table = nil; // GCN_GUEST_PAGES uint64 (shared)
     id<MTLBuffer> fault = nil; // GCN_GUEST_FAULT_DWORDS uint32 (shared)
-    std::vector<uint32_t> pages; // mapped 64 MiB pages, in mapping order
-    std::vector<uint8_t> mapped; // per page: in `pages`
+    std::vector<uint32_t> pages;     // mapped 64 MiB pages
+    std::vector<uint64_t> last_used; // per page: present index of its last access (0: not mapped)
+    uint64_t wrong_guesses = 0;      // real dispatches that met a page their probes had not reported
 } g_gmem;
+
+// A mapped page no dispatch accessed for this many presents is dropped from the table (its
+// window is then released by the usual idle sweep unless something else uses it).
+constexpr uint64_t kGuestPageIdlePresents = 600;
 
 bool EnsureGuestMemoryState() {
     if (g_gmem.table) return true;
@@ -3054,27 +3067,50 @@ bool EnsureGuestMemoryState() {
         return false;
     }
     memset(g_gmem.table.contents, 0, g_gmem.table.length);
-    g_gmem.mapped.assign(GCN_GUEST_PAGES, 0);
+    g_gmem.last_used.assign(GCN_GUEST_PAGES, 0);
+    return true;
+}
+
+// The no-copy window holding guest page p and the table entry for it: the GPU address of guest
+// address p << GCN_GUEST_PAGE_SHIFT. Page 0's window starts at PS4_GNM_WINDOW0_BASE
+// (= GCN_GUEST_FIRST_MAPPED, below which the shader never accesses).
+static_assert(PS4_GNM_WINDOW0_BASE == GCN_GUEST_FIRST_MAPPED, "page 0's first mapped address");
+bool GuestPageWindow(uint32_t p, __strong id<MTLBuffer>* mb, uint64_t* entry) {
+    const uint64_t start = (uint64_t)p << GCN_GUEST_PAGE_SHIFT;
+    const uint64_t first = p == 0 ? PS4_GNM_WINDOW0_BASE : start;
+    const uint64_t end = start + (1ull << GCN_GUEST_PAGE_SHIFT);
+    if (first >= S.ctx->mem_size) return false;
+    uint64_t off = 0;
+    if (!GuestBuffer(first, std::min<uint64_t>(end, S.ctx->mem_size) - first, GuestAccess::Write, mb, &off) || off != 0)
+        return false;
+    *entry = (*mb).gpuAddress - (first - start);
     return true;
 }
 
 // The page table with an entry for every mapped page; each window is (re)created through
-// GuestBuffer (windows idle for a while are released) and made resident on the encoder.
+// GuestBuffer (windows idle for a while are released) and made resident on the encoder. Pages
+// idle for kGuestPageIdlePresents are dropped first.
 bool BindGuestPageTable(Binder& b, __strong id<MTLBuffer>* out) {
     if (!EnsureGuestMemoryState()) return false;
     uint64_t* table = (uint64_t*)g_gmem.table.contents;
+    size_t n = 0;
     for (uint32_t p : g_gmem.pages) {
-        const uint64_t base = (uint64_t)p << GCN_GUEST_PAGE_SHIFT;
+        if (S.present_idx > g_gmem.last_used[p] + kGuestPageIdlePresents) {
+            table[p] = 0;
+            g_gmem.last_used[p] = 0;
+            continue;
+        }
+        g_gmem.pages[n++] = p;
         id<MTLBuffer> mb = nil;
-        uint64_t off = 0;
-        if (!GuestBuffer(base, std::min<uint64_t>(1ull << GCN_GUEST_PAGE_SHIFT, S.ctx->mem_size - base),
-                         GuestAccess::Write, &mb, &off) || off != 0) {
+        uint64_t entry = 0;
+        if (!GuestPageWindow(p, &mb, &entry)) {
             table[p] = 0; // the next probe reports it again
             continue;
         }
-        table[p] = mb.gpuAddress;
+        table[p] = entry;
         b.Use(mb, true);
     }
+    g_gmem.pages.resize(n);
     *out = g_gmem.table;
     return true;
 }
@@ -3102,13 +3138,23 @@ std::string GuestStatusText(uint32_t st) {
     add(GCN_GUEST_STATUS_UNMAPPED, "an unmapped guest page");
     add(GCN_GUEST_STATUS_FORMAT, "a V# format other than 32-bit uint/sint/float");
     add(GCN_GUEST_STATUS_SWIZZLE, "a swizzled V#");
-    add(GCN_GUEST_STATUS_RANGE, "an address past 40 bits");
+    add(GCN_GUEST_STATUS_RANGE, "an address past 40 bits or in the first 64 KiB");
     add(GCN_GUEST_STATUS_UNALIGNED, "an unaligned dword");
     return t;
 }
 
+// Marks the 64 MiB pages of the 1 MiB read / written bitmaps as used now.
+void TouchGuestPages(const uint32_t* f) {
+    for (uint32_t base : {GCN_GUEST_READ, GCN_GUEST_WRITTEN})
+        for (auto [a, n] : BitmapRanges(f + base, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT))
+            for (uint64_t p = a >> GCN_GUEST_PAGE_SHIFT; p <= (a + n - 1) >> GCN_GUEST_PAGE_SHIFT; ++p)
+                if (g_gmem.last_used[p]) g_gmem.last_used[p] = std::max<uint64_t>(S.present_idx, 1);
+}
+
 // Runs the probes and the dispatch (encode binds and encodes one pass). False: nothing ran
-// (logged).
+// (logged). A probe that found missing pages maps them and probes again: what else it reported
+// may come from values it read as 0 from those pages (a V# loaded from one, say), so the other
+// status bits are judged only on a probe that found every page mapped.
 bool GuestMemoryDispatch(const Shader* cs, const char* queue, const std::function<bool()>& encode) {
     if (!EnsureGuestMemoryState()) {
         RLog("guestmem", "%s CS 0x%llx skipped: no guest memory buffers", queue, (unsigned long long)cs->code_addr);
@@ -3125,17 +3171,19 @@ bool GuestMemoryDispatch(const Shader* cs, const char* queue, const std::functio
         WaitAll();
         return !S.hung;
     };
-    constexpr int kMaxProbes = 4;
+    constexpr int kMaxProbes = 8;
     for (int probe = 0;; ++probe) {
         if (!run(1)) return false;
-        if (const uint32_t st = f[GCN_GUEST_STATUS] & ~GCN_GUEST_STATUS_UNMAPPED) {
-            RLog("guestmem", "%s CS 0x%llx skipped: it accesses guest memory through %s", queue,
-                 (unsigned long long)cs->code_addr, GuestStatusText(st).c_str());
-            S.n_skipped++;
-            return false;
-        }
         const auto missing = BitmapRanges(f + GCN_GUEST_UNMAPPED, GCN_GUEST_PAGES, GCN_GUEST_PAGE_SHIFT);
-        if (missing.empty()) break;
+        if (missing.empty()) {
+            if (const uint32_t st = f[GCN_GUEST_STATUS] & ~GCN_GUEST_STATUS_UNMAPPED) {
+                RLog("guestmem", "%s CS 0x%llx skipped: it accesses guest memory through %s", queue,
+                     (unsigned long long)cs->code_addr, GuestStatusText(st).c_str());
+                S.n_skipped++;
+                return false;
+            }
+            break;
+        }
         if (probe + 1 == kMaxProbes) {
             RLog("guestmem", "%s CS 0x%llx skipped: guest pages still missing after %d probes", queue,
                  (unsigned long long)cs->code_addr, kMaxProbes);
@@ -3146,22 +3194,19 @@ bool GuestMemoryDispatch(const Shader* cs, const char* queue, const std::functio
             for (uint64_t at = a; at < a + n; at += 1ull << GCN_GUEST_PAGE_SHIFT) {
                 const uint32_t p = (uint32_t)(at >> GCN_GUEST_PAGE_SHIFT);
                 id<MTLBuffer> mb = nil;
-                uint64_t off = 0;
-                if (at < PS4_GNM_WINDOW0_BASE || at >= S.ctx->mem_size ||
-                    !GuestBuffer(at, std::min<uint64_t>(1ull << GCN_GUEST_PAGE_SHIFT, S.ctx->mem_size - at),
-                                 GuestAccess::Write, &mb, &off) || off != 0) {
+                uint64_t entry = 0;
+                if (!GuestPageWindow(p, &mb, &entry)) {
                     RLog("guestmem", "%s CS 0x%llx skipped: guest page 0x%llx (64 MiB) cannot be mapped", queue,
                          (unsigned long long)cs->code_addr, (unsigned long long)at);
                     S.n_skipped++;
                     return false;
                 }
-                if (!g_gmem.mapped[p]) {
-                    g_gmem.mapped[p] = 1;
-                    g_gmem.pages.push_back(p);
-                }
+                if (!g_gmem.last_used[p]) g_gmem.pages.push_back(p);
+                g_gmem.last_used[p] = std::max<uint64_t>(S.present_idx, 1);
             }
         }
     }
+    TouchGuestPages(f);
     const auto written = BitmapRanges(f + GCN_GUEST_WRITTEN, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT);
     if (cap::g_pass) {
         auto accessed = BitmapRanges(f + GCN_GUEST_READ, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT);
@@ -3169,9 +3214,14 @@ bool GuestMemoryDispatch(const Shader* cs, const char* queue, const std::functio
         cap::NoteGuestMemory(accessed, written);
     }
     if (!run(0)) return false;
-    if (const uint32_t st = f[GCN_GUEST_STATUS])
-        RLog("guestmem", "%s CS 0x%llx: accesses through %s were not made", queue, (unsigned long long)cs->code_addr,
-             GuestStatusText(st).c_str());
+    if (const uint32_t st = f[GCN_GUEST_STATUS]) {
+        // the probes predicted other pages than the dispatch accessed (an address depending on
+        // a value the probe could not produce, e.g. an atomic's result)
+        if (st & GCN_GUEST_STATUS_UNMAPPED) g_gmem.wrong_guesses++;
+        RLog("guestmem", "%s CS 0x%llx: accesses through %s were not made (wrong probe guesses so far: %llu)", queue,
+             (unsigned long long)cs->code_addr, GuestStatusText(st).c_str(), (unsigned long long)g_gmem.wrong_guesses);
+    }
+    TouchGuestPages(f);
     // sampled textures over the written pages are stale
     std::vector<GpuWrite> w;
     for (auto [a, n] : BitmapRanges(f + GCN_GUEST_WRITTEN, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT))
@@ -3179,6 +3229,8 @@ bool GuestMemoryDispatch(const Shader* cs, const char* queue, const std::functio
     if (S.tex && !w.empty()) S.tex->InvalidateWrites(w);
     return true;
 }
+
+uint64_t GuestMemoryWrongGuesses() { return g_gmem.wrong_guesses; }
 
 bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_t>& flat, Binder& b,
                const BindCtx& bc, const gcn_push_data& push, std::string* why) {
@@ -3440,7 +3492,13 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
     for (uint32_t i = 0; i < s->samps.size(); ++i) {
         const gcn_sampler_binding& sb = s->samps[i];
         uint32_t ss[4] = {};
-        gcn_shader_fetch_sampler_sharp(s->sh, i, flat.data(), ss);
+        if (!gcn_shader_fetch_sampler_sharp(s->sh, i, flat.data(), ss)) {
+            // an S# the shader loads at run time (or an invalid one): the zero S# is bound
+            char k[64];
+            snprintf(k, sizeof(k), "sampler-unfetched-%llx-%u", (unsigned long long)s->code_addr, i);
+            RLog(k, "shader 0x%llx sampler %u: no S# to fetch (loaded at run time or invalid); bound the zero S#",
+                 (unsigned long long)s->code_addr, i);
+        }
         if (cap::g_pass) cap::NoteSampler(b.stage, i, ss);
         b.Sampler(GetSampler(ss, sb.is_depth), sb.msl_sampler);
     }

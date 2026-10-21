@@ -183,6 +183,13 @@ clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_u4_cs_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
 "$T/gcn_u4_cs_test" "$R/tests/host/data" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
+# T#s / S#s not read from the resource tables as they are: loaded through a run-time V# (null
+# image, counted, also after the shader cache; the S# cannot be fetched) or computed in the
+# shader (the translation fails, naming the instruction).
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_runtime_sharp_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gcn_runtime_sharp_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+"$T/gcn_runtime_sharp_test" 2>&1 | { grep -v "^\[gcn [WIDEC]\]\|^ImageRead at\|^ImageSampleRaw at" || true; }
 # Wave-level instructions executed on Metal: EXEC half writes in a wave64, V# dwords spilled to
 # VGPR lanes, a wave64 compare read from both halves.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_wave_exec_test.mm" \

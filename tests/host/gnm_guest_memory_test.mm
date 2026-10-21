@@ -11,7 +11,13 @@
 //  - the same shader with the destination's "thread < num_records" compare removed (so the
 //    threads past it do store): those stores are discarded by the range check;
 //  - a destination V# with an 8_8_8_8 unorm format (not implemented): the dispatch is skipped and
-//    nothing is written.
+//    nothing is written;
+//  - a zeroed destination V# in the table: a no-op for that entry, the other entries still copy.
+// Hand-assembled shaders (V#s read from a table at an offset the shader computes):
+//  - buffer_load_dword / buffer_store_dword offen through stride-0 V#s (byte num_records), the
+//    source in guest page 0;
+//  - buffer_load_format_xyzw with dst_sel W Z 1 X, stored with buffer_store_dwordx4;
+//  - a chained probe: a V# loaded through a run-time V# from a page not mapped yet.
 //
 // usage: gnm_guest_memory_test <dir with the fixtures>
 #import <Foundation/Foundation.h>
@@ -22,6 +28,7 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#include <array>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -69,6 +76,7 @@ struct Entry {
     uint64_t src, dst;
     uint32_t src_records, dst_records, count;
     uint32_t dst_dword3 = 0x18024004u;
+    bool null_dst = false; // the destination V# is all zero (num_records 0)
 };
 
 bool Load(const std::string& dir) {
@@ -103,6 +111,10 @@ void Run(const std::vector<Entry>& entries, bool remove_dst_compare) {
         CHECK(w[0] == 0xD1A80002u && w[1] == 0x0002000Eu, "fixture changed: %08x %08x", w[0], w[1]);
         w[0] = w[1] = 0xBF800000u;
         memcpy(&code[0x74], w, 8);
+        // another program: another shader hash in its OrbShdr footer (byte 216; hash at +16), or
+        // the renderer would reuse the translation of the unpatched one
+        CHECK(memcmp(&code[216], "OrbShdr", 7) == 0, "fixture footer moved");
+        code[216 + 16] ^= 0x5A;
     }
     memcpy(g_mem + kCode, code.data(), code.size());
     memset(g_mem + kTable, 0, 512);
@@ -110,11 +122,12 @@ void Run(const std::vector<Entry>& entries, bool remove_dst_compare) {
     for (size_t i = 0; i < entries.size(); ++i) {
         const Entry& e = entries[i];
         PutVsharp(At(kTable + 16 * i), e.src, 4, e.src_records, 0x20024004u);
-        PutVsharp(At(kTable + 128 + 16 * i), e.dst, 4, e.dst_records, e.dst_dword3);
+        if (e.null_dst) memset(At(kTable + 128 + 16 * i), 0, 16);
+        else PutVsharp(At(kTable + 128 + 16 * i), e.dst, 4, e.dst_records, e.dst_dword3);
         At(kTable + 256)[i] = e.count;
         for (uint32_t k = 0; k < 64; ++k) {
             At(e.src)[k] = 0xA5000000u | uint32_t(i << 16) | k;
-            At(e.dst)[k] = kSentinel;
+            if (!e.null_dst) At(e.dst)[k] = kSentinel;
         }
     }
     // the CPU wrote guest memory the renderer may have cached
@@ -162,6 +175,177 @@ void TestUnsupportedFormat() {
     for (uint32_t k = 0; k < 64; ++k) CHECK(At(e.dst)[k] == kSentinel, "dst[%u] = %08x written", k, At(e.dst)[k]);
 }
 
+void TestNullDestination() {
+    // a table entry with a zeroed destination V# between two good ones: that entry stores
+    // nothing (num_records 0: a no-op on GCN), the others still copy. Without the shader's own
+    // "thread < dst num_records" compare, so the stores through the zeroed V# are issued.
+    const Entry e0{kSrc + 0x400000, kDst + 0x400000, 24, 24, 24};
+    Entry e1{kSrc + 0x500000, 0, 24, 0, 24};
+    e1.null_dst = true;
+    const Entry e2{kSrc + 0x600000, kDst + 0x600000, 24, 24, 24};
+    const uint64_t skipped0 = ps4draw::SkippedCount();
+    Run({e0, e1, e2}, true);
+    CHECK(ps4draw::SkippedCount() == skipped0, "the dispatch was skipped");
+    for (uint32_t k = 0; k < 64; ++k) {
+        CHECK(At(e0.dst)[k] == (k < 24 ? (0xA5000000u | k) : kSentinel), "entry 0 dst[%u] = %08x", k, At(e0.dst)[k]);
+        CHECK(At(e2.dst)[k] == (k < 24 ? (0xA5020000u | k) : kSentinel), "entry 2 dst[%u] = %08x", k, At(e2.dst)[k]);
+    }
+}
+
+// ---- Hand-assembled compute shaders (64 threads, s[0:1] = a table of V#s read at an offset the
+// shader computes from the workgroup id s2, which the SRT walker does not know) ----
+namespace gcn {
+uint32_t Smrd(uint32_t op, uint32_t sdst, uint32_t sbase, uint32_t soff) { // offset in an SGPR
+    return 0xC0000000u | op << 22 | sdst << 15 | (sbase / 2) << 9 | soff;
+}
+uint32_t SAddU32(uint32_t sdst, uint32_t ssrc0, uint32_t ssrc1) { return 0x80000000u | sdst << 16 | ssrc1 << 8 | ssrc0; }
+uint32_t Vop1(uint32_t op, uint32_t vdst, uint32_t src0) { return 0x7E000000u | vdst << 17 | op << 9 | src0; }
+uint32_t VLshlrev(uint32_t vdst, uint32_t src0, uint32_t vsrc1) { return 26u << 25 | vdst << 17 | vsrc1 << 9 | src0; }
+void Mubuf(std::vector<uint32_t>& c, uint32_t op, bool idxen, bool offen, uint32_t vaddr, uint32_t vdata, uint32_t srsrc) {
+    c.push_back(0xE0000000u | op << 18 | uint32_t(idxen) << 13 | uint32_t(offen) << 12);
+    c.push_back(0x80u << 24 | (srsrc / 4) << 16 | vdata << 8 | vaddr); // soffset 0
+}
+constexpr uint32_t V(uint32_t n) { return 0x100 + n; }
+constexpr uint32_t kWait = 0xBF8C0000u, kEnd = 0xBF810000u;
+constexpr uint32_t kMov = 1, kReadFirstLane = 2;
+constexpr uint32_t kLoadFmtX = 0, kLoadFmtXyzw = 3, kStoreFmtX = 4, kLoadDword = 12, kLoadDwordx4 = 14,
+                   kStoreDword = 28, kStoreDwordx4 = 30;
+// s8 = s2 + 0 (workgroup 0); s[4:7] = V# at table + 0, s[12:15] = V# at table + 16
+void LoadTwoVsharps(std::vector<uint32_t>& c) {
+    c.push_back(SAddU32(8, 2, 0x80));
+    c.push_back(Smrd(2, 4, 0, 8));
+    c.push_back(SAddU32(9, 8, 0x90)); // + 16
+    c.push_back(Smrd(2, 12, 0, 9));
+    c.push_back(kWait);
+}
+// the program with the header and OrbShdr footer the translator looks for
+std::vector<uint32_t> WithFooter(std::vector<uint32_t> body, uint64_t hash) {
+    std::vector<uint32_t> code = {0xBEEB03FF, 0};
+    code.insert(code.end(), body.begin(), body.end());
+    while (code.size() % 2) code.push_back(0xBF800000);
+    code[1] = uint32_t(code.size() / 2 - 1);
+    uint8_t bi[32] = {'O', 'r', 'b', 'S', 'h', 'd', 'r', 7};
+    const uint32_t w = (uint32_t(code.size() * 4) & 0xFFFFFF) << 8;
+    memcpy(bi + 8, &w, 4);
+    memcpy(bi + 16, &hash, 8);
+    const size_t at = code.size();
+    code.resize(at + 8);
+    memcpy(&code[at], bi, 32);
+    return code;
+}
+} // namespace gcn
+
+constexpr uint64_t kCode2 = 0x01100000, kTable2 = 0x02100000;
+
+// Runs a hand-assembled program over table kTable2 (V#s at bytes 0, 16, ...).
+void RunProgram(const std::vector<uint32_t>& body, uint64_t hash, const std::vector<std::array<uint32_t, 4>>& vsharps) {
+    const std::vector<uint32_t> code = gcn::WithFooter(body, hash);
+    memcpy(g_mem + kCode2, code.data(), code.size() * 4);
+    memset(g_mem + kTable2, 0, 256);
+    for (size_t i = 0; i < vsharps.size(); ++i) memcpy(At(kTable2 + 16 * i), vsharps[i].data(), 16);
+    std::vector<uint32_t> regs = g_regs;
+    regs[0x2E0C] = uint32_t(kCode2 >> 8);
+    regs[0x2E12] = 1 | (2 << 6); // 8 VGPRs, 24 SGPRs
+    regs[0x2E13] = 2 << 1 | 1 << 7; // 2 user SGPRs, s2 = workgroup id x
+    regs[0x2E40] = uint32_t(kTable2);
+    ps4draw::NotifyGuestWrite(kTable2, 4096, false, 0);
+    ps4draw::Dispatch(&g_ctx, regs.data(), 1, 1, 1, 0, "gfx");
+    ps4draw::Flush(true);
+}
+
+std::array<uint32_t, 4> Vsharp(uint64_t base, uint32_t stride, uint32_t num_records, uint32_t dword3) {
+    std::array<uint32_t, 4> v;
+    PutVsharp(v.data(), base, stride, num_records, dword3);
+    return v;
+}
+
+void TestDwordOffenStride0() {
+    // buffer_load_dword / buffer_store_dword offen (byte offset thread * 4) through stride-0 V#s
+    // (num_records in bytes): 40 source bytes, 120 destination bytes. The source is in guest page 0.
+    using namespace gcn;
+    std::vector<uint32_t> c;
+    LoadTwoVsharps(c);
+    c.push_back(VLshlrev(2, 0x82, 0)); // v2 = v0 << 2
+    Mubuf(c, kLoadDword, false, true, 2, 1, 4);
+    c.push_back(kWait);
+    Mubuf(c, kStoreDword, false, true, 2, 1, 12);
+    c.push_back(kEnd);
+    const uint64_t src = 0x03000000, dst = kDst + 0x700000;
+    for (uint32_t k = 0; k < 64; ++k) {
+        At(src)[k] = 0xC0000000u | k;
+        At(dst)[k] = kSentinel;
+    }
+    const uint64_t skipped0 = ps4draw::SkippedCount();
+    RunProgram(c, 0x5CA1AB1E0000D001ull, {Vsharp(src, 0, 40, 0x20024004u), Vsharp(dst, 0, 120, 0x18024004u)});
+    CHECK(ps4draw::SkippedCount() == skipped0, "the dispatch was skipped");
+    for (uint32_t k = 0; k < 64; ++k) {
+        const uint32_t want = k < 10 ? (0xC0000000u | k) : k < 30 ? 0u : kSentinel;
+        CHECK(At(dst)[k] == want, "dword dst[%u] = %08x, want %08x", k, At(dst)[k], want);
+    }
+}
+
+void TestDstSel() {
+    // buffer_load_format_xyzw (idxen) through a 32_32_32_32 uint V# with dst_sel W Z 1 X, stored
+    // with buffer_store_dwordx4 offen (thread * 16) through a stride-0 V#: 8 records
+    using namespace gcn;
+    std::vector<uint32_t> c;
+    LoadTwoVsharps(c);
+    Mubuf(c, kLoadFmtXyzw, true, false, 0, 4, 4);
+    c.push_back(VLshlrev(2, 0x84, 0)); // v2 = v0 << 4
+    c.push_back(kWait);
+    Mubuf(c, kStoreDwordx4, false, true, 2, 4, 12);
+    c.push_back(kEnd);
+    const uint64_t src = kSrc + 0x800000, dst = kDst + 0x800000;
+    for (uint32_t k = 0; k < 256; ++k) {
+        At(src)[k] = 0xB0000000u | (k / 4) << 4 | (k % 4);
+        At(dst)[k] = kSentinel;
+    }
+    const uint32_t sel = 7 | (6 << 3) | (1 << 6) | (4 << 9);
+    const uint32_t dw3 = sel | (4u << 12) | (14u << 15); // uint, 32_32_32_32
+    const uint64_t skipped0 = ps4draw::SkippedCount();
+    RunProgram(c, 0x5CA1AB1E0000D002ull, {Vsharp(src, 16, 8, dw3), Vsharp(dst, 0, 8 * 16, 0x18024004u)});
+    CHECK(ps4draw::SkippedCount() == skipped0, "the dispatch was skipped");
+    for (uint32_t t = 0; t < 16; ++t) {
+        const uint32_t r = 0xB0000000u | t << 4;
+        const uint32_t want[4] = {r | 3, r | 2, 1u, r | 0};
+        for (uint32_t c4 = 0; c4 < 4; ++c4) {
+            const uint32_t w = t < 8 ? want[c4] : kSentinel;
+            CHECK(At(dst)[t * 4 + c4] == w, "dst_sel dst[%u].%u = %08x, want %08x", t, c4, At(dst)[t * 4 + c4], w);
+        }
+    }
+}
+
+void TestChainedProbe() {
+    // V# A (table) -> buffer_load_dwordx4 of V# B from guest page 7 -> buffer_load_format_x
+    // through B from page 9 -> buffer_store_format_x through V# C (table) to page 11. The
+    // first probe reads B as 0 (page 7 unmapped): it must map page 7 and probe again (finding
+    // page 9), not judge B's format from that 0.
+    using namespace gcn;
+    std::vector<uint32_t> c;
+    LoadTwoVsharps(c);
+    c.push_back(Vop1(kMov, 1, 0x80)); // v1 = 0
+    Mubuf(c, kLoadDwordx4, false, true, 1, 4, 4);
+    c.push_back(kWait);
+    for (uint32_t k = 0; k < 4; ++k) c.push_back(Vop1(kReadFirstLane, 16 + k, V(4 + k)));
+    Mubuf(c, kLoadFmtX, true, false, 0, 2, 16);
+    c.push_back(kWait);
+    Mubuf(c, kStoreFmtX, true, false, 0, 2, 12);
+    c.push_back(kEnd);
+    const uint64_t a = 0x1C000000, b = 0x24000000, dst = 0x2C000000;
+    PutVsharp(At(a), b, 4, 64, 0x20024004u); // V# B, stored where V# A points
+    for (uint32_t k = 0; k < 64; ++k) {
+        At(b)[k] = 0xD0000000u | k;
+        At(dst)[k] = kSentinel;
+    }
+    const uint64_t skipped0 = ps4draw::SkippedCount();
+    RunProgram(c, 0x5CA1AB1E0000D003ull, {Vsharp(a, 0, 16, 0x20024004u), Vsharp(dst, 4, 48, 0x18024004u)});
+    CHECK(ps4draw::SkippedCount() == skipped0, "the dispatch was skipped");
+    for (uint32_t k = 0; k < 64; ++k) {
+        const uint32_t want = k < 48 ? (0xD0000000u | k) : kSentinel;
+        CHECK(At(dst)[k] == want, "chained dst[%u] = %08x, want %08x", k, At(dst)[k], want);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -196,6 +380,10 @@ int main(int argc, char** argv) {
         TestCopy();
         TestStoreRangeCheck();
         TestUnsupportedFormat();
+        TestNullDestination();
+        TestDwordOffenStride0();
+        TestDstSel();
+        TestChainedProbe();
         if (g_fail) {
             fprintf(stderr, "gnm_guest_memory_test: %d failure(s)\n", g_fail);
             return 1;
