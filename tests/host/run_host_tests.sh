@@ -106,6 +106,11 @@ G="$R/pkg/runtime/modules/libSceGnmDriver"
 # PM4 INDIRECT_BUFFER chaining: chained chunks run to the end, calls return, deep calls stop.
 clang++ -std=c++17 -Wall -Werror -g -fsanitize=address,undefined -I "$G" "$R/tests/host/gnm_ib_chain_test.cc" \
   -o "$T/gnm_ib_chain_test"
+# Compute queues stop at an unsatisfied WAIT_REG_MEM and continue there later.
+clang++ -std=c++17 -Wall -Werror -g -fsanitize=address,undefined -I "$G" "$R/tests/host/gnm_compute_wait_test.cc" \
+  -o "$T/gnm_compute_wait_test"
+"$T/gnm_compute_wait_test" > "$T/gnm_compute_wait.txt" || { cat "$T/gnm_compute_wait.txt"; exit 1; }
+echo "gnm_compute_wait_test: PASS"
 "$T/gnm_ib_chain_test"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
@@ -132,6 +137,46 @@ clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 
   -framework Metal -framework Foundation -o "$T/tex_evict_test"
 "$T/tex_evict_test" > "$T/tex_evict.txt" 2>&1 || { cat "$T/tex_evict.txt"; exit 1; }
 tail -1 "$T/tex_evict.txt"
+# RectList draws: a translated vertex shader drawn as rectangles (capture, barrier, expansion);
+# the colours at all 4 corners of each rectangle, with Metal API validation on.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_rectlist_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gnm_rectlist_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+MTL_DEBUG_LAYER=1 "$T/gnm_rectlist_test" 2>&1 | { grep -v "Metal API Validation Enabled" || true; }
+# Shader permutations with another SRT program are found (not re-translated per draw up to the
+# cap), and the push constants bound cover the translated shaders' MSL struct.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_shader_perm_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gnm_shader_perm_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+"$T/gnm_shader_perm_test"
+# Misaligned guest buffer bases: the shader reads the guest's bytes from the dword below.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_buffer_align_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gcn_buffer_align_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+"$T/gcn_buffer_align_test"
+# Uncharted 4 chapter 1 compute shaders the translator rejected (EXEC half writes, sharps
+# spilled to VGPR lanes, wave64 ballots through workgroup memory): translated and Metal-accepted.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_u4_cs_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gcn_u4_cs_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+"$T/gcn_u4_cs_test" "$R/tests/host/data" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
+# Wave-level instructions executed on Metal: EXEC half writes in a wave64, V# dwords spilled to
+# VGPR lanes, a wave64 compare read from both halves.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_wave_exec_test.mm" \
+  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gcn_wave_exec_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+"$T/gcn_wave_exec_test" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
+# Mapping a compute queue drops its waiting submissions before the new mapping is published.
+RT_INC=$(find "$R/pkg/runtime" -type d | sed 's/^/-I/' | tr '\n' ' ')
+# shellcheck disable=SC2086
+clang -std=gnu11 -Wall -Werror -g -fsanitize=address,undefined $RT_INC "$R/tests/host/gnm_compute_map_test.c" \
+  "$G/ps4_gnmdriver.c" -o "$T/gnm_compute_map_test"
+"$T/gnm_compute_map_test" > "$T/gnm_compute_map.txt" 2>&1 || { cat "$T/gnm_compute_map.txt"; exit 1; }
+echo "gnm_compute_map_test: PASS"
+# Fast-clear colours of integer/snorm targets.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/gnm_clear_color_test.mm" -framework Metal \
+  -framework Foundation -o "$T/gnm_clear_color_test"
+"$T/gnm_clear_color_test"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   "$G/ps4_gnm_library_store.mm" -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"

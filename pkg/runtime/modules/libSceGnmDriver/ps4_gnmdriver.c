@@ -660,12 +660,14 @@ static void gnm_remember_ctx(GuestContext *ctx) {
     __atomic_store_n(&g_gnm_proc_ctx, proc, __ATOMIC_RELEASE);
 }
 
-static void gnm_process_ring_span(GuestContext *ctx, GnmComputeQueue *q, uint32_t from_dw, uint32_t size_dw) {
-    if (!ctx || !ctx->mem_base || size_dw == 0) return;
+// Returns nonzero when the queue stopped at a WAIT_REG_MEM; the renderer then advances the
+// read pointer itself as the packets complete.
+static int gnm_process_ring_span(GuestContext *ctx, GnmComputeQueue *q, uint32_t from_dw, uint32_t size_dw) {
+    if (!ctx || !ctx->mem_base || size_dw == 0) return 0;
     uint64_t addr = q->ring_base_addr + (uint64_t)from_dw * 4u;
-    if (addr == 0 || addr >= ctx->mem_size || (uint64_t)size_dw * 4u > ctx->mem_size - addr) return;
+    if (addr == 0 || addr >= ctx->mem_size || (uint64_t)size_dw * 4u > ctx->mem_size - addr) return 0;
     const uint32_t *words = (const uint32_t *)(ctx->mem_base + addr);
-    ps4_gnm_metal_process_compute_packets(ctx, words, size_dw, q->pipe_id, (uint32_t)(q - g_compute_queues), q->read_ptr, q->ring_size_dw, from_dw);
+    return ps4_gnm_metal_process_compute_packets(ctx, words, size_dw, q->pipe_id, (uint32_t)(q - g_compute_queues), q->read_ptr, q->ring_size_dw, from_dw);
 }
 
 void ps4_gnm_dingdong(GuestContext *ctx, uint32_t gnm_vqid, uint32_t next_offs_dw) {
@@ -688,6 +690,7 @@ void ps4_gnm_dingdong(GuestContext *ctx, uint32_t gnm_vqid, uint32_t next_offs_d
     if (next_offs_dw > q->ring_size_dw) next_offs_dw %= q->ring_size_dw;
 
     uint32_t offs = q->next_offs_dw;
+    int waiting = 0;
     if (next_offs_dw != offs) {
         if (!s_logged_first_dingdong) {
             s_logged_first_dingdong = true;
@@ -696,15 +699,15 @@ void ps4_gnm_dingdong(GuestContext *ctx, uint32_t gnm_vqid, uint32_t next_offs_d
         }
         if (next_offs_dw < offs && next_offs_dw != 0) {
             // Submission wrapped around the end of the ring: process the tail first.
-            gnm_process_ring_span(ctx, q, offs, q->ring_size_dw - offs);
+            waiting |= gnm_process_ring_span(ctx, q, offs, q->ring_size_dw - offs);
             offs = 0;
         }
         uint32_t end = next_offs_dw ? next_offs_dw : q->ring_size_dw;
         if (end > offs) {
-            gnm_process_ring_span(ctx, q, offs, end - offs);
+            waiting |= gnm_process_ring_span(ctx, q, offs, end - offs);
         }
         q->next_offs_dw = next_offs_dw;
-        if (q->read_ptr) {
+        if (q->read_ptr && !waiting) {
             __atomic_store_n(q->read_ptr, next_offs_dw % q->ring_size_dw, __ATOMIC_SEQ_CST);
         }
     }
@@ -756,6 +759,9 @@ int32_t sceGnmMapComputeQueue(uint32_t pipe_id, uint32_t queue_id, uint64_t ring
     q->ring_size_dw = ring_size_dw;
     q->read_ptr = read_ptr_addr;
     q->next_offs_dw = 0;
+    // drop waiting submissions of the slot's previous mapping before the new one is published
+    // (lock order compute -> CP state, as in DingDong)
+    ps4_gnm_metal_reset_compute_queue((uint32_t)slot);
     if (read_ptr_addr) *read_ptr_addr = 0;
     pthread_mutex_unlock(&g_gnm_compute_mutex);
 
@@ -774,6 +780,7 @@ int32_t sceGnmUnmapComputeQueue(uint32_t pipe_id, uint32_t queue_id) {
     pthread_mutex_lock(&g_gnm_compute_mutex);
     for (int i = 0; i < (int)GNM_MAX_COMPUTE_QUEUES; i++) {
         if (g_compute_queues[i].in_use && g_compute_queues[i].pipe_id == pipe_id && g_compute_queues[i].queue_id == queue_id) {
+            ps4_gnm_metal_reset_compute_queue((uint32_t)i);
             memset(&g_compute_queues[i], 0, sizeof(g_compute_queues[i]));
         }
     }

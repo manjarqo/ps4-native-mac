@@ -37,6 +37,7 @@ set(GCN_SOURCES
     src/api/gcn_recompiler.cpp
     src/api/gcn_msl.cpp
     src/api/gcn_shader_cache.cpp
+    src/api/gcn_rectlist.cpp
 )
 
 # Build identity for persistent shader caches (gcn_shader_cache_id): a hash of every source that

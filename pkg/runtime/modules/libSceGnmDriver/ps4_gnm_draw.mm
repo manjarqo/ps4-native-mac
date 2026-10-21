@@ -57,6 +57,9 @@
 #include "ps4_gnm_draw.h"
 #include "ps4_gnm_guest_window.h"
 #include "ps4_gnm_membudget.h"
+#include "ps4_gnm_rectlist.h"
+#include "ps4_gnm_push_data.h"
+#include "ps4_gnm_clear_color.h"
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_shader_cache.h"
 #include "ps4_gnm_pipeline_archive.h"
@@ -275,6 +278,7 @@ inline uint64_t Fnv(const void* data, size_t n, uint64_t h = 1469598103934665603
     return h;
 }
 
+void TraceVertexStream(uint64_t addr);
 inline float AsF(uint32_t v) {
     float f;
     memcpy(&f, &v, 4);
@@ -336,6 +340,9 @@ struct Shader {
     ps4gnm_lib_store::Key lib_key; // the MSL's key in the library store (lib_key.h1 == msl_hash)
     uint32_t lib_stage = 0;        // ps4gnm_lib_store::Stage of the function, 0: not stored
     bool from_store = false;       // fn was loaded from the library store
+    // Translated on the worker thread from the draw's guest memory read later than the draw, so
+    // its specialization may describe another draw: never the base of the permutation lookup.
+    bool from_worker = false;
     id<MTLFunction> fn = nil;
     bool pending = false;     // Metal library still compiling (fn not yet available)
     // Compute kernel compiling in the background (fn stays nil): the encoder waits for it at the
@@ -346,6 +353,19 @@ struct Shader {
     std::vector<gcn_image_binding> imgs;
     std::vector<gcn_sampler_binding> samps;
     std::vector<gcn_vertex_attrib> attrs;
+    // VS only: the two vertex shaders of RectList draws (ps4_gnm_rectlist.h), made by the first
+    // RectList draw that uses this shader. They only carry fn / uid / msl_hash / code_addr.
+    struct RectList {
+        Shader* capture = nullptr;
+        Shader* expand = nullptr;
+        uint32_t vertex_stride = 0, capture_slot = 0, params_slot = 0;
+        // Metal libraries still compiling (their fn is set before the count drops), and whether
+        // one failed.
+        std::atomic<int> compiling{2};
+        std::atomic<bool> failed{false};
+    };
+    RectList* rect = nullptr;
+    bool rect_failed = false;
 };
 
 struct PassKey {
@@ -459,6 +479,7 @@ struct State {
     // caches
     std::unordered_map<uint64_t, std::vector<Shader*>> shaders;
     std::unordered_set<uint64_t> shader_fail;
+    std::unordered_set<uint64_t> async_retry; // fail_keys whose worker translation failed: retried on the CP thread
     std::unordered_map<uint64_t, id<MTLLibrary>> libs;
     // Asynchronous shader/pipeline compilation: Metal completion handlers push results here and
     // the submitting thread applies them (DrainAsyncCompiles) before each draw/dispatch.
@@ -493,6 +514,8 @@ struct State {
     };
     std::vector<std::shared_ptr<GcnJob>> async_gcn_done;
     std::unordered_set<uint64_t> gcn_pending;
+    // programs (GetShader key) with a worker translation in flight: one per program, see GetShader
+    std::unordered_set<uint64_t> gcn_pending_prog;
     Shader pending_shader; // returned while a translation is in flight (fn == nil)
     // Shaders made ready ahead of time by the warm-up threads, by MSL hash: functions loaded from
     // the library store (fn) or libraries compiled from the on-disk MSL cache (lib). h2 is the
@@ -1627,13 +1650,18 @@ void DrainAsyncCompiles() {
     }
     for (auto& j : jobs) {
         S.gcn_pending.erase(j->pend_key);
+        S.gcn_pending_prog.erase(j->key);
         if (!j->sh) {
-            RLog("compile-fail", "shader 0x%llx (hw %u) failed to compile: status %d: %s",
+            // The worker read the draw's memory later than the draw (it may hold another draw's
+            // sharps by then): translate it again on the CP thread at the next draw, and only
+            // give up if that fails too.
+            RLog("compile-fail-async", "shader 0x%llx (hw %u) failed to compile on the worker: status %d: %s",
                  (unsigned long long)j->code_addr, j->hw, j->status, j->err.c_str());
-            S.shader_fail.insert(j->fail_key);
+            S.async_retry.insert(j->fail_key);
             continue;
         }
-        FinishShader(j->sh, j->hw, j->code_addr, j->key, j->fail_key, true, CFAbsoluteTimeGetCurrent());
+        if (Shader* fs = FinishShader(j->sh, j->hw, j->code_addr, j->key, j->fail_key, true, CFAbsoluteTimeGetCurrent()))
+            fs->from_worker = true;
     }
     for (auto& r : libs) {
         auto it = S.libs_pending.find(r.mh);
@@ -1954,21 +1982,39 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
     const int fi = hw == GCN_HW_VS ? 0 : hw == GCN_HW_PS ? 1 : hw == GCN_HW_CS ? 2 : -1;
     if (fi >= 0) S.flat_from[fi] = nullptr;
     if (!vec.empty()) {
-        const gcn_shader* list[64];
+        // The lookup builds the draw's specialization from list[0]: a permutation translated on
+        // this thread from the draw's own memory, not one from the worker (see from_worker).
         const uint32_t n = (uint32_t)std::min<size_t>(vec.size(), 64);
-        for (uint32_t i = 0; i < n; ++i) list[i] = vec[i]->sh;
+        uint32_t base = 0;
+        while (base + 1 < n && vec[base]->from_worker) ++base;
+        const gcn_shader* list[64];
+        uint32_t order[64];
+        order[0] = base;
+        for (uint32_t i = 0, k = 1; i < n; ++i)
+            if (i != base) order[k++] = i;
+        for (uint32_t i = 0; i < n; ++i) list[i] = vec[order[i]]->sh;
         int hit;
         if (fi >= 0) {
             // walk the pointer chains once: the flattened user data serves the check here and
             // the binding of the draw
-            BuildFlat(vec[0], ud, &S.flat_scratch[fi]);
-            S.flat_from[fi] = vec[0];
+            BuildFlat(vec[base], ud, &S.flat_scratch[fi]);
+            S.flat_from[fi] = vec[base];
             hit = gcn_shader_find_compatible_flat(list, n, ud, S.flat_scratch[fi].data(), S.flat_scratch[fi].size(),
                                                   &rt, ReadGuest, S.ctx);
         } else {
             hit = gcn_shader_find_compatible(list, n, ud, &rt, ReadGuest, S.ctx);
         }
-        if (hit >= 0) return vec[hit];
+        if (hit >= 0) return vec[order[hit]];
+        static std::set<uint64_t> explained; // once per program and count
+        if ((n == 8 || n == 16 || n == 32 || n == 47) && explained.insert(key * 64 + n).second) {
+            // Many permutations of one program: say why the first and the latest do not fit.
+            char why0[256], why1[256];
+            gcn_shader_explain_mismatch(vec[base]->sh, ud, &rt, ReadGuest, S.ctx, why0, sizeof(why0));
+            gcn_shader_explain_mismatch(vec[n - 1]->sh, ud, &rt, ReadGuest, S.ctx, why1, sizeof(why1));
+            fprintf(stderr, "[gnm-draw] shader 0x%llx (hw %u) has %u permutations; no fit: base %u%s: %s; latest%s: %s\n",
+                    (unsigned long long)code_addr, hw, n, base, vec[base]->from_worker ? " (worker)" : "", why0,
+                    vec[n - 1]->from_worker ? " (worker)" : "", why1);
+        }
     }
     const uint64_t fail_key = Fnv(&rt, sizeof(rt), key * 1000003ull);
     if (S.shader_fail.count(fail_key)) return nullptr;
@@ -2039,7 +2085,13 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
     // game rewrites per draw, so read later they likely belong to another draw (a copy of the
     // existing permutation's SRT reads did not cover them). New programs, the bulk of a new
     // area, still go to the worker.
-    if (allow_async && S.async_compile && vec.empty()) {
+    if (allow_async && S.async_compile && vec.empty() && !S.async_retry.count(fail_key)) {
+        // One worker translation per program: the draws of a new program differ in user data,
+        // and one job per draw (cold cache, a busy first frame) made dozens of permutations from
+        // memory read after their draws; none fitted, and Uncharted 4's UI vertex shader hit
+        // the cap of 48 ("too many permutations", ~400 skipped draws per frame). The other draws
+        // wait for the first translation; further permutations are then made on this thread.
+        if (!S.gcn_pending_prog.insert(key).second) return &S.pending_shader;
         // Translate GCN -> MSL on a worker thread (1-2 ms per shader, but new areas bring
         // hundreds at once); draws using it are skipped until the result is applied.
         S.gcn_pending.insert(pend_key);
@@ -2110,6 +2162,81 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
     return FinishShader(sh, hw, code_addr, key, fail_key, allow_async, t0);
 }
 
+
+// The RectList vertex shaders of `vs` (gcn_shader_rectlist_msl), made once per shader on the CP
+// thread. Their Metal libraries compile in the background like any new shader's (a synchronous
+// compile stalls the CP thread for tens of ms); draws are skipped until both are ready.
+// Returns nullptr (logged once per shader) if the shader cannot be expanded, and sets *pending
+// while the libraries compile.
+Shader::RectList* RectListShaders(Shader* vs, bool* pending) {
+    *pending = false;
+    if (vs->rect_failed) return nullptr;
+    if (Shader::RectList* r = vs->rect) {
+        if (r->compiling.load(std::memory_order_acquire) > 0) {
+            *pending = true;
+            return nullptr;
+        }
+        if (r->failed.load(std::memory_order_relaxed)) {
+            RLog("rect-fail", "VS 0x%llx: Metal rejected its RectList shaders", (unsigned long long)vs->code_addr);
+            vs->rect_failed = true;
+            return nullptr;
+        }
+        return r;
+    }
+    gcn_rectlist_msl m{};
+    char err[512] = {0};
+    if (gcn_shader_rectlist_msl(vs->sh, &S.msl, &m, err, sizeof(err)) != GCN_OK) {
+        RLog("rect-fail", "VS 0x%llx: no RectList variant: %s", (unsigned long long)vs->code_addr, err);
+        vs->rect_failed = true;
+        return nullptr;
+    }
+    auto* r = new Shader::RectList();
+    r->vertex_stride = m.vertex_stride;
+    r->capture_slot = m.capture_buffer;
+    r->params_slot = m.params_buffer;
+    const uint64_t code_addr = vs->code_addr;
+    auto start = [&](const char* src, bool expand) -> Shader* {
+        // the same edits as FinishShader: no optnone helpers; an invariant rasterized position
+        std::string msl = src;
+        const std::string tag = "[[clang::optnone]] ";
+        for (size_t pos; (pos = msl.find(tag)) != std::string::npos;) msl.erase(pos, tag.size());
+        if (expand) {
+            const std::string pos = "[[position]]";
+            for (size_t at = 0; (at = msl.find(pos, at)) != std::string::npos; at += 23)
+                msl.replace(at, pos.size(), "[[position, invariant]]");
+        }
+        Shader* s = new Shader();
+        s->hw = GCN_HW_VS;
+        s->code_addr = code_addr;
+        s->uid = S.next_uid++;
+        s->msl_hash = Fnv(msl.data(), msl.size());
+        s->pending = true;
+        DumpMsl(s, msl.c_str());
+        MTLCompileOptions* opt = [MTLCompileOptions new];
+        opt.fastMathEnabled = NO;
+        if (@available(macOS 11.0, *)) opt.preserveInvariance = YES;
+        [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()]
+                            options:opt
+                  completionHandler:^(id<MTLLibrary> lib, NSError* e) {
+                      s->fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
+                      if (!s->fn) {
+                          fprintf(stderr, "[gnm-draw] VS 0x%llx: Metal rejected its RectList %s shader: %s\n",
+                                  (unsigned long long)code_addr, expand ? "expansion" : "capture",
+                                  e ? e.localizedDescription.UTF8String : "no main0");
+                          r->failed.store(true, std::memory_order_relaxed);
+                      }
+                      s->pending = false;
+                      r->compiling.fetch_sub(1, std::memory_order_release);
+                  }];
+        return s;
+    };
+    r->capture = start(m.capture_msl, false);
+    r->expand = start(m.expand_msl, true);
+    gcn_rectlist_msl_free(&m);
+    vs->rect = r;
+    *pending = true;
+    return nullptr;
+}
 
 // =====================================================================================
 // Resource binding (shadPS4 Rasterizer::BindBuffers / BindTextures)
@@ -2373,7 +2500,9 @@ void BuildFlat(const Shader* s, const uint32_t ud[16], std::vector<uint32_t>* fl
 void StageFlat(int fi, const Shader* s, const uint32_t ud[16]) {
     const Shader* from = S.flat_from[fi];
     S.flat_from[fi] = nullptr;
-    if (from && from->info.flatbuf_size_dw == s->info.flatbuf_size_dw &&
+    // Reused only if built with the same SRT program: another permutation's program may place
+    // the flattened dwords elsewhere even with the same size.
+    if (from && gcn_shader_same_srt(from->sh, s->sh) &&
         S.flat_scratch[fi].size() == std::max<uint32_t>(s->info.flatbuf_size_dw, 16) && !ShouldTrace())
         return;
     BuildFlat(s, ud, &S.flat_scratch[fi]);
@@ -2440,11 +2569,17 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             }
             if (bd.size_bytes >= 0x80000000u) bd.size_bytes = 64u << 20; // "unbounded" V#
             if (base & 3) {
-                RLog("buf-align", "shader 0x%llx: buffer %u not dword aligned (0x%llx)",
-                     (unsigned long long)s->code_addr, i, (unsigned long long)base);
+                // Bound at the dword below: the shader is specialized on base & 3 and reads its
+                // dwords shifted by that many bytes (gcn BufferSpecialization::misalign); the
+                // bounds limit below includes the bytes below the base.
                 base &= ~3ull;
             }
-            if (!GuestBuffer(base, bd.size_bytes, bb.is_written ? GuestAccess::Write : GuestAccess::Read, &mb, &off)) {
+            // misaligned: the binding also covers the partial dword holding the buffer's last
+            // bytes (the shader reads guest dword i from bound dwords i and i+1)
+            const uint32_t bound_bytes = base == bd.base_address
+                                             ? bd.size_bytes
+                                             : (bd.size_bytes + (uint32_t)(bd.base_address - base) + 3) & ~3u;
+            if (!GuestBuffer(base, bound_bytes, bb.is_written ? GuestAccess::Write : GuestAccess::Read, &mb, &off)) {
                 RLog("buf-range", "shader 0x%llx: buffer %u out of range (0x%llx+0x%x)",
                      (unsigned long long)s->code_addr, i, (unsigned long long)base, bd.size_bytes);
                 mb = S.dummy;
@@ -2454,6 +2589,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             if (ShouldTrace()) {
                 fprintf(stderr, "[gnm-trace]    buf[%u] 0x%llx size %u stride %u%s\n", i, (unsigned long long)base,
                         bd.size_bytes, bd.stride, bb.is_written ? " written" : "");
+                if (bd.stride == 32 && bd.size_bytes > 4096) TraceVertexStream(bd.base_address);
                 static const bool dumpbufs = getenv("PS4_GNM_TRACE_BUFS") != nullptr;
                 if (dumpbufs && bd.size_bytes <= 512) {
                     const uint32_t* w = (const uint32_t*)(S.ctx->mem_base + base);
@@ -2465,6 +2601,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                 }
             }
             if (bb.buffer_slot < GCN_MAX_BUFFERS) {
+                // the exact guest bytes from the bound base (the shader derives its dword limits)
                 uint32_t lim = bd.size_bytes + (uint32_t)(bd.base_address - base);
                 if (bounds_off) lim = 0xffffffffu;
                 else if (bounds_mode && !strcmp(bounds_mode, "raw") && bd.stride != 0) lim = 64u << 20;
@@ -2628,8 +2765,10 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
         b.Sampler(GetSampler(ss, sb.is_depth), sb.msl_sampler);
     }
 
-    if (s->info.msl_push_constant_buffer >= 0)
-        b.Bytes(&pd, sizeof(pd), (uint32_t)s->info.msl_push_constant_buffer);
+    if (s->info.msl_push_constant_buffer >= 0) {
+        const ps4gnm_push::Padded padded(pd);
+        b.Bytes(padded.bytes, sizeof(padded.bytes), (uint32_t)s->info.msl_push_constant_buffer);
+    }
     return true;
 }
 
@@ -3663,93 +3802,7 @@ id<MTLComputeCommandEncoder> ComputeEncoder() {
 }
 
 
-// Raw clear words -> MTLClearColor for the attachment's Metal format (the texture has the
-// same memory layout as the guest surface, so the raw bits decode directly; cf. shadPS4
-// LiverpoolToVK::ColorBufferClearValue).
-inline double SrgbToLinear(double c) {
-    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
-}
-inline float Half(uint32_t h) {
-    __fp16 v;
-    uint16_t x = (uint16_t)h;
-    memcpy(&v, &x, 2);
-    return (float)v;
-}
-inline float UFloat(uint32_t v, int mbits) { // unsigned small float with 5 bit exponent
-    const uint32_t e = (v >> mbits) & 31, m = v & ((1u << mbits) - 1);
-    if (e == 0) return ldexpf((float)m, -14 - mbits);
-    if (e == 31) return m ? NAN : INFINITY;
-    return ldexpf(1.0f + (float)m / (float)(1u << mbits), (int)e - 15);
-}
-
-bool ClearColorFor(MTLPixelFormat f, uint32_t w0, uint32_t w1, MTLClearColor* out) {
-    double r = 0, g = 0, b = 0, a = 1;
-    switch (f) {
-    case MTLPixelFormatRGBA8Unorm:
-    case MTLPixelFormatRGBA8Unorm_sRGB:
-        r = (w0 & 255) / 255.0; g = ((w0 >> 8) & 255) / 255.0; b = ((w0 >> 16) & 255) / 255.0; a = (w0 >> 24) / 255.0;
-        break;
-    case MTLPixelFormatBGRA8Unorm:
-    case MTLPixelFormatBGRA8Unorm_sRGB:
-        b = (w0 & 255) / 255.0; g = ((w0 >> 8) & 255) / 255.0; r = ((w0 >> 16) & 255) / 255.0; a = (w0 >> 24) / 255.0;
-        break;
-    case MTLPixelFormatRGB10A2Unorm:
-        r = (w0 & 1023) / 1023.0; g = ((w0 >> 10) & 1023) / 1023.0; b = ((w0 >> 20) & 1023) / 1023.0; a = (w0 >> 30) / 3.0;
-        break;
-    case MTLPixelFormatBGR10A2Unorm:
-        b = (w0 & 1023) / 1023.0; g = ((w0 >> 10) & 1023) / 1023.0; r = ((w0 >> 20) & 1023) / 1023.0; a = (w0 >> 30) / 3.0;
-        break;
-    case MTLPixelFormatRG11B10Float:
-        r = UFloat(w0 & 2047, 6); g = UFloat((w0 >> 11) & 2047, 6); b = UFloat(w0 >> 22, 5);
-        break;
-    case MTLPixelFormatRGBA16Float:
-        r = Half(w0); g = Half(w0 >> 16); b = Half(w1); a = Half(w1 >> 16);
-        break;
-    case MTLPixelFormatRGBA16Unorm:
-        r = (w0 & 65535) / 65535.0; g = (w0 >> 16) / 65535.0; b = (w1 & 65535) / 65535.0; a = (w1 >> 16) / 65535.0;
-        break;
-    case MTLPixelFormatRG16Float:
-        r = Half(w0); g = Half(w0 >> 16);
-        break;
-    case MTLPixelFormatRG16Unorm:
-        r = (w0 & 65535) / 65535.0; g = (w0 >> 16) / 65535.0;
-        break;
-    case MTLPixelFormatR16Float:
-        r = Half(w0);
-        break;
-    case MTLPixelFormatR16Unorm:
-        r = (w0 & 65535) / 65535.0;
-        break;
-    case MTLPixelFormatR32Float:
-        r = AsF(w0);
-        break;
-    case MTLPixelFormatRG32Float:
-        r = AsF(w0); g = AsF(w1);
-        break;
-    case MTLPixelFormatRGBA32Float:
-        r = g = b = AsF(w0); a = AsF(w1);
-        break;
-    case MTLPixelFormatR8Unorm:
-        r = (w0 & 255) / 255.0;
-        break;
-    case MTLPixelFormatRG8Unorm:
-        r = (w0 & 255) / 255.0; g = ((w0 >> 8) & 255) / 255.0;
-        break;
-    case MTLPixelFormatR32Uint:
-    case MTLPixelFormatR32Sint:
-        r = (double)w0;
-        break;
-    default:
-        return false;
-    }
-    if (f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm_sRGB) {
-        r = SrgbToLinear(r);
-        g = SrgbToLinear(g);
-        b = SrgbToLinear(b);
-    }
-    *out = MTLClearColorMake(r, g, b, a);
-    return true;
-}
+using ps4gnm_clear::ClearColorFor; // raw clear words -> MTLClearColor (ps4_gnm_clear_color.h)
 
 void RegisterMeta(uint64_t addr) {
     if (addr) S.meta.emplace(addr, MetaState{});
@@ -4113,6 +4166,14 @@ void DumpAfterWork(id<MTLTexture> rt, const char* what) {
 }
 
 // PS4_GNM_DUMP_RT=<present index>: write every GPU color target as PNG (debugging)
+// traced indirect draws: argument address and a label, printed with their final arguments
+// when the targets are dumped (after the GPU finished the frame)
+static std::vector<std::pair<uint64_t, std::string>> s_traced_indirect;
+// vertex-like streams (stride 32) bound by traced work; their first vertices are printed with
+// the dumped targets (PS4_GNM_DUMP_RT after the traced present)
+static std::set<uint64_t> s_traced_streams;
+void TraceVertexStream(uint64_t addr) { s_traced_streams.insert(addr); }
+
 void DumpTargets(uint64_t present_idx) {
     static const char* env = getenv("PS4_GNM_DUMP_RT");
     static const char* dir = getenv("PS4_SCREENSHOT_DIR");
@@ -4129,6 +4190,37 @@ void DumpTargets(uint64_t present_idx) {
     if (!dir || (present_idx != s_req_rt_present && (!env || strtoull(env, nullptr, 0) != present_idx))) return;
     Commit();
     WaitAll();
+    for (const auto& [addr, what] : s_traced_indirect) {
+        uint32_t a[5] = {};
+        ReadGuest(S.ctx, addr, a, sizeof(a));
+        fprintf(stderr, "[gnm-draw] indirect args 0x%llx %s: count %u inst %u first %u base %u start %u\n",
+                (unsigned long long)addr, what.c_str(), a[0], a[1], a[2], a[3], a[4]);
+    }
+    s_traced_indirect.clear();
+    for (uint64_t a : s_traced_streams) {
+        float f[16] = {};
+        ReadGuest(S.ctx, a, f, sizeof(f));
+        fprintf(stderr, "[gnm-draw] stream 0x%llx: v0 (%g %g %g | %g %g %g %g %g) v1 (%g %g %g | %g %g %g %g %g)\n",
+                (unsigned long long)a, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12],
+                f[13], f[14], f[15]);
+    }
+    s_traced_streams.clear();
+    // PS4_GNM_DUMP_MEM=<addr>:<bytes>[,<addr>:<bytes>...]: print guest memory as floats (debugging)
+    if (const char* dm = getenv("PS4_GNM_DUMP_MEM")) {
+        for (const char* c = dm; c && *c;) {
+            char* e = nullptr;
+            const uint64_t a = strtoull(c, &e, 0);
+            const uint64_t n = (e && *e == ':') ? strtoull(e + 1, &e, 0) : 64;
+            std::vector<uint32_t> w((n + 3) / 4);
+            ReadGuest(S.ctx, a, w.data(), w.size() * 4);
+            for (size_t k = 0; k < w.size(); k += 8) {
+                fprintf(stderr, "[gnm-mem] 0x%llx:", (unsigned long long)(a + k * 4));
+                for (size_t j = k; j < k + 8 && j < w.size(); ++j) fprintf(stderr, " %08x(%g)", w[j], AsF(w[j]));
+                fprintf(stderr, "\n");
+            }
+            c = (e && *e == ',') ? e + 1 : nullptr;
+        }
+    }
     TextureCache* tc = S.tex;
     tc->ForEachGpuTexture(^(uint64_t addr, int kind, id<MTLTexture> t) {
         if (t.sampleCount > 1) return;
@@ -4187,7 +4279,37 @@ void DumpTargets(uint64_t present_idx) {
         if (kind != 1) return;
         std::vector<uint8_t> px;
         if (!tc->ReadTextureBGRA8(t, DataFormat::FormatInvalid, NumberFormat::Unorm, CompMapping{}, &px)) {
-            fprintf(stderr, "[gnm-draw] dump: cannot read 0x%llx fmt %lu\n", (unsigned long long)addr, (unsigned long)t.pixelFormat);
+            // integer formats: write the raw texels (rt_<present>_<addr>_f<fmt>_<w>x<h>_<bpp>.raw)
+            size_t bpp = 0;
+            switch (t.pixelFormat) {
+            case MTLPixelFormatR8Uint: bpp = 1; break;
+            case MTLPixelFormatR16Uint: case MTLPixelFormatRG8Uint: bpp = 2; break;
+            case MTLPixelFormatR32Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA8Uint: bpp = 4; break;
+            case MTLPixelFormatRG32Uint: case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRG32Float: bpp = 8; break;
+            case MTLPixelFormatR32Float: bpp = 4; break;
+            case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Float: bpp = 16; break;
+            default: break;
+            }
+            if (!bpp || t.textureType != MTLTextureType2D) {
+                fprintf(stderr, "[gnm-draw] dump: cannot read 0x%llx fmt %lu\n", (unsigned long long)addr, (unsigned long)t.pixelFormat);
+                return;
+            }
+            const size_t w = t.width, h = t.height;
+            id<MTLBuffer> b = [S.dev newBufferWithLength:w * h * bpp options:MTLResourceStorageModeShared];
+            id<MTLCommandBuffer> cb = [S.queue commandBuffer];
+            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+            [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                       toBuffer:b destinationOffset:0 destinationBytesPerRow:w * bpp destinationBytesPerImage:w * h * bpp];
+            [bl endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/rt_%llu_%llx_f%lu_%zux%zu_%zu.raw", dir, (unsigned long long)present_idx,
+                     (unsigned long long)addr, (unsigned long)t.pixelFormat, w, h, bpp);
+            if (FILE* f = fopen(path, "wb")) {
+                fwrite(b.contents, 1, w * h * bpp, f);
+                fclose(f);
+            }
             return;
         }
         const size_t w = t.width, h = t.height;
@@ -4817,6 +4939,19 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
                 regs[0xA102] != 0 || (args.indexed && !args.max_index))
                 return false;
         }
+        if (rs.raster.prim == PrimitiveType::RectList && !indirect) {
+            bool pending = false;
+            if (!RectListShaders(vs, &pending)) {
+                S.n_skipped++;
+                if (pending) {
+                    g_hitch.pending_draws++;
+                } else {
+                    RLog("rect-skip", "%s skipped: VS 0x%llx has no RectList variant", args.name,
+                         (unsigned long long)vs_addr);
+                }
+                return true;
+            }
+        }
         Shader* ps = nullptr;
         if (ps_addr) {
             gcn_runtime_info_from_regs(regs, 0x10000, GCN_HW_PS, GCN_SW_FRAGMENT, &S.profile, &ps_rt);
@@ -5104,8 +5239,27 @@ void DrawEncode(DrawRec& r) {
 
         // ---- pipeline
         const bool a2c = (regs[0xA2DC] & 1) != 0; // DB_ALPHA_TO_MASK
+        // RectList (ps4_gnm_rectlist.h): the VS's capture variant with the draw's vertex inputs
+        // and no rasterization, then the expansion VS with the PS and the draw's state.
+        const Shader::RectList* rect =
+            rs.raster.prim == PrimitiveType::RectList && !indirect ? vs->rect : nullptr;
+        id<MTLRenderPipelineState> rect_capture = nil;
+        if (rect) {
+            RenderState crs = rs;
+            crs.raster.rasterizer_discard = true;
+            rect_capture = GetGfxPipeline(rect->capture, nullptr, crs, color_fmt, write_mask, depth_fmt, samples,
+                                          vattrs, vlocs, false);
+            if (!rect_capture) {
+                S.n_skipped++;
+                g_hitch.pending_draws++;
+                return;
+            }
+        }
+        static const std::vector<VertexAttr> no_attrs;
+        static const std::vector<uint32_t> no_locs;
         id<MTLRenderPipelineState> pso =
-            GetGfxPipeline(vs, ps, rs, color_fmt, write_mask, depth_fmt, samples, vattrs, vlocs, a2c);
+            GetGfxPipeline(rect ? rect->expand : vs, ps, rs, color_fmt, write_mask, depth_fmt, samples,
+                           rect ? no_attrs : vattrs, rect ? no_locs : vlocs, a2c);
         if (!pso) {
             S.n_skipped++;
             g_hitch.pending_draws++;
@@ -5161,7 +5315,7 @@ void DrawEncode(DrawRec& r) {
                 (!args.index_base || !GuestBuffer(args.index_base, (uint64_t)args.max_index * isz, GuestAccess::Read, &ib, &ib_off) ||
                  (ib_off & 3)))
                 { S.n_skipped++; return; }
-        } else if (rs.raster.needs_emulation) {
+        } else if (rs.raster.needs_emulation && !rect) {
             if (rs.raster.prim == PrimitiveType::QuadList) {
                 size_t aoff;
                 if (!BuildQuadListIndices(args, args.count, &ib, &aoff, &draw_count)) {
@@ -5173,7 +5327,8 @@ void DrawEncode(DrawRec& r) {
                 indexed = true;
                 prim = MTLPrimitiveTypeTriangle;
             } else {
-                RLog("prim", "%s: primitive type %s not supported yet; skipped", args.name, NameOf(rs.raster.prim));
+                RLog("prim", "%s: primitive type %s not supported yet; skipped (VS 0x%llx PS 0x%llx n=%u)", args.name,
+                     NameOf(rs.raster.prim), (unsigned long long)vs_addr, (unsigned long long)ps_addr, args.count);
                 S.n_skipped++;
                 return;
             }
@@ -5193,6 +5348,46 @@ void DrawEncode(DrawRec& r) {
                 memcpy(ptr, S.ctx->mem_base + addr, bytes);
                 ib_off = aoff;
             }
+        }
+        const uint32_t inst = std::max(1u, args.num_instances);
+        ps4gnm_rect::Buffers rect_bufs{};
+        if (rect) {
+            // capture index of every vertex, and room for every captured vertex
+            const uint32_t n = args.count;
+            if (n % 3) {
+                RLog("rect-count", "%s: RectList with %u vertices (not 3 per rectangle); skipped", args.name, n);
+                S.n_skipped++;
+                return;
+            }
+            const uint8_t* src = nullptr;
+            if (indexed) {
+                const uint64_t isz = args.index_type == 1 ? 4 : 2;
+                src = S.ctx->mem_base + args.index_base + (uint64_t)args.index_offset * isz; // checked above
+            }
+            void* sp;
+            void* pp;
+            void* vp_;
+            size_t soff, poff, voff;
+            if (!S.arena.Alloc(S.dev, (size_t)n * 4, 16, &rect_bufs.slots, &soff, &sp) ||
+                !S.arena.Alloc(S.dev, 4, 16, &rect_bufs.params, &poff, &pp)) {
+                S.n_skipped++;
+                return;
+            }
+            const uint32_t per_instance = ps4gnm_rect::BuildSlots(src, args.index_type == 1, n, (uint32_t*)sp);
+            *(uint32_t*)pp = per_instance;
+            const uint64_t bytes = (uint64_t)per_instance * inst * rect->vertex_stride;
+            if (bytes > (64u << 20) ||
+                !S.arena.Alloc(S.dev, (size_t)bytes, 16, &rect_bufs.vertices, &voff, &vp_)) {
+                RLog("rect-size", "%s: RectList of %u vertices x %u instances needs %llu bytes; skipped", args.name, n,
+                     inst, (unsigned long long)bytes);
+                S.n_skipped++;
+                return;
+            }
+            rect_bufs.slots_off = soff;
+            rect_bufs.params_off = poff;
+            rect_bufs.vertices_off = voff;
+            rect_bufs.capture_slot = rect->capture_slot;
+            rect_bufs.params_slot = rect->params_slot;
         }
 
         // ---- vertex / instance offsets (shadPS4 GetDrawOffsets)
@@ -5297,13 +5492,27 @@ void DrawEncode(DrawRec& r) {
         }
         for (size_t i = 0; i < vbufs.size(); ++i) vb.Buffer(vbufs[i].first, vbufs[i].second, vattrs[i].buffer);
 
-        const uint32_t inst = std::max(1u, args.num_instances);
         if (indirect) {
             if (indexed)
                 [enc drawIndexedPrimitives:prim indexType:itype indexBuffer:ib indexBufferOffset:ib_off
                             indirectBuffer:arg_buf indirectBufferOffset:arg_off];
             else
                 [enc drawPrimitives:prim indirectBuffer:arg_buf indirectBufferOffset:arg_off];
+        } else if (rect) {
+            ps4gnm_rect::Geometry g;
+            g.count = args.count;
+            g.instances = inst;
+            g.base_instance = instance_offset;
+            g.vertex_start = vertex_offset;
+            g.base_vertex = (int32_t)vertex_offset;
+            g.index_buffer = indexed ? ib : nil;
+            g.index_offset = ib_off;
+            g.index_type = itype;
+            ps4gnm_rect::Encode(enc, rect_capture, pso, g, rect_bufs);
+            if (es) { // Encode bound these vertex buffers itself; the pipeline it leaves is pso
+                for (uint32_t k : {0u, 1u, 2u, rect_bufs.capture_slot, rect_bufs.params_slot})
+                    es->buf[(int)Stage::Vertex][k].gen = 0;
+            }
         } else if (indexed) {
             [enc drawIndexedPrimitives:prim indexCount:draw_count indexType:itype indexBuffer:ib
                      indexBufferOffset:ib_off instanceCount:inst baseVertex:(NSInteger)(int32_t)vertex_offset
@@ -5333,13 +5542,23 @@ void DrawEncode(DrawRec& r) {
                      (unsigned long)sc.x, (unsigned long)sc.y, (unsigned long)sc.width, (unsigned long)sc.height,
                      clr.any() ? " CLEAR" : "", rs.raster.clip_disabled ? " clipdis" : "");
         static const bool dump_draws = getenv("PS4_GNM_DUMP_DRAWS") != nullptr;
-        if (dump_draws && key.color[0]) {
+        static const uint64_t dump_rt = getenv("PS4_GNM_DUMP_DRAWS_RT") ? strtoull(getenv("PS4_GNM_DUMP_DRAWS_RT"), nullptr, 0) : 0;
+        if (dump_draws && key.color[0] && (!dump_rt || dump_rt == rs.color[0].address)) {
             char what[64];
             snprintf(what, sizeof(what), "ps%llx_rt%llx", (unsigned long long)ps_addr, (unsigned long long)rs.color[0].address);
             DumpAfterWork(key.color[0], what);
         }
         if (trace) {
             fprintf(stderr, "[gnm-trace] %s\n", desc);
+            if (indirect) {
+                uint32_t a[5] = {};
+                ReadGuest(S.ctx, args.indirect_addr, a, sizeof(a));
+                fprintf(stderr, "[gnm-trace]    indirect 0x%llx at encode: count %u inst %u first %u base %u\n",
+                        (unsigned long long)args.indirect_addr, a[0], a[1], a[2], a[3]);
+                char what[64];
+                snprintf(what, sizeof(what), "VS=0x%llx PS=0x%llx", (unsigned long long)vs_addr, (unsigned long long)ps_addr);
+                s_traced_indirect.emplace_back(args.indirect_addr, what);
+            }
             for (int i = 0; i < 8; ++i) {
                 const ColorTarget& c = rs.color[i];
                 if (!c.bound) continue;
@@ -5643,9 +5862,15 @@ void DispatchEncode(DispatchRec& r) {
         wr.dispatch = true;
         LogWork(wr);
         if (!S.storage_bound.empty()) SyncStorageToDepth();
-        if (ShouldTrace())
+        if (ShouldTrace()) {
             fprintf(stderr, "[gnm-trace] %s dispatch CS=0x%llx groups=%ux%ux%u wg=%ux%ux%u%s\n", queue,
                     (unsigned long long)addr, dim_x, dim_y, dim_z, wx, wy, wz, indirect_addr ? " indirect" : "");
+            if (indirect_addr) {
+                char what[64];
+                snprintf(what, sizeof(what), "CS=0x%llx (dispatch)", (unsigned long long)addr);
+                s_traced_indirect.emplace_back(indirect_addr, what);
+            }
+        }
     }
 }
 

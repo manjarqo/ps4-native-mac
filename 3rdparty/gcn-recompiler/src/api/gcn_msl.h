@@ -33,4 +33,19 @@ bool Convert(const std::vector<uint32_t>& spirv, const gcn_msl_options& opt, std
              std::string& err, Bindings* bindings,
              const std::vector<uint32_t>* arg_candidates = nullptr);
 
+// Buffer slots of a vertex shader's capture variant: the stage output struct of vertex v of
+// instance i is written to output[i * params[0] + v] ([[buffer(output_buffer)]], indexed from the
+// draw's base vertex / base instance; params is [[buffer(params_buffer)]]).
+struct CaptureSlots {
+    uint32_t output_buffer = 0;
+    uint32_t params_buffer = 0;
+};
+
+// MSL of the vertex shader `spirv` that stores its outputs instead of rasterizing them, with the
+// resource slots of `like` (the Bindings of the shader's own MSL, from Convert). Fails if a slot
+// would differ.
+bool ConvertCapture(const std::vector<uint32_t>& spirv, const gcn_msl_options& opt,
+                    const Bindings& like, const CaptureSlots& slots, std::string& out,
+                    std::string& err);
+
 } // namespace GcnMsl

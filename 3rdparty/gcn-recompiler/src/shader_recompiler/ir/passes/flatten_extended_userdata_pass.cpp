@@ -20,6 +20,7 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/opcodes.h"
+#include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/srt.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/ir/reg.h"
@@ -542,6 +543,12 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
         if (auto* inst = base->Arg(0).TryInst();
             inst && inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
             continue;
+        }
+        for (size_t k = 0; k < 2; ++k) {
+            // PS4Recomp: a pointer spilled to VGPR lanes and read back (see SpilledLaneValue)
+            if (const IR::Value v = SpilledLaneValue(base->Arg(k)); !(v == base->Arg(k))) {
+                base->SetArg(k, v);
+            }
         }
         ASSERT_MSG(IsReadConstSource(base->Arg(0)), "ReadConst base low not from constant memory");
         ASSERT_MSG(IsReadConstSource(base->Arg(1)), "ReadConst base high not from constant memory");

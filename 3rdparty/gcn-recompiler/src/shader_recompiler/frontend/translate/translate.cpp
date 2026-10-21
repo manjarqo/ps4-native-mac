@@ -1043,9 +1043,35 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
         return ir.SetVccHi(result);
     case OperandField::M0:
         return ir.SetM0(result);
+    case OperandField::ExecLo:
+    case OperandField::ExecHi: {
+        // PS4Recomp: a 32-bit write of one half of EXEC (e.g. s_mov_b32 exec_lo, -1 then
+        // exec_hi, -1 to enable every lane): each lane of that half takes its bit, the other
+        // half keeps its EXEC. Done per lane, without a ballot: Metal simdgroups are 32 wide, so
+        // InverseBallot of a 64-bit mask would test the low half in both simdgroups of a wave64.
+        const IR::U32 bits = result.Type() == IR::Type::F32 ? ir.BitCast<IR::U32>(IR::F32{result})
+                                                            : IR::U32{result};
+        const bool lo_half = operand.field == OperandField::ExecLo;
+        const IR::U32 lane = Lane64();
+        const IR::U1 in_half = lo_half ? ir.ILessThan(lane, ir.Imm32(32u), false)
+                                       : ir.IGreaterThanEqual(lane, ir.Imm32(32u), false);
+        const IR::U1 bit = ir.INotEqual(
+            ir.BitFieldExtract(bits, ir.BitwiseAnd(lane, ir.Imm32(31u)), ir.Imm32(1u)), ir.Imm32(0u));
+        return ir.SetExec(IR::U1{ir.Select(in_half, bit, ir.GetExec())});
+    }
     default:
         UNREACHABLE_MSG("Unknown field {}", u32(operand.field));
     }
+}
+
+// PS4Recomp: the GCN lane (0..63) of this invocation. A wave64 compute shader runs as two
+// 32-wide Metal simdgroups, so its GCN lane is the workgroup-local index modulo 64; elsewhere
+// the subgroup lane is the GCN lane.
+IR::U32 Translator::Lane64() {
+    const auto [x, y, z] = runtime_info.hw.cs.workgroup_size;
+    if (info.hw_stage == HwStage::Compute && profile.subgroup_size < 64 && x * y * z > 32)
+        return ir.BitwiseAnd(ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex), ir.Imm32(63u));
+    return ir.LaneId();
 }
 
 template <bool is_signed>

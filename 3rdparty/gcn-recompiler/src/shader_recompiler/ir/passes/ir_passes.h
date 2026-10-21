@@ -14,6 +14,11 @@ void InjectClipDistanceAttributes(IR::Program& program, RuntimeInfo& runtime_inf
 
 namespace Shader::Optimization {
 
+// PS4Recomp (resource_discover_pass.cpp): the spilled SGPR value a v_readlane_b32 of a sharp or
+// pointer dword reads back, or `value` itself if it cannot be resolved to exactly one.
+IR::Value SpilledLaneValue(const IR::Value& value);
+
+
 void SsaRewritePass(IR::Program& program);
 void SsaRepairPass(IR::Program& program);
 void PhiSimplificationPass(IR::Program& program);

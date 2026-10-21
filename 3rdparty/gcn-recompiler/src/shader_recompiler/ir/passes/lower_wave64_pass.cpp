@@ -166,7 +166,14 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
                 ir.IAdd(ir.Imm32(scratch_base), ir.ShiftLeftLogical(subgroup_id, ir.Imm32(2u)));
             ir.WriteShared(32, mask_low, offset);
             ir.Barrier();
-            const IR::U64 mask = IR::U64{ir.LoadShared(64, false, offset)};
+            // PS4Recomp: two 32-bit loads of the subgroup pair instead of one 64-bit load. A
+            // u64 view of workgroup memory next to the u32 one needs explicit workgroup layouts
+            // (aliased blocks), which the MSL backend drops: the variables went undeclared and
+            // Metal rejected the shader (Uncharted 4 async CS 0x130015c400).
+            const IR::U32 pair = ir.BitwiseAnd(offset, ir.Imm32(~7u));
+            const IR::U32 lo = IR::U32{ir.LoadShared(32, false, pair)};
+            const IR::U32 hi = IR::U32{ir.LoadShared(32, false, ir.IAdd(pair, ir.Imm32(4u)))};
+            const IR::U64 mask = ir.PackUint2x32(ir.CompositeConstruct(lo, hi));
             ir.Barrier();
             inst->ReplaceUsesWithAndRemove(mask);
         } else if (inst->GetOpcode() == IR::Opcode::ReadLane) {

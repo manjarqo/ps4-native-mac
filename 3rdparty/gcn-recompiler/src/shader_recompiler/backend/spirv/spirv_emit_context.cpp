@@ -255,8 +255,17 @@ void EmitContext::DefineBufferProperties() {
                     OpShiftRightLogical(U32[1], size_bytes, ConstU32(1U));
             }
             if (True(desc.used_types & (IR::Type::U32 | IR::Type::F32))) {
-                buffer.Size(PointerSize::B32) =
-                    OpShiftRightLogical(U32[1], size_bytes, ConstU32(2U));
+                if (buffer.misalign != 0) {
+                    // size_bytes = guest size + misalign: the bound dwords round it up, the
+                    // guest dwords are those wholly inside the guest buffer
+                    buffer.Size(PointerSize::B32) = OpShiftRightLogical(
+                        U32[1], OpIAdd(U32[1], size_bytes, ConstU32(3U)), ConstU32(2U));
+                    buffer.guest_dwords = OpShiftRightLogical(
+                        U32[1], OpISub(U32[1], size_bytes, ConstU32(buffer.misalign)), ConstU32(2U));
+                } else {
+                    buffer.Size(PointerSize::B32) =
+                        OpShiftRightLogical(U32[1], size_bytes, ConstU32(2U));
+                }
             }
             if (True(desc.used_types & IR::Type::U64)) {
                 buffer.Size(PointerSize::B64) =
@@ -621,6 +630,11 @@ void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
+    // GCN computes a position bit-identically in every shader that runs the same code, and games
+    // rely on it: a depth prepass followed by passes with depth func EQUAL (Uncharted 4's g-buffer
+    // pass; its characters use different vertex shaders in the two passes). Metal guarantees that
+    // only for invariant positions (with MTLCompileOptions.preserveInvariance).
+    Decorate(output_position, spv::Decoration::Invariant);
     const bool needs_clip_distance_emulation = sw_stage == SwStage::Vertex &&
                                                hw_stage == HwStage::Vertex &&
                                                profile.needs_clip_distance_emulation;
@@ -900,11 +914,22 @@ void EmitContext::DefineBuffers() {
 
         // Define aliases depending on the shader usage.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
+        if (desc.buffer_type == BufferType::Guest && !profile.needs_buffer_offsets) {
+            // Bound at the dword below the base (Metal buffer offsets are dword aligned).
+            spv_buffer.misalign = u32(buf_sharp.base_address & 3);
+            if (spv_buffer.misalign != 0) {
+                spv_buffer.Offset(PointerSize::B8) = ConstU32(spv_buffer.misalign);
+                if ((spv_buffer.misalign & 1) == 0) {
+                    spv_buffer.Offset(PointerSize::B16) = ConstU32(spv_buffer.misalign >> 1);
+                }
+            }
+        }
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
                 DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);
         }
-        if (True(desc.used_types & IR::Type::U32)) {
+        // (misaligned stores go through the U32 alias with atomics, whatever the data type)
+        if (True(desc.used_types & IR::Type::U32) || (spv_buffer.misalign != 0 && desc.is_written)) {
             spv_buffer.Alias(PointerType::U32) =
                 DefineBuffer(desc.is_written, is_coherent, 2, desc.buffer_type, U32[1]);
         }

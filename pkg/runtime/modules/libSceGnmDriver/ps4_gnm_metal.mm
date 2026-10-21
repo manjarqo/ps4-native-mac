@@ -21,6 +21,7 @@
 #include "ps4_gnm_draw.h"
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_ib.h"
+#include "ps4_gnm_wait_queue.h"
 #include "ps4_gnmdriver.h"
 #include "gcn_recompiler.h"
 
@@ -1033,106 +1034,171 @@ static void ComputeDispatch(GuestContext *ctx, uint32_t slot, uint32_t x, uint32
     memcpy(&g_liverpool_regs[CS_REG_BLOCK_BASE], saved, sizeof(saved));
 }
 
-static void ProcessComputePackets(GuestContext *ctx, const uint32_t *words, uint32_t dw, uint32_t pipe_id,
-                                  uint32_t slot, int depth, uint32_t *read_ptr, uint32_t ring_size_dw,
-                                  uint32_t read_base_dw) {
-    uint32_t pc = 0;
-    while (pc < dw) {
-        uint32_t header = words[pc];
-        uint32_t type = (header >> 30) & 0x3;
-        uint32_t step;
-        if (type == 3) {
-            uint32_t opcode = (header >> 8) & 0xFF;
-            uint32_t payload_dw = ((header >> 16) & 0x3FFF) + 1;
-            if (pc + 1 + payload_dw > dw) break;
-            const uint32_t *payload = &words[pc + 1];
-            switch (opcode) {
-            case PM4_OP_RELEASE_MEM:
-                if (!g_min_barriers) ps4draw::ComputeBarrier();
-                HandleReleaseMem(ctx, payload, payload_dw, pipe_id);
-                break;
-            case PM4_OP_EVENT_WRITE_EOP: // not expected on MEC, but harmless
-                if (!g_min_barriers) ps4draw::ComputeBarrier();
-                HandleEventWriteEop(ctx, payload, payload_dw, pipe_id);
-                break;
-            case PM4_OP_EVENT_WRITE_EOS:
-                if (!g_min_barriers) ps4draw::ComputeBarrier();
-                HandleEventWriteEos(ctx, payload, payload_dw);
-                break;
-            case PM4_OP_EVENT_WRITE:
-            case PM4_OP_ACQUIRE_MEM:
-                ps4draw::ComputeBarrier(); // CS partial flush / cache flushes
-                break;
-            case PM4_OP_WRITE_DATA:
-                if (!g_min_barriers) ps4draw::ComputeBarrier();
-                HandleWriteData(ctx, payload, payload_dw);
-                break;
-            case PM4_OP_WAIT_REG_MEM:
-                ps4draw::ComputeBarrier();
-                HandleWaitRegMem(ctx, payload, payload_dw, false);
-                break;
-            case PM4_OP_DMA_DATA:
-                ps4draw::ComputeBarrier();
-                HandleDmaData(ctx, payload, payload_dw);
-                break;
-            case PM4_OP_SET_SH_REG: {
-                const uint32_t off = payload[0] & 0xFFFF;
-                for (uint32_t r = 1; r < payload_dw; r++) {
-                    const uint32_t reg = 0x2C00 + off + r - 1;
-                    if (reg >= CS_REG_BLOCK_BASE && reg < CS_REG_BLOCK_BASE + CS_REG_BLOCK_SIZE)
-                        g_cs_regs[slot][reg - CS_REG_BLOCK_BASE] = payload[r];
-                    else if (reg < 0x10000)
-                        g_liverpool_regs[reg] = payload[r];
-                }
-                break;
-            }
-            case PM4_OP_DISPATCH_DIRECT:
-                if (payload_dw >= 4 && (payload[3] & 1))
-                    ComputeDispatch(ctx, slot, payload[0], payload[1], payload[2], 0, "asc");
-                break;
-            case PM4_OP_DISPATCH_INDIRECT:
-                if (payload_dw >= 3 && (payload[2] & 1)) {
-                    const uint64_t addr = (uint64_t)payload[0] | ((uint64_t)(payload[1] & 0xFFFF) << 32);
-                    ComputeDispatch(ctx, slot, 0, 0, 0, addr, "asc-indirect");
-                }
-                break;
-            case PM4_OP_INDIRECT_BUFFER: {
-                const uint32_t *ib = nullptr;
-                uint32_t ib_dw = 0;
-                // chained inside an IB: continue in the new buffer and do not return. At ring
-                // level (depth 0, with or without a read pointer) the CP returns to the ring, so
-                // the packet is a call.
-                if (ps4gnm_ib::ComputeChainReplaces(ps4gnm_ib::IsChained(payload, payload_dw), depth)) {
-                    if (!DecodeIndirectBuffer(ctx, payload, payload_dw, &ib, &ib_dw)) break;
-                    words = ib;
-                    dw = ib_dw;
-                    pc = 0;
-                    continue;
-                }
-                if (depth >= kMaxIbDepth) {
-                    if (LogOnce(s_logged_ib_depth)) {
-                        fprintf(stderr, "[ps4-gnm] INDIRECT_BUFFER nesting too deep; skipping (logged once)\n");
-                    }
-                } else if (DecodeIndirectBuffer(ctx, payload, payload_dw, &ib, &ib_dw)) {
-                    ProcessComputePackets(ctx, ib, ib_dw, pipe_id, slot, depth + 1, nullptr, 0, 0);
-                }
-                break;
-            }
-            default:
-                // ACQUIRE_MEM, EVENT_WRITE, NOP, ...: no-op here.
-                break;
-            }
-            step = 1 + payload_dw;
-        } else if (type == 0) {
-            step = ((header >> 16) & 0x3FFF) + 2;
-        } else {
-            step = 1;
+// ---- Compute queues. A submission (a ring span) runs in order per queue; a WAIT_REG_MEM whose
+// value is neither in memory nor pending from encoded GPU work suspends the queue, like the
+// graphics queue: Uncharted 4's async compute copies the depth buffer after waiting for the
+// graphics depth prepass, and the game kicks that job before the graphics command buffer, so
+// the copy ran first and copied stale depth (later passes then tested against a depth buffer
+// without the characters, and the water was drawn over Drake). A suspended queue continues when
+// graphics work produces labels, on its next submission, or from the watchdog (after
+// kGfxWaitLimitMs it continues without the wait, as before).
+struct ComputeSubmit {
+    GuestContext *ctx = nullptr;
+    uint32_t pipe_id = 0, slot = 0;
+    uint32_t *read_ptr = nullptr; // ring read pointer, advanced as depth-0 packets complete
+    uint32_t ring_size_dw = 0, read_base_dw = 0;
+    std::vector<ps4gnm_ib::Frame> frames;
+};
+using ComputeQueueState = ps4gnm_wq::WaitQueue<ComputeSubmit>;
+static ComputeQueueState g_cq[kMaxComputeQueues];
+static uint64_t g_cq_suspends = 0, g_cq_timeouts = 0;
+static uint64_t g_queue_progress = 0; // bumped whenever a suspended queue runs again
+static constexpr uint64_t kComputeWaitLimitMs = 50;
+
+// Runs the submission until it finishes (true) or a WAIT_REG_MEM suspends it (false).
+// skip_wait: the first WAIT_REG_MEM reached continues without waiting (watchdog timeout).
+static bool ProcessComputePackets(ComputeSubmit &sub, bool skip_wait) {
+    GuestContext *ctx = sub.ctx;
+    const uint32_t pipe_id = sub.pipe_id, slot = sub.slot;
+    auto exec = [&](const ps4gnm_ib::Frame &f, int depth, ps4gnm_ib::Packet &pk) {
+        const uint32_t header = f.words[f.pc];
+        const uint32_t type = (header >> 30) & 0x3;
+        if (type == 0) {
+            pk.step = ((header >> 16) & 0x3FFF) + 2;
+            return;
         }
-        pc += step;
-        if (read_ptr && ring_size_dw) {
-            __atomic_store_n(read_ptr, (read_base_dw + (pc < dw ? pc : dw)) % ring_size_dw, __ATOMIC_SEQ_CST);
+        if (type != 3) {
+            pk.step = 1;
+            return;
         }
+        const uint32_t opcode = (header >> 8) & 0xFF;
+        const uint32_t payload_dw = ((header >> 16) & 0x3FFF) + 1;
+        if (f.pc + 1 + payload_dw > f.dw) return; // truncated: step 0 drops the rest
+        const uint32_t *payload = &f.words[f.pc + 1];
+        pk.step = 1 + payload_dw;
+        switch (opcode) {
+        case PM4_OP_RELEASE_MEM:
+            if (!g_min_barriers) ps4draw::ComputeBarrier();
+            HandleReleaseMem(ctx, payload, payload_dw, pipe_id);
+            break;
+        case PM4_OP_EVENT_WRITE_EOP: // not expected on MEC, but harmless
+            if (!g_min_barriers) ps4draw::ComputeBarrier();
+            HandleEventWriteEop(ctx, payload, payload_dw, pipe_id);
+            break;
+        case PM4_OP_EVENT_WRITE_EOS:
+            if (!g_min_barriers) ps4draw::ComputeBarrier();
+            HandleEventWriteEos(ctx, payload, payload_dw);
+            break;
+        case PM4_OP_EVENT_WRITE:
+        case PM4_OP_ACQUIRE_MEM:
+            ps4draw::ComputeBarrier(); // CS partial flush / cache flushes
+            break;
+        case PM4_OP_WRITE_DATA:
+            if (!g_min_barriers) ps4draw::ComputeBarrier();
+            HandleWriteData(ctx, payload, payload_dw);
+            break;
+        case PM4_OP_WAIT_REG_MEM:
+            ps4draw::ComputeBarrier();
+            if (skip_wait) {
+                skip_wait = false; // timed out: continue as before suspension existed
+            } else if (!HandleWaitRegMem(ctx, payload, payload_dw, true)) {
+                pk.suspend = true; // the queue stops at this packet
+                return;
+            }
+            break;
+        case PM4_OP_DMA_DATA:
+            ps4draw::ComputeBarrier();
+            HandleDmaData(ctx, payload, payload_dw);
+            break;
+        case PM4_OP_SET_SH_REG: {
+            const uint32_t off = payload[0] & 0xFFFF;
+            for (uint32_t r = 1; r < payload_dw; r++) {
+                const uint32_t reg = 0x2C00 + off + r - 1;
+                if (reg >= CS_REG_BLOCK_BASE && reg < CS_REG_BLOCK_BASE + CS_REG_BLOCK_SIZE)
+                    g_cs_regs[slot][reg - CS_REG_BLOCK_BASE] = payload[r];
+                else if (reg < 0x10000)
+                    g_liverpool_regs[reg] = payload[r];
+            }
+            break;
+        }
+        case PM4_OP_DISPATCH_DIRECT:
+            if (payload_dw >= 4 && (payload[3] & 1))
+                ComputeDispatch(ctx, slot, payload[0], payload[1], payload[2], 0, "asc");
+            break;
+        case PM4_OP_DISPATCH_INDIRECT:
+            if (payload_dw >= 3 && (payload[2] & 1)) {
+                const uint64_t addr = (uint64_t)payload[0] | ((uint64_t)(payload[1] & 0xFFFF) << 32);
+                ComputeDispatch(ctx, slot, 0, 0, 0, addr, "asc-indirect");
+            }
+            break;
+        case PM4_OP_INDIRECT_BUFFER: {
+            // chained inside an IB: continue in the new buffer and do not return. At ring
+            // level (depth 0, with or without a read pointer) the CP returns to the ring, so
+            // the packet is a call.
+            pk.chain = ps4gnm_ib::IsChained(payload, payload_dw);
+            if (!ps4gnm_ib::ComputeChainReplaces(pk.chain, depth) && depth >= kMaxIbDepth) {
+                if (LogOnce(s_logged_ib_depth)) {
+                    fprintf(stderr, "[ps4-gnm] INDIRECT_BUFFER nesting too deep; skipping (logged once)\n");
+                }
+            } else if (!DecodeIndirectBuffer(ctx, payload, payload_dw, &pk.ib, &pk.ib_dw)) {
+                pk.ib = nullptr;
+            }
+            break;
+        }
+        default:
+            // ACQUIRE_MEM, EVENT_WRITE, NOP, ...: no-op here.
+            break;
+        }
+    };
+    auto progress = [&](uint32_t pc) {
+        if (sub.read_ptr && sub.ring_size_dw)
+            __atomic_store_n(sub.read_ptr, (sub.read_base_dw + pc) % sub.ring_size_dw, __ATOMIC_SEQ_CST);
+    };
+    return ps4gnm_ib::Walk(sub.frames, true, exec, progress);
+}
+
+static void StartGfxWatchdog();
+
+// Runs the queue's submissions in order until one suspends. force: the suspended one continues
+// past its wait.
+static void RunComputeQueue(uint32_t slot, bool force) {
+    ComputeQueueState &q = g_cq[slot];
+    const uint64_t timeouts = q.timeouts;
+    const bool stopped = q.Run(force, clock_gettime_nsec_np(CLOCK_UPTIME_RAW),
+                               [](ComputeSubmit &sub, bool skip) { return ProcessComputePackets(sub, skip); });
+    g_cq_timeouts += q.timeouts - timeouts;
+    if (stopped) {
+        g_cq_suspends++;
+        if ((g_cq_suspends & (g_cq_suspends - 1)) == 0)
+            fprintf(stderr, "[ps4-gnm] a compute queue waits for another queue: %llu times, %llu timed out\n",
+                    (unsigned long long)g_cq_suspends, (unsigned long long)g_cq_timeouts);
+        StartGfxWatchdog();
     }
+}
+
+// Continues suspended compute queues whose wait is satisfied (or timed out). Called with
+// g_state.mutex held.
+static void ResumeComputeQueues() {
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (uint32_t slot = 0; slot < kMaxComputeQueues; ++slot) {
+        ComputeQueueState &q = g_cq[slot];
+        if (!q.Suspended()) continue;
+        const ComputeSubmit &sub = q.pending.front();
+        if (sub.frames.empty()) continue;
+        const ps4gnm_ib::Frame &f = sub.frames.back();
+        const uint32_t payload_dw = ((f.words[f.pc] >> 16) & 0x3FFF) + 1;
+        const bool ready = WaitRegMemReady(sub.ctx, &f.words[f.pc + 1], payload_dw);
+        if (!ready && !q.TimedOut(now, kComputeWaitLimitMs * 1000000ull)) continue;
+        if (ready) q.suspended_at = 0;
+        RunComputeQueue(slot, !ready);
+        g_queue_progress++;
+    }
+}
+
+static bool AnyComputeSuspended() {
+    for (const auto &q : g_cq)
+        if (q.Suspended()) return true;
+    return false;
 }
 
 // ---- Graphics queue: command buffers run in order; a WAIT_REG_MEM that is not satisfied yet
@@ -1217,7 +1283,23 @@ static void ResumeGfxQueue() {
     if (!ready && !timed_out) return;
     if (ready) g_gfx.suspended_at = 0;
     RunGfxQueue(!ready);
+    g_queue_progress++;
     if (ready || !g_gfx.suspended_at) ps4draw::OnSubmit();
+}
+
+// Lets suspended queues wait for each other: runs whichever can continue until none does.
+// Called with the CP lock held.
+static void PumpQueues() {
+    const uint64_t start = g_queue_progress;
+    for (int i = 0; i < 64; ++i) {
+        const uint64_t before = g_queue_progress;
+        ResumeComputeQueues();
+        ResumeGfxQueue();
+        if (g_queue_progress == before) break;
+    }
+    // commit what the queues that continued encoded (nothing new otherwise: the watchdog calls
+    // this every millisecond while a queue waits)
+    if (g_queue_progress != start && ps4draw::HasPendingWork()) ps4draw::Flush(false);
 }
 
 static void StartGfxWatchdog() {
@@ -1228,9 +1310,9 @@ static void StartGfxWatchdog() {
         for (;;) {
             usleep(1000);
             std::scoped_lock lock(g_state.mutex);
-            if (g_gfx.active && g_gfx.suspended_at) {
+            if ((g_gfx.active && g_gfx.suspended_at) || AnyComputeSuspended()) {
                 @autoreleasepool {
-                    ResumeGfxQueue();
+                    PumpQueues();
                     ps4draw::WaitKernelCompiles();
                 }
             }
@@ -1259,15 +1341,31 @@ int32_t ps4_gnm_metal_process_compute_packets(GuestContext *ctx, const uint32_t 
     }
     std::scoped_lock lock(g_state.mutex);
     CpTimer cp_timer;
+    const uint32_t slot = queue_slot % kMaxComputeQueues;
+    ComputeQueueState &q = g_cq[slot];
     @autoreleasepool {
-        ProcessComputePackets(ctx, words, size_dw, pipe_id, queue_slot % kMaxComputeQueues, 0, read_ptr,
-                              ring_size_dw, read_base_dw);
+        ComputeSubmit sub;
+        sub.ctx = ctx;
+        sub.pipe_id = pipe_id;
+        sub.slot = slot;
+        sub.read_ptr = read_ptr;
+        sub.ring_size_dw = ring_size_dw;
+        sub.read_base_dw = read_base_dw;
+        sub.frames.push_back({words, size_dw, 0});
+        q.pending.push_back(std::move(sub));
+        if (!q.Suspended()) RunComputeQueue(slot, false);
         // compute work without a trailing fence still has to reach the GPU
         if (ps4draw::HasPendingWork()) ps4draw::Flush(false);
-        ResumeGfxQueue();
+        PumpQueues();
         ps4draw::WaitKernelCompiles();
     }
-    return 0;
+    // nonzero: part of the submission still waits; the caller must not report it consumed
+    return q.pending.empty() ? 0 : 1;
+}
+
+void ps4_gnm_metal_reset_compute_queue(uint32_t queue_slot) {
+    std::scoped_lock lock(g_state.mutex);
+    g_cq[queue_slot % kMaxComputeQueues].Reset();
 }
 
 int32_t ps4_gnm_metal_process_command_buffers(GuestContext *ctx, uint32_t count,
@@ -1305,6 +1403,7 @@ int32_t ps4_gnm_metal_process_command_buffers(GuestContext *ctx, uint32_t count,
             g_gfx.pending.push_back(sub);
         }
         RunGfxQueue(false);
+        PumpQueues();
         ps4draw::OnSubmit();
         ps4draw::WaitKernelCompiles();
     }
