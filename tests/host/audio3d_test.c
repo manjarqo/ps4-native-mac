@@ -536,6 +536,19 @@ static void test_bed_plus_object(const char *dump) {
   CHECK_EQ(other, 0);
 }
 
+// Per-channel energy added to the port mix between two level snapshots must equal want[c]
+// (relative 1e-6, absolute 1e-9 for silent channels).
+static void check_channels(const Ps4Audio3dLevels *a, const Ps4Audio3dLevels *b, const double want[8],
+                           int line) {
+  for (int c = 0; c < 8; c++) {
+    double got = b->mix_ch_sq[c] - a->mix_ch_sq[c];
+    if (fabs(got - want[c]) > want[c] * 1e-6 + 1e-9) {
+      fprintf(stderr, "audio3d_test:%d: channel %d energy %.9g, want %.9g\n", line, c, got, want[c]);
+      g_fail = 1;
+    }
+  }
+}
+
 // Replays Uncharted 4's Audio3d calls with the exact attribute arrays of its pump
 // (brbDriverBase::Pump3D, eboot 0x15e680-0x15f23b; see audio3dmix-report.md): a port of 10
 // objects (2 passthrough + 8 ambisonic, no dynamic objects), the 8-channel speaker bus on an
@@ -614,6 +627,13 @@ static void test_u4_call_shapes(void) {
   CHECK(fabs((lv2.object_sq - lv1.object_sq) - pt_want) < pt_want * 1e-6);
   CHECK(fabs((lv2.mix_sq - lv1.mix_sq) - pt_want) < pt_want * 1e-6);
   CHECK_EQ(lv2.bed_sq - lv1.bed_sq, 0);
+  {
+    // L only on FL, R only on FR (a swap or a pan of the passthrough pair fails here).
+    double w[8] = {0};
+    w[PS4_A3D_CH_FL] = 3.0 * GRAN * (0.5 * master) * (0.5 * master);
+    w[PS4_A3D_CH_FR] = 3.0 * GRAN * (0.25 * master) * (0.25 * master);
+    check_channels(&lv1, &lv2, w, __LINE__);
+  }
 
   // 3. The ambisonic-channel call is refused (AMBISONICS is not advertised) and queues nothing.
   const uint32_t amb_ch = 0;
@@ -622,6 +642,14 @@ static void test_u4_call_shapes(void) {
                                 attr(PS4_AUDIO3D_ATTR_AMBISONICS, &amb_ch, 4),
                                 attr(PS4_AUDIO3D_ATTR_PCM, &pcm_l, 0x18)};
   CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[2], 4, amb, 0), PS4_AUDIO3D_ERROR_NOT_SUPPORTED);
+  {
+    Ps4Audio3dLevels a, b;
+    CHECK_EQ(ps4_audio3d_port_get_levels(port, &a), 0);
+    CHECK_EQ(ps4_audio3d_port_advance(port), 0);
+    CHECK_EQ(ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC), 0);
+    CHECK_EQ(ps4_audio3d_port_get_levels(port, &b), 0);
+    CHECK_EQ(b.object_grains - a.object_grains, 0); // the refused call queued nothing
+  }
 
   // 4. A dynamic object in U4's layout, with the trailing RESET_STATE {7, NULL, 0} the pump adds
   //    when its reset flag is set: 1 m straight ahead -> FC only, gain applied once.
@@ -642,6 +670,37 @@ static void test_u4_call_shapes(void) {
   CHECK_EQ(lv3.object_grains - lv2.object_grains, 1);
   const double dyn_want = GRAN * (0.4 * 0.5) * (0.4 * 0.5);
   CHECK(fabs((lv3.object_sq - lv2.object_sq) - dyn_want) < dyn_want * 1e-6);
+  {
+    // Pan positions: ahead -> FC; 30 deg right -> FR; 90 deg right (+x) -> SR; 45 deg left ->
+    // between SL (-90) and FL (-30) at 3/4 of the way, constant power.
+    const double e = GRAN * (0.4 * 0.5) * (0.4 * 0.5);
+    const double t = 0.75 * M_PI / 2;
+    struct {
+      float x, z;
+      int ch_a, ch_b;
+      double ga, gb;
+    } cases[] = {
+        {0.0f, 1.0f, PS4_A3D_CH_FC, -1, 1.0, 0.0},
+        {0.5f, 0.8660254f, PS4_A3D_CH_FR, -1, 1.0, 0.0},
+        {1.0f, 0.0f, PS4_A3D_CH_SR, -1, 1.0, 0.0},
+        {-1.0f, 1.0f, PS4_A3D_CH_SL, PS4_A3D_CH_FL, cos(t), sin(t)},
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+      float pk[3] = {cases[k].x, 0.0f, cases[k].z};
+      Ps4Audio3dAttribute dk[6] = {da[0], da[1], da[2], da[3], da[4], da[5]};
+      dk[0] = attr(PS4_AUDIO3D_ATTR_POSITION, pk, 12);
+      Ps4Audio3dLevels a, b;
+      CHECK_EQ(ps4_audio3d_port_get_levels(port, &a), 0);
+      CHECK_EQ(ps4_audio3d_object_set_attributes(port, obj[3], 6, dk, 0), 0);
+      CHECK_EQ(ps4_audio3d_port_advance(port), 0);
+      CHECK_EQ(ps4_audio3d_port_push(port, PS4_AUDIO3D_BLOCKING_SYNC), 0);
+      CHECK_EQ(ps4_audio3d_port_get_levels(port, &b), 0);
+      double w[8] = {0};
+      w[cases[k].ch_a] = e * cases[k].ga * cases[k].ga;
+      if (cases[k].ch_b >= 0) w[cases[k].ch_b] = e * cases[k].gb * cases[k].gb;
+      check_channels(&a, &b, w, __LINE__);
+    }
+  }
 
   Ps4Audio3dLevels none;
   CHECK_EQ(ps4_audio3d_port_get_levels(port + 1, &none), PS4_AUDIO3D_ERROR_INVALID_PORT);

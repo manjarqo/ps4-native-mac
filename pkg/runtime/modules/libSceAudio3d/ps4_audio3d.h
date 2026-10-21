@@ -84,8 +84,11 @@ typedef struct {
   uint64_t ptr; // guest pointer
 } Ps4Audio3dAudioOutParam;
 
-// Cumulative signal levels of a port since it was opened (always maintained; read by tests and
-// by the PS4_AUDIO_LOG statistics). Sums of squares are over every channel sample.
+// Cumulative signal levels of a port (read by tests and by the PS4_AUDIO_LOG statistics). The
+// counters (advances, grains, frames) always run; the sums of squares only accumulate while
+// levels are in use: from Initialize when PS4_AUDIO_LOG is set, otherwise from the first
+// ps4_audio3d_port_get_levels call on (that call returns the sums so far, possibly 0).
+// Sums of squares are over every channel sample.
 //   objects: the panned object mix alone (PortAdvance), object_frames frames of 8 channels;
 //   bed:     the BedWrite beds alone, mixed in the same advances;
 //   mix:     the port's own output grain (objects + bed) that PortPush submits;
@@ -96,6 +99,7 @@ typedef struct {
   uint64_t object_grains; // object PCM grains consumed by advances
   uint64_t frames;        // frames mixed by advances (granularity each)
   double object_sq, bed_sq, mix_sq;
+  double mix_ch_sq[8];    // mix_sq per output channel (FL FR FC LFE BL BR SL SR)
   uint64_t bus_grains, bus_samples;
   double bus_sq;
 } Ps4Audio3dLevels;

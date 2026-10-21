@@ -113,6 +113,7 @@
 #include "ps4_audioout_internal.h"
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -202,6 +203,14 @@ static int a3d_log_level(void) {
 
 static bool a3d_log(void) { return a3d_log_level() >= 1; }
 static bool a3d_verbose(void) { return a3d_log_level() >= 2; }
+
+// Signal levels (sums of squares in Ps4Audio3dLevels, per-bus statistics) cost a few passes over
+// every grain, so they are only accumulated once someone reads them: PS4_AUDIO_LOG (set at
+// Initialize) or the first ps4_audio3d_port_get_levels call. The default path reads one relaxed
+// atomic per grain and does no other work.
+static atomic_bool g_levels_on;
+
+static bool levels_on(void) { return atomic_load_explicit(&g_levels_on, memory_order_relaxed); }
 
 static uint64_t now_us(void) {
   struct timespec ts;
@@ -321,6 +330,7 @@ int32_t ps4_audio3d_initialize(int64_t reserved) {
     return PS4_AUDIO3D_ERROR_NOT_READY;
   }
   g_initialized = true;
+  if (a3d_log()) atomic_store_explicit(&g_levels_on, true, memory_order_relaxed);
   for (uint32_t i = 0; i < A3D_MAX_PORTS; i++) {
     memset(&g_ports[i], 0, sizeof(g_ports[i]));
     g_ports[i].out_handle = -1;
@@ -569,15 +579,24 @@ static void port_mix_grain(A3dPort *p) {
       p->object_count--;
     }
   }
-  p->lv.object_sq += sum_sq(dst, nf);
+  const bool lv = levels_on();
+  if (lv) p->lv.object_sq += sum_sq(dst, nf);
   if (p->bed_count) {
     const float *b = p->bed + p->bed_read * nf;
-    p->lv.bed_sq += sum_sq(b, nf);
+    if (lv) p->lv.bed_sq += sum_sq(b, nf);
     for (size_t i = 0; i < nf; i++) dst[i] += b[i];
     p->bed_read = (p->bed_read + 1) % p->queue_depth;
     p->bed_count--;
   }
-  p->lv.mix_sq += sum_sq(dst, nf);
+  if (lv) {
+    for (size_t i = 0; i < nf; i++) {
+      const double v = dst[i];
+      p->lv.mix_ch_sq[i % A3D_OUT_CH] += v * v;
+    }
+    double t = 0.0;
+    for (uint32_t c = 0; c < A3D_OUT_CH; c++) t += p->lv.mix_ch_sq[c];
+    p->lv.mix_sq = t;
+  }
   if (a3d_log()) {
     for (size_t i = 0; i < nf; i++) {
       float a = fabsf(dst[i]);
@@ -1125,7 +1144,11 @@ int32_t ps4_audio3d_audioout_outputs(const Ps4Audio3dAudioOutParam *params, uint
       memset(dst, 0, a->bytes); // NULL submits silence for this grain
     }
     a->pend_count++;
-    // Bus level (always) and per-bus statistics (PS4_AUDIO_LOG=2).
+    a->st_grains++;
+    a->st_null += params[i].ptr == 0;
+    p->lv.bus_grains++;
+    if (!levels_on()) continue;
+    // Bus level and per-bus statistics (only while levels are read, see levels_on).
     const uint32_t count = a->bytes / (a->is_float ? 4u : 2u);
     double sq = 0.0;
     float peak = 0.0f;
@@ -1133,7 +1156,7 @@ int32_t ps4_audio3d_audioout_outputs(const Ps4Audio3dAudioOutParam *params, uint
       float v;
       if (a->is_float) {
         memcpy(&v, dst + (size_t)k * 4, 4);
-        if (!(v == v)) v = 0.0f;
+        if (!isfinite(v)) v = 0.0f;
       } else {
         int16_t s16;
         memcpy(&s16, dst + (size_t)k * 2, 2);
@@ -1142,11 +1165,8 @@ int32_t ps4_audio3d_audioout_outputs(const Ps4Audio3dAudioOutParam *params, uint
       if (fabsf(v) > peak) peak = fabsf(v);
       sq += (double)v * v;
     }
-    p->lv.bus_grains++;
     p->lv.bus_samples += count;
     p->lv.bus_sq += sq;
-    a->st_grains++;
-    a->st_null += params[i].ptr == 0;
     a->st_samples += count;
     a->st_sq += sq;
     if (peak > a->st_peak) a->st_peak = peak;
@@ -1157,6 +1177,7 @@ int32_t ps4_audio3d_audioout_outputs(const Ps4Audio3dAudioOutParam *params, uint
 
 int32_t ps4_audio3d_port_get_levels(uint32_t port_id, Ps4Audio3dLevels *out) {
   if (!out) return PS4_AUDIO3D_ERROR_INVALID_PARAMETER;
+  atomic_store_explicit(&g_levels_on, true, memory_order_relaxed);
   pthread_mutex_lock(&g_lock);
   A3dPort *p = port_get(port_id);
   if (p) *out = p->lv;

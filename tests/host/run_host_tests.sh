@@ -16,6 +16,11 @@ clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/ru
   -framework AudioToolbox -o "$T/audio3d_test"
 "$T/audio3d_test" 2> "$T/audio3d.txt" || { cat "$T/audio3d.txt"; exit 1; }
 grep "^audio3d_test" "$T/audio3d.txt"
+# libSceAudioOut 8-channel -> stereo fold (centre / surrounds at -3 dB, LFE dropped) on the headless device.
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/runtime/core" -I "$AO" \
+  "$R/tests/host/audioout_downmix_test.c" "$AO/ps4_audioout.c" -framework AudioToolbox -o "$T/audioout_downmix_test"
+"$T/audioout_downmix_test" 2> "$T/downmix.txt" || { cat "$T/downmix.txt"; exit 1; }
+grep "^audioout_downmix_test" "$T/downmix.txt"
 # Asynchronous stdout/stderr: nothing is lost on abort() or exit(), with one shared file and with two.
 clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/core" "$R/tests/host/log_abort_test.c" "$R/pkg/runtime/core/ps4_log.c" \
   -o "$T/log_abort_test"
