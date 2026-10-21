@@ -99,7 +99,10 @@ void Translator::EmitDataShare(const GcnInst& inst) {
 
 void Translator::V_READFIRSTLANE_B32(const GcnInst& inst) {
     const IR::U32 value{GetSrc(inst.src[0])};
-    SetDst(inst.dst[0], ir.ReadFirstLane(value));
+    // PS4Recomp: the first lane in EXEC. v_readfirstlane ignores the EXEC scope, so it may run in
+    // lanes outside EXEC (e.g. right after s_and_saveexec); LowerWaveOpsPass drops EXEC where the
+    // executing lanes are the EXEC lanes.
+    SetDst(inst.dst[0], ir.ReadFirstLane(value, ir.GetExec()));
 }
 
 void Translator::V_READLANE_B32(const GcnInst& inst) {

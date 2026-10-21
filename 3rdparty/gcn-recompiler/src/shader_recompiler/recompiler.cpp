@@ -136,7 +136,10 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::SsaRewritePass(program);
     Shader::Optimization::SharedMemoryBarrierPass(program, runtime_info, profile);
     Shader::Optimization::DeadCodeEliminationPass(program);
-    Shader::Optimization::LowerWave64BallotPass(program, runtime_info, profile);
+    // PS4Recomp: fold the structurizer's conditions first, so that LowerWaveOpsPass sees an EXEC
+    // scope's condition as the EXEC value itself
+    Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+    Shader::Optimization::LowerWaveOpsPass(program, runtime_info, profile);
     Shader::Optimization::LowerHardwareIntrinsics(program);
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
     Shader::Optimization::DeadCodeEliminationPass(program);

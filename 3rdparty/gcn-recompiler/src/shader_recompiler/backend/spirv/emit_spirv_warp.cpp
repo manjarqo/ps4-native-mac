@@ -22,8 +22,18 @@ Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id index) {
     return ctx.OpGroupNonUniformQuadBroadcast(ctx.U32[1], SubgroupScope(ctx), value, index);
 }
 
-Id EmitReadFirstLane(EmitContext& ctx, Id value) {
-    return ctx.OpGroupNonUniformBroadcastFirst(ctx.U32[1], SubgroupScope(ctx), value);
+// PS4Recomp: the value of the first invocation in EXEC (of invocation 0 when EXEC has none, as
+// GCN reads lane 0 then). Plain broadcast of the first executing invocation when every executing
+// invocation is in EXEC.
+Id EmitReadFirstLane(EmitContext& ctx, Id value, const IR::Value& exec) {
+    if (exec.IsImmediate() && exec.U1()) {
+        return ctx.OpGroupNonUniformBroadcastFirst(ctx.U32[1], SubgroupScope(ctx), value);
+    }
+    const Id ballot{ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.Def(exec))};
+    const Id first{ctx.OpGroupNonUniformBallotFindLSB(ctx.U32[1], SubgroupScope(ctx), ballot)};
+    const Id none{ctx.OpIEqual(ctx.U1[1], first, ctx.ConstU32(~0u))};
+    const Id lane{ctx.OpSelect(ctx.U32[1], none, ctx.u32_zero_value, first)};
+    return ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value, lane);
 }
 
 Id EmitShuffle(EmitContext& ctx, Id value, Id index) {
@@ -39,7 +49,7 @@ Id EmitReadLane(EmitContext& ctx, Id value, Id lane) {
 }
 
 Id EmitWriteLane(EmitContext& ctx, Id value, Id write_value, u32 lane) {
-    return ctx.u32_zero_value;
+    UNREACHABLE_MSG("WriteLane is lowered to a per-lane select by LowerWaveOpsPass");
 }
 
 Id EmitBallot(EmitContext& ctx, Id bit) {

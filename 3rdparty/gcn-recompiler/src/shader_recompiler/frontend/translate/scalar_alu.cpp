@@ -562,8 +562,10 @@ void Translator::S_FF1_I32_B32(const GcnInst& inst) {
 }
 
 void Translator::S_FF1_I32_B64(const GcnInst& inst) {
+    // PS4Recomp: a plain scan of the 64 bits (-1 when none is set). The subgroup ballot scan
+    // only looks at as many bits as the host subgroup has lanes (32 on Metal).
     const IR::U64 src0{GetSrc64(inst.src[0])};
-    SetDst(inst.dst[0], ir.BallotFindLsb(src0));
+    SetDst(inst.dst[0], ir.FindILsb(src0));
 }
 
 void Translator::S_FLBIT_I32_B32(const GcnInst& inst) {
@@ -661,9 +663,14 @@ void Translator::S_BITCMP(bool compare_mode, u32 bits, const GcnInst& inst) {
         const IR::U32 bittest = [&]() -> IR::U32 {
             if (bits == 64) {
                 const IR::U64 src0 = GetSrc64(inst.src[0]);
-                const IR::U64 bit{
-                    ir.BitwiseAnd(ir.ShiftRightLogical(src0, bitpos), ir.Imm64(u64(1)))};
-                return ir.UConvert(32, bit);
+                // PS4Recomp: the bit from the 32-bit half holding it (there is no 64 -> 32 bit
+                // integer conversion in the IR)
+                const IR::Value halves = ir.UnpackUint2x32(src0);
+                const IR::U32 word = IR::U32{ir.Select(ir.ILessThan(bitpos, ir.Imm32(32u), false),
+                                                       ir.CompositeExtract(halves, 0),
+                                                       ir.CompositeExtract(halves, 1))};
+                return ir.BitwiseAnd(ir.ShiftRightLogical(word, ir.BitwiseAnd(bitpos, ir.Imm32(31u))),
+                                     ir.Imm32(1u));
             }
             if (bits != 32) {
                 UNREACHABLE();
