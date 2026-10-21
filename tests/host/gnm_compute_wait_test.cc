@@ -4,10 +4,14 @@
 // running on. Uncharted 4's async compute waits for the graphics depth prepass and then copies
 // the depth buffer; the walker ran through the wait, copied stale depth, and later passes drew
 // the water over Drake. The read pointer must not pass the waiting packet.
+// The queue (ps4gnm_wq::WaitQueue): submissions run in order, a later one waits behind a
+// suspended one, a timed-out wait is skipped, and every wait gets its own time limit (a
+// submission's second wait inherited the first one's start time and was skipped ~1 ms later).
 #include <stdint.h>
 #include <stdio.h>
 #include <vector>
 #include "ps4_gnm_ib.h"
+#include "ps4_gnm_wait_queue.h"
 
 static int g_fail;
 
@@ -69,6 +73,50 @@ struct Queue {
     }
 };
 
+// A submission: a list of waits (flag index, value); progress = waits passed.
+struct Sub {
+    std::vector<std::pair<int, uint32_t>> waits;
+    size_t at = 0;
+    int id;
+};
+
+static void TestWaitQueue() {
+    uint32_t flags[3] = {0, 0, 0};
+    std::vector<int> done;
+    auto process = [&](Sub &s, bool skip) {
+        for (; s.at < s.waits.size(); ++s.at) {
+            const auto [f, v] = s.waits[s.at];
+            if (flags[f] == v) continue;
+            if (skip) {
+                skip = false;
+                continue;
+            }
+            return false;
+        }
+        done.push_back(s.id);
+        return true;
+    };
+    ps4gnm_wq::WaitQueue<Sub> q;
+    q.pending.push_back({{{0, 1}, {1, 1}}, 0, 1});
+    q.pending.push_back({{}, 0, 2});
+    const uint64_t ms = 1000000;
+    check(q.Run(false, 100 * ms, process) && q.Suspended(), "the queue stops at the first wait");
+    check(done.empty(), "the submission behind it does not run");
+    check(!q.TimedOut(120 * ms, 50 * ms) && q.TimedOut(151 * ms, 50 * ms), "the wait times out after its limit");
+    check(q.Run(true, 151 * ms, process), "after the timeout it stops again at the second wait");
+    check(q.timeouts == 1 && q.suspends == 2, "one timeout, two suspensions counted");
+    check(!q.TimedOut(152 * ms, 50 * ms), "the second wait gets its own time limit");
+    check(q.TimedOut(202 * ms, 50 * ms), "and times out 50 ms after it started");
+    flags[1] = 1;
+    q.suspended_at = 0; // the value arrived (ResumeComputeQueues)
+    check(!q.Run(false, 160 * ms, process) && !q.Suspended(), "the value arrives: both submissions finish");
+    check(done == std::vector<int>({1, 2}), "in order");
+    q.pending.push_back({{{2, 5}}, 0, 3});
+    check(q.Run(false, 170 * ms, process), "a new submission waits");
+    q.Reset();
+    check(q.pending.empty() && !q.Suspended(), "a remapped queue drops its waiting submissions");
+}
+
 int main() {
     // ring: 1, IB call -> [2, chain -> [3, WAIT f0==1, 4]], 5, WAIT f1==7, 6
     Arena a; // the IBs first, so their indices are known
@@ -121,5 +169,6 @@ int main() {
     Queue tq{&t, {{t.w.data(), (uint32_t)t.w.size(), 0}}, {}, 0, flags};
     check(tq.Run() && tq.log == std::vector<uint32_t>({1}), "a truncated packet ends the buffer");
 
+    TestWaitQueue();
     return g_fail;
 }

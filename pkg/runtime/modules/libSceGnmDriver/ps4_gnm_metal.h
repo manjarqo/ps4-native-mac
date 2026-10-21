@@ -33,6 +33,10 @@ int32_t ps4_gnm_metal_process_compute_packets(GuestContext *ctx, const uint32_t 
                                               uint32_t pipe_id, uint32_t queue_slot, uint32_t *read_ptr,
                                               uint32_t ring_size_dw, uint32_t read_base_dw);
 
+// The compute queue in `queue_slot` was mapped again or unmapped: drop its submissions that
+// still wait (they point into the old ring).
+void ps4_gnm_metal_reset_compute_queue(uint32_t queue_slot);
+
 // Presentation hook for libSceVideoOut: if the display buffer at `addr` was rendered by the GPU,
 // present it from the Metal texture (returns 1); returns 0 if the caller must present from guest
 // memory instead (all GPU work has then completed). tiling_mode/pixel_format as given to

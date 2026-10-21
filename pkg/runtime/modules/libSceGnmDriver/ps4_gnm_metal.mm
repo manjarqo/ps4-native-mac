@@ -21,6 +21,7 @@
 #include "ps4_gnm_draw.h"
 #include "ps4_gnm_resources.h"
 #include "ps4_gnm_ib.h"
+#include "ps4_gnm_wait_queue.h"
 #include "ps4_gnmdriver.h"
 #include "gcn_recompiler.h"
 
@@ -1048,10 +1049,8 @@ struct ComputeSubmit {
     uint32_t ring_size_dw = 0, read_base_dw = 0;
     std::vector<ps4gnm_ib::Frame> frames;
 };
-static struct ComputeQueueState {
-    std::deque<ComputeSubmit> pending;
-    uint64_t suspended_at = 0; // ns, 0 = running
-} g_cq[kMaxComputeQueues];
+using ComputeQueueState = ps4gnm_wq::WaitQueue<ComputeSubmit>;
+static ComputeQueueState g_cq[kMaxComputeQueues];
 static uint64_t g_cq_suspends = 0, g_cq_timeouts = 0;
 static uint64_t g_queue_progress = 0; // bumped whenever a suspended queue runs again
 static constexpr uint64_t kComputeWaitLimitMs = 50;
@@ -1164,40 +1163,32 @@ static void StartGfxWatchdog();
 // past its wait.
 static void RunComputeQueue(uint32_t slot, bool force) {
     ComputeQueueState &q = g_cq[slot];
-    while (!q.pending.empty()) {
-        const bool skip = force && q.suspended_at;
-        force = false;
-        if (skip) g_cq_timeouts++;
-        if (!ProcessComputePackets(q.pending.front(), skip)) {
-            if (!q.suspended_at) {
-                q.suspended_at = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-                g_cq_suspends++;
-                if ((g_cq_suspends & (g_cq_suspends - 1)) == 0)
-                    fprintf(stderr, "[ps4-gnm] a compute queue waits for another queue: %llu times, %llu timed out\n",
-                            (unsigned long long)g_cq_suspends, (unsigned long long)g_cq_timeouts);
-                StartGfxWatchdog();
-            }
-            return;
-        }
-        q.suspended_at = 0;
-        q.pending.pop_front();
+    const uint64_t timeouts = q.timeouts;
+    const bool stopped = q.Run(force, clock_gettime_nsec_np(CLOCK_UPTIME_RAW),
+                               [](ComputeSubmit &sub, bool skip) { return ProcessComputePackets(sub, skip); });
+    g_cq_timeouts += q.timeouts - timeouts;
+    if (stopped) {
+        g_cq_suspends++;
+        if ((g_cq_suspends & (g_cq_suspends - 1)) == 0)
+            fprintf(stderr, "[ps4-gnm] a compute queue waits for another queue: %llu times, %llu timed out\n",
+                    (unsigned long long)g_cq_suspends, (unsigned long long)g_cq_timeouts);
+        StartGfxWatchdog();
     }
 }
 
 // Continues suspended compute queues whose wait is satisfied (or timed out). Called with
 // g_state.mutex held.
 static void ResumeComputeQueues() {
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     for (uint32_t slot = 0; slot < kMaxComputeQueues; ++slot) {
         ComputeQueueState &q = g_cq[slot];
-        if (!q.suspended_at || q.pending.empty()) continue;
+        if (!q.Suspended()) continue;
         const ComputeSubmit &sub = q.pending.front();
         if (sub.frames.empty()) continue;
         const ps4gnm_ib::Frame &f = sub.frames.back();
         const uint32_t payload_dw = ((f.words[f.pc] >> 16) & 0x3FFF) + 1;
         const bool ready = WaitRegMemReady(sub.ctx, &f.words[f.pc + 1], payload_dw);
-        const bool timed_out =
-            clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - q.suspended_at > kComputeWaitLimitMs * 1000000ull;
-        if (!ready && !timed_out) continue;
+        if (!ready && !q.TimedOut(now, kComputeWaitLimitMs * 1000000ull)) continue;
         if (ready) q.suspended_at = 0;
         RunComputeQueue(slot, !ready);
         g_queue_progress++;
@@ -1206,7 +1197,7 @@ static void ResumeComputeQueues() {
 
 static bool AnyComputeSuspended() {
     for (const auto &q : g_cq)
-        if (q.suspended_at) return true;
+        if (q.Suspended()) return true;
     return false;
 }
 
@@ -1299,13 +1290,16 @@ static void ResumeGfxQueue() {
 // Lets suspended queues wait for each other: runs whichever can continue until none does.
 // Called with the CP lock held.
 static void PumpQueues() {
+    const uint64_t start = g_queue_progress;
     for (int i = 0; i < 64; ++i) {
         const uint64_t before = g_queue_progress;
         ResumeComputeQueues();
         ResumeGfxQueue();
         if (g_queue_progress == before) break;
     }
-    if (ps4draw::HasPendingWork()) ps4draw::Flush(false);
+    // commit what the queues that continued encoded (nothing new otherwise: the watchdog calls
+    // this every millisecond while a queue waits)
+    if (g_queue_progress != start && ps4draw::HasPendingWork()) ps4draw::Flush(false);
 }
 
 static void StartGfxWatchdog() {
@@ -1358,13 +1352,18 @@ int32_t ps4_gnm_metal_process_compute_packets(GuestContext *ctx, const uint32_t 
         sub.read_base_dw = read_base_dw;
         sub.frames.push_back({words, size_dw, 0});
         q.pending.push_back(std::move(sub));
-        if (!q.suspended_at) RunComputeQueue(slot, false);
+        if (!q.Suspended()) RunComputeQueue(slot, false);
         // compute work without a trailing fence still has to reach the GPU
         if (ps4draw::HasPendingWork()) ps4draw::Flush(false);
         PumpQueues();
     }
     // nonzero: part of the submission still waits; the caller must not report it consumed
     return q.pending.empty() ? 0 : 1;
+}
+
+void ps4_gnm_metal_reset_compute_queue(uint32_t queue_slot) {
+    std::scoped_lock lock(g_state.mutex);
+    g_cq[queue_slot % kMaxComputeQueues].Reset();
 }
 
 int32_t ps4_gnm_metal_process_command_buffers(GuestContext *ctx, uint32_t count,
