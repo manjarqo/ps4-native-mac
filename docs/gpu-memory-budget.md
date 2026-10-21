@@ -108,10 +108,14 @@ the sampled bytes, the cache budget and the evictions so far.
   budget, U4 chapter 1 grows its sampled textures from 240 MiB to 1.5 GiB in 5 minutes and keeps growing; at
   512 MiB it holds about 470 MiB with no fps cost; at 256 MiB re-uploads of still-used textures cost long frames.
   TLOU's courtyard needs about 400 MiB in all.
-- **Not evicted: GPU-owned surfaces.** They grow too (U4 chapter 1: 300 MiB to 1.2 GiB in 4 minutes). The
-  `[gnm-mem] GPU-owned surfaces:` line reports how many overlap a surface created after them (the game reused
-  their memory) and how many were not looked up for 10 s. Evicting them needs the renderer's caches that are
-  keyed by texture pointer (depth companions, EQAA twins) to drop their entries first.
+- **GPU-owned surfaces** hold the only copy of what the GPU wrote, so they are evicted only when superseded:
+  their guest memory is overlapped by a GPU-owned surface created after them (the game reused it; on the PS4
+  their contents are gone too), they were not looked up for 10 s (2 s while the over-budget sweep purges) and
+  their last command buffer has completed (`TextureCache::EvictSuperseded`, once a second). The renderer drops
+  the state it keys by texture pointer (depth companions, depth versions, EQAA twins) before the textures are
+  freed, so a new texture at the same address never inherits it. U4 chapter 1 without this: GPU-owned surfaces
+  grew from 300 MiB to 1.2 GiB in 4 minutes, about 70% of them superseded. The `[gnm-mem] GPU-owned surfaces:`
+  line reports the superseded and the 10 s idle surfaces still cached.
 - **GPU budget pressure**: when the over-budget sweep purges the transient caches (with its back-off), every
   candidate not used for 250 ms is evicted as well.
 - **GPU writes**: an evicted entry takes its GPU-upload epoch with it. A re-created texture is uploaded from guest
@@ -120,6 +124,8 @@ the sampled bytes, the cache budget and the evictions so far.
   the re-creation marks the new entry stale once (one extra upload, never stale contents).
 - The GPU-owned range index (`OverlapsGpuTexture`) is rebuilt when a GPU-owned entry was added, removed or
   resized (a version counter); the entry count no longer works as that signal once entries are evicted.
+- `[gnm-mem] sweeps:` gives the time `Commit` spent in the window sweep and the eviction since the previous
+  line, and the longest single call.
 - A re-created texture reads the guest memory as it is now. The cache does not see every CPU write to guest
   memory (only the notified ones), so a texture the game rewrote without such a notification can show its new
   contents after an eviction where the never-evicting cache kept showing the old ones.
