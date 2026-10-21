@@ -3,7 +3,8 @@
 // by ps4draw::Dispatch and its output matches the captured bytes; a capture whose output was
 // altered is reported as a mismatch at the altered byte; a pass that is not replayable is
 // refused with its reason; GPU-owned textures created from captured identities hold the
-// captured contents (mip levels, depth and stencil planes).
+// captured contents (mip levels, depth and stencil planes); replay_props decodes and measures
+// replayed outputs.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -20,6 +21,7 @@
 #include "ps4_gnm_capture.h"
 #include "ps4_gnm_draw.h"
 #include "ps4_gnm_resources.h"
+#include "replay_props.h"
 
 using namespace ps4gnm_capture;
 
@@ -178,6 +180,41 @@ void TestTextureSeeding() {
     CHECK(!ps4draw::ReplayReadTexture(other, &back), "texture found under another identity");
 }
 
+// replay_props (the fix tests' view of replayed outputs) on a known 2x2 RGBA16Float output:
+// texel decoding, region statistics with a NaN texel left out, lookup by role suffix.
+void TestProps() {
+    ps4replay::Result r;
+    r.ran = true;
+    ps4replay::OutputResult o;
+    o.what = "t0_color0";
+    o.is_texture = o.compared = o.match = true;
+    o.tex.mtl_format = kRGBA16Float;
+    o.tex.mtl_width = o.tex.mtl_height = 2;
+    // (1, 1, 1, 1), (0.5, 0, 0, 1), (0, 2, 0, 1), (NaN, 0, 0, 1): halves 0x3C00 1.0, 0x3800 0.5, 0x4000 2.0, 0x7E00 NaN
+    const uint16_t h[16] = {0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3800, 0, 0, 0x3C00,
+                            0, 0x4000, 0, 0x3C00, 0x7E00, 0, 0, 0x3C00};
+    o.bytes.assign((const uint8_t*)h, (const uint8_t*)h + sizeof(h));
+    r.outputs.push_back(o);
+    const ps4replay::OutputResult* f = replay_props::Find(r, "_color0");
+    CHECK(f == &r.outputs[0] && !replay_props::Find(r, "_depth"), "Find by role suffix");
+    float c[4];
+    CHECK(f && replay_props::Texel(*f, 1, 0, c) && c[0] == 0.5f && c[1] == 0 && c[3] == 1, "texel (1, 0)");
+    CHECK(f && !replay_props::Texel(*f, 2, 0, c), "texel outside the image decoded");
+    if (!f) return;
+    const replay_props::Stats st = replay_props::RegionStats(*f);
+    const double l0 = 1.0, l1 = 0.2126 * 0.5, l2 = 0.7152 * 2;
+    const double mean = (l0 + l1 + l2) / 3;
+    CHECK(st.texels == 4 && st.non_finite == 1, "texels %llu non-finite %llu", (unsigned long long)st.texels,
+          (unsigned long long)st.non_finite);
+    CHECK(fabs(st.mean_luma - mean) < 1e-6 && fabs(st.max_luma - l2) < 1e-6, "luma mean %f max %f", st.mean_luma,
+          st.max_luma);
+    CHECK(fabs(st.mean[0] - 0.5) < 1e-6 && fabs(st.mean[1] - 1.0) < 1e-6, "channel means %f %f", st.mean[0], st.mean[1]);
+    const double sd = sqrt((l0 * l0 + l1 * l1 + l2 * l2) / 3 - mean * mean);
+    CHECK(fabs(st.luma_stddev - sd) < 1e-6, "luma stddev %f, expected %f", st.luma_stddev, sd);
+    const replay_props::Stats one = replay_props::RegionStats(*f, 1, 1, 1, 1);
+    CHECK(one.texels == 1 && one.non_finite == 1, "region of the NaN texel");
+}
+
 } // namespace
 
 int main() {
@@ -187,6 +224,7 @@ int main() {
         if (!root) return 1;
         TestDispatchReplay(root);
         TestTextureSeeding();
+        TestProps();
         const std::string cmd = std::string("rm -rf '") + root + "'";
         if (system(cmd.c_str()) != 0) g_fail++;
         if (g_fail) {
