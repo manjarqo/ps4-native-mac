@@ -137,7 +137,8 @@ uint64_t ps4_gpumem_for_each_readable(const void *p, uint64_t len,
 // ---- Texture cache eviction ----
 // Sampled textures are detiled copies of guest memory: an evicted one is created and uploaded
 // again on its next use. GPU-owned surfaces (render targets, depth, storage images) hold the only
-// copy of what the GPU wrote and are never evicted.
+// copy of what the GPU wrote; the cache evicts them only when superseded
+// (TextureCache::EvictSuperseded), never by this policy.
 typedef struct ps4_texcache_policy {
     uint64_t budget;   // sampled texture bytes kept; above it the cache evicts down to low_water
     uint64_t low_water;// 90% of budget

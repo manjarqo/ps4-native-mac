@@ -89,8 +89,8 @@ Code: `ps4_texcache_*` in `ps4_gnm_membudget.c` (policy), `TextureCache::EvictSa
 
 The cache holds two kinds of textures. **Sampled** textures are detiled copies of guest memory: an evicted one
 is created and uploaded again (CPU or GPU detile, as for a first use) the next time a T# needs it. **GPU-owned**
-surfaces (render targets, depth, storage images and their copies) hold the only copy of what the GPU wrote and
-are never evicted. The `[gnm-mem] texture cache:` line reports both (count, `allocatedSize` bytes), the peak of
+surfaces (render targets, depth, storage images and their copies) hold the only copy of what the GPU wrote; they
+are evicted only once other surfaces overwrote all of their memory (see below). The `[gnm-mem] texture cache:` line reports both (count, `allocatedSize` bytes), the peak of
 the sampled bytes, the cache budget and the evictions so far.
 
 - **Last use**: at every commit the renderer tells the cache the sequence number of the command buffer that
@@ -109,13 +109,21 @@ the sampled bytes, the cache budget and the evictions so far.
   512 MiB it holds about 470 MiB with no fps cost; at 256 MiB re-uploads of still-used textures cost long frames.
   TLOU's courtyard needs about 400 MiB in all.
 - **GPU-owned surfaces** hold the only copy of what the GPU wrote, so they are evicted only when superseded:
-  their guest memory is overlapped by a GPU-owned surface created after them (the game reused it; on the PS4
-  their contents are gone too), they were not looked up for 10 s (2 s while the over-budget sweep purges) and
-  their last command buffer has completed (`TextureCache::EvictSuperseded`, once a second). The renderer drops
-  the state it keys by texture pointer (depth companions, depth versions, EQAA twins) before the textures are
-  freed, so a new texture at the same address never inherits it. U4 chapter 1 without this: GPU-owned surfaces
-  grew from 300 MiB to 1.2 GiB in 4 minutes, about 70% of them superseded. The `[gnm-mem] GPU-owned surfaces:`
-  line reports the superseded and the 10 s idle surfaces still cached.
+  other GPU-owned surfaces **wrote all of their guest memory after their last use**. Then on the PS4 every byte
+  is overwritten and their contents are dead. Writes are stamped by command buffer: a bind as a render target,
+  a bind as a depth target with depth writes or a stencil test, a storage-image bind, or a copy destination.
+  These do not count:
+  - a newer surface that was only created, read, or bound for depth tests;
+  - one used in the same command buffer (the order is unknown);
+  - one covering only part of the memory (the rest may still hold GPU-only data).
+  The surface must also not have been looked up for 10 s (2 s while the over-budget sweep purges), and its last
+  command buffer must have completed (`TextureCache::EvictSuperseded`, once a second).
+  - The cache hands every texture it drops to the renderer: superseded ones, and depth arrays replaced when they
+    grow (`TakeRetired`). The renderer then erases the state it keys by texture pointer (`ForgetTexture`: depth
+    companions, depth versions, depth write order, EQAA twins) before the texture is freed, so a new texture at
+    the same address never inherits that state.
+  - U4 chapter 1 without this: GPU-owned surfaces grew from 300 MiB to 1.2 GiB in 4 minutes. The
+    `[gnm-mem] GPU-owned surfaces:` line reports the superseded and the 10 s idle surfaces still cached.
 - **GPU budget pressure**: when the over-budget sweep purges the transient caches (with its back-off), every
   candidate not used for 250 ms is evicted as well.
 - **GPU writes**: an evicted entry takes its GPU-upload epoch with it. A re-created texture is uploaded from guest

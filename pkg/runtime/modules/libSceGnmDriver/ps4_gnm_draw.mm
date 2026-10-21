@@ -528,7 +528,9 @@ struct State {
     uint32_t cb_extent[8] = {};
     uint32_t db_extent = 0;
 
-    // depth surfaces read as color (R32F companions) and depth-copy tracking
+    // depth surfaces read as color (R32F companions) and depth-copy tracking. The maps keyed by a
+    // texture pointer here (depth_comp, depth_version, depth_last_write, eqaa_twin, eqaa_orig) are
+    // erased by ForgetTexture when the texture cache drops the texture: add any new one there.
     struct Companion {
         id<MTLTexture> tex;
         uint64_t version = ~0ull;
@@ -907,34 +909,43 @@ void SweepGuestWindows() {
 // those not used for texpol.keep_ns; when the over-budget sweep purged the transient caches (with
 // its back-off), every sampled texture not used for texpol.press_ns. Only textures whose last
 // command buffer has completed are evicted (TextureCache::EvictSampled).
+// Renderer state keyed by a texture pointer must not outlive the texture: a new texture can get
+// the same address. Every such map is erased here (keep this list complete when adding one).
+void ForgetTexture(void* key) {
+    S.depth_comp.erase(key);
+    S.depth_version.erase(key);
+    S.depth_last_write.erase(key);
+    auto tw = S.eqaa_twin.find(key);
+    if (tw != S.eqaa_twin.end()) {
+        S.eqaa_orig.erase((__bridge void*)tw->second);
+        S.eqaa_twin.erase(tw);
+    }
+}
+
+// Textures the cache dropped (superseded evictions, grown depth arrays): forget them, then let
+// them go (command buffers that still use them keep them alive).
+void ForgetRetiredTextures(TextureCache* tc) {
+    std::vector<id<MTLTexture>> gone;
+    tc->TakeRetired(&gone);
+    for (id<MTLTexture> t : gone) ForgetTexture((__bridge void*)t);
+}
+
 void EvictTextures() {
     TextureCache* tc = S.tex;
     if (!tc) return;
+    ForgetRetiredTextures(tc);
     const bool gpu_purge = g_mem.tex_purge;
     g_mem.tex_purge = false;
     const uint64_t now = g_mem.tick;
     // superseded GPU-owned surfaces: once a second (with the purge too), idle 10 s (2 s over budget)
     if (gpu_purge || now - g_mem.last_gpu_evict >= 1000000000ull) {
         g_mem.last_gpu_evict = now;
-        std::vector<id<MTLTexture>> gone;
         const TextureCache::EvictResult gr =
-            tc->EvictSuperseded(gpu_purge ? 2000000000ull : 10000000000ull, now, CompletedSeq(), &gone);
-        // renderer state keyed by texture pointer must not outlive the texture (a new texture
-        // can get the same address)
-        for (id<MTLTexture> t : gone) {
-            void* key = (__bridge void*)t;
-            S.depth_comp.erase(key);
-            S.depth_version.erase(key);
-            S.depth_last_write.erase(key);
-            auto tw = S.eqaa_twin.find(key);
-            if (tw != S.eqaa_twin.end()) {
-                S.eqaa_orig.erase((__bridge void*)tw->second);
-                S.eqaa_twin.erase(tw);
-            }
-        }
+            tc->EvictSuperseded(gpu_purge ? 2000000000ull : 10000000000ull, now, CompletedSeq());
         if (gr.count)
             RLog("tex-evict-gpu", "[gnm-mem] evicted %llu superseded GPU-owned surfaces (%llu MiB)",
                  (unsigned long long)gr.count, (unsigned long long)(gr.bytes >> 20));
+        ForgetRetiredTextures(tc);
     }
     if (!gpu_purge && (now - g_mem.last_tex_evict < 100000000ull ||
                        !ps4_texcache_evict_due(&g_mem.texpol, tc->GetMemStats().sampled_bytes, 0)))
@@ -3934,7 +3945,7 @@ void ResolvePass(const RenderState& rs) {
     const ColorTarget& src = rs.color[0];
     const ColorTarget& dst = rs.color[1];
     if (!src.bound || !dst.bound) return;
-    id<MTLTexture> s = S.tex->GetColorTarget(src);
+    id<MTLTexture> s = S.tex->GetColorTarget(src, true, false); // read by the resolve
     id<MTLTexture> d = S.tex->GetColorTarget(dst);
     if (!s || !d) return;
     EndEncoders();
@@ -4853,7 +4864,7 @@ void DrawEncode(DrawRec& r) {
         if (want_depth && db.bound && db.mtl_format) {
             if (db.htile_enable) RegisterMeta(db.htile_address);
             id<MTLTexture> grown_from = nil;
-            id<MTLTexture> t = S.tex->GetDepthTarget(db, &grown_from);
+            id<MTLTexture> t = S.tex->GetDepthTarget(db, &grown_from, rs.ds.depth_write || rs.ds.stencil_test);
             if (t && grown_from) {
                 // The array grew (a view selected a later slice): keep the slices written so far.
                 EndEncoders();

@@ -773,10 +773,13 @@ public:
 
     // Render target / depth textures (created on first use, contents loaded from guest memory
     // once when load_from_guest is true; afterwards owned by the GPU and never re-uploaded).
-    id<MTLTexture> GetColorTarget(const ColorTarget& cb, bool load_from_guest = true);
+    // written: the caller lets the GPU write the surface (false for e.g. a resolve source); the
+    // last write decides when an overlapping older surface is superseded (EvictSuperseded).
+    id<MTLTexture> GetColorTarget(const ColorTarget& cb, bool load_from_guest = true, bool written = true);
     // One texture per depth surface: views of later slices grow it to a larger 2D array, and the
     // texture it replaced is returned in *grown_from so the caller can copy its slices over.
-    id<MTLTexture> GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from = nullptr);
+    // The replaced texture is also queued for TakeRetired.
+    id<MTLTexture> GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from = nullptr, bool written = true);
 
     // CPU wrote [addr, addr+size): sampled textures overlapping are re-uploaded on next use.
     // Render-target textures are not touched (GPU owns them) unless include_render_targets.
@@ -855,25 +858,27 @@ public:
     void SetUse(uint64_t seq, uint64_t now_ns);
     // Evicts sampled textures chosen by ps4_texcache_select: only entries whose last command
     // buffer has completed (completed_seq), least recently used first. GPU-owned surfaces are
-    // never evicted. An evicted texture still referenced by a command buffer lives until that
+    // never evicted here (see EvictSuperseded). An evicted texture still referenced by a command buffer lives until that
     // command buffer is done; its next lookup creates and uploads it again.
     struct EvictResult {
         uint64_t count = 0, bytes = 0;
     };
     EvictResult EvictSampled(const ps4_texcache_policy& p, bool gpu_over, uint64_t now_ns, uint64_t completed_seq);
-    // GPU-owned surfaces (never evicted): how many overlap the guest memory of a surface created
-    // after them (the game reused that memory, so their contents are dead on the PS4 too), and how
-    // many were not looked up for idle_ns. Takes the lock and walks the GPU-owned entries.
+    // GPU-owned surfaces: how many are superseded (see EvictSuperseded) and how many were not
+    // looked up for idle_ns. Takes the lock and walks the GPU-owned entries.
     struct GpuOwnedStats {
         uint64_t superseded_count = 0, superseded_bytes = 0, idle_count = 0, idle_bytes = 0;
     };
     GpuOwnedStats GetGpuOwnedStats(uint64_t idle_ns) const;
-    // Evicts superseded GPU-owned surfaces: ones whose guest memory a surface created after them
-    // overlaps (the game reused it; on the PS4 their contents are gone), that were not looked up
-    // for idle_ns and whose last command buffer has completed. Their textures are appended to
-    // *evicted so the renderer can drop state it keys by texture pointer before they are freed.
-    EvictResult EvictSuperseded(uint64_t idle_ns, uint64_t now_ns, uint64_t completed_seq,
-                                std::vector<id<MTLTexture>>* evicted);
+    // Evicts superseded GPU-owned surfaces: ones whose whole guest range other GPU-owned surfaces
+    // wrote after this one's last use (on the PS4 their bytes are overwritten), not looked up for
+    // idle_ns and whose last command buffer has completed. Partial cover, or a newer surface that
+    // was only created or read, keeps the surface: GPU-only contents are never dropped.
+    EvictResult EvictSuperseded(uint64_t idle_ns, uint64_t now_ns, uint64_t completed_seq);
+    // GPU-owned textures the cache dropped (superseded evictions, depth arrays replaced when they
+    // grew), handed to the renderer so it forgets state keyed by their pointers before they are
+    // freed; the cache keeps them alive until taken. Cheap when there are none.
+    void TakeRetired(std::vector<id<MTLTexture>>* out);
     // Totals since start (any thread).
     uint64_t EvictedCount() const { return evicted_count_.load(std::memory_order_relaxed); }
     uint64_t EvictedBytes() const { return evicted_bytes_.load(std::memory_order_relaxed); }
@@ -889,9 +894,12 @@ private:
     void WaitIdleLocked();
     // Adds (sign +1) or removes (sign -1) an entry's texture in the MemStats counters.
     void TrackLocked(const Entry* e, int sign);
-    // Stamps the entry's last use with the SetUse values.
+    // Stamps the entry's last use with the SetUse values (UseLocked: and its last write).
     void TouchLocked(const Entry* e) const;
-    uint64_t create_clock_ = 0;
+    void UseLocked(const Entry* e, bool written) const;
+    void RetireLocked(id<MTLTexture> t);
+    std::vector<id<MTLTexture>> retired_;
+    std::atomic<bool> retired_pending_{false};
 
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;

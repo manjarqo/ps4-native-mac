@@ -67,7 +67,7 @@ static ps4_texcache_policy small_policy(uint64_t budget) {
 
 static void test_select() {
     const ps4_texcache_policy p = small_policy(100);
-    // id, last_ns, last_seq, bytes
+    // last_ns, last_seq, bytes, id
     ps4_texcache_item it[6] = {
         {10000 * MS, 50, 30, 0}, // used at 10 s by command buffer 50 (in flight)
         {1000 * MS, 5, 30, 1},   // oldest
@@ -138,21 +138,35 @@ static uint8_t FirstByte(id<MTLTexture> t) {
     return px[0];
 }
 
-static ColorTarget Rt(uint64_t addr) {
+static ColorTarget Rt(uint64_t addr, uint32_t height = 64, uint32_t mtl_format = MTLPixelFormatRGBA8Unorm) {
     ColorTarget c;
     c.bound = true;
     c.address = addr;
     c.pitch = 64;
-    c.height = 64;
-    c.slice_bytes = 64 * 64 * 4;
+    c.height = height;
+    c.slice_bytes = 64 * height * 4;
     c.num_slices = 1;
     c.num_samples = 1;
     c.bpp = 32;
     c.dfmt = DataFormat::Format8_8_8_8;
     c.nfmt = NumberFormat::Unorm;
-    c.mtl_format = MTLPixelFormatRGBA8Unorm;
+    c.mtl_format = mtl_format;
     c.tile_mode = TileMode::DisplayLinearAligned;
     return c;
+}
+
+static DepthTarget Db(uint64_t addr, uint32_t slices) {
+    DepthTarget d;
+    d.bound = true;
+    d.z_read_address = addr;
+    d.pitch = 64;
+    d.height = 64;
+    d.slice_bytes = 64 * 64 * 4;
+    d.num_slices = slices;
+    d.num_samples = 1;
+    d.bpp = 32;
+    d.mtl_format = MTLPixelFormatDepth32Float;
+    return d;
 }
 
 static void test_cache(id<MTLDevice> dev) {
@@ -268,35 +282,115 @@ static void test_cache(id<MTLDevice> dev) {
         check(rt2 != nil, "second render target created");
         check(tc.OverlapsGpuTexture(C2, 16), "range index rebuilt for a render target added after an eviction");
         check(tc.FindColorTarget(C1) == rt1, "render target kept");
-        // GPU-owned telemetry: a newer surface over part of C1's memory supersedes C1
-        TextureCache::GpuOwnedStats go = tc.GetGpuOwnedStats(1000 * MS);
-        check(go.superseded_count == 0, "no GPU-owned surface superseded yet");
-        tc.SetUse(7, 40000 * MS);
-        check(tc.GetColorTarget(Rt(C1 + 0x1000), false) != nil, "overlapping newer render target created");
-        tc.FindColorTarget(C1 + 0x1000);
-        go = tc.GetGpuOwnedStats(1000 * MS);
-        check(go.superseded_count == 1, "the older overlapped render target counts as superseded");
-        check(go.idle_count == 2, "C1 and C2, last looked up at 30 s, are idle at 40 s; the new one is not");
-        // superseded GPU-owned eviction: C1 (last used by command buffer 6) once that has completed
-        const uint64_t gpu_before = tc.GetMemStats().gpu_count;
-        std::vector<id<MTLTexture>> gone;
-        TextureCache::EvictResult gr = tc.EvictSuperseded(1000 * MS, 40500 * MS, 5, &gone);
-        check(gr.count == 0 && gone.empty(), "superseded surface of a command buffer in flight kept");
-        gr = tc.EvictSuperseded(20000 * MS, 40500 * MS, 7, &gone);
-        check(gr.count == 0, "superseded surface used within the idle time kept");
-        weak_rt1 = rt1;
-        rt1 = nil;
-        gr = tc.EvictSuperseded(1000 * MS, 40500 * MS, 7, &gone);
-        check(gr.count == 1 && gone.size() == 1 && gone[0] == weak_rt1, "idle superseded render target evicted and handed back");
-        check(tc.GetMemStats().gpu_count == gpu_before - 1 && tc.EvictedGpuCount() == 1, "GPU-owned accounting removed");
-        check(tc.FindColorTarget(C1) == nil && tc.FindColorTarget(C2) == rt2 && tc.FindColorTarget(C1 + 0x1000) != nil,
-              "only the superseded surface went (not the idle unsuperseded one, not the newer one)");
-        check(!tc.OverlapsGpuTexture(C1, 16) && tc.OverlapsGpuTexture(C1 + 0x1000, 16),
-              "range index rebuilt after a GPU-owned eviction");
-        gone.clear();
     }
-    check(weak_rt1 == nil, "evicted render target freed once the renderer dropped it");
+    (void)weak_rt1;
     munmap(g.base, g.size);
+}
+
+// Superseded GPU-owned surfaces: only when other surfaces wrote all of their memory after their
+// last use. Each case uses its own addresses; command buffer n is open at n s.
+static void test_superseded(id<MTLDevice> dev) {
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    const uint64_t size = 64 * MiB;
+    uint8_t* base = (uint8_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    TextureCache tc(dev, q, base, size);
+    auto at = [&](uint64_t seq) { tc.SetUse(seq, seq * 1000 * MS); };
+    const uint32_t BGRA = MTLPixelFormatBGRA8Unorm;
+    const uint64_t X1 = 0x100000, X2 = 0x200000, X3 = 0x300000, X4 = 0x400000, X5 = 0x500000, X6 = 0x600000,
+                   Y = 0x700000, Z1 = 0x800000, Z2 = 0x900000;
+    __weak id<MTLTexture> weak_a1 = nil;
+    std::vector<id<MTLTexture>> retired;
+    @autoreleasepool {
+        // 1: the same memory rendered again as another surface: the old one is superseded
+        at(1);
+        id<MTLTexture> a1 = tc.GetColorTarget(Rt(X1), false);
+        at(2);
+        id<MTLTexture> b1 = tc.GetColorTarget(Rt(X1, 64, BGRA), false);
+        check(a1 && b1 && a1 != b1, "case 1: two surfaces over the same memory");
+        check(tc.GetGpuOwnedStats(1000 * MS).superseded_count == 1, "case 1: the older one counts as superseded");
+        TextureCache::EvictResult r = tc.EvictSuperseded(1000 * MS, 3500 * MS, 0);
+        check(r.count == 0, "case 1: its command buffer in flight: kept");
+        r = tc.EvictSuperseded(5000 * MS, 3500 * MS, 2);
+        check(r.count == 0, "case 1: used within the idle time: kept");
+        weak_a1 = a1;
+        a1 = nil;
+        r = tc.EvictSuperseded(1000 * MS, 3500 * MS, 2);
+        check(r.count == 1 && tc.FindColorTarget(X1) == b1, "case 1: superseded surface evicted, the newer one kept");
+        tc.TakeRetired(&retired);
+        check(retired.size() == 1 && retired[0] == weak_a1, "case 1: evicted texture handed to the renderer");
+        check(!tc.OverlapsGpuTexture(X1 + 0x10000, 16) && tc.OverlapsGpuTexture(X1, 16), "case 1: range index rebuilt");
+        retired.clear();
+    }
+    check(weak_a1 == nil, "case 1: freed once the renderer dropped it");
+
+    @autoreleasepool {
+        // 2: the older surface is rendered again after the newer one was created (review I1)
+        at(10);
+        id<MTLTexture> a2 = tc.GetColorTarget(Rt(X2), false);
+        at(11);
+        tc.GetColorTarget(Rt(X2, 64, BGRA), false);
+        at(12);
+        check(tc.GetColorTarget(Rt(X2), false) == a2, "case 2: older surface rendered again");
+        // 3: partial cover keeps the older surface (its first 4 KiB were not overwritten)
+        at(13);
+        id<MTLTexture> a3 = tc.GetColorTarget(Rt(X3), false);
+        at(14);
+        tc.GetColorTarget(Rt(X3 + 0x1000), false);
+        // 4: a newer surface starting before the older one and covering it (backward overlap)
+        at(15);
+        id<MTLTexture> a4 = tc.GetColorTarget(Rt(X4), false);
+        id<MTLTexture> a5 = tc.GetColorTarget(Rt(X5), false);
+        at(16);
+        tc.GetColorTarget(Rt(X4 - 0x1000, 128), false);
+        tc.GetColorTarget(Rt(X5 - 0x1000, 128), false);
+        at(17);
+        check(tc.FindColorTarget(X5) == a5, "case 4: X5 read again after the cover was written");
+        // 5: both used by the same command buffer: order unknown, both kept
+        at(18);
+        id<MTLTexture> a6 = tc.GetColorTarget(Rt(X6), false);
+        tc.GetColorTarget(Rt(X6, 64, BGRA), false);
+        // 6: a depth array over a render target, bound for depth tests only, grows
+        at(19);
+        id<MTLTexture> ay = tc.GetColorTarget(Rt(Y), false);
+        at(20);
+        id<MTLTexture> dy = tc.GetDepthTarget(Db(Y, 1), nullptr, false);
+        at(21);
+        id<MTLTexture> grown_from = nil;
+        id<MTLTexture> dy2 = tc.GetDepthTarget(Db(Y, 2), &grown_from, false);
+        check(dy && dy2 && dy2 != dy && grown_from == dy, "case 6: depth array grew");
+        tc.TakeRetired(&retired);
+        check(retired.size() == 1 && retired[0] == dy, "case 6: the replaced depth texture is handed to the renderer");
+        retired.clear();
+        // 7: a compute copy into memory of an older surface, which is read afterwards
+        at(22);
+        tc.GetColorTarget(Rt(Z1), false);
+        id<MTLTexture> az = tc.GetColorTarget(Rt(Z2, 64, BGRA), false);
+        at(23);
+        id<MTLTexture> cs = nil, cd = nil;
+        int kind = 0;
+        check(tc.CloneGpuTexture(Z1, Z2, &cs, &cd, &kind) && cd && cd != az, "case 7: surface copied over Z2");
+        at(24);
+        check(tc.GetColorTarget(Rt(Z2, 64, BGRA), false, false) == az, "case 7: the older surface read after the copy");
+        at(30);
+        const uint64_t before = tc.GetMemStats().gpu_count;
+        TextureCache::EvictResult r = tc.EvictSuperseded(1000 * MS, 40000 * MS, 30);
+        // evicted: case 2's newer surface (overwritten by the older one at 12), case 4's X4
+        check(tc.FindColorTarget(X2) == a2 && tc.GetColorTarget(Rt(X2), false) == a2,
+              "case 2: surface rendered after the newer one was created is kept");
+        check(tc.FindColorTarget(X3) == a3, "case 3: partially covered surface kept");
+        check(tc.FindColorTarget(X5) == a5, "case 4: covered surface read after the cover was written is kept");
+        check(tc.FindColorTarget(X4) == nil && a4 != nil, "case 4: surface covered by a newer one starting before it is evicted");
+        check(tc.FindColorTarget(X6) == a6, "case 5: same command buffer: kept");
+        check(tc.FindColorTarget(Y) == ay && tc.FindDepthTarget(Y) == dy2,
+              "case 6: render target under a test-only depth array that grew is kept");
+        check(tc.GetColorTarget(Rt(Z2, 64, BGRA), false, false) == az, "case 7: older surface read after a copy into its memory is kept");
+        check(r.count == 2 && tc.GetMemStats().gpu_count == before - 2,
+              "exactly two surfaces evicted (case 2's overwritten newer one, case 4's X4)");
+        tc.TakeRetired(&retired);
+        check(retired.size() == 2, "both handed to the renderer");
+        retired.clear();
+    }
+    munmap(base, size);
 }
 
 int main() {
@@ -309,6 +403,7 @@ int main() {
             return 1;
         }
         test_cache(dev);
+        test_superseded(dev);
     }
     printf("tex_evict_test: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;
