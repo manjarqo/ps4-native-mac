@@ -9,13 +9,18 @@
 // Rectangles have their corner at vertex 0, 1 and 2, in both windings; draws are non-indexed
 // from vertex 0, non-indexed from a later vertex, indexed (16-bit indices, base vertex),
 // instanced, and with back faces culled (a rectangle is drawn whole or not at all).
+// It also runs the renderer's background compile of the two RectList shaders
+// (ps4gnm_rect::CompileLibrary) from a stack frame that is gone before Metal completes.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "gcn_recompiler.h"
@@ -341,6 +346,68 @@ void CheckRects(const DrawCase& c, const std::vector<float>& px) {
     CHECK(holes == 0, "%s: %u pixels of the rectangles not drawn", c.name, holes);
 }
 
+// The renderer's background compile of the RectList shaders (ps4gnm_rect::CompileLibrary, called
+// by RectListShaders in ps4_gnm_draw.mm): Metal runs the completion on one of its threads after
+// the function that started the compiles has returned. Each round starts both compiles from a
+// frame that is then overwritten (zeros) before Metal can finish; a completion that reaches into
+// that frame instead of the heap objects it was given crashes or leaves the state wrong.
+struct BgShader {
+    id<MTLFunction> fn = nil;
+    bool pending = true;
+};
+struct BgRect : ps4gnm_rect::LibraryStatus {
+    BgShader capture, expand;
+};
+
+// A source Metal has not compiled before (in this process or its on-disk cache), so the compile
+// takes its full time, as a new shader's does in a cold-cache game run.
+std::string Uncached(const std::string& msl, int round) {
+    char tag[96];
+    std::snprintf(tag, sizeof(tag), "// gnm_rectlist_test background compile %d.%d.%lld\n", (int)getpid(), round,
+                  (long long)std::chrono::steady_clock::now().time_since_epoch().count());
+    return tag + msl;
+}
+
+__attribute__((noinline)) void StartBackgroundCompiles(id<MTLDevice> dev, const gcn_rectlist_msl& m, BgRect* r,
+                                                       uint64_t code_addr, int round) {
+    ps4gnm_rect::CompileLibrary(dev, Uncached(ps4gnm_rect::PrepareMsl(m.capture_msl, false), round), &r->capture.fn,
+                                &r->capture.pending, r, code_addr, false);
+    ps4gnm_rect::CompileLibrary(dev, Uncached(ps4gnm_rect::PrepareMsl(m.expand_msl, true), round), &r->expand.fn,
+                                &r->expand.pending, r, code_addr, true);
+}
+
+// Overwrites the stack below the caller (where the returned frames were) with zeros.
+__attribute__((noinline)) void ScribbleStack() {
+    volatile uint8_t junk[64 * 1024];
+    for (size_t i = 0; i < sizeof(junk); i++) junk[i] = 0;
+}
+
+void CheckBackgroundCompile(Fixture& f) {
+    const std::string expand = ps4gnm_rect::PrepareMsl(f.rect.expand_msl, true);
+    CHECK(expand.find("[[position, invariant]]") != std::string::npos && expand.find("[[position]]") == std::string::npos,
+          "the expansion shader's position is not made invariant");
+    CHECK(ps4gnm_rect::PrepareMsl(f.rect.capture_msl, false).find("[[clang::optnone]]") == std::string::npos,
+          "optnone left in the capture shader");
+    for (int round = 0; round < 4; round++) {
+        auto* r = new BgRect();
+        StartBackgroundCompiles(f.dev, f.rect, r, f.code_addr, round);
+        ScribbleStack();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (r->compiling.load(std::memory_order_acquire) > 0 && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const int left = r->compiling.load(std::memory_order_acquire);
+        CHECK(left == 0, "round %d: %d RectList libraries still compiling after 30 s", round, left);
+        if (left != 0) return; // the completions may still write into r: leave it allocated
+        CHECK(!r->failed.load(std::memory_order_relaxed), "round %d: a RectList library is marked failed", round);
+        CHECK(r->capture.fn && r->capture.fn.functionType == MTLFunctionTypeVertex,
+              "round %d: no capture vertex function", round);
+        CHECK(r->expand.fn && r->expand.fn.functionType == MTLFunctionTypeVertex,
+              "round %d: no expansion vertex function", round);
+        CHECK(!r->capture.pending && !r->expand.pending, "round %d: a shader is still marked pending", round);
+        delete r;
+    }
+}
+
 } // namespace
 
 int main() {
@@ -366,6 +433,7 @@ int main() {
             {"back faces culled", {a, b, cr, d}, 0, false, 0, 1, true},
         };
         for (const DrawCase& c : cases) CheckRects(c, Render(f, c));
+        CheckBackgroundCompile(f);
         gcn_rectlist_msl_free(&f.rect);
         gcn_shader_destroy(f.vs);
         if (g_fail) return 1;

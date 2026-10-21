@@ -355,14 +355,12 @@ struct Shader {
     std::vector<gcn_vertex_attrib> attrs;
     // VS only: the two vertex shaders of RectList draws (ps4_gnm_rectlist.h), made by the first
     // RectList draw that uses this shader. They only carry fn / uid / msl_hash / code_addr.
-    struct RectList {
+    // compiling / failed (ps4gnm_rect::LibraryStatus): Metal libraries still compiling (their fn
+    // is set before the count drops), and whether one failed.
+    struct RectList : ps4gnm_rect::LibraryStatus {
         Shader* capture = nullptr;
         Shader* expand = nullptr;
         uint32_t vertex_stride = 0, capture_slot = 0, params_slot = 0;
-        // Metal libraries still compiling (their fn is set before the count drops), and whether
-        // one failed.
-        std::atomic<int> compiling{2};
-        std::atomic<bool> failed{false};
     };
     RectList* rect = nullptr;
     bool rect_failed = false;
@@ -2163,6 +2161,23 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
 }
 
 
+// One of the two RectList vertex shaders of the VS at code_addr (capture, or expansion if
+// `expand`), its Metal library compiling in the background (ps4gnm_rect::CompileLibrary). The
+// completion runs after RectListShaders has returned: it only reaches the heap objects r and the
+// returned Shader, never this function's or its caller's stack.
+static Shader* StartRectListShader(Shader::RectList* r, uint64_t code_addr, const char* src, bool expand) {
+    const std::string msl = ps4gnm_rect::PrepareMsl(src, expand);
+    Shader* s = new Shader();
+    s->hw = GCN_HW_VS;
+    s->code_addr = code_addr;
+    s->uid = S.next_uid++;
+    s->msl_hash = Fnv(msl.data(), msl.size());
+    s->pending = true;
+    DumpMsl(s, msl.c_str());
+    ps4gnm_rect::CompileLibrary(S.dev, msl, &s->fn, &s->pending, r, code_addr, expand);
+    return s;
+}
+
 // The RectList vertex shaders of `vs` (gcn_shader_rectlist_msl), made once per shader on the CP
 // thread. Their Metal libraries compile in the background like any new shader's (a synchronous
 // compile stalls the CP thread for tens of ms); draws are skipped until both are ready.
@@ -2194,44 +2209,8 @@ Shader::RectList* RectListShaders(Shader* vs, bool* pending) {
     r->vertex_stride = m.vertex_stride;
     r->capture_slot = m.capture_buffer;
     r->params_slot = m.params_buffer;
-    const uint64_t code_addr = vs->code_addr;
-    auto start = [&](const char* src, bool expand) -> Shader* {
-        // the same edits as FinishShader: no optnone helpers; an invariant rasterized position
-        std::string msl = src;
-        const std::string tag = "[[clang::optnone]] ";
-        for (size_t pos; (pos = msl.find(tag)) != std::string::npos;) msl.erase(pos, tag.size());
-        if (expand) {
-            const std::string pos = "[[position]]";
-            for (size_t at = 0; (at = msl.find(pos, at)) != std::string::npos; at += 23)
-                msl.replace(at, pos.size(), "[[position, invariant]]");
-        }
-        Shader* s = new Shader();
-        s->hw = GCN_HW_VS;
-        s->code_addr = code_addr;
-        s->uid = S.next_uid++;
-        s->msl_hash = Fnv(msl.data(), msl.size());
-        s->pending = true;
-        DumpMsl(s, msl.c_str());
-        MTLCompileOptions* opt = [MTLCompileOptions new];
-        opt.fastMathEnabled = NO;
-        if (@available(macOS 11.0, *)) opt.preserveInvariance = YES;
-        [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()]
-                            options:opt
-                  completionHandler:^(id<MTLLibrary> lib, NSError* e) {
-                      s->fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
-                      if (!s->fn) {
-                          fprintf(stderr, "[gnm-draw] VS 0x%llx: Metal rejected its RectList %s shader: %s\n",
-                                  (unsigned long long)code_addr, expand ? "expansion" : "capture",
-                                  e ? e.localizedDescription.UTF8String : "no main0");
-                          r->failed.store(true, std::memory_order_relaxed);
-                      }
-                      s->pending = false;
-                      r->compiling.fetch_sub(1, std::memory_order_release);
-                  }];
-        return s;
-    };
-    r->capture = start(m.capture_msl, false);
-    r->expand = start(m.expand_msl, true);
+    r->capture = StartRectListShader(r, vs->code_addr, m.capture_msl, false);
+    r->expand = StartRectListShader(r, vs->code_addr, m.expand_msl, true);
     gcn_rectlist_msl_free(&m);
     vs->rect = r;
     *pending = true;

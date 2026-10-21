@@ -11,7 +11,10 @@
 
 #import <Metal/Metal.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <string>
 
 namespace ps4gnm_rect {
 
@@ -79,6 +82,58 @@ inline void Encode(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> c
     [enc setVertexBuffer:b.params offset:b.params_off atIndex:2];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:g.count / 3 * 6
           instanceCount:g.instances baseInstance:g.base_instance];
+}
+
+// The Metal libraries of a RectList draw's two vertex shaders (capture and expansion), compiled in
+// the background by CompileLibrary: how many are still compiling, and whether Metal rejected one.
+struct LibraryStatus {
+    std::atomic<int> compiling{2};
+    std::atomic<bool> failed{false};
+};
+
+// The edits the renderer makes to every translated shader's MSL (FinishShader): no optnone
+// helpers, and for the expansion shader (the one that is rasterized) an invariant position.
+inline std::string PrepareMsl(const char* src, bool expand) {
+    std::string msl = src;
+    const std::string tag = "[[clang::optnone]] ";
+    for (size_t pos; (pos = msl.find(tag)) != std::string::npos;) msl.erase(pos, tag.size());
+    if (expand) {
+        const std::string pos = "[[position]]", inv = "[[position, invariant]]";
+        for (size_t at = 0; (at = msl.find(pos, at)) != std::string::npos; at += inv.size())
+            msl.replace(at, pos.size(), inv);
+    }
+    return msl;
+}
+
+// Starts compiling `msl` (the capture or, if `expand`, the expansion shader of the guest vertex
+// shader at code_addr) and returns at once. When Metal is done, on one of its threads, *fn holds
+// the library's main0 (nil if Metal rejected it: logged and status->failed set), *pending is false,
+// and then status->compiling drops by one (release: who reads it at 0 sees *fn).
+//
+// The completion runs after this function and its caller have returned, so the block captures
+// only the values passed here, by value: fn, pending and status must point into objects that live
+// until the compile is done (the caller's heap objects), never into a stack frame.
+inline void CompileLibrary(id<MTLDevice> dev, const std::string& msl, __strong id<MTLFunction>* fn, bool* pending,
+                           LibraryStatus* status, uint64_t code_addr, bool expand) {
+    MTLCompileOptions* opt = [MTLCompileOptions new];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    opt.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+    if (@available(macOS 11.0, *)) opt.preserveInvariance = YES;
+    [dev newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()]
+                      options:opt
+            completionHandler:^(id<MTLLibrary> lib, NSError* e) {
+                *fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
+                if (!*fn) {
+                    std::fprintf(stderr, "[gnm-draw] VS 0x%llx: Metal rejected its RectList %s shader: %s\n",
+                                 (unsigned long long)code_addr, expand ? "expansion" : "capture",
+                                 e ? e.localizedDescription.UTF8String : "no main0");
+                    status->failed.store(true, std::memory_order_relaxed);
+                }
+                *pending = false;
+                status->compiling.fetch_sub(1, std::memory_order_release);
+            }];
 }
 
 } // namespace ps4gnm_rect
