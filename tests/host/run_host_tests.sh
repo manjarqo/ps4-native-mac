@@ -103,6 +103,11 @@ clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/
   "$VO/ps4_present_queue.c" -o "$T/present_queue_test"
 "$T/present_queue_test"
 G="$R/pkg/runtime/modules/libSceGnmDriver"
+# Frame capture store (ps4_gnm_capture.cpp): snapshot dedup, register file and manifest round trip,
+# raw texture layout sizes, the documented per-format view mapping, thumbnails. No Metal.
+clang++ -std=c++17 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$G" "$R/tests/host/gnm_capture_test.cc" \
+  "$G/ps4_gnm_capture.cpp" -lz -o "$T/gnm_capture_test"
+"$T/gnm_capture_test"
 # PM4 INDIRECT_BUFFER chaining: chained chunks run to the end, calls return, deep calls stop.
 clang++ -std=c++17 -Wall -Werror -g -fsanitize=address,undefined -I "$G" "$R/tests/host/gnm_ib_chain_test.cc" \
   -o "$T/gnm_ib_chain_test"
