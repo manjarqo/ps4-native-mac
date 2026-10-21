@@ -1795,6 +1795,13 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
         RLog(k, "shader 0x%llx (hw %u): %u image read(s) through a T# loaded at run time read the null image",
              (unsigned long long)code_addr, (unsigned)hw, s->info.null_image_reads);
     }
+    if (s->info.zeroed_write_lanes) {
+        // known translator gap: v_writelane results are emitted as 0 (see EmitWriteLane)
+        char k[64];
+        snprintf(k, sizeof(k), "zero-writelane-%llx-%u", (unsigned long long)code_addr, (unsigned)hw);
+        RLog(k, "shader 0x%llx (hw %u): %u v_writelane result(s) emitted as 0 (known translator gap)",
+             (unsigned long long)code_addr, (unsigned)hw, s->info.zeroed_write_lanes);
+    }
     s->bufs.resize(s->info.num_buffers);
     for (uint32_t i = 0; i < s->info.num_buffers; ++i) gcn_shader_get_buffer(sh, i, &s->bufs[i]);
     s->imgs.resize(s->info.num_images);

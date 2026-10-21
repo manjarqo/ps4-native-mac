@@ -179,7 +179,7 @@ public:
     [[nodiscard]] U32 QuadBroadcast(const U32& value, const U32& index);
     [[nodiscard]] U32 Shuffle(const U32& value, const U32& index);
     [[nodiscard]] U32 ShuffleXor(const U32& value, const U32& mask);
-    [[nodiscard]] U32 ReadFirstLane(const U32& value);
+    [[nodiscard]] U32 ReadFirstLane(const U32& value, const U1& exec);
     [[nodiscard]] U32 ReadLane(const U32& value, const U32& lane);
     [[nodiscard]] U32 WriteLane(const U32& value, const U32& write_value, const U32& lane);
     [[nodiscard]] U64 Ballot(const U1& bit);

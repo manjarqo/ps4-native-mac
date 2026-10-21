@@ -331,6 +331,8 @@ typedef struct gcn_shader_info {
                                          GCN_GUEST_* (bind the page table and fault buffer) */
     uint32_t null_image_reads;        /* image reads through a T# loaded at run time: they read the
                                          null image (no binding can stand for that T#) */
+    uint32_t zeroed_write_lanes;      /* v_writelane results emitted as 0 for the whole register (a
+                                         known gap: the select hung a U4 compute shader) */
     bool translation_failed;          /* some instructions were unknown (shader may be wrong) */
     uint32_t shared_memory_size;      /* CS: bytes of threadgroup memory used (incl. scratch) */
     uint32_t workgroup_size[3];

@@ -7,6 +7,7 @@
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/frontend/translate/translate.h"
+#include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/condition.h"
@@ -1070,7 +1071,7 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
 IR::U32 Translator::Lane64() {
     const auto [x, y, z] = runtime_info.hw.cs.workgroup_size;
     if (info.hw_stage == HwStage::Compute && profile.subgroup_size < 64 && x * y * z > 32)
-        return ir.BitwiseAnd(ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex), ir.Imm32(63u));
+        return Optimization::ComputeWaveLane(ir);
     return ir.LaneId();
 }
 
