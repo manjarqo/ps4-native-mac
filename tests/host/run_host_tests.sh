@@ -154,6 +154,13 @@ clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_wave_exec_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
 "$T/gcn_wave_exec_test" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
+# Mapping a compute queue drops its waiting submissions before the new mapping is published.
+RT_INC=$(find "$R/pkg/runtime" -type d | sed 's/^/-I/' | tr '\n' ' ')
+# shellcheck disable=SC2086
+clang -std=gnu11 -Wall -Werror -g -fsanitize=address,undefined $RT_INC "$R/tests/host/gnm_compute_map_test.c" \
+  "$G/ps4_gnmdriver.c" -o "$T/gnm_compute_map_test"
+"$T/gnm_compute_map_test" > "$T/gnm_compute_map.txt" 2>&1 || { cat "$T/gnm_compute_map.txt"; exit 1; }
+echo "gnm_compute_map_test: PASS"
 # Fast-clear colours of integer/snorm targets.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/gnm_clear_color_test.mm" -framework Metal \
   -framework Foundation -o "$T/gnm_clear_color_test"

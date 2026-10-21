@@ -759,9 +759,11 @@ int32_t sceGnmMapComputeQueue(uint32_t pipe_id, uint32_t queue_id, uint64_t ring
     q->ring_size_dw = ring_size_dw;
     q->read_ptr = read_ptr_addr;
     q->next_offs_dw = 0;
+    // drop waiting submissions of the slot's previous mapping before the new one is published
+    // (lock order compute -> CP state, as in DingDong)
+    ps4_gnm_metal_reset_compute_queue((uint32_t)slot);
     if (read_ptr_addr) *read_ptr_addr = 0;
     pthread_mutex_unlock(&g_gnm_compute_mutex);
-    ps4_gnm_metal_reset_compute_queue((uint32_t)slot);
 
     int32_t vqid = slot + 1; // DingDong expects [1..64]
     printf("[ps4-gnm] ASC pipe %u queue %u mapped to vqid %d (ring 0x%llx, %u dw)\n",
@@ -778,10 +780,8 @@ int32_t sceGnmUnmapComputeQueue(uint32_t pipe_id, uint32_t queue_id) {
     pthread_mutex_lock(&g_gnm_compute_mutex);
     for (int i = 0; i < (int)GNM_MAX_COMPUTE_QUEUES; i++) {
         if (g_compute_queues[i].in_use && g_compute_queues[i].pipe_id == pipe_id && g_compute_queues[i].queue_id == queue_id) {
-            memset(&g_compute_queues[i], 0, sizeof(g_compute_queues[i]));
-            pthread_mutex_unlock(&g_gnm_compute_mutex);
             ps4_gnm_metal_reset_compute_queue((uint32_t)i);
-            pthread_mutex_lock(&g_gnm_compute_mutex);
+            memset(&g_compute_queues[i], 0, sizeof(g_compute_queues[i]));
         }
     }
     pthread_mutex_unlock(&g_gnm_compute_mutex);
