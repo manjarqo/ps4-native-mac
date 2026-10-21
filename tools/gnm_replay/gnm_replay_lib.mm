@@ -215,6 +215,23 @@ Result ReplayPass(const Options& o) {
         AddOutput(o, std::move(out), g_mem + b.addr, b.size, have ? &want : nullptr, &r);
         g_loaded.push_back({b.addr, b.size});
     }
+    // guest memory written through V#s the shader loads at run time (no bound buffer: the
+    // capture records the written pages, ps4_gnm_draw.mm GuestMemoryDispatch)
+    for (const BlobRef& ob : p.outputs) {
+        bool bound = false;
+        for (const BufferRec& b : p.buffers)
+            bound |= b.written && ob.addr == b.addr && ob.size == b.size;
+        if (bound || ob.addr >= g_mem_size || ob.size > g_mem_size - ob.addr) continue;
+        OutputResult out;
+        char what[64];
+        snprintf(what, sizeof(what), "buffer 0x%llx", (unsigned long long)ob.addr); // "guest pages"
+        out.what = what;
+        out.addr = ob.addr;
+        std::vector<uint8_t> want;
+        const bool have = !ob.file.empty() && ReadFile(o.frame_dir + "/" + ob.file, &want);
+        AddOutput(o, std::move(out), g_mem + ob.addr, ob.size, have ? &want : nullptr, &r);
+        g_loaded.push_back({ob.addr, ob.size});
+    }
     if (r.outputs.empty()) {
         // nothing recorded as written: say what the shaders' code can write (memory the renderer
         // does not track, or stores the translation dropped, would not show up as an output)

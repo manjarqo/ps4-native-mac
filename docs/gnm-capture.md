@@ -65,6 +65,10 @@ Addresses and hashes are hex strings (`"0x13100b0000"`), other numbers are JSON 
   `post_file`, `png_file`, `png_mode`, `pre_hash`, `post_hash`, `readback` (non-empty: why the
   contents were not read: `msaa`, `format`, `budget`, ...).
 - Blob (`inputs`, `outputs`): `addr`, `size`, `hash`, `file` (empty: over the 256 MiB snapshot limit).
+  A compute dispatch that reads or writes guest memory through V#s it loads at run time
+  (`gcn_shader_info.uses_guest_memory`) has no bound buffer for those accesses: its inputs are
+  stored after its probe pass (before it runs) and include the 1 MiB pages it accesses; the pages
+  it writes are `outputs` without a matching buffer, which the replay compares as well.
 - State (draws): `prim`, `color_mode`, `blend_enable[8]`, `blend_raw[8]`, `write_mask[8]`,
   `depth_test`, `depth_write`, `depth_compare`, `stencil_test`, `stencil_ref_front`,
   `stencil_ref_back`, `viewport[6]` (x, y, width, height, znear, zfar), `scissor[4]`.
