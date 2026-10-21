@@ -1140,6 +1140,7 @@ id<MTLTexture> DepthCompanion(id<MTLTexture> dt, bool encode);
 bool HasStencil(MTLPixelFormat f);
 id<MTLTexture> DepthFromMemory(const ImageDesc& img, bool encode);
 id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode);
+bool MipChainSources(const ImageDesc& img, std::vector<id<MTLTexture>>* srcs);
 id<MTLComputeCommandEncoder> ComputeEncoder();
 id<MTLTexture> SampledTexture(const ImageDesc& img);
 
@@ -2657,6 +2658,12 @@ void NoteStage(const char* stage, const Shader* s, const uint32_t ud[16]) {
     memcpy(r.user_data, ud, sizeof(r.user_data));
     g_pass->stages.push_back(r);
     g_reads.push_back({s->code_addr, std::max<uint32_t>(s->info.code_size, 4)});
+    // the translation finds the program's length and hash in its OrbShdr footer, which is not part
+    // of code_size and, for a program without the header that points at it, is searched for:
+    // record what that search reads (CodeSignature and gcn_compile run the same one)
+    uint32_t footer_size = 0;
+    uint64_t footer_hash = 0;
+    gcn_find_binary_info(RecordRead, nullptr, s->code_addr, &footer_size, &footer_hash);
     if (s->info.has_fetch_shader && s->info.fetch_shader_sgpr_base < 15) {
         const uint64_t fs = ((uint64_t)ud[s->info.fetch_shader_sgpr_base + 1] << 32 | ud[s->info.fetch_shader_sgpr_base]) &
                             ((1ull << 40) - 1);
@@ -2830,6 +2837,14 @@ void NoteImage(Stage st, uint32_t index, const ImageDesc& img, bool storage, boo
         // written: only the entry the renderer binds as the storage image (NoteStorage, Finish)
         if (t) r.textures.push_back(AddTexture(gid, t, storage ? "storage" : "sampled", false));
     }
+    // a mip chain assembled from render targets (MipChainFor) also reads the targets of its levels
+    std::vector<id<MTLTexture>> mips;
+    if (!storage && !depth_image && !ids.empty() && !S.tex->FindDepthTarget(img.address) && MipChainSources(img, &mips))
+        for (size_t m = 1; m < mips.size(); ++m) {
+            GpuTextureId gid;
+            if (mips[m] && S.tex->DescribeGpuTexture(mips[m], &gid))
+                r.textures.push_back(AddTexture(gid, mips[m], "sampled", false));
+        }
     if (ids.empty()) { // read from guest memory (or created there by GetStorageTexture)
         r.guest_bytes = ApproxImageBytes(img);
         g_reads.push_back({img.address, r.guest_bytes});
@@ -3569,6 +3584,22 @@ uint64_t MipChainKey(const ImageDesc& img) {
     return Fnv(k, sizeof(k));
 }
 
+// The render targets a mip chain of `img` is assembled from (MipChainFor): (*srcs)[m] is the one
+// at level m's address (nil: none; level 0 is the base). False if `img` is not a mipmapped 2D
+// texture whose base level is a GPU render target of its size.
+bool MipChainSources(const ImageDesc& img, std::vector<id<MTLTexture>>* srcs) {
+    if (img.mtl_texture_type != MTLTextureType2D || img.NumViewLevels() < 2 || img.pixel.compressed) return false;
+    id<MTLTexture> base = S.tex->FindColorTarget(img.address);
+    if (!base || base.sampleCount > 1 || base.width != img.width || base.height != img.height) return false;
+    SurfaceLayout layout;
+    if (!ComputeSurfaceLayout(img.ToSurfaceDesc(), &layout)) return false;
+    const uint32_t levels = std::min<uint32_t>(img.NumViewLevels(), layout.num_mips);
+    srcs->assign(levels, nil);
+    (*srcs)[0] = base;
+    for (uint32_t m = 1; m < levels; ++m) (*srcs)[m] = S.tex->FindColorTarget(img.address + layout.mips[m].offset);
+    return true;
+}
+
 // A sampled 2D texture with several mip levels whose base level is a GPU render target: the game
 // rendered each level separately (bloom/downsample chains). Assemble a mipmapped copy from the
 // render targets found at the mip addresses (blits encoded into the current command buffer).
@@ -3581,10 +3612,9 @@ id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode) {
     if (!encode) return it != S.mip_chains.end() ? it->second.tex : nil;
     State::MipChain& mc = S.mip_chains[key];
     if (mc.tex && mc.built_submit == S.submit_idx + (S.n_draws << 20)) return mc.tex;
-    SurfaceLayout layout;
-    const SurfaceDesc sd = img.ToSurfaceDesc();
-    if (!ComputeSurfaceLayout(sd, &layout)) return nil;
-    const uint32_t levels = std::min<uint32_t>(img.NumViewLevels(), layout.num_mips);
+    std::vector<id<MTLTexture>> srcs;
+    if (!MipChainSources(img, &srcs)) return nil;
+    const uint32_t levels = (uint32_t)srcs.size();
     if (!mc.tex || mc.tex.mipmapLevelCount != levels) {
         MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:base.pixelFormat
                                                                                       width:img.width
@@ -3601,7 +3631,7 @@ id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode) {
     id<MTLBlitCommandEncoder> bl = [S.cmd blitCommandEncoder];
     for (uint32_t m = 0; m < levels; ++m) {
         const uint32_t w = std::max(1u, img.width >> m), h = std::max(1u, img.height >> m);
-        id<MTLTexture> src = m == 0 ? base : S.tex->FindColorTarget(img.address + layout.mips[m].offset);
+        id<MTLTexture> src = srcs[m];
         if (!src || src.pixelFormat != base.pixelFormat || src.sampleCount > 1 || src.width < w || src.height < h) continue;
         [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                  sourceSize:MTLSizeMake(w, h, 1) toTexture:mc.tex destinationSlice:0 destinationLevel:m
