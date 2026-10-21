@@ -93,7 +93,8 @@ One- and two-channel formats show R (and G). Multisampled textures have no view.
   ps4draw::Draw / Dispatch and prints MATCH / DIFF per output. Exit status 0: every output is
   byte-exact; 1: a mismatch; 2: not replayed (the reason is printed: not stored replayable,
   contents over the raw budget, skipped by the renderer, ...) or nothing to compare (the capture
-  records no output the pass writes). `--out <dir>` writes the replayed outputs (`.raw`, `.png`,
+  records no output of the pass: it may still write memory the renderer does not track, and the
+  notes on stderr list the store instructions in its shaders' GCN code). `--out <dir>` writes the replayed outputs (`.raw`, `.png`,
   `.bin`). The replay runs the renderer with `PS4_GNM_SYNC_ENCODE`, `PS4_GNM_SYNC_COMPILE` and no
   shader cache, PSO archive or library store, so it reads and writes nothing outside its process.
 - `tools/gnm_capture_extract.py <frame_dir> <pass> <out>`: one pass as a minimal frame for a

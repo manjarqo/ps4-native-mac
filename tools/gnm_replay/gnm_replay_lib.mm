@@ -13,6 +13,7 @@
 #include <algorithm>
 
 #include "gcn_recompiler.h"
+#include "gcn_stores.h"
 #include "ps4_gnm_capture.h"
 #include "ps4_gnm_draw.h"
 
@@ -213,6 +214,19 @@ Result ReplayPass(const Options& o) {
                 have = ReadFile(o.frame_dir + "/" + ob.file, &want);
         AddOutput(o, std::move(out), g_mem + b.addr, b.size, have ? &want : nullptr, &r);
         g_loaded.push_back({b.addr, b.size});
+    }
+    if (r.outputs.empty()) {
+        // nothing recorded as written: say what the shaders' code can write (memory the renderer
+        // does not track, or stores the translation dropped, would not show up as an output)
+        for (const StageRec& s : p.stages) {
+            if (!s.code_size || s.code_addr + s.code_size > g_mem_size) continue;
+            const GcnStores st = ScanGcnStores((const uint32_t*)(g_mem + s.code_addr), s.code_size / 4);
+            char m[256];
+            snprintf(m, sizeof(m), "%s 0x%llx: no output recorded; its GCN code has %s%s", s.stage.c_str(),
+                     (unsigned long long)s.code_addr, st.Describe().c_str(),
+                     st.complete ? "" : " (scan stopped at an unknown encoding)");
+            r.notes.push_back(m);
+        }
     }
     return r;
 }

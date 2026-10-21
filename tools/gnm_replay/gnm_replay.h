@@ -49,9 +49,13 @@ struct Result {
     }
 };
 
-// Replays one pass and compares every output it wrote with the capture, byte for byte. May be
-// called several times in one process (each call reloads its pass's inputs); the renderer's
-// caches persist between calls as they do in the game. All calls must use frames with the same
+// Replays one pass and compares every output it wrote with the capture, byte for byte. The
+// renderer starts cold: no shader, pipeline or texture-cache state from the game, only what the
+// pass's capture seeds (guest memory, the GPU-owned textures it uses, pending fast clears). A
+// game bug that depends on stale cached state (a texture not re-uploaded, a translation reused
+// for changed code) is therefore not reproduced by a replay. May be called several times in one
+// process: each call reloads its pass's inputs (reported to the renderer as CPU writes), while
+// the renderer's caches keep what earlier calls built. All calls must use frames with the same
 // mem_size and neo mode.
 Result ReplayPass(const Options& o);
 

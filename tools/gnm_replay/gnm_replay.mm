@@ -2,7 +2,8 @@
 // gnm_replay <frame_dir> <pass> [--out <dir>]: replays one captured pass through the renderer and
 // compares its outputs with the capture byte for byte (gnm_replay.h).
 // Exit status: 0 every output matches, 1 a mismatch, 2 the pass could not be replayed or the
-// capture records no output of it (nothing to compare).
+// capture records no output of it (nothing to compare; the notes on stderr list the store
+// instructions in its shaders, whose writes the renderer may not track).
 #import <Foundation/Foundation.h>
 
 #include <stdio.h>
@@ -23,13 +24,14 @@ int main(int argc, char** argv) {
         for (int i = 3; i + 1 < argc; ++i)
             if (!strcmp(argv[i], "--out")) o.out_dir = argv[++i];
         const ps4replay::Result r = ps4replay::ReplayPass(o);
-        for (const std::string& n : r.notes) printf("note: %s\n", n.c_str());
+        for (const std::string& n : r.notes) fprintf(stderr, "note: %s\n", n.c_str());
         if (!r.ran) {
             printf("pass %u: NOT REPLAYED: %s\n", o.pass, r.error.c_str());
             return 2;
         }
         if (r.outputs.empty()) {
-            printf("pass %u: NOTHING TO COMPARE: the capture records no output this pass writes\n", o.pass);
+            printf("pass %u: NOTHING TO COMPARE: no output recorded; the shader may write memory the renderer "
+                   "does not track\n", o.pass);
             return 2;
         }
         for (const ps4replay::OutputResult& out : r.outputs) {
