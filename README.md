@@ -19,7 +19,7 @@ not measured yet.
 | Game | Stage | fps | Resolution | Notes |
 | --- | --- | --- | --- | --- |
 | The Last of Us Remastered (CUSA00557) | Playable: boot, menus, movies, gameplay, saves | Walking (330 s scripted routes): chapter 1 courtyard 89.7 fps, spore corridor 99.6 fps, 0 frames > 100 ms. Standing: courtyard 78.5–78.9 fps, Sarah's house 113.7–114.5 fps. | 1920x1080 (base PS4 mode, `PS4_PRO=0`), MetalFX off. Pro mode: TBD | 30-minute courtyard soak: no fatal errors, no hangs, memory footprint flat at ~3.5 GB. Exit: 3/3 by closing the window, 3/3 by terminate, no crash reports. |
-| Uncharted 4: A Thief's End | In progress — boots to menu, not yet playable | Up to ~30 fps at the menu (the game sets a 30 Hz flip rate). Gameplay: an earlier development build reached a full level at 40+ fps in PS4 Pro mode without MetalFX (observed by hand, not benchmarked) | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Logos, then the first-boot options menu, held for 120–180 s with no GPU errors. The menu does not yet react to D-pad or stick input. Missing HLE (Vdecsw, Audiodec, Audio3d) and renderer fixes are on development branches, not yet in `main`. |
+| Uncharted 4: A Thief's End (CUSA04529) | In progress: boots, menus, New Game, chapter 1 (boat cutscene and boat gameplay), saves, audio | TBD (being re-measured after the guest-memory dispatch fix); before the lighting fix: menu 43 fps, boat gameplay 33–34 fps (`PS4_PRO=0`), Pro mode 24–26 fps | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Title screen renders like a PS4 (lit scene, light shafts). Boat cutscene: Drake and Sully lit; a motion-blur smear remains (fix in progress). Gameplay still shows red streaks and flat water. Base mode is recommended: Pro mode stays under 30 fps. |
 
 How the TLOU numbers were taken:
 
@@ -95,8 +95,8 @@ eboot.bin + sce_module/*.prx
 | Saves | `libSceSaveData` mapped to host directories (see [Where saves and caches live](#where-saves-and-caches-live)) |
 | Other | Pad (GameController.framework), user/system service, NP that always reports "signed out", Cocoa dialogs, FreeType, network modules (Net, Http, Ssl) |
 
-The Uncharted 4 branches add AAC decoding (`libSceAudiodec`, AudioToolbox), `libSceVdecsw`
-(VideoToolbox) and `libSceAudio3d`. They are not in `main` yet.
+The table also covers what Uncharted 4 needs: AAC decoding (`libSceAudiodec`, AudioToolbox),
+`libSceVdecsw` (VideoToolbox) and `libSceAudio3d` (object and bed mixing to the 8-channel bus).
 
 ### Renderer: GNM on Metal
 
@@ -107,6 +107,16 @@ The Uncharted 4 branches add AAC decoding (`libSceAudiodec`, AudioToolbox), `lib
 - Guest memory is mapped zero-copy into Metal buffers on unified memory.
 - Textures are detiled and cached. GPU writes invalidate the cached copies.
 - The frame is presented through `CAMetalLayer`, with optional MetalFX spatial upscaling.
+- Compute queues run beside the graphics ring. A compute queue that waits on memory
+  (`WAIT_REG_MEM`) is suspended and resumed, so cross-queue ordering follows the guest's own
+  synchronisation.
+- Buffer accesses through descriptors (V#) that a shader loads at run time read and write guest
+  memory directly, through a page table of zero-copy windows. Uncharted 4 builds its per-draw
+  matrices this way.
+- GPU texture memory has a budget; unused textures are evicted.
+- A separate presenter thread shows the frames. By default (`PS4_PRESENT_MODE=uncapped`) every
+  frame is shown at the next display refresh; `vsync` holds each frame for the guest's flip
+  interval (`sceVideoOutSetFlipRate`). See [docs/present-pacing.md](docs/present-pacing.md).
 
 ### Shaders
 
@@ -121,6 +131,12 @@ GCN bytecode (from guest memory)
 - Built pipelines are stored in Metal binary archives (the PSO archive) and loaded at the next
   start, so known pipelines do not compile mid-frame.
 - New shaders compile in the background.
+- GCN runs 64 lanes per wave; Apple GPUs run 32-lane simdgroups, so a wave64 shader runs as two
+  simdgroups. In wave-uniform control flow, cross-lane operations (readlane, readfirstlane,
+  ballots, 64-bit masks such as EXEC) see the whole wave. Inside per-lane EXEC scopes they still
+  act per 32-lane half (see Known issues).
+- The known translation gaps (image reads through T#s loaded at run time, `v_writelane`) are
+  counted and logged once per shader, also when the shader comes from the on-disk cache.
 
 ### Third-party components
 
@@ -157,7 +173,7 @@ folder, which contains `eboot.bin`, `sce_module/` and `sce_sys/`.
 ### 2. Clone with the third-party sources
 
 ```bash
-git clone --recursive <repository-url> ps4-native-mac
+git clone --recursive https://github.com/manjarqo/ps4-native-mac.git ps4-native-mac
 cd ps4-native-mac
 # already cloned without --recursive:
 git submodule update --init --recursive
@@ -283,7 +299,8 @@ How the settings are stored and overridden:
   default for a new profile. TLOU stores its text, subtitle and speech language in its save. Once a
   save exists, change the language in the game's own Options menu.
 
-fps in PS4 Pro mode has not been measured yet (TBD); the status table above uses base PS4 mode.
+TLOU's fps in PS4 Pro mode has not been measured yet (TBD); its row in the status table uses base
+PS4 mode.
 
 ### 8. Environment variables
 
@@ -311,9 +328,34 @@ fps in PS4 Pro mode has not been measured yet (TBD); the status table above uses
 | `PS4_GNM_GPU_TIMEOUT=<ms>` | Command buffer watchdog (default 4000) |
 | `PS4_SCREENSHOT_DIR=<dir>`, `PS4_SCREENSHOT_EVERY=<frames>` | Save presented frames as PNG |
 | `PS4_RECOMP_HEADLESS=1`, `PS4_BACKGROUND_WINDOW=1`, `PS4_PAD_SCRIPT=...` | Automated test runs |
+| `PS4_PRESENT_MODE=uncapped\|vsync\|mailbox` | Frame pacing (default `uncapped`; see [docs/present-pacing.md](docs/present-pacing.md)) |
+| `PS4_GNM_CAPTURE_FRAME=<n>`, `PS4_GNM_CAPTURE_DIR=<dir>` | Capture frame `n` (see [Debugging the renderer](#debugging-the-renderer)) |
+| `PS4_GNM_SYNC_ENCODE=1`, `PS4_GNM_SYNC_COMPILE=1` | Encode and compile synchronously (captures, debugging) |
+| `PS4_DUMP_SHADERS=<dir>` | Write every distinct VS/PS/CS program and its registers (see [Debugging the renderer](#debugging-the-renderer)) |
 
-Host unit tests: `tests/host/run_host_tests.sh`. The benchmark scripts behind the status table
-(walking routes, A/B runs) are not in the repository yet.
+Host unit tests: `tests/host/run_host_tests.sh`. A few cases need shaders dumped from your own
+game; without them they are reported as SKIP (see [tests/host/README.md](tests/host/README.md)).
+The benchmark scripts behind the status table (walking routes, A/B runs) are not in the
+repository yet.
+
+### Debugging the renderer
+
+- **Frame capture.** `PS4_GNM_CAPTURE_FRAME=<n>` records every draw and dispatch of frame `n`:
+  a manifest, a PNG and raw bytes of every output, and the guest memory each pass reads.
+  See [docs/gnm-capture.md](docs/gnm-capture.md).
+- **Overview.** `tools/gnm_capture_view.py <capture>` writes an HTML page listing the passes in
+  order with thumbnails, to find the first pass that goes wrong.
+- **Replay.** `tools/gnm_replay` runs one captured pass through the same shader translation and
+  Metal code as the game and compares the result byte for byte with the capture.
+- **Reference comparison.** `tools/refcompare.py <frame.png> <reference.png>` compares mean colour
+  and luminance on a 4x4 grid plus a luminance histogram.
+- **Shader dumps.** `PS4_DUMP_SHADERS=<dir>` writes each distinct VS/PS/CS program as
+  `<stage>_<addr>.bin` with its registers in `<stage>_<addr>.txt`.
+  `3rdparty/gcn-recompiler/tools/gcn_test` translates such dumps and checks the MSL with Metal;
+  `gcn_dis` disassembles them.
+
+Captures and shader dumps contain game data: keep them outside the repository and do not share
+them.
 
 ### Where saves and caches live
 
@@ -328,8 +370,18 @@ The on-disk names still say `PS4Recomp`; they come from the code and have not be
 
 ### Known issues
 
-- **Uncharted 4.** The fixes for it are not in `main`. The menu ignores D-pad and stick input. Some
-  draws are skipped (vertex shader permutation cap, RectList auto-index draws).
+- **Uncharted 4.**
+  - Gameplay: red streaks and flat, blocky water; the sky is dark.
+  - Boat cutscene: a motion-blur smear remains; its fix is in progress.
+  - The title-screen fog is weaker than on a PS4.
+  - Images read through descriptors (T#) loaded at run time read a null image (counted and logged
+    per shader).
+  - Decals are not applied (CMASK is not emulated).
+  - The shadow cube map is resolved from a 2D target ("texture type mismatch" in the log).
+  - `v_writelane` returns 0 (a counted, logged gap): its correct form makes one async compute
+    shader exceed the GPU watchdog, under investigation.
+  - Inside per-lane EXEC scopes, `v_readfirstlane` and `v_mbcnt` of a wave64 shader act per
+    32-lane half (expected failures in `gcn_wave_exec_test`).
 - **x87.** 80-bit values are kept as doubles, which loses 11 mantissa bits.
 - **Misaligned atomics.** A LOCK operation on an operand that crosses a 16-byte boundary raises
   SIGBUS. TLOU has none.
@@ -364,6 +416,8 @@ The on-disk names still say `PS4Recomp`; they come from the code and have not be
 │       ├── kernel/          # memory, threading, sync, vfs, aio, equeue, syscalls
 │       └── modules/         # libSce* HLE modules (GnmDriver, VideoOut, AudioOut, Ajm, ...)
 ├── tests/                   # host unit tests and runtime test programs
+├── tools/                   # capture viewer, pass replay, reference comparison
+├── docs/                    # renderer notes (capture, GPU memory budget, present pacing), plans
 └── 3rdparty/                # see "Third-party components"
 ```
 
