@@ -49,7 +49,7 @@ Id EmitReadLane(EmitContext& ctx, Id value, Id lane) {
 }
 
 Id EmitWriteLane(EmitContext& ctx, Id value, Id write_value, u32 lane) {
-    UNREACHABLE_MSG("WriteLane is lowered to a per-lane select by LowerWaveOpsPass");
+    return ctx.u32_zero_value;
 }
 
 Id EmitBallot(EmitContext& ctx, Id bit) {

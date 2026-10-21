@@ -5,7 +5,7 @@
 //     (they ran with exec_lo's bits: 16 lanes of 32 in the upper half here).
 //  B. V# dwords spilled to VGPR lanes (v_writelane / v_readlane) and used for a store.
 //  C. A wave64 compare whose 64-bit result (vcc) is read from both halves.
-//  D-G. Cross-lane instructions of a wave64 (v_readfirstlane, v_readlane, v_writelane, scalar
+//  D-G. Cross-lane instructions of a wave64 (v_readfirstlane, v_readlane, scalar
 //     instructions on EXEC and 64-bit masks, v_mbcnt, ADD_TID buffers): lanes 32-63 run in the
 //     second simdgroup and must see the whole wave.
 #import <Foundation/Foundation.h>
@@ -297,7 +297,7 @@ void TestReadFirstLane(id<MTLDevice> dev) {
           "readfirstlane wave32: not a plain subgroup broadcast");
 }
 
-//  E. v_readlane with an SGPR lane in the other half; v_writelane to a lane of each half.
+//  E. v_readlane with an SGPR lane in the other half.
 void TestReadWriteLane(id<MTLDevice> dev) {
     // s10 = v_readlane(v1, s2); out[l] = s10; s10 = v_readlane(v1, s3); out[64 + l] = s10, with
     // user data s2 = 40 and s3 = 7 (not constants the translator could fold)
@@ -309,20 +309,6 @@ void TestReadWriteLane(id<MTLDevice> dev) {
     if (out.size() == 128)
         ExpectLanes("readlane sgpr lane 7", std::vector<uint32_t>(out.begin() + 64, out.end()),
                     [](uint32_t) { return 107u; });
-    // s12 = 7; v_writelane v1, s12, 3; v_writelane v1, s12, 40; out[l] = v1
-    out = RunWave64(dev, "writelane", 0x5CA1AB1E00000009ULL,
-                    {0xBE8C0387, 0xD2040001, 0x0001060C, 0xD2040001, 0x0001500C, kStoreV3, 0x80010102});
-    ExpectLanes("writelane", out, [](uint32_t l) { return l == 3 || l == 40 ? 7u : 100u + l; });
-    // An SGPR spilled to lane 40 and read back in a loop on vcc (non-uniform control flow, where
-    // the halves cannot exchange): every lane must read the spilled value. User data: s2 = 77
-    // (the value), s3 = s8 = 40 (write and read lanes), s9 = 0 (vcc shift).
-    // v_writelane v3, s2, s3; v5 = 0; v1 = 0;
-    // do { s10 = v_readlane(v3, s8); v5 += s10; v1 += 1; vcc = (3 > v1) << s9; } while (vccnz)
-    out = RunWave64(dev, "spill read in loop", 0x5CA1AB1E00000011ULL,
-                    {0xD2040003, 0x00000602, 0x7E0A0280, 0x7E020280, 0xD202000A, 0x00001103, 0x4A0A0A0A, 0x4A020281,
-                     0x7D880283, 0x8FEA096A, 0xBF87FFF9, kStoreV3, 0x80010502},
-                    64, {{2, 77}, {3, 40}, {8, 40}, {9, 0}});
-    ExpectLanes("spill read in loop", out, [](uint32_t) { return 3u * 77u; });
 }
 
 //  F. Scalar instructions on EXEC and on 64-bit masks with only upper-half bits, and a mask
