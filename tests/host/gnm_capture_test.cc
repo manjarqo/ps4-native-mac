@@ -38,6 +38,26 @@ static void TestCoalesce() {
               (unsigned long long)r[1].second);
     }
     CHECK(CoalescePages({{0x7ffff000, 0x2000}}, 0x80000000)[0].second == 0x4000, "clamped to mem_size");
+    auto z = CoalescePages({{0, 64}, {0x8000, 4}}, 1ull << 30);
+    CHECK(z.size() == 1 && z[0].first == 0x8000, "a range at address 0 is dropped (%zu ranges)", z.size());
+}
+
+// Guest memory with a PROT_NONE page in the middle: the snapshot ranges skip it.
+static void TestReadable() {
+    const size_t pg = (size_t)getpagesize();
+    uint8_t* m = (uint8_t*)mmap(nullptr, 4 * pg, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    CHECK(m != MAP_FAILED, "mmap");
+    if (m == MAP_FAILED) return;
+    CHECK(mprotect(m + pg, pg, PROT_NONE) == 0, "mprotect");
+    auto r = ClampReadable(m, {{0, 4 * pg}});
+    CHECK(r.size() == 2 && r[0].first == 0 && r[0].second == pg && r[1].first == 2 * pg && r[1].second == 2 * pg,
+          "PROT_NONE page cut out: %zu ranges", r.size());
+    auto t = ClampReadable(m, {{pg + 8, 16}});
+    CHECK(t.empty(), "a range inside the guard page is dropped (%zu)", t.size());
+    uint64_t sum = 0;
+    for (auto& [a, n] : r) sum += Fnv64(m + a, n) & 1; // reading every kept byte does not fault
+    (void)sum;
+    munmap(m, 4 * pg);
 }
 
 static void TestRawSize() {
@@ -215,7 +235,10 @@ static void TestWriterRoundTrip() {
     std::string err;
     CHECK(w.Begin(&err), "Begin: %s", err.c_str());
     const BlobRef a = w.Snapshot(mem.data(), 0x10000, kPage);
-    const BlobRef b = w.Snapshot(mem.data(), 0x10000, kPage); // same content: one file
+    CHECK(unlink((dir + "/" + a.file).c_str()) == 0, "remove the first blob");
+    const BlobRef b = w.Snapshot(mem.data(), 0x10000, kPage); // same content: the stored file is reused
+    std::vector<uint8_t> gone;
+    CHECK(!ReadFile(dir + "/" + a.file, &gone), "an already stored blob is not written again");
     CHECK(!a.file.empty() && a.file == b.file && a.hash == b.hash, "dedup: %s vs %s", a.file.c_str(), b.file.c_str());
     mem[0x10001] = 0xEE;
     const BlobRef c = w.Snapshot(mem.data(), 0x10000, kPage); // changed content: new file
@@ -322,6 +345,7 @@ static void TestWriterRoundTrip() {
 
 int main() {
     TestCoalesce();
+    TestReadable();
     TestRawSize();
     TestViews();
     TestDepthWritten();

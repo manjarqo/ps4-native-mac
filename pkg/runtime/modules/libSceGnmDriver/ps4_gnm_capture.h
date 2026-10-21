@@ -191,9 +191,15 @@ constexpr bool DepthTargetWritten(bool depth_write, bool stencil_test, bool clea
 }
 
 uint64_t Fnv64(const void* data, size_t n, uint64_t h = 0xcbf29ce484222325ull);
-// Page-aligned cover of the ranges, sorted and merged (adjacent pages join).
+// Page-aligned cover of the ranges, sorted and merged (adjacent pages join). Ranges at address 0
+// (null pointers) are dropped; the cover is clamped to mem_size.
 std::vector<std::pair<uint64_t, uint64_t>> CoalescePages(std::vector<std::pair<uint64_t, uint64_t>> ranges,
                                                          uint64_t mem_size);
+// The parts of the (addr, size) ranges of mem_base the host can read: pages that are unmapped or
+// not readable (PROT_NONE guards and reservations inside guest memory) are cut out, so a snapshot
+// never faults. Sorted input stays sorted.
+std::vector<std::pair<uint64_t, uint64_t>> ClampReadable(const uint8_t* mem_base,
+                                                         const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 
 // Writes one frame. Not thread-safe; the renderer calls it from the encoder thread only.
 class Writer {

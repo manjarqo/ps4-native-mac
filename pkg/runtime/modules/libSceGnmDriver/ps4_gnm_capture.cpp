@@ -7,6 +7,10 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <zlib.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -64,7 +68,7 @@ std::vector<std::pair<uint64_t, uint64_t>> CoalescePages(std::vector<std::pair<u
                                                          uint64_t mem_size) {
     std::vector<std::pair<uint64_t, uint64_t>> pages; // [lo, hi)
     for (auto& [a, n] : r) {
-        if (!n || a >= mem_size) continue;
+        if (!n || !a || a >= mem_size) continue;
         const uint64_t lo = a & ~(kPage - 1);
         const uint64_t hi = std::min(mem_size, (a + n + kPage - 1) & ~(kPage - 1));
         pages.push_back({lo, hi});
@@ -76,6 +80,39 @@ std::vector<std::pair<uint64_t, uint64_t>> CoalescePages(std::vector<std::pair<u
         else out.push_back(p);
     }
     for (auto& p : out) p.second -= p.first; // -> (addr, size)
+    return out;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> ClampReadable(const uint8_t* mem_base,
+                                                         const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    const uint64_t base = (uint64_t)(uintptr_t)mem_base;
+    for (const auto& [a, n] : ranges) {
+        uint64_t lo = base + a;
+        const uint64_t hi = lo + n;
+#if defined(__APPLE__)
+        while (lo < hi) {
+            mach_vm_address_t r = lo;
+            mach_vm_size_t rsize = 0;
+            vm_region_basic_info_data_64_t info;
+            mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t object = MACH_PORT_NULL;
+            // the region containing lo, or the next one above it
+            if (mach_vm_region(mach_task_self(), &r, &rsize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count,
+                               &object) != KERN_SUCCESS ||
+                r >= hi)
+                break;
+            const uint64_t from = std::max<uint64_t>(lo, r), to = std::min<uint64_t>(hi, r + rsize);
+            if (info.protection & VM_PROT_READ) {
+                if (!out.empty() && out.back().first + out.back().second == from - base) out.back().second += to - from;
+                else out.push_back({from - base, to - from});
+            }
+            lo = to;
+        }
+#else
+        out.push_back({lo - base, hi - lo}); // no region query on this host
+#endif
+    }
     return out;
 }
 

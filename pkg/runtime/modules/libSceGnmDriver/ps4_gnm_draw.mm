@@ -2881,13 +2881,18 @@ void Finish() {
             g_tex.push_back(t);
         }
     }
+    // estimated lengths (fetch shaders, ApproxImageBytes) may reach into guard pages: only readable
+    // guest memory is stored
     if (p->replayable)
-        for (auto& [a, n] : CoalescePages(g_reads, S.ctx->mem_size)) p->inputs.push_back(g_writer->Snapshot(S.ctx->mem_base, a, n));
+        for (auto& [a, n] : ClampReadable(S.ctx->mem_base, CoalescePages(g_reads, S.ctx->mem_size)))
+            p->inputs.push_back(g_writer->Snapshot(S.ctx->mem_base, a, n));
     Commit();
     WaitAll();
     if (p->replayable)
         for (const BufferRec& b : p->buffers)
-            if (b.written) p->outputs.push_back(g_writer->Snapshot(S.ctx->mem_base, b.addr, b.size));
+            if (b.written)
+                for (auto& [a, n] : ClampReadable(S.ctx->mem_base, {{b.addr, b.size}}))
+                    p->outputs.push_back(g_writer->Snapshot(S.ctx->mem_base, a, n));
     for (size_t i = 0; i < p->textures.size(); ++i) {
         TextureRec& tr = p->textures[i];
         // contents that cannot be read (msaa, format, EQAA twin) have no view either; the budget only
