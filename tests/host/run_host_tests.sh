@@ -241,4 +241,7 @@ mkdir -p "$T/gcnl_s" "$T/gcnl_r" "$T/gcnl_o"
 "$T/gcn_cache_lookup_test" restart "$T/gcnl_r" 3000 2>&1 | grep '^gcn_cache_lookup_test'
 # an entry of another resource layout in the bucket: found through the one-by-one path
 "$T/gcn_cache_lookup_test" odd "$T/gcnl_o" 500 2>&1 | grep '^gcn_cache_lookup_test'
+# Capture tools (tools/*.py): overview page, fixture extraction, reference comparison.
+python3 -m unittest discover -s "$R/tools/tests" -p 'test_*.py' > "$T/tools_tests.txt" 2>&1 || { cat "$T/tools_tests.txt"; exit 1; }
+echo "capture tools: PASS ($(grep -o 'Ran [0-9]* tests' "$T/tools_tests.txt"))"
 rm -rf "$T"
