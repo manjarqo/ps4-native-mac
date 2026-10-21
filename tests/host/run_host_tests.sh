@@ -16,6 +16,11 @@ clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/ru
   -framework AudioToolbox -o "$T/audio3d_test"
 "$T/audio3d_test" 2> "$T/audio3d.txt" || { cat "$T/audio3d.txt"; exit 1; }
 grep "^audio3d_test" "$T/audio3d.txt"
+# libSceAudioOut 8-channel -> stereo fold (centre / surrounds at -3 dB, LFE dropped) on the headless device.
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/runtime/core" -I "$AO" \
+  "$R/tests/host/audioout_downmix_test.c" "$AO/ps4_audioout.c" -framework AudioToolbox -o "$T/audioout_downmix_test"
+"$T/audioout_downmix_test" 2> "$T/downmix.txt" || { cat "$T/downmix.txt"; exit 1; }
+grep "^audioout_downmix_test" "$T/downmix.txt"
 # Asynchronous stdout/stderr: nothing is lost on abort() or exit(), with one shared file and with two.
 clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/core" "$R/tests/host/log_abort_test.c" "$R/pkg/runtime/core/ps4_log.c" \
   -o "$T/log_abort_test"
@@ -69,6 +74,10 @@ clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/boot_hle_test.c" "$M
   "$M/libSceNp/ps4_np_extras.c" "$M/libSceNpProfileDialog/ps4_np_profile_dialog.c" "$M/libSceNet/ps4_net.c" \
   "$M/libSceNetCtl/ps4_netctl.c" "$M/libSceHttp/ps4_http.c" "$M/libSceNoopStubs/ps4_noop_stubs.c" -o "$T/boot_hle_test"
 "$T/boot_hle_test" 2>/dev/null
+# libScePad: controller information as Uncharted 4 reads it, and PS4_PAD_CTL command order.
+clang -std=gnu11 -fobjc-arc -Wall -Werror -g "${RT[@]}" "$R/tests/host/pad_test.m" "$M/libScePad/ps4_pad.m" \
+  -framework Foundation -framework GameController -framework Cocoa -o "$T/pad_test"
+"$T/pad_test"
 
 # H.264 through libSceVdecsw and libSceVideodec on the shared VideoToolbox core: a stream made
 # by VideoToolbox's encoder (with B-frames) must come out complete, in display order, with the
