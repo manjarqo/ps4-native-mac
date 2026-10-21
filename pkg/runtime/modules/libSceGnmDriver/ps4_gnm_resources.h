@@ -773,13 +773,17 @@ public:
 
     // Render target / depth textures (created on first use, contents loaded from guest memory
     // once when load_from_guest is true; afterwards owned by the GPU and never re-uploaded).
-    // written: the caller lets the GPU write the surface (false for e.g. a resolve source); the
-    // last write decides when an overlapping older surface is superseded (EvictSuperseded).
-    id<MTLTexture> GetColorTarget(const ColorTarget& cb, bool load_from_guest = true, bool written = true);
+    id<MTLTexture> GetColorTarget(const ColorTarget& cb, bool load_from_guest = true);
     // One texture per depth surface: views of later slices grow it to a larger 2D array, and the
     // texture it replaced is returned in *grown_from so the caller can copy its slices over.
     // The replaced texture is also queued for TakeRetired.
-    id<MTLTexture> GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from = nullptr, bool written = true);
+    id<MTLTexture> GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from = nullptr);
+    // The GPU-owned surface `tex` at `address` gets every byte of guest [lo, hi) written by the open
+    // command buffer (a clear of that range). Only such exactly known writes let a surface supersede
+    // older ones (EvictSuperseded); a draw's pixels, or a storage image's stores, are not known.
+    // The range is clipped to the entry. Returns false if no such entry exists.
+    // seq: the command buffer the write belongs to (0 = the open one, the SetUse value).
+    bool NoteExactWrite(uint64_t address, id<MTLTexture> tex, uint64_t lo, uint64_t hi, uint64_t seq = 0);
 
     // CPU wrote [addr, addr+size): sampled textures overlapping are re-uploaded on next use.
     // Render-target textures are not touched (GPU owns them) unless include_render_targets.
@@ -827,9 +831,10 @@ public:
     // GPU-side copies of whole surfaces (e.g. a compute shader copying a depth buffer through
     // buffer loads/stores, shadPS4 Rasterizer::IsComputeImageCopy): find the GPU-owned texture at
     // src_addr and find/create one with the same description at dst_addr. The caller encodes the
-    // blit. kind_out: 1 color, 2 depth.
-    bool CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, id<MTLTexture>* src, id<MTLTexture>* dst,
-                         int* kind_out);
+    // blit. kind_out: 1 color, 2 depth. written_bytes: the guest bytes the copy writes from
+    // dst_addr (an exactly known write, see NoteExactWrite).
+    bool CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, uint64_t written_bytes, id<MTLTexture>* src,
+                         id<MTLTexture>* dst, int* kind_out);
 
     // Debugging: visit every GPU-owned texture (kind: 1 color/storage, 2 depth).
     void ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<MTLTexture> tex)) const;
@@ -870,10 +875,11 @@ public:
         uint64_t superseded_count = 0, superseded_bytes = 0, idle_count = 0, idle_bytes = 0;
     };
     GpuOwnedStats GetGpuOwnedStats(uint64_t idle_ns) const;
-    // Evicts superseded GPU-owned surfaces: ones whose whole guest range other GPU-owned surfaces
-    // wrote after this one's last use (on the PS4 their bytes are overwritten), not looked up for
-    // idle_ns and whose last command buffer has completed. Partial cover, or a newer surface that
-    // was only created or read, keeps the surface: GPU-only contents are never dropped.
+    // Evicts superseded GPU-owned surfaces: ones whose whole guest range exactly known writes of
+    // other GPU-owned surfaces (NoteExactWrite, compute copies) covered after this one's last use
+    // (on the PS4 their bytes are overwritten), not looked up for idle_ns and whose last command
+    // buffer has completed. Partial cover, draws, storage stores, or a newer surface that was only
+    // created or read keep the surface: GPU-only contents are never dropped.
     EvictResult EvictSuperseded(uint64_t idle_ns, uint64_t now_ns, uint64_t completed_seq);
     // GPU-owned textures the cache dropped (superseded evictions, depth arrays replaced when they
     // grew), handed to the renderer so it forgets state keyed by their pointers before they are
@@ -894,9 +900,10 @@ private:
     void WaitIdleLocked();
     // Adds (sign +1) or removes (sign -1) an entry's texture in the MemStats counters.
     void TrackLocked(const Entry* e, int sign);
-    // Stamps the entry's last use with the SetUse values (UseLocked: and its last write).
+    // Stamps the entry's last use with the SetUse values (ExactWriteLocked: and an exactly known
+    // write of guest [lo, hi), clipped to the entry).
     void TouchLocked(const Entry* e) const;
-    void UseLocked(const Entry* e, bool written) const;
+    void ExactWriteLocked(const Entry* e, uint64_t lo, uint64_t hi, uint64_t seq = 0) const;
     void RetireLocked(id<MTLTexture> t);
     std::vector<id<MTLTexture>> retired_;
     std::atomic<bool> retired_pending_{false};

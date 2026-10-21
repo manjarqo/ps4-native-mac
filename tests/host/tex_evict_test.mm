@@ -4,7 +4,8 @@
 // referenced by a command buffer in flight is never evicted and stays alive until that command
 // buffer is done, that its memory is then freed, that an evicted texture comes back with the
 // current guest memory, how GPU-write invalidation behaves around eviction, that GPU-owned surfaces
-// stay, and that the GPU-owned range index notices entries added after an eviction.
+// are evicted only when exactly known writes covered all of their memory after their last use, and
+// that the GPU-owned range index notices entries added after an eviction.
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
@@ -138,14 +139,16 @@ static uint8_t FirstByte(id<MTLTexture> t) {
     return px[0];
 }
 
-static ColorTarget Rt(uint64_t addr, uint32_t height = 64, uint32_t mtl_format = MTLPixelFormatRGBA8Unorm) {
+static ColorTarget Rt(uint64_t addr, uint32_t height = 64, uint32_t mtl_format = MTLPixelFormatRGBA8Unorm,
+                      uint32_t num_slices = 1, uint32_t base_slice = 0) {
     ColorTarget c;
     c.bound = true;
     c.address = addr;
     c.pitch = 64;
     c.height = height;
     c.slice_bytes = 64 * height * 4;
-    c.num_slices = 1;
+    c.num_slices = num_slices;
+    c.base_slice = base_slice;
     c.num_samples = 1;
     c.bpp = 32;
     c.dfmt = DataFormat::Format8_8_8_8;
@@ -267,9 +270,8 @@ static void test_cache(id<MTLDevice> dev) {
     id<MTLTexture> tb3 = tc.GetTexture(Tsharp(B, 64, 64));
     check(tb3 == tb2 && FirstByte(tb3) == 0x55, "late GPU-write retirement re-uploads the re-created texture");
 
-    // GPU-owned surfaces are never evicted, and the range index sees surfaces added after an eviction
+    // the range index sees GPU-owned surfaces added after an eviction
     const uint64_t C1 = 0x100000, C2 = 0x200000;
-    __weak id<MTLTexture> weak_rt1 = nil;
     @autoreleasepool { // returned textures may be autoreleased: the freed check below runs after the pool
         id<MTLTexture> rt1 = tc.GetColorTarget(Rt(C1), false);
         check(rt1 != nil && tc.GetMemStats().gpu_count == 1, "render target created");
@@ -283,12 +285,12 @@ static void test_cache(id<MTLDevice> dev) {
         check(tc.OverlapsGpuTexture(C2, 16), "range index rebuilt for a render target added after an eviction");
         check(tc.FindColorTarget(C1) == rt1, "render target kept");
     }
-    (void)weak_rt1;
     munmap(g.base, g.size);
 }
 
-// Superseded GPU-owned surfaces: only when other surfaces wrote all of their memory after their
-// last use. Each case uses its own addresses; command buffer n is open at n s.
+// Superseded GPU-owned surfaces: only when exactly known writes (clears, compute copies) of other
+// surfaces covered all of their memory after their last use. Draws and storage stores never count:
+// which bytes they write is unknown. Each case uses its own addresses; command buffer n is open at n s.
 static void test_superseded(id<MTLDevice> dev) {
     id<MTLCommandQueue> q = [dev newCommandQueue];
     const uint64_t size = 64 * MiB;
@@ -296,98 +298,169 @@ static void test_superseded(id<MTLDevice> dev) {
     TextureCache tc(dev, q, base, size);
     auto at = [&](uint64_t seq) { tc.SetUse(seq, seq * 1000 * MS); };
     const uint32_t BGRA = MTLPixelFormatBGRA8Unorm;
-    const uint64_t X1 = 0x100000, X2 = 0x200000, X3 = 0x300000, X4 = 0x400000, X5 = 0x500000, X6 = 0x600000,
-                   Y = 0x700000, Z1 = 0x800000, Z2 = 0x900000;
-    __weak id<MTLTexture> weak_a1 = nil;
+    const uint64_t K16 = 64 * 64 * 4; // one 64x64 RGBA8 slice
+    // a clear of slice `slice` of a color target, as draw.mm's NoteClearedColor credits it
+    auto clear_slice = [&](const ColorTarget& c, id<MTLTexture> t, uint32_t slice) {
+        const uint64_t lo = c.address + (uint64_t)slice * c.slice_bytes;
+        return tc.NoteExactWrite(c.address, t, lo, lo + c.slice_bytes);
+    };
+    auto evict_all_idle = [&](uint64_t now_s, uint64_t completed) {
+        return tc.EvictSuperseded(1000 * MS, now_s * 1000 * MS, completed);
+    };
     std::vector<id<MTLTexture>> retired;
+    __weak id<MTLTexture> weak_a1 = nil;
     @autoreleasepool {
-        // 1: the same memory rendered again as another surface: the old one is superseded
+        // 1: the same memory used as another surface. Drawing to it proves nothing; a clear does.
+        const uint64_t X1 = 0x100000;
         at(1);
         id<MTLTexture> a1 = tc.GetColorTarget(Rt(X1), false);
         at(2);
         id<MTLTexture> b1 = tc.GetColorTarget(Rt(X1, 64, BGRA), false);
-        check(a1 && b1 && a1 != b1, "case 1: two surfaces over the same memory");
+        check(evict_all_idle(5, 4).count == 0 && tc.FindColorTarget(X1, 64, 64) != nil,
+              "case 1: a newer surface only drawn to does not supersede");
+        at(6);
+        check(clear_slice(Rt(X1, 64, BGRA), b1, 0), "case 1: clear of the newer surface noted");
         check(tc.GetGpuOwnedStats(1000 * MS).superseded_count == 1, "case 1: the older one counts as superseded");
-        TextureCache::EvictResult r = tc.EvictSuperseded(1000 * MS, 3500 * MS, 0);
-        check(r.count == 0, "case 1: its command buffer in flight: kept");
-        r = tc.EvictSuperseded(5000 * MS, 3500 * MS, 2);
-        check(r.count == 0, "case 1: used within the idle time: kept");
+        check(evict_all_idle(8, 0).count == 0, "case 1: its own last command buffer in flight: kept");
+        check(tc.EvictSuperseded(20000 * MS, 8000 * MS, 6).count == 0, "case 1: used within the idle time: kept");
         weak_a1 = a1;
         a1 = nil;
-        r = tc.EvictSuperseded(1000 * MS, 3500 * MS, 2);
-        check(r.count == 1 && tc.FindColorTarget(X1) == b1, "case 1: superseded surface evicted, the newer one kept");
+        check(evict_all_idle(8, 2).count == 1, "case 1: cleared over after its last use: evicted");
         tc.TakeRetired(&retired);
         check(retired.size() == 1 && retired[0] == weak_a1, "case 1: evicted texture handed to the renderer");
-        check(!tc.OverlapsGpuTexture(X1 + 0x10000, 16) && tc.OverlapsGpuTexture(X1, 16), "case 1: range index rebuilt");
+        check(tc.OverlapsGpuTexture(X1, 16), "case 1: the newer surface stays in the range index");
         retired.clear();
     }
     check(weak_a1 == nil, "case 1: freed once the renderer dropped it");
 
     @autoreleasepool {
-        // 2: the older surface is rendered again after the newer one was created (review I1)
+        // 2: the older surface is used again after the newer one was cleared (review I1)
+        const uint64_t X2 = 0x200000;
         at(10);
         id<MTLTexture> a2 = tc.GetColorTarget(Rt(X2), false);
         at(11);
-        tc.GetColorTarget(Rt(X2, 64, BGRA), false);
+        clear_slice(Rt(X2, 64, BGRA), tc.GetColorTarget(Rt(X2, 64, BGRA), false), 0);
         at(12);
         check(tc.GetColorTarget(Rt(X2), false) == a2, "case 2: older surface rendered again");
         // 3: partial cover keeps the older surface (its first 4 KiB were not overwritten)
+        const uint64_t X3 = 0x300000;
         at(13);
         id<MTLTexture> a3 = tc.GetColorTarget(Rt(X3), false);
         at(14);
-        tc.GetColorTarget(Rt(X3 + 0x1000), false);
+        clear_slice(Rt(X3 + 0x1000), tc.GetColorTarget(Rt(X3 + 0x1000), false), 0);
         // 4: a newer surface starting before the older one and covering it (backward overlap)
+        const uint64_t X4 = 0x400000, X5 = 0x500000;
         at(15);
         id<MTLTexture> a4 = tc.GetColorTarget(Rt(X4), false);
         id<MTLTexture> a5 = tc.GetColorTarget(Rt(X5), false);
         at(16);
-        tc.GetColorTarget(Rt(X4 - 0x1000, 128), false);
-        tc.GetColorTarget(Rt(X5 - 0x1000, 128), false);
+        clear_slice(Rt(X4 - 0x1000, 128), tc.GetColorTarget(Rt(X4 - 0x1000, 128), false), 0);
+        clear_slice(Rt(X5 - 0x1000, 128), tc.GetColorTarget(Rt(X5 - 0x1000, 128), false), 0);
         at(17);
-        check(tc.FindColorTarget(X5) == a5, "case 4: X5 read again after the cover was written");
-        // 5: both used by the same command buffer: order unknown, both kept
+        check(tc.FindColorTarget(X5) == a5, "case 4: X5 read again after the cover was cleared");
+        // 5: both used by the same command buffer: order unknown, kept
+        const uint64_t X6 = 0x600000;
         at(18);
         id<MTLTexture> a6 = tc.GetColorTarget(Rt(X6), false);
-        tc.GetColorTarget(Rt(X6, 64, BGRA), false);
-        // 6: a depth array over a render target, bound for depth tests only, grows
+        clear_slice(Rt(X6, 64, BGRA), tc.GetColorTarget(Rt(X6, 64, BGRA), false), 0);
+        // 6: a depth array over a render target, never cleared, grows
+        const uint64_t Y = 0x700000;
         at(19);
         id<MTLTexture> ay = tc.GetColorTarget(Rt(Y), false);
         at(20);
-        id<MTLTexture> dy = tc.GetDepthTarget(Db(Y, 1), nullptr, false);
+        id<MTLTexture> dy = tc.GetDepthTarget(Db(Y, 1));
         at(21);
         id<MTLTexture> grown_from = nil;
-        id<MTLTexture> dy2 = tc.GetDepthTarget(Db(Y, 2), &grown_from, false);
+        id<MTLTexture> dy2 = tc.GetDepthTarget(Db(Y, 2), &grown_from);
         check(dy && dy2 && dy2 != dy && grown_from == dy, "case 6: depth array grew");
         tc.TakeRetired(&retired);
         check(retired.size() == 1 && retired[0] == dy, "case 6: the replaced depth texture is handed to the renderer");
         retired.clear();
-        // 7: a compute copy into memory of an older surface, which is read afterwards
+        // 7: compute copies into older surfaces' memory: read after (Z2), only half (Z3), whole (Z4)
+        const uint64_t Z1 = 0x800000, Z2 = 0x900000, Z3 = 0xA00000, Z4 = 0xB00000;
         at(22);
         tc.GetColorTarget(Rt(Z1), false);
-        id<MTLTexture> az = tc.GetColorTarget(Rt(Z2, 64, BGRA), false);
+        id<MTLTexture> az2 = tc.GetColorTarget(Rt(Z2, 64, BGRA), false);
+        id<MTLTexture> az3 = tc.GetColorTarget(Rt(Z3, 64, BGRA), false);
+        id<MTLTexture> az4 = tc.GetColorTarget(Rt(Z4, 64, BGRA), false);
         at(23);
         id<MTLTexture> cs = nil, cd = nil;
         int kind = 0;
-        check(tc.CloneGpuTexture(Z1, Z2, &cs, &cd, &kind) && cd && cd != az, "case 7: surface copied over Z2");
+        check(tc.CloneGpuTexture(Z1, Z2, K16, &cs, &cd, &kind) && cd && cd != az2, "case 7: whole surface copied to Z2");
+        check(tc.CloneGpuTexture(Z1, Z3, K16 / 2, &cs, &cd, &kind), "case 7: half a surface copied to Z3");
+        check(tc.CloneGpuTexture(Z1, Z4, K16, &cs, &cd, &kind), "case 7: whole surface copied to Z4");
         at(24);
-        check(tc.GetColorTarget(Rt(Z2, 64, BGRA), false, false) == az, "case 7: the older surface read after the copy");
+        check(tc.GetColorTarget(Rt(Z2, 64, BGRA), false) == az2, "case 7: Z2's older surface read after the copy");
+        // 8: a slice view: clearing slice 1 of an array leaves slice 0's older surface alone (review I1-R)
+        const uint64_t X7 = 0xC00000;
+        at(25);
+        id<MTLTexture> a7 = tc.GetColorTarget(Rt(X7), false);
+        at(26);
+        const ColorTarget arr = Rt(X7, 64, BGRA, 2, 1);
+        check(clear_slice(arr, tc.GetColorTarget(arr, false), 1), "case 8: slice 1 of the array cleared");
+        // 9: depth array: a clear of slice 1 keeps the color surface aliasing slice 0
+        const uint64_t Y2 = 0xD00000;
+        at(27);
+        id<MTLTexture> ay2 = tc.GetColorTarget(Rt(Y2), false);
+        at(28);
+        id<MTLTexture> dz = tc.GetDepthTarget(Db(Y2, 2));
+        check(tc.NoteExactWrite(Y2, dz, Y2 + K16, Y2 + 2 * K16), "case 9: depth slice 1 cleared");
+        // 10: a storage image bound to a larger existing surface: stores are not exact writes. The
+        // older surface is a depth target, so the storage bind can only match the larger color one.
+        const uint64_t W1 = 0xE00000;
+        at(29);
+        id<MTLTexture> aw = tc.GetDepthTarget(Db(W1, 1));
         at(30);
+        tc.GetColorTarget(Rt(W1, 128, BGRA), false);
+        at(31);
+        ImageDesc st = Tsharp(W1, 64, 64);
+        id<MTLTexture> stex = tc.GetStorageTexture(st);
+        check(stex != nil && stex != aw, "case 10: storage image bound to the larger color surface over W1");
+        // 11: unions of covers: two halves (evicted), the same half twice (kept), a 256-byte gap (kept)
+        const uint64_t U1 = 0xF00000, U2 = 0x1000000, U3 = 0x1100000, H = K16 / 2;
+        at(32);
+        tc.GetColorTarget(Rt(U1), false);
+        id<MTLTexture> au2 = tc.GetColorTarget(Rt(U2), false);
+        id<MTLTexture> au3 = tc.GetColorTarget(Rt(U3), false);
+        at(33);
+        auto half = [&](uint64_t addr) { clear_slice(Rt(addr, 32, BGRA), tc.GetColorTarget(Rt(addr, 32, BGRA), false), 0); };
+        half(U1);
+        half(U1 + H);
+        half(U2);
+        clear_slice(Rt(U2, 32, MTLPixelFormatRGBA8Unorm_sRGB), tc.GetColorTarget(Rt(U2, 32, MTLPixelFormatRGBA8Unorm_sRGB), false), 0);
+        half(U3);
+        half(U3 + H + 256);
+
+        // one pass: everything idle for 1 s, all command buffers complete
         const uint64_t before = tc.GetMemStats().gpu_count;
-        TextureCache::EvictResult r = tc.EvictSuperseded(1000 * MS, 40000 * MS, 30);
-        // evicted: case 2's newer surface (overwritten by the older one at 12), case 4's X4
-        check(tc.FindColorTarget(X2) == a2 && tc.GetColorTarget(Rt(X2), false) == a2,
-              "case 2: surface rendered after the newer one was created is kept");
+        TextureCache::EvictResult r = evict_all_idle(60, 40);
+        check(tc.GetColorTarget(Rt(X2), false) == a2, "case 2: surface used after the newer one was cleared is kept");
         check(tc.FindColorTarget(X3) == a3, "case 3: partially covered surface kept");
-        check(tc.FindColorTarget(X5) == a5, "case 4: covered surface read after the cover was written is kept");
         check(tc.FindColorTarget(X4) == nil && a4 != nil, "case 4: surface covered by a newer one starting before it is evicted");
-        check(tc.FindColorTarget(X6) == a6, "case 5: same command buffer: kept");
+        check(tc.FindColorTarget(X5) == a5, "case 4: covered surface read after the cover was cleared is kept");
+        check(tc.FindColorTarget(X6, 64, 64) != nil && a6 != nil && tc.GetColorTarget(Rt(X6), false) == a6,
+              "case 5: same command buffer: kept");
         check(tc.FindColorTarget(Y) == ay && tc.FindDepthTarget(Y) == dy2,
-              "case 6: render target under a test-only depth array that grew is kept");
-        check(tc.GetColorTarget(Rt(Z2, 64, BGRA), false, false) == az, "case 7: older surface read after a copy into its memory is kept");
-        check(r.count == 2 && tc.GetMemStats().gpu_count == before - 2,
-              "exactly two surfaces evicted (case 2's overwritten newer one, case 4's X4)");
+              "case 6: render target under a depth array that grew (never cleared) is kept");
+        check(tc.GetColorTarget(Rt(Z2, 64, BGRA), false) == az2, "case 7: Z2: read after the copy: kept");
+        check(tc.GetColorTarget(Rt(Z3, 64, BGRA), false) == az3, "case 7: Z3: only half overwritten: kept");
+        check(az4 != nil, "case 7: Z4 had a surface");
+        check(tc.GetColorTarget(Rt(X7), false) == a7, "case 8: slice-0 surface under a slice-1 clear kept");
+        check(tc.GetColorTarget(Rt(Y2), false) == ay2, "case 9: color alias of depth slice 0 kept under a slice-1 clear");
+        check(tc.FindDepthTarget(W1) == aw, "case 10: surface under a storage image bind kept");
+        check(tc.GetColorTarget(Rt(U2), false) == au2, "case 11: the same half covered twice: kept");
+        check(tc.GetColorTarget(Rt(U3), false) == au3, "case 11: two halves with a gap: kept");
+        // evicted: case 4's X4, case 7's Z4 surface, case 11's U1 surface
+        check(r.count == 3 && tc.GetMemStats().gpu_count == before - 3, "exactly three surfaces evicted (X4, Z4, U1)");
         tc.TakeRetired(&retired);
-        check(retired.size() == 2, "both handed to the renderer");
+        check(retired.size() == 3, "all three handed to the renderer");
+        retired.clear();
+        // case 9, second step: slice 0 cleared too, after the color alias's last use (61)
+        at(62);
+        check(tc.NoteExactWrite(Y2, dz, Y2, Y2 + K16), "case 9: depth slice 0 cleared");
+        r = evict_all_idle(70, 62);
+        check(r.count == 1 && tc.FindDepthTarget(Y2) == dz, "case 9: color alias of slice 0 evicted once slice 0 is cleared");
+        tc.TakeRetired(&retired);
         retired.clear();
     }
     munmap(base, size);

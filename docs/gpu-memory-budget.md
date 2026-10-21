@@ -108,16 +108,21 @@ the sampled bytes, the cache budget and the evictions so far.
   budget, U4 chapter 1 grows its sampled textures from 240 MiB to 1.5 GiB in 5 minutes and keeps growing; at
   512 MiB it holds about 470 MiB with no fps cost; at 256 MiB re-uploads of still-used textures cost long frames.
   TLOU's courtyard needs about 400 MiB in all.
-- **GPU-owned surfaces** hold the only copy of what the GPU wrote, so they are evicted only when superseded:
-  other GPU-owned surfaces **wrote all of their guest memory after their last use**. Then on the PS4 every byte
-  is overwritten and their contents are dead. Writes are stamped by command buffer: a bind as a render target,
-  a bind as a depth target with depth writes or a stencil test, a storage-image bind, or a copy destination.
-  These do not count:
-  - a newer surface that was only created, read, or bound for depth tests;
-  - one used in the same command buffer (the order is unknown);
-  - one covering only part of the memory (the rest may still hold GPU-only data).
-  The surface must also not have been looked up for 10 s (2 s while the over-budget sweep purges), and its last
-  command buffer must have completed (`TextureCache::EvictSuperseded`, once a second).
+- **GPU-owned surfaces** hold the only copy of what the GPU wrote, so they are evicted only when superseded: the
+  whole guest range of the surface was covered by **exactly known writes** of other GPU-owned surfaces, made by
+  command buffers after its last use. On the PS4 every byte was then overwritten, so its contents are dead.
+  - Only these writes count, and only for the guest bytes they certainly write:
+    - a clear: a CMASK fast clear resolved by a draw or by fast-clear elimination, or a depth clear (register or
+      HTILE). It is credited with the first slice of the view (`base_slice`) and the command buffer of the clear
+      itself (`TextureCache::NoteExactWrite`, `NoteClearedColor` in draw.mm);
+    - a recognised compute surface copy, credited with the bytes the copy writes (`CloneGpuTexture`'s
+      `written_bytes`).
+  - These never count: draws (which pixels they write is unknown), storage-image stores, writes in the same
+    command buffer as the surface's last use, and a newer surface that was only created or read. Partial cover
+    keeps the surface, and so does a cover with a gap. The covers are merged as a union, so a byte covered
+    twice does not count twice.
+  - The surface must also not have been looked up for 10 s (2 s while the over-budget sweep purges), and its
+    last command buffer must have completed (`TextureCache::EvictSuperseded`, once a second).
   - The cache hands every texture it drops to the renderer: superseded ones, and depth arrays replaced when they
     grow (`TakeRetired`). The renderer then erases the state it keys by texture pointer (`ForgetTexture`: depth
     companions, depth versions, depth write order, EQAA twins) before the texture is freed, so a new texture at

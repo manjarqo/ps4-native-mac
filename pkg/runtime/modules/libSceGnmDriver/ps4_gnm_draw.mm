@@ -360,6 +360,7 @@ struct PassKey {
 
 struct MetaState {
     bool cleared = false;
+    uint64_t cleared_seq = 0; // command buffer the clear (CMASK/HTILE fill) belongs to
 };
 
 // Compact record of the work encoded into a command buffer, printed when it fails or hangs
@@ -2414,7 +2415,10 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             if (bb.is_written) {
                 NoteGpuWrite(base, bd.size_bytes);
                 auto mit = S.meta.find(base);
-                if (mit != S.meta.end() && b.stage == Stage::Compute) mit->second.cleared = true;
+                if (mit != S.meta.end() && b.stage == Stage::Compute) {
+                    mit->second.cleared = true;
+                    mit->second.cleared_seq = S.committed_seq + 1;
+                }
             }
             break;
         }
@@ -3680,10 +3684,12 @@ void RegisterMeta(uint64_t addr) {
     if (addr) S.meta.emplace(addr, MetaState{});
 }
 
-bool TakeMetaCleared(uint64_t addr) {
+// seq (optional): the command buffer the clear belongs to.
+bool TakeMetaCleared(uint64_t addr, uint64_t* seq = nullptr) {
     auto it = S.meta.find(addr);
     if (it == S.meta.end() || !it->second.cleared) return false;
     it->second.cleared = false;
+    if (seq) *seq = it->second.cleared_seq;
     return true;
 }
 
@@ -3920,10 +3926,21 @@ bool BuildQuadListIndices(const DrawArgs& a, uint32_t count, __strong id<MTLBuff
 // =====================================================================================
 // Fast clear elimination / resolve passes (shadPS4 Rasterizer::FilterDraw)
 // =====================================================================================
+// A clear writes every byte of the cleared slices of a color target: an exactly known write
+// (TextureCache::NoteExactWrite). Only the first slice of the view (base_slice) is credited, which
+// is always a subset of what the PS4 clears.
+// seq: the command buffer of the CMASK clear, which can precede the draw that resolves it.
+void NoteClearedColor(const ColorTarget& c, id<MTLTexture> t, uint64_t seq) {
+    if (!c.slice_bytes || !seq) return;
+    const uint64_t lo = c.address + (uint64_t)c.base_slice * c.slice_bytes;
+    S.tex->NoteExactWrite(c.address, t, lo, lo + c.slice_bytes, seq);
+}
+
 void EliminateFastClear(const RenderState& rs) {
     const ColorTarget& c = rs.color[0];
     if (!c.bound || !c.fast_clear) return;
-    if (!TakeMetaCleared(c.cmask_address)) return;
+    uint64_t clear_seq = 0;
+    if (!TakeMetaCleared(c.cmask_address, &clear_seq)) return;
     id<MTLTexture> t = S.tex->GetColorTarget(c);
     if (!t) return;
     ClearReq clr;
@@ -3932,6 +3949,7 @@ void EliminateFastClear(const RenderState& rs) {
         return;
     }
     clr.color[0] = true;
+    NoteClearedColor(c, t, clear_seq);
     PassKey k;
     k.color[0] = t;
     id<MTLTexture> hold[9] = {t};
@@ -3945,7 +3963,7 @@ void ResolvePass(const RenderState& rs) {
     const ColorTarget& src = rs.color[0];
     const ColorTarget& dst = rs.color[1];
     if (!src.bound || !dst.bound) return;
-    id<MTLTexture> s = S.tex->GetColorTarget(src, true, false); // read by the resolve
+    id<MTLTexture> s = S.tex->GetColorTarget(src);
     id<MTLTexture> d = S.tex->GetColorTarget(dst);
     if (!s || !d) return;
     EndEncoders();
@@ -4545,7 +4563,10 @@ void NotifyGuestWriteImpl(uint64_t addr, uint64_t size, bool is_fill, uint32_t f
     (void)fill_value;
     if (is_fill) {
         auto it = S.meta.find(addr);
-        if (it != S.meta.end()) it->second.cleared = true;
+        if (it != S.meta.end()) {
+            it->second.cleared = true;
+            it->second.cleared_seq = S.committed_seq + 1;
+        }
     }
     if (S.tex) S.tex->InvalidateRange(addr, size, false);
 }
@@ -4845,9 +4866,12 @@ void DrawEncode(DrawRec& r) {
             rt_w = std::min<uint32_t>(rt_w, (uint32_t)t.width);
             rt_h = std::min<uint32_t>(rt_h, (uint32_t)t.height);
             any_rt = true;
-            if (c.fast_clear && TakeMetaCleared(c.cmask_address)) {
-                if (ClearColorFor(t.pixelFormat, c.clear_word0, c.clear_word1, &clr.color_value[i]))
+            uint64_t clear_seq = 0;
+            if (c.fast_clear && TakeMetaCleared(c.cmask_address, &clear_seq)) {
+                if (ClearColorFor(t.pixelFormat, c.clear_word0, c.clear_word1, &clr.color_value[i])) {
                     clr.color[i] = true;
+                    NoteClearedColor(c, t, clear_seq);
+                }
             }
         }
         uint32_t depth_fmt = 0;
@@ -4864,7 +4888,7 @@ void DrawEncode(DrawRec& r) {
         if (want_depth && db.bound && db.mtl_format) {
             if (db.htile_enable) RegisterMeta(db.htile_address);
             id<MTLTexture> grown_from = nil;
-            id<MTLTexture> t = S.tex->GetDepthTarget(db, &grown_from, rs.ds.depth_write || rs.ds.stencil_test);
+            id<MTLTexture> t = S.tex->GetDepthTarget(db, &grown_from);
             if (t && grown_from) {
                 // The array grew (a view selected a later slice): keep the slices written so far.
                 EndEncoders();
@@ -4903,10 +4927,20 @@ void DrawEncode(DrawRec& r) {
                 const bool depth_enable = (dc >> 1) & 1, depth_write = (dc >> 2) & 1;
                 if (depth_write || rs.ds.stencil_test || db.depth_clear_enable || db.stencil_clear_enable)
                     BumpDepthVersion(t);
-                const bool htile_clear = db.htile_enable && TakeMetaCleared(db.htile_address);
+                uint64_t htile_seq = 0;
+                const bool htile_clear = db.htile_enable && TakeMetaCleared(db.htile_address, &htile_seq);
                 if ((db.depth_clear_enable && depth_enable && depth_write) || htile_clear) {
                     clr.depth = true;
                     clr.depth_value = db.depth_clear;
+                    // a clear writes every depth byte of the bound slice (the stencil plane is its
+                    // own surface on the PS4); only that slice is credited
+                    const uint64_t za = db.z_read_address ? db.z_read_address : db.stencil_read_address;
+                    // the register clear belongs to this draw; an HTILE clear to its fill
+                    const uint64_t seq = (db.depth_clear_enable && depth_enable && depth_write) ? S.committed_seq + 1
+                                                                                                 : htile_seq;
+                    if (db.z_read_address && db.slice_bytes && seq)
+                        S.tex->NoteExactWrite(za, t, za + (uint64_t)db.base_slice * db.slice_bytes,
+                                              za + (uint64_t)(db.base_slice + 1) * db.slice_bytes, seq);
                 }
                 if (db.stencil_clear_enable && HasStencil(t.pixelFormat)) {
                     clr.stencil = true;
@@ -5399,7 +5433,7 @@ void DispatchEncode(DispatchRec& r) {
                     wr.base_address && rd.size_bytes > 4096) {
                     id<MTLTexture> src = nil, dst = nil;
                     int kind = 0;
-                    if (S.tex->CloneGpuTexture(rd.base_address, wr.base_address, &src, &dst, &kind)) {
+                    if (S.tex->CloneGpuTexture(rd.base_address, wr.base_address, wr.size_bytes, &src, &dst, &kind)) {
                         EndEncoders();
                         EnsureCmd();
                         id<MTLBlitCommandEncoder> bl = [S.cmd blitCommandEncoder];
