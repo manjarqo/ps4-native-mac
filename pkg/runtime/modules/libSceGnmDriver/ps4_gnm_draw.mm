@@ -1020,8 +1020,12 @@ id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode);
 id<MTLComputeCommandEncoder> ComputeEncoder();
 id<MTLTexture> SampledTexture(const ImageDesc& img);
 
-void NoteGpuWrite(uint64_t addr, uint64_t size) {
+// exact: [addr, addr + size) is the real written range (false for "unbounded" V#s, whose size
+// is only a guess: render targets around them are not marked).
+void NoteGpuWrite(uint64_t addr, uint64_t size, bool exact) {
     if (!size) return;
+    // render targets in that memory no longer hold its contents (refreshed when next sampled)
+    if (exact && S.tex && S.tex->OverlapsGpuTexture(addr, size)) S.tex->NoteBufferWrite(addr, size, S.write_epoch + 1);
     // the same range written again by this command buffer: only its latest write matters (the
     // hazard check and the texture invalidation both take the latest epoch of a range)
     uint32_t& slot = S.gpu_written_slot[((addr >> 8) ^ size) & 63];
@@ -2392,7 +2396,8 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                             (unsigned long long)s->code_addr, i, (unsigned long long)bd.base_address, bd.size_bytes,
                             bd.stride, bd.num_records, bb.is_written ? " written" : "");
             }
-            if (bd.size_bytes >= 0x80000000u) bd.size_bytes = 64u << 20; // "unbounded" V#
+            const bool unbounded = bd.size_bytes >= 0x80000000u;
+            if (unbounded) bd.size_bytes = 64u << 20; // "unbounded" V#
             if (base & 3) {
                 // Bound at the dword below: the shader is specialized on base & 3 and reads its
                 // dwords shifted by that many bytes (gcn BufferSpecialization::misalign); the
@@ -2446,7 +2451,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                 }
             }
             if (bb.is_written) {
-                NoteGpuWrite(base, bd.size_bytes);
+                NoteGpuWrite(base, bd.size_bytes, !unbounded);
                 auto mit = S.meta.find(base);
                 if (mit != S.meta.end() && b.stage == Stage::Compute) mit->second.cleared = true;
             }
@@ -3286,6 +3291,23 @@ void VerifyGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up) {
 // 256; 0: every size; -1: off). -1 turns off only this bind-time GPU path: the hazard path
 // (GpuUploadTexture, for memory with GPU writes still pending) still copies on the GPU through
 // the shared staging pool (S.detile_staging) with EncodeGpuUpload's up-front bounds check.
+// A render target whose guest memory a buffer store or DMA wrote after it was drawn (U4: a
+// compute writes 0x1311380000 as a buffer each frame, and the lighting sampled the target left
+// there by a cutscene): copy guest memory into it on the GPU, behind the writing work.
+void RefreshGuestNewer(const ImageDesc& img) {
+    TextureCache::GpuUpload up;
+    bool mismatch = false;
+    if (!S.tex->TakeGuestNewer(img, &up, &mismatch)) {
+        if (mismatch)
+            RLog("guest-newer", "render target 0x%llx written by a buffer store is sampled as %ux%u fmt %u/%u: not refreshed",
+                 (unsigned long long)img.address, img.width, img.height, img.raw_dfmt, img.raw_nfmt);
+        return;
+    }
+    if (!EncodeGpuUpload(img, up, nil))
+        RLog("guest-newer", "render target 0x%llx: refresh from guest memory could not be encoded",
+             (unsigned long long)img.address);
+}
+
 id<MTLTexture> SampledTexture(const ImageDesc& img) {
     static const int64_t min_kb = [] {
         const char* v = getenv("PS4_GNM_GPU_UPLOAD_MIN_KB");
@@ -3328,6 +3350,13 @@ id<MTLTexture> SampledTexture(const ImageDesc& img) {
 // is not possible, the GPU is drained first). Must run before encoding starts.
 void ResolveTextureHazards(const Shader* s, const std::vector<uint32_t>& flat) {
     if (s->imgs.empty()) return;
+    if (S.tex->GuestNewerCount()) {
+        for (uint32_t i = 0; i < s->imgs.size(); ++i) {
+            if (s->imgs[i].is_storage || s->imgs[i].is_depth) continue;
+            ImageDesc img;
+            if (StageImage(s, flat, i, &img) && img.valid) RefreshGuestNewer(img);
+        }
+    }
     PruneCompletedWrites();
     if (S.gpu_written.empty() && S.inflight_written.empty()) return;
     for (uint32_t i = 0; i < s->imgs.size(); ++i) {
@@ -4412,7 +4441,7 @@ bool GpuDmaImpl(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, 
         [bl copyFromBuffer:sb sourceOffset:soff toBuffer:db destinationOffset:doff size:n];
     [bl endEncoding];
     LogWork("dma");
-    if (!dst_gds) NoteGpuWrite(dst, n);
+    if (!dst_gds) NoteGpuWrite(dst, n, true);
     return true;
 }
 

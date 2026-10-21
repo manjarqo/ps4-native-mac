@@ -154,6 +154,10 @@ clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_wave_exec_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
 "$T/gcn_wave_exec_test" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
+# Render targets written by buffer stores are refreshed from guest memory when next sampled.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" -I "$R/pkg/runtime/core" "$R/tests/host/gnm_guest_newer_test.mm" \
+  "$G/ps4_gnm_resources.mm" -framework Metal -framework Foundation -o "$T/gnm_guest_newer_test"
+"$T/gnm_guest_newer_test"
 # Mapping a compute queue drops its waiting submissions before the new mapping is published.
 RT_INC=$(find "$R/pkg/runtime" -type d | sed 's/^/-I/' | tr '\n' ' ')
 # shellcheck disable=SC2086
