@@ -49,7 +49,7 @@ not measured yet.
 | Game | Stage | fps | Resolution | Notes |
 | --- | --- | --- | --- | --- |
 | The Last of Us Remastered (CUSA00557) | Playable: boot, menus, movies, gameplay, saves | Walking (330 s scripted routes): chapter 1 courtyard 89.7 fps, spore corridor 99.6 fps, 0 frames > 100 ms. Standing: courtyard 78.5–78.9 fps, Sarah's house 113.7–114.5 fps. | 1920x1080 (base PS4 mode, `PS4_PRO=0`), MetalFX off. Pro mode: TBD | 30-minute courtyard soak: no fatal errors, no hangs, memory footprint flat at ~3.5 GB. Exit: 3/3 by closing the window, 3/3 by terminate, no crash reports. |
-| Uncharted 4: A Thief's End (CUSA04529) | In progress: boots, menus, New Game, chapter 1 (boat cutscene and boat gameplay), saves, audio | TBD (being re-measured after the guest-memory dispatch fix); before the lighting fix: menu 43 fps, boat gameplay 33–34 fps (`PS4_PRO=0`), Pro mode 24–26 fps | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Title screen renders like a PS4 (lit scene, light shafts). Boat cutscene: Drake and Sully lit; a motion-blur smear remains (fix in progress). Gameplay still shows red streaks and flat water. Base mode is recommended: Pro mode stays under 30 fps. |
+| Uncharted 4: A Thief's End (CUSA04529) | In progress: boots, menus, New Game, chapter 1 (boat cutscene and boat gameplay), saves, audio | TBD (being re-measured after the guest-memory dispatch fix); before the lighting fix: menu 43 fps, boat gameplay 33–34 fps (`PS4_PRO=0`), Pro mode 24–26 fps | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Title screen: the scene is lit, but fog and light shafts are missing. Boat cutscene: Drake and Sully lit; a motion-blur smear remains (fix in progress). Gameplay still shows red streaks and flat water. Base mode is recommended: Pro mode stays under 30 fps. |
 
 How the TLOU numbers were taken:
 
@@ -72,7 +72,7 @@ How the TLOU numbers were taken:
 - **Uncharted 4.**
   - Gameplay: red streaks and flat, blocky water; the sky is dark.
   - Boat cutscene: a motion-blur smear remains; its fix is in progress.
-  - The title-screen fog is weaker than on a PS4.
+  - The title screen has no fog and no light shafts.
   - Images read through descriptors (T#) loaded at run time read a null image (counted and logged
     per shader).
   - Decals are not applied (CMASK is not emulated).
