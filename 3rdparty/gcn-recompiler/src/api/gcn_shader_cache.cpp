@@ -31,15 +31,21 @@ namespace {
 constexpr u32 kMagic = 0x534E4347; // "GCNS"
 // Bump when the serialized layout below changes without a source change elsewhere.
 #define GCN_SHADER_CACHE_FORMAT "3"
-constexpr u32 kFormatVersion = 4; // 2: Info::uses_guest_memory, 3: Info::null_image_reads,
-                                   // 4: Info::zeroed_write_lanes
+constexpr u32 kFormatVersion = 7; // 2: Info::uses_guest_memory, 3: Info::null_image_reads,
+                                   // 4: Info::zeroed_write_lanes,
+                                   // 5: Info::unpredicated_wave_regions / per_subgroup_lane_ops,
+                                   // 6: Info::per_lane_ends (u4-graphics) or Info::image_tables,
+                                   //    ImageResource::table / table_entry,
+                                   //    StageSpecialization::image_tables (u4-bindless): two
+                                   //    different layouts used 6,
+                                   // 7: both
 constexpr char kCacheId[] = GCN_BUILD_ID "-f" GCN_SHADER_CACHE_FORMAT;
 
 // Tripwires: a new member in one of these types must be added to Write()/Read() below.
-static_assert(sizeof(InfoPersistent) == 7776, "update gcn_shader_cache.cpp for InfoPersistent");
-static_assert(sizeof(Info) == 8208, "update gcn_shader_cache.cpp for Info");
-static_assert(sizeof(StageSpecialization) == 1480, "update gcn_shader_cache.cpp for StageSpecialization");
-static_assert(sizeof(gcn_shader) == 10232, "update gcn_shader_cache.cpp for gcn_shader");
+static_assert(sizeof(InfoPersistent) == 8696, "update gcn_shader_cache.cpp for InfoPersistent");
+static_assert(sizeof(Info) == 9128, "update gcn_shader_cache.cpp for Info");
+static_assert(sizeof(StageSpecialization) == 1512, "update gcn_shader_cache.cpp for StageSpecialization");
+static_assert(sizeof(gcn_shader) == 11184, "update gcn_shader_cache.cpp for gcn_shader");
 static_assert(std::is_trivially_copyable_v<RuntimeInfo>);
 static_assert(std::is_trivially_copyable_v<Profile>);
 static_assert(StageSpecialization::MaxStageResources % 64 == 0);
@@ -194,7 +200,11 @@ void WriteInfo(Writer& w, const Info& info) {
     w.Pod(info.uses_dma);
     w.Pod(info.uses_guest_memory);
     w.Pod(info.null_image_reads);
+    w.Seq(info.image_tables);
     w.Pod(info.zeroed_write_lanes);
+    w.Pod(info.unpredicated_wave_regions);
+    w.Pod(info.per_subgroup_lane_ops);
+    w.Pod(info.per_lane_ends);
     // Info. user_data and flattened_ud_buf belong to the compiling draw and pgm_base to the
     // code address; they are re-established on read.
     w.Seq(info.srt_info.program);
@@ -255,7 +265,11 @@ void ReadInfo(Reader& r, Info& info) {
     r.Pod(info.uses_dma);
     r.Pod(info.uses_guest_memory);
     r.Pod(info.null_image_reads);
+    r.Seq(info.image_tables, info.image_tables.capacity());
     r.Pod(info.zeroed_write_lanes);
+    r.Pod(info.unpredicated_wave_regions);
+    r.Pod(info.per_subgroup_lane_ops);
+    r.Pod(info.per_lane_ends);
     r.Seq(info.srt_info.program);
     r.Pod(info.srt_info.flattened_bufsize_dw);
     r.Pod(info.loads);
@@ -314,6 +328,7 @@ void WriteSpec(Writer& w, const StageSpecialization& spec) {
     w.Seq(spec.images);
     w.Seq(spec.fmasks);
     w.Seq(spec.samplers);
+    w.Seq(spec.image_tables);
     w.Pod(spec.start);
 }
 
@@ -329,6 +344,7 @@ void ReadSpec(Reader& r, StageSpecialization& spec) {
     r.Seq(spec.images, NUM_IMAGES);
     r.Seq(spec.fmasks, NUM_FMASKS);
     r.Seq(spec.samplers, NUM_SAMPLERS);
+    r.Seq(spec.image_tables, 8 * 3);
     r.Pod(spec.start);
 }
 

@@ -12,6 +12,22 @@ T=$(mktemp -d)
 FIX="${PS4_HOST_GAME_FIXTURES:-$R/tests/host/data/game}"
 # output of the tests with fixture cases, for the SKIP count at the end
 : > "$T/fixture_cases.txt"
+# Every test that runs Metal work runs under a hard timeout: a kernel that never ends (a GPU
+# hang) fails the run instead of holding the GPU for other work. A stopped test exits with 124
+# (timeout) or 142 (SIGALRM, the fallback without coreutils), and set -e ends the run.
+GPU_TIMEOUT=${GPU_TIMEOUT:-120}
+gpu() {
+  local rc=0
+  if command -v timeout > /dev/null; then
+    timeout -k 10 "$GPU_TIMEOUT" "$@" || rc=$?
+  else
+    perl -e 'alarm shift; exec @ARGV or die "exec $ARGV[0]: $!"' "$GPU_TIMEOUT" "$@" || rc=$?
+  fi
+  if [ $rc -eq 124 ] || [ $rc -eq 137 ] || [ $rc -eq 142 ]; then
+    echo "$(basename "$1"): TIMEOUT, stopped after ${GPU_TIMEOUT} s (a GPU hang?)" >&2
+  fi
+  return $rc
+}
 "$R/tests/host/runtime_link_check.sh"
 clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/kernel/threading" "$R/tests/host/stall_profile_test.c" \
   "$R/pkg/runtime/kernel/threading/ps4_stall_profile.c" -o "$T/stall_profile_test"
@@ -111,6 +127,16 @@ clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/
 clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/tests/host/present_queue_test.c" \
   "$VO/ps4_present_queue.c" -o "$T/present_queue_test"
 "$T/present_queue_test"
+# sceGnmSubmitAndFlipCommandBuffers with the display behind (u4_research/crash_0x1ceb9d0.md),
+# through the whole runtime, with PS4_GNM_SYNC_ENCODE and with the encoder thread: the call (and
+# draining the encoder) returns at once, the EOP label is written, the flip stays pending until
+# the display takes the frame; the 1 s and 3-frame drops; a CPU-written display buffer.
+"$R/tests/host/build_runtime_test.sh" "$T/rt_test" "$R/tests/host/gnm_submit_flip_nonblocking_test.mm" \
+  > "$T/rt_test_build.txt" 2>&1 || { cat "$T/rt_test_build.txt"; exit 1; }
+for mode in sync async nohooks; do
+  "$T/rt_test/gnm_submit_flip_nonblocking_test" $mode > "$T/flip_nonblocking.txt" 2>&1 || { cat "$T/flip_nonblocking.txt"; exit 1; }
+  grep "^gnm_submit_flip_nonblocking_test" "$T/flip_nonblocking.txt"
+done
 G="$R/pkg/runtime/modules/libSceGnmDriver"
 # Frame capture store (ps4_gnm_capture.cpp): snapshot dedup, register file and manifest round trip,
 # raw texture layout sizes, the documented per-format view mapping, thumbnails. No Metal.
@@ -129,85 +155,115 @@ echo "gnm_compute_wait_test: PASS"
 # GPU windows over guest memory work with the guest NULL page guard on.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
   -framework Foundation -o "$T/guest_window_test"
-"$T/guest_window_test"
+gpu "$T/guest_window_test"
 # Shader translator (3rdparty/gcn-recompiler) scalar reads on Metal: SRT reads at offsets only the
-# shader knows, s_buffer_load past num_records, and a compute shader dumped from Uncharted 4
-# (local fixture).
+# shader knows, s_buffer_load past num_records, and compute shaders dumped from Uncharted 4 (local
+# fixtures: a blur, the tiled lighting and the reflection-probe culling T# tables).
 GR="$R/3rdparty/gcn-recompiler"
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_scalar_reads_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_scalar_reads_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-"$T/gcn_scalar_reads_test" "$FIX" | tee -a "$T/fixture_cases.txt"
+gpu "$T/gcn_scalar_reads_test" "$FIX" | tee -a "$T/fixture_cases.txt"
 # GPU memory accounting and budget decisions, the hole check against real mappings, and the Metal
 # facts the accounting rests on (no-copy lengths in currentAllocatedSize, GPU use wires the range).
 clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$G" -c "$G/ps4_gnm_membudget.c" -o "$T/membudget.o"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$G" "$R/tests/host/gpu_membudget_test.mm" \
   "$T/membudget.o" -framework Metal -framework Foundation -o "$T/gpu_membudget_test"
-"$T/gpu_membudget_test" > "$T/gpu_membudget.txt" || { cat "$T/gpu_membudget.txt"; exit 1; }
+gpu "$T/gpu_membudget_test" > "$T/gpu_membudget.txt" || { cat "$T/gpu_membudget.txt"; exit 1; }
 tail -1 "$T/gpu_membudget.txt"
 # Texture cache eviction: the policy and the real TextureCache on Metal (lifetime of textures used
 # by command buffers in flight, re-upload after eviction, GPU-write invalidation, GPU-owned surfaces).
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 -fsanitize=address,undefined \
   -I "$G" -I "$R/pkg/runtime/core" "$R/tests/host/tex_evict_test.mm" "$G/ps4_gnm_resources.mm" "$G/ps4_gnm_capture.cpp" "$T/membudget.o" \
   -framework Metal -framework Foundation -lz -o "$T/tex_evict_test"
-"$T/tex_evict_test" > "$T/tex_evict.txt" 2>&1 || { cat "$T/tex_evict.txt"; exit 1; }
+gpu "$T/tex_evict_test" > "$T/tex_evict.txt" 2>&1 || { cat "$T/tex_evict.txt"; exit 1; }
 tail -1 "$T/tex_evict.txt"
 # Frame capture on the TextureCache: entry identities, an entry re-created from its identity,
 # and the raw layout of ReadRaw / WriteRaw (levels, slices, depth and stencil planes).
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 -fsanitize=address,undefined \
   -I "$G" -I "$R/pkg/runtime/core" "$R/tests/host/gnm_capture_tex_test.mm" "$G/ps4_gnm_resources.mm" "$G/ps4_gnm_capture.cpp" \
   "$T/membudget.o" -framework Metal -framework Foundation -lz -o "$T/gnm_capture_tex_test"
-"$T/gnm_capture_tex_test" > "$T/gnm_capture_tex.txt" 2>&1 || { cat "$T/gnm_capture_tex.txt"; exit 1; }
+gpu "$T/gnm_capture_tex_test" > "$T/gnm_capture_tex.txt" 2>&1 || { cat "$T/gnm_capture_tex.txt"; exit 1; }
 tail -1 "$T/gnm_capture_tex.txt"
 # Pass replay through the real renderer (tools/gnm_replay): a synthetic captured dispatch is
 # translated, bound and encoded by ps4draw::Dispatch and matches its capture byte for byte; an
 # altered capture is reported at the altered byte; seeded GPU-owned textures keep their contents.
 "$R/tools/gnm_replay/build.sh" "$T/replay" "$R/tests/host/gnm_replay_test.mm" "$R/tests/host/gnm_guest_memory_test.mm" \
+  "$R/tests/host/gnm_buffer_over_target_test.mm" "$R/tests/host/gnm_tsharp_table_test.mm" \
   > "$T/replay_build.txt" 2>&1 || { cat "$T/replay_build.txt"; exit 1; }
-"$T/replay/gnm_replay_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
+gpu "$T/replay/gnm_replay_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
+# Buffer stores over a GPU-owned surface, replayed pass by pass: a store covering the whole surface
+# makes the GPU copy guest memory into its texture before it is next sampled; a partial store
+# keeps the GPU-only contents; a storage write after the store survives (the copy runs first).
+gpu "$T/replay/gnm_buffer_over_target_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
 # Buffer loads and stores through V#s a compute shader loads at run time (Uncharted 4's GPU copy
-# shader, capture r13c pass 21; local fixture) through the renderer: probe, guest page table,
-# dispatch; each destination gets its source's dwords, GCN's range check on loads and stores, an
-# unimplemented V# format skips the dispatch. Hand-assembled shaders cover the same paths.
-"$T/replay/gnm_guest_memory_test" "$FIX" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; } \
+# shader, capture r13c pass 21; local fixture; hand-assembled shaders cover the same paths
+# without it) through the renderer: probe, guest page table, dispatch; each
+# destination gets its source's dwords, GCN's range check on loads and stores, an unimplemented
+# V# format skips the dispatch. The fast path (no CPU wait) gives the same results; a probe that
+# meets a new page re-runs the dispatch without a second effect; after a barrier the CP waits for
+# such dispatches before it reads guest memory (also where a pass wrote outside its prediction:
+# a resource table, a cached texture), per queue; a miss is re-run without further work.
+gpu "$T/replay/gnm_guest_memory_test" "$FIX" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; } \
   | tee -a "$T/fixture_cases.txt"
+# A result that never becomes final: the CP's wait and the command buffer throttle give up on the
+# GPU after the GPU timeout (separate runs: the renderer is hung afterwards).
+# The default mode (fast path not requested): every guest memory dispatch is waited for.
+gpu "$T/replay/gnm_guest_memory_test" "$FIX" default 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; } \
+  | tee -a "$T/fixture_cases.txt"
+for mode in hang-cp hang-throttle hang-fast-throttle; do
+  gpu "$T/replay/gnm_guest_memory_test" "$FIX" "$mode" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; } \
+    | tee -a "$T/fixture_cases.txt"
+done
+# T# tables a compute shader indexes at run time (light records behind a V#, a table behind an
+# SRT pointer indexed through a buffer, a loop over N records), sampled and image_load_mip'd
+# through the renderer: each workgroup gets the texture its index selects, 0 past the table and
+# for a record holding no T# (not created); the loop's entry count is part of the specialization;
+# a table record written by a pending dispatch is copied after draining the GPU. Pending is judged
+# at the CP's copy of the tables, not at encoding: a draw's VS and PS both read again after one
+# drain; a CP DMA pending at the copy in a captured frame (whose passes start encoding with the
+# GPU drained); with the encoder thread, a second reader encoded after the first one's drain.
+gpu "$T/replay/gnm_tsharp_table_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
+for mode in capture async; do
+  gpu "$T/replay/gnm_tsharp_table_test" $mode 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
+done
 # RectList draws: a translated vertex shader drawn as rectangles (capture, barrier, expansion);
 # the colours at all 4 corners of each rectangle, with Metal API validation on.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_rectlist_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gnm_rectlist_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-MTL_DEBUG_LAYER=1 "$T/gnm_rectlist_test" 2>&1 | { grep -v "Metal API Validation Enabled" || true; }
+MTL_DEBUG_LAYER=1 gpu "$T/gnm_rectlist_test" 2>&1 | { grep -v "Metal API Validation Enabled" || true; }
 # Shader permutations with another SRT program are found (not re-translated per draw up to the
 # cap), and the push constants bound cover the translated shaders' MSL struct.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_shader_perm_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gnm_shader_perm_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-"$T/gnm_shader_perm_test"
+gpu "$T/gnm_shader_perm_test"
 # Misaligned guest buffer bases: the shader reads the guest's bytes from the dword below.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_buffer_align_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_buffer_align_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-"$T/gcn_buffer_align_test"
+gpu "$T/gcn_buffer_align_test"
 # Uncharted 4 chapter 1 compute shaders the translator rejected (EXEC half writes, sharps
 # spilled to VGPR lanes, wave64 ballots through workgroup memory): translated and Metal-accepted
 # (local fixtures).
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_u4_cs_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_u4_cs_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-"$T/gcn_u4_cs_test" "$FIX" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; } | tee -a "$T/fixture_cases.txt"
+gpu "$T/gcn_u4_cs_test" "$FIX" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; } | tee -a "$T/fixture_cases.txt"
 # T#s / S#s not read from the resource tables as they are: loaded through a run-time V# (null
 # image, counted, also after the shader cache; the S# cannot be fetched) or computed in the
 # shader (the translation fails, naming the instruction).
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_runtime_sharp_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_runtime_sharp_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-"$T/gcn_runtime_sharp_test" 2>&1 | { grep -v "^\[gcn [WIDEC]\]\|^ImageRead at\|^ImageSampleRaw at" || true; }
+gpu "$T/gcn_runtime_sharp_test" 2>&1 | { grep -v "^\[gcn [WIDEC]\]\|^ImageRead at\|^ImageSampleRaw at" || true; }
 # Wave-level instructions executed on Metal: EXEC half writes in a wave64, V# dwords spilled to
 # VGPR lanes, a wave64 compare read from both halves.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_wave_exec_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_wave_exec_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-"$T/gcn_wave_exec_test" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
+gpu "$T/gcn_wave_exec_test" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
 # Mapping a compute queue drops its waiting submissions before the new mapping is published.
 RT_INC=$(find "$R/pkg/runtime" -type d | sed 's/^/-I/' | tr '\n' ' ')
 # shellcheck disable=SC2086
@@ -218,58 +274,58 @@ echo "gnm_compute_map_test: PASS"
 # Fast-clear colours of integer/snorm targets.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/gnm_clear_color_test.mm" -framework Metal \
   -framework Foundation -o "$T/gnm_clear_color_test"
-"$T/gnm_clear_color_test"
+gpu "$T/gnm_clear_color_test"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   "$G/ps4_gnm_library_store.mm" -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"
 # A fresh shader per suite run (nonce) keeps pipeline caches of earlier runs from satisfying it.
 NONCE=$(( $(date +%s) % 100000 * 10 + RANDOM % 10 ))
-"$T/pso_archive_test" write "$A" $NONCE
-"$T/pso_archive_test" read "$A" $NONCE
-"$T/pso_archive_test" append "$A" $NONCE
-"$T/pso_archive_test" read2 "$A" $NONCE
-"$T/pso_archive_test" stale "$A" $NONCE
-"$T/pso_archive_test" write "$A" $NONCE
-"$T/pso_archive_test" budget "$A" $NONCE
-"$T/pso_archive_test" write "$A" $NONCE
-"$T/pso_archive_test" corrupt "$A" $NONCE
+gpu "$T/pso_archive_test" write "$A" $NONCE
+gpu "$T/pso_archive_test" read "$A" $NONCE
+gpu "$T/pso_archive_test" append "$A" $NONCE
+gpu "$T/pso_archive_test" read2 "$A" $NONCE
+gpu "$T/pso_archive_test" stale "$A" $NONCE
+gpu "$T/pso_archive_test" write "$A" $NONCE
+gpu "$T/pso_archive_test" budget "$A" $NONCE
+gpu "$T/pso_archive_test" write "$A" $NONCE
+gpu "$T/pso_archive_test" corrupt "$A" $NONCE
 # Two processes on one directory: hold owns it, lookup (meanwhile) must change nothing; once
 # hold is gone, read owns it again.
 L="$T/shared"; mkdir -p "$L"
-"$T/pso_archive_test" write "$L" $NONCE
+gpu "$T/pso_archive_test" write "$L" $NONCE
 "$T/pso_archive_test" hold "$L" $NONCE > "$T/hold.txt" &
 HOLD=$!
 for n in $(seq 300); do grep -q holding "$T/hold.txt" && break; sleep 0.1; done
 grep -q holding "$T/hold.txt" || { echo "pso_archive_test: hold did not start"; kill $HOLD; exit 1; }
-"$T/pso_archive_test" lookup "$L" $NONCE || { kill $HOLD; exit 1; }
+gpu "$T/pso_archive_test" lookup "$L" $NONCE || { kill $HOLD; exit 1; }
 kill $HOLD; wait $HOLD 2>/dev/null || true
-"$T/pso_archive_test" read "$L" $NONCE
+gpu "$T/pso_archive_test" read "$L" $NONCE
 # eviction: 6 one-pipeline files, then a cap of 4 files
 E="$T/evict"; mkdir -p "$E"
-for k in 0 1 2 3 4 5; do "$T/pso_archive_test" add$k "$E" $NONCE; done
-PS4_GNM_PSO_ARCHIVE_MAX_FILES=4 "$T/pso_archive_test" evict "$E" $NONCE
-"$T/pso_archive_test" evicted "$E" $NONCE
+for k in 0 1 2 3 4 5; do gpu "$T/pso_archive_test" add$k "$E" $NONCE; done
+PS4_GNM_PSO_ARCHIVE_MAX_FILES=4 gpu "$T/pso_archive_test" evict "$E" $NONCE
+gpu "$T/pso_archive_test" evicted "$E" $NONCE
 B="$T/budgetstop"; mkdir -p "$B"
-"$T/pso_archive_test" budgetstop "$B" $NONCE
+gpu "$T/pso_archive_test" budgetstop "$B" $NONCE
 # Shader library store: key and format units, then write / read (new process, no compiler) /
 # corrupt / other options, the size budget on a second directory, and the pipeline-failure
 # fallback with the session circuit breaker on a third.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/lib_store_test.mm" "$G/ps4_gnm_library_store.mm" \
   -framework Metal -framework Foundation -o "$T/lib_store_test"
-"$T/lib_store_test" unit
+gpu "$T/lib_store_test" unit
 LS="$T/libstore"; mkdir -p "$LS"
-for m in write read corrupt config; do "$T/lib_store_test" $m "$LS" $NONCE; done
+for m in write read corrupt config; do gpu "$T/lib_store_test" $m "$LS" $NONCE; done
 LB="$T/libbudget"; mkdir -p "$LB"
-"$T/lib_store_test" write "$LB" $NONCE
-"$T/lib_store_test" budget "$LB" $NONCE
+gpu "$T/lib_store_test" write "$LB" $NONCE
+gpu "$T/lib_store_test" budget "$LB" $NONCE
 LK="$T/libbreaker"; mkdir -p "$LK"
-"$T/lib_store_test" write "$LK" $NONCE
-"$T/lib_store_test" breaker "$LK" $NONCE
+gpu "$T/lib_store_test" write "$LK" $NONCE
+gpu "$T/lib_store_test" breaker "$LK" $NONCE
 # Compute kernels compiled in the background: Start does not block, compiles overlap, an
 # encoder-like thread waiting in order gets correct kernels, one job per MSL, failures stick.
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/kernel_compile_test.mm" "$G/ps4_gnm_kernel_compile.mm" \
   -framework Metal -framework Foundation -o "$T/kernel_compile_test"
-"$T/kernel_compile_test" $NONCE
+gpu "$T/kernel_compile_test" $NONCE
 # GCN translation cache lookups with 3000 permutations of one program: found from memory in the
 # session that stored them (files deleted), never waiting for the startup loader of a new
 # process, and at a cost that does not grow with the number of permutations.
@@ -283,7 +339,7 @@ mkdir -p "$T/gcnl_s" "$T/gcnl_r" "$T/gcnl_o"
 "$T/gcn_cache_lookup_test" restart "$T/gcnl_r" 3000 2>&1 | grep '^gcn_cache_lookup_test'
 # an entry of another resource layout in the bucket: found through the one-by-one path
 "$T/gcn_cache_lookup_test" odd "$T/gcnl_o" 500 2>&1 | grep '^gcn_cache_lookup_test'
-# Capture tools (tools/*.py): overview page, reference comparison.
+# Capture tools (tools/*.py): overview page, fixture extraction, reference comparison.
 python3 -m unittest discover -s "$R/tools/tests" -p 'test_*.py' > "$T/tools_tests.txt" 2>&1 || { cat "$T/tools_tests.txt"; exit 1; }
 echo "capture tools: PASS ($(grep -o 'Ran [0-9]* tests' "$T/tools_tests.txt"))"
 skipped=$(grep -c '^SKIP:' "$T/fixture_cases.txt" || true)

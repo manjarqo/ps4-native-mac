@@ -2,7 +2,11 @@
 // PS4Recomp - memory-writing instructions in a GCN (Sea Islands) program, for replay diagnostics:
 // a pass whose capture records no output may still write memory the renderer does not track
 // (gnm_replay prints what this finds). Walks the instruction stream by encoding (sizes and
-// literal constants as in the Sea Islands ISA) up to s_endpgm or the end of the code.
+// literal constants as in the Sea Islands ISA) to the end of the code: a program can have several
+// s_endpgm (early exits), so the first one does not end the scan.
+//
+// The scan runs only for passes with no recorded output (gnm_replay_lib.mm ReplayPass): it is a
+// diagnostic for "why is there nothing to compare", not part of the comparison.
 #pragma once
 
 #include <stddef.h>
@@ -14,7 +18,7 @@ namespace ps4replay {
 
 struct GcnStores {
     uint32_t buffer = 0, tbuffer = 0, image = 0, flat = 0; // stores and atomics
-    bool complete = false; // reached s_endpgm without an unknown encoding
+    bool complete = false; // reached the end of the code without an unknown encoding
     uint32_t Total() const { return buffer + tbuffer + image + flat; }
     std::string Describe() const {
         std::string s;
@@ -41,7 +45,7 @@ inline GcnStores ScanGcnStores(const uint32_t* code, size_t dwords) {
         size_t len = 1;
         bool literal = false;
         if ((w >> 23) == 0x17F) { // SOPP
-            if (((w >> 16) & 0x7F) == 1) { r.complete = true; return r; } // s_endpgm
+            // s_endpgm and the other SOPP are one dword: no literal, nothing to count
         } else if ((w >> 23) == 0x17E) { // SOPC
             literal = (w & 0xFF) == 255 || ((w >> 8) & 0xFF) == 255;
         } else if ((w >> 23) == 0x17D) { // SOP1
@@ -64,9 +68,9 @@ inline GcnStores ScanGcnStores(const uint32_t* code, size_t dwords) {
             case 0x34: break; // VOP3
             case 0x32: len = 1; break; // VINTRP
             case 0x36: break; // DS (LDS / GDS: not memory a pass outputs)
-            case 0x38: { // MUBUF: stores 4-7, 24-31; atomics 48-94
+            case 0x38: { // MUBUF: stores 4-7, 24-31; atomics 48-96 (FMAX_X2)
                 const uint32_t op = (w >> 18) & 0x7F;
-                if ((op >= 4 && op <= 7) || (op >= 24 && op <= 31) || (op >= 48 && op <= 94)) r.buffer++;
+                if ((op >= 4 && op <= 7) || (op >= 24 && op <= 31) || (op >= 48 && op <= 96)) r.buffer++;
                 break;
             }
             case 0x3A: { // MTBUF: tbuffer_store_format 4-7
@@ -74,14 +78,14 @@ inline GcnStores ScanGcnStores(const uint32_t* code, size_t dwords) {
                 if (op >= 4) r.tbuffer++;
                 break;
             }
-            case 0x3C: { // MIMG: image_store 8-11, atomics 15-27
+            case 0x3C: { // MIMG: image_store 8-11, atomics 15-31
                 const uint32_t op = (w >> 18) & 0x7F;
-                if ((op >= 8 && op <= 11) || (op >= 15 && op <= 27)) r.image++;
+                if ((op >= 8 && op <= 11) || (op >= 15 && op <= 31)) r.image++;
                 break;
             }
-            case 0x37: { // FLAT: stores 24-30, atomics 48-95
+            case 0x37: { // FLAT: stores 24-31, atomics 48-96 (FMAX_X2)
                 const uint32_t op = (w >> 18) & 0x7F;
-                if ((op >= 24 && op <= 30) || (op >= 48 && op <= 95)) r.flat++;
+                if ((op >= 24 && op <= 31) || (op >= 48 && op <= 96)) r.flat++;
                 break;
             }
             case 0x3E: break; // EXP
@@ -90,6 +94,7 @@ inline GcnStores ScanGcnStores(const uint32_t* code, size_t dwords) {
         }
         i += len + (literal ? 1 : 0);
     }
+    r.complete = true;
     return r;
 }
 

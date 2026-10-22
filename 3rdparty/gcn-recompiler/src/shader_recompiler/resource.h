@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <bit>
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
@@ -152,6 +153,57 @@ enum class MipStorageFallbackMode : u16 {
     ConstantIndex,
 };
 
+// PS4Recomp: false for a T# no Metal texture can be made of (MTLTextureDescriptor validation
+// aborts the process): 1D with mips or a block-compressed format, multisampled with more than 8
+// samples, 3D past 2048 texels, a cube that is not square, more layers than an array texture
+// holds. The unused entries of T# tables hold data that is no T# (Uncharted 4's lights: floats)
+// and decode to such T#s. Mirrors the renderer's check (ps4_gnm_resources.mm
+// DecodeImageUncached); a table entry failing it counts as unbound (GetSharp: the null image).
+inline bool IsCreatableImage(const AmdGpu::Image& image) {
+    using AmdGpu::ImageType;
+    const ImageType type = image.GetType();
+    const u32 width = u32(image.width) + 1, height = u32(image.height) + 1;
+    const u32 depth_field = u32(image.depth) + 1;
+    const bool msaa = type == ImageType::Color2DMsaa || type == ImageType::Color2DMsaaArray;
+    const bool is1d = type == ImageType::Color1D || type == ImageType::Color1DArray;
+    const bool cube = type == ImageType::Cube;
+    u32 layers = type == ImageType::Color3D ? 1 : depth_field * (cube ? 6 : 1);
+    if (image.pow2pad) {
+        layers = std::bit_ceil(layers);
+    }
+    if (is1d && (image.last_level > 0 || AmdGpu::IsBlockCoded(image.GetDataFmt()))) {
+        return false;
+    }
+    if (msaa && image.last_level > 3) {
+        return false;
+    }
+    if (type == ImageType::Color3D && (width > 2048 || height > 2048 || depth_field > 2048)) {
+        return false;
+    }
+    if (cube && width != height) {
+        return false;
+    }
+    return layers <= (cube ? 2046u : 2048u);
+}
+
+// PS4Recomp: no table (ImageResource::table)
+constexpr u8 NoImageTable = 0xFF;
+
+// PS4Recomp: the host's test whether a guest address is mapped (gcn_set_image_address_check).
+// A table entry whose T# starts at an unmapped address holds no T# a draw could read (the GPU
+// faults on it): unbound, like an entry failing IsCreatableImage. Without a test (fn null)
+// every address counts as mapped.
+struct ImageAddressCheck {
+    bool (*fn)(void* ctx, u64 addr){};
+    void* ctx{};
+};
+extern ImageAddressCheck g_image_address_check;
+
+inline bool IsMappedImage(const AmdGpu::Image& image) {
+    const ImageAddressCheck& c = g_image_address_check;
+    return !c.fn || c.fn(c.ctx, image.Address());
+}
+
 struct ImageResource {
     SharpFetch<AmdGpu::Image> sharp_fetch{};
     bool is_depth{};
@@ -162,6 +214,10 @@ struct ImageResource {
     u8 constant_mip_index{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
+    // PS4Recomp: entry `table_entry` of T# table `table` (Info::image_tables), a T# the SRT
+    // program copies from a table the shader indexes at run time; NoImageTable otherwise
+    u8 table = NoImageTable;
+    u8 table_entry{};
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const {
         AmdGpu::Image image{};
@@ -171,6 +227,13 @@ struct ImageResource {
         if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
             image.type = u64(AmdGpu::ImageType::Color2DArray);
             image.depth = (image.depth + 1) * 6 - 1;
+        }
+        if (table != NoImageTable && image.Valid() &&
+            (!IsCreatableImage(image) || AmdGpu::IsFmask(image.GetDataFmt()) ||
+             !IsMappedImage(image))) {
+            // an entry that holds no T# the instruction can read: unbound (the null image). An
+            // FMask surface is only read through the FMask path of a T# known at translation.
+            return AmdGpu::Image::Null(is_depth);
         }
         if (!image.Valid()) {
             image = AmdGpu::Image::Null(is_depth);

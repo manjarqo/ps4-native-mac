@@ -309,9 +309,17 @@ static void TestWriterRoundTrip() {
     ir.addr = tr.id.address;
     ir.textures = {0};
     p.images.push_back(ir);
+    // a T# table entry (gcn_image_binding.table / table_entry)
+    ImageRec te;
+    te.stage = "cs";
+    te.index = 5;
+    te.table = 1;
+    te.entry = 3;
+    p.images.push_back(te);
     p.inputs.push_back(a);
     p.outputs.push_back(w.Snapshot(mem.data(), 0x14000, kPage));
     p.meta_cleared.push_back(0x9900);
+    p.unstable = {"input 0x1000+0x4000", "texture t3_sampled"};
     p.state.viewport[2] = 1920.5;
     p.state.blend_enable[3] = true;
     p.name = "name with \"quotes\"";
@@ -332,9 +340,13 @@ static void TestWriterRoundTrip() {
                   q.textures[0].id.surface.size() == 4 && q.textures[0].id.surface[3] == 0xFFFFFFFFu &&
                   q.textures[0].id.swizzle[0] == 3 && q.textures[0].id.entry_format == kRGBA16Float + 1 && q.textures[0].post_hash == tr.post_hash,
               "texture id");
-        CHECK(q.images.size() == 1 && q.images[0].textures.size() == 1 && q.images[0].textures[0] == 0, "image -> texture");
+        CHECK(q.images.size() == 2 && q.images[0].textures.size() == 1 && q.images[0].textures[0] == 0, "image -> texture");
+        CHECK(q.images.size() == 2 && q.images[0].table == -1 && q.images[0].entry == -1 && q.images[1].table == 1 &&
+                  q.images[1].entry == 3 && q.images[1].index == 5,
+              "T# table entry marks");
         CHECK(q.inputs.size() == 1 && q.inputs[0].file == a.file && q.inputs[0].hash == a.hash, "inputs");
         CHECK(q.meta_cleared.size() == 1 && q.meta_cleared[0] == 0x9900, "meta");
+        CHECK(q.unstable.size() == 2 && q.unstable[0] == "input 0x1000+0x4000" && q.unstable[1] == "texture t3_sampled", "unstable");
         CHECK(q.state.viewport[2] == 1920.5 && q.state.blend_enable[3], "state");
         std::vector<uint32_t> r2;
         CHECK(LoadRegs(dir, q.regs_file, &r2, &err) && r2 == regs, "register file round trip: %s", err.c_str());
@@ -351,6 +363,167 @@ static void TestWriterRoundTrip() {
     CHECK(system(cmd.c_str()) == 0, "cleanup");
 }
 
+// Shader-address selection (ShaderSelection): keys count occurrences per stage pair and frame; the
+// producers of a selected pass are the latest earlier writers of each byte it reads, so a writer
+// whose bytes a later pass overwrote entirely is not one, two writers of different halves both are,
+// and passes after the reader, writers of bytes nobody selected reads, and readers of other
+// shaders' outputs are not.
+static void TestShaderSelection() {
+    using R = ShaderSelection::Range;
+    ShaderSelection sel;
+    std::string err;
+    CHECK(!sel.Parse("", &err) && sel.Empty(), "empty list accepted");
+    CHECK(!sel.Parse("0x10,zz", &err) && sel.Empty() && err.find("zz") != std::string::npos, "bad entry: %s",
+          err.c_str());
+    CHECK(!sel.Parse("0x10,,0x20", &err), "empty entry accepted");
+    CHECK(!sel.Parse("0", &err), "address 0 accepted");
+    CHECK(!sel.Parse("-1", &err) && !sel.Parse(" 0x10", &err) && !sel.Parse("pgm:-5", &err) && sel.Empty(),
+          "a negative or space-led entry accepted");
+    CHECK(sel.Parse("0x200081af00,4096,0x1000", &err) && sel.Shaders().size() == 2 &&
+              sel.Shaders()[0] == 0x1000 && sel.Shaders()[1] == 0x200081af00,
+          "hex and decimal, duplicates merged");
+
+    const uint64_t VS = 0x1300007500, PS = 0x200081af00, CS = 0x5000, VS2 = 0x6000, PS2 = 0x7000;
+    // learning frame:
+    //  0 cs        writes T [0x10000, +0x1000)            (overwritten by 1: not a producer)
+    //  1 vs2/ps2   writes T [0x10000, +0x1000)            producer (T)
+    //  2 cs        writes U [0x20000, +0x800)             producer (first half of U)
+    //  3 cs        writes U [0x20800, +0x800)             producer (second half of U)
+    //  4 vs2/ps2   writes V [0x30000, +0x100)             nobody selected reads V: not a producer
+    //  5 vs/ps     reads T, U, its target W; writes W     the selected pass (W never written before)
+    //  6 vs2/ps2   reads W, writes T                      after the reader: not a producer
+    //  7 vs/ps     reads T                                second occurrence: its producer is 6
+    sel.BeginFrame();
+    SelectKey k[8];
+    k[0] = sel.Next(CS, 0);
+    k[1] = sel.Next(VS2, PS2);
+    k[2] = sel.Next(CS, 0);
+    k[3] = sel.Next(CS, 0);
+    k[4] = sel.Next(VS2, PS2);
+    k[5] = sel.Next(VS, PS);
+    k[6] = sel.Next(VS2, PS2);
+    k[7] = sel.Next(VS, PS);
+    CHECK(k[3].occurrence == 2 && k[4].occurrence == 1 && k[7].occurrence == 1 && k[5].occurrence == 0,
+          "occurrences %u %u %u", k[3].occurrence, k[4].occurrence, k[7].occurrence);
+    CHECK(sel.UsesShader(k[5]) && sel.UsesShader(k[7]) && !sel.UsesShader(k[1]) && !sel.UsesShader(k[0]),
+          "UsesShader");
+    sel.Learn(k[0], {{0x40000, 0x10}}, {{0x10000, 0x1000}});
+    sel.Learn(k[1], {}, {{0x10000, 0x800}, {0x10800, 0x800}});
+    sel.Learn(k[2], {}, {{0x20000, 0x800}});
+    sel.Learn(k[3], {}, {{0x20800, 0x800}});
+    sel.Learn(k[4], {}, {{0x30000, 0x100}});
+    sel.Learn(k[5], {{0x10100, 0x10}, {0x20000, 0x1000}, {0x50000, 0x100}}, {{0x50000, 0x100}});
+    sel.Learn(k[6], {{0x50000, 0x100}}, {{0x10000, 0x1000}});
+    sel.Learn(k[7], {{0x10000, 4}}, std::vector<R>{});
+    sel.FinishLearning();
+    CHECK(sel.NumReaders() == 2 && sel.NumProducers() == 4, "%zu readers, %zu producers", sel.NumReaders(),
+          sel.NumProducers());
+    // captured frame: the same passes match by key
+    sel.BeginFrame();
+    bool want[8] = {false, true, true, true, false, true, true, true};
+    SelectKey n[8];
+    n[0] = sel.Next(CS, 0);
+    n[1] = sel.Next(VS2, PS2);
+    n[2] = sel.Next(CS, 0);
+    n[3] = sel.Next(CS, 0);
+    n[4] = sel.Next(VS2, PS2);
+    n[5] = sel.Next(VS, PS);
+    n[6] = sel.Next(VS2, PS2);
+    n[7] = sel.Next(VS, PS);
+    for (int i = 0; i < 8; ++i) {
+        CHECK(n[i] == k[i], "pass %d: key differs between frames", i);
+        CHECK(sel.Selects(n[i]) == want[i], "pass %d: selected %d", i, (int)sel.Selects(n[i]));
+    }
+    CHECK(!sel.Selects(sel.Next(CS, 0)), "a pass the learning frame did not have");
+
+    // program hashes: a shader the game loads at another address in another run is still found
+    ShaderSelection byp;
+    CHECK(!byp.Parse("pgm:", &err) && err.find("program hash") != std::string::npos, "empty pgm entry: %s",
+          err.c_str());
+    CHECK(!byp.Parse("pgm:0x4c71zz", &err) && byp.Empty(), "bad pgm entry accepted");
+    CHECK(byp.Parse("pgm:0x4c7184e1f5d449ec,0x1000", &err) && byp.Programs().size() == 1 &&
+              byp.Programs()[0] == 0x4c7184e1f5d449ecull && byp.Shaders().size() == 1 && byp.Shaders()[0] == 0x1000,
+          "pgm and address entries");
+    byp.BeginFrame();
+    const SelectKey w = byp.Next(0x130010c200, 0, 0x4c7184e1a73a4797ull, 0);   // zeroes the field
+    const SelectKey f = byp.Next(0x130010cf00, 0, 0x4c7184e1f5d449ecull, 0);   // the selected program
+    const SelectKey d = byp.Next(0x2000300000, 0x2000400000, 0x11, 0x22);      // reads it
+    CHECK(!byp.UsesShader(w) && byp.UsesShader(f) && !byp.UsesShader(d), "UsesShader by program hash");
+    byp.Learn(w, {}, {{0x1900400000, 0x100}});
+    byp.Learn(f, {{0x1900400000, 0x100}}, {{0x1900400000, 0x100}});
+    byp.Learn(d, {{0x1900400000, 0x100}}, std::vector<R>{});
+    byp.FinishLearning();
+    byp.BeginFrame();
+    const SelectKey w2 = byp.Next(0x130010c200, 0, 0x4c7184e1a73a4797ull, 0);
+    const SelectKey f2 = byp.Next(0x130010cf00, 0, 0x4c7184e1f5d449ecull, 0);
+    CHECK(byp.NumReaders() == 1 && byp.Selects(w2) && byp.Selects(f2), "program-hash reader and its producer");
+    CHECK(byp.Known(f2) && !byp.Known(byp.Next(0x130010cf00, 0, 0x4c7184e1f5d449ecull, 0)),
+          "a selected pass the learning frame did not have is not known");
+}
+
+// Writes declared by a texture or a bound V# range may cover only part of it (a draw covers some
+// pixels, a compute shader stores some fields): such a writer is a producer of the bytes it may
+// have written but hides no earlier writer. Only exact writes (the probed ranges of a guest
+// memory dispatch) hide earlier writers, also when they cover just a part of an earlier write.
+static void TestPartialWriters() {
+    using R = ShaderSelection::Range;
+    ShaderSelection sel;
+    std::string err;
+    CHECK(sel.Parse("0x9000", &err), "parse");
+    const uint64_t VB = 0x1902b00000, N = 0x1000;
+    sel.BeginFrame();
+    // the ocean vertex buffer: a dispatch zeroes it, the foam dispatch stores fields 13-16 of each
+    // vertex; both bind the whole buffer; the selected draw reads it
+    const SelectKey zero = sel.Next(0x5000, 0), foam = sel.Next(0x6000, 0);
+    // exact writes: a whole range, then its middle third, then a part outside the middle only
+    const SelectKey all = sel.Next(0x7000, 0), mid = sel.Next(0x7100, 0), part = sel.Next(0x7200, 0);
+    const SelectKey after = sel.Next(0x7300, 0); // exactly overwrites the first third
+    const SelectKey draw = sel.Next(0x9000, 0);
+    const uint64_t X = 0x40000000;
+    sel.Learn(zero, {}, {}, {{VB, N}});
+    sel.Learn(foam, {}, {}, {{VB, N}});
+    sel.Learn(part, {}, {{X + 0x100, 0x100}});
+    sel.Learn(all, {}, {{X, 0x3000}});
+    sel.Learn(mid, {}, {{X + 0x1000, 0x1000}});
+    sel.Learn(after, {}, {{X, 0x1000}});
+    sel.Learn(draw, {{VB, N}, {X, 0x3000}}, std::vector<R>{});
+    sel.FinishLearning();
+    CHECK(sel.Selects(zero), "an earlier writer of the whole buffer hidden by a later partial writer");
+    CHECK(sel.Selects(foam), "the later partial writer is not a producer");
+    CHECK(sel.Selects(after) && sel.Selects(mid) && sel.Selects(all),
+          "exact writers of the first third, the middle third and the last third: %d %d %d", sel.Selects(after),
+          sel.Selects(mid), sel.Selects(all));
+    CHECK(!sel.Selects(part), "a writer whose bytes later exact writes replaced entirely is a producer");
+    CHECK(sel.NumProducers() == 5, "%zu producers", sel.NumProducers());
+}
+
+// ChangedInputs: guest memory rewritten after a snapshot is reported; a range the pass wrote
+// itself and a range recorded without contents are not.
+void TestChangedInputs() {
+    std::vector<uint8_t> mem(0x40000, 0x11);
+    std::string root = "/tmp/gnm_capture_changed.XXXXXX";
+    CHECK(mkdtemp(&root[0]) != nullptr, "mkdtemp");
+    Writer ww(root + "/f", 1, mem.size(), false, "id");
+    std::string err;
+    CHECK(ww.Begin(&err), "%s", err.c_str());
+    std::vector<BlobRef> in = {ww.Snapshot(mem.data(), 0x0, kPage), ww.Snapshot(mem.data(), 0x4000, kPage),
+                               ww.Snapshot(mem.data(), 0x8000, kPage)};
+    BlobRef big;
+    big.addr = 0xC000;
+    big.size = kPage; // recorded, not stored (no file)
+    in.push_back(big);
+    std::vector<BlobRef> out = {BlobRef{0x8000, 16, 0, ""}};
+    CHECK(ChangedInputs(mem.data(), in, out).empty(), "unchanged memory reported");
+    mem[0x4010] = 0x22; // a guest thread rewrote a byte of the second range
+    mem[0x8010] = 0x22; // the pass wrote the third range
+    mem[0xC010] = 0x22; // the fourth has no contents to compare
+    const std::vector<std::string> ch = ChangedInputs(mem.data(), in, out);
+    CHECK(ch.size() == 1 && ch[0] == "input 0x4000+0x4000", "changed inputs: %zu (%s)", ch.size(),
+          ch.empty() ? "" : ch[0].c_str());
+    const std::string cmd = "rm -rf '" + root + "'";
+    CHECK(system(cmd.c_str()) == 0, "cleanup");
+}
+
 int main() {
     TestCoalesce();
     TestReadable();
@@ -358,6 +531,9 @@ int main() {
     TestViews();
     TestDepthWritten();
     TestWriterRoundTrip();
+    TestShaderSelection();
+    TestPartialWriters();
+    TestChangedInputs();
     if (g_fail) {
         fprintf(stderr, "gnm_capture_test: %d failure(s)\n", g_fail);
         return 1;

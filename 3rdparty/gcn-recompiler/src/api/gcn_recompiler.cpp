@@ -686,6 +686,7 @@ GCN_API gcn_status gcn_compile(const gcn_compile_desc* desc, gcn_shader** out, c
     sh->code_addr = desc->code_addr;
     sh->code_size = size;
     sh->profile = ToProfile(cprof);
+    sh->profile.wave64_force_fallback = (desc->flags & GCN_COMPILE_WAVE64_FALLBACK) != 0;
     std::memcpy(sh->user_data.data(), desc->user_data, 64);
 
     try {
@@ -821,7 +822,11 @@ GCN_API void gcn_shader_get_info(const gcn_shader* s, gcn_shader_info* o) {
     o->uses_dma = info.uses_dma;
     o->uses_guest_memory = info.uses_guest_memory;
     o->null_image_reads = info.null_image_reads;
+    o->num_image_tables = info.image_tables.size();
     o->zeroed_write_lanes = info.zeroed_write_lanes;
+    o->unpredicated_wave_regions = info.unpredicated_wave_regions;
+    o->per_subgroup_lane_ops = info.per_subgroup_lane_ops;
+    o->per_lane_ends = info.per_lane_ends;
     o->translation_failed = info.translation_failed;
     if (info.hw_stage == HwStage::Compute) {
         o->shared_memory_size =
@@ -905,6 +910,42 @@ GCN_API bool gcn_shader_get_image(const gcn_shader* s, uint32_t index, gcn_image
     if (auto it = s->msl_bindings.textures.find(binding); it != s->msl_bindings.textures.end()) {
         o->msl_texture = it->second;
     }
+    o->table = im.table == NoImageTable ? UINT32_MAX : im.table;
+    o->table_entry = im.table == NoImageTable ? UINT32_MAX : im.table_entry;
+    return true;
+}
+
+GCN_API uint32_t gcn_shader_image_table_reads(const gcn_shader* s, const uint32_t* flatbuf,
+                                              uint64_t (*out)[2], uint32_t max) {
+    if (!s || !flatbuf || s->info.image_tables.empty()) {
+        return 0;
+    }
+    u32 n = 0;
+    Shader::ForEachSrtTableRead(s->info.srt_info.program, flatbuf, [&](u64 addr, u64 size) {
+        if (out && n < max) {
+            out[n][0] = addr;
+            out[n][1] = size;
+        }
+        ++n;
+    });
+    return n;
+}
+
+GCN_API bool gcn_shader_get_image_table(const gcn_shader* s, uint32_t index, gcn_image_table* o) {
+    if (!s || !o || index >= s->info.image_tables.size()) {
+        return false;
+    }
+    const auto& t = s->info.image_tables[index];
+    std::memset(o, 0, sizeof(*o));
+    o->kind = static_cast<u32>(t.kind);
+    o->table_buffer = t.table_buffer;
+    o->index_buffer = t.index_buffer == ~0u ? UINT32_MAX : t.index_buffer;
+    o->first_dw = t.first_dw;
+    o->stride_dw = t.stride_dw;
+    o->num_dwords = t.num_dwords;
+    o->num_entries = t.num_entries;
+    o->reached = t.reached;
+    o->num_sites = t.num_sites;
     return true;
 }
 
@@ -1038,6 +1079,10 @@ GCN_API void gcn_set_direct_guest_memory(gcn_read_guest_fn read, void* ctx, cons
     Shader::g_srt_direct = Shader::SrtDirectMemory{read, ctx, static_cast<const u8*>(base), read ? size : 0};
 }
 
+GCN_API void gcn_set_image_address_check(gcn_guest_mapped_fn mapped, void* ctx) {
+    Shader::g_image_address_check = Shader::ImageAddressCheck{mapped, mapped ? ctx : nullptr};
+}
+
 GCN_API bool gcn_shader_is_compatible(const gcn_shader* s, const uint32_t user_data[16],
                                       const gcn_runtime_info* runtime, gcn_read_guest_fn read,
                                       void* ctx) {
@@ -1125,6 +1170,13 @@ GCN_API bool gcn_shader_explain_mismatch(const gcn_shader* s, const uint32_t use
             put("vertex attributes");
         } else if (have.fetch_shader_data != spec.fetch_shader_data) {
             put("fetch shader");
+        } else if (have.image_tables != spec.image_tables) {
+            std::string m = "T# table entry buckets";
+            for (size_t i = 0; i < std::max(have.image_tables.size(), spec.image_tables.size()); ++i) {
+                m += fmt::format(" {}/{}", i < have.image_tables.size() ? int(have.image_tables[i]) : -1,
+                                 i < spec.image_tables.size() ? int(spec.image_tables[i]) : -1);
+            }
+            put(m);
         } else if (have.buffers.size() != spec.buffers.size() || have.images.size() != spec.images.size() ||
                    have.samplers.size() != spec.samplers.size()) {
             put("resource counts");
@@ -1278,6 +1330,8 @@ u64 SpecHash(const Shader::StageSpecialization& sp, const u64 mask[2]) {
     }
     HashMix(h, sp.fmasks.size());
     for (const auto& f : sp.fmasks) HashMix(h, (u64(f.width) << 32) | f.height);
+    HashMix(h, sp.image_tables.size());
+    for (const u8 b : sp.image_tables) HashMix(h, 3000 + b);
     if (sp.buffers.empty() && sp.images.empty() && sp.samplers.empty()) return h; // see operator==
     u32 binding = 0;
     for (const auto& b : sp.buffers) {

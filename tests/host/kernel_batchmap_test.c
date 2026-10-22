@@ -7,7 +7,8 @@
 //    failed entry and the ones after it are not run;
 //  - the failure rules: length 0, unknown operation, NULL array, a failing operation;
 //  - type protect splits extents at the range edges and fails on an unmapped range;
-//  - the guest-ABI shim reads the entries and the out count from guest memory.
+//  - the guest-ABI shim reads the entries and the out count from guest memory;
+//  - the provably unmapped ranges (recomp_vm_unmapped_ranges) and their generation.
 #include "ps4_direct_mem.h"
 
 #include <pthread.h>
@@ -251,6 +252,42 @@ static void test_shim(GuestContext *ctx) {
   CHECK((int32_t)ctx->rax == EINVAL_ORBIS, "mtypeprotect shim on an unmapped range");
 }
 
+// recomp_vm_unmapped_ranges (the renderer's T# address check): only free extents and untouched
+// reservations are unmapped. Memory without an extent (below the VM window: module images) and
+// an extent that sceKernelMprotect made PROT_NONE as a whole (for one guard page inside it) are
+// not; mapping into a reservation removes the mapped part; every change bumps the generation.
+static int in_unmapped(GuestContext *ctx, uint64_t addr, uint64_t *gen) {
+  uint64_t r[64][2];
+  const size_t n = recomp_vm_unmapped_ranges(ctx, r, 64, gen);
+  for (size_t i = 0; i < n && i < 64; i++)
+    if (addr >= r[i][0] && addr < r[i][1])
+      return 1;
+  return 0;
+}
+
+static void test_unmapped_ranges(GuestContext *ctx) {
+  uint64_t g0 = 0, g1 = 0, g2 = 0, g3 = 0;
+  CHECK(!in_unmapped(ctx, VM_START - 0x100000, &g0), "memory below the VM window (module images) is mapped");
+  CHECK(in_unmapped(ctx, 0x62000000, &g0), "a free extent is unmapped");
+  void *p = (void *)0x62000000;
+  CHECK(sceKernelMapNamedFlexibleMemory(ctx, &p, 8 * MB, 3, 0x10, "tex") == 0, "map");
+  CHECK(!in_unmapped(ctx, 0x62000000 + 4 * MB, &g1) && g1 != g0, "a mapped extent is mapped, generation %llu -> %llu",
+        (unsigned long long)g0, (unsigned long long)g1);
+  CHECK(sceKernelMprotect(ctx, (void *)(0x62000000 + 7 * MB), 0x4000, 0) == 0, "mprotect a guard page");
+  CHECK(!in_unmapped(ctx, 0x62000000 + 4 * MB, &g2), "an extent mprotect'ed to PROT_NONE is still mapped");
+  void *r = (void *)0x70000000;
+  CHECK(sceKernelReserveVirtualRange(ctx, &r, 4 * MB, 0x10, 0) == 0 && r == (void *)0x70000000, "reserve");
+  CHECK(in_unmapped(ctx, 0x70000000 + MB, &g2), "an untouched reservation is unmapped");
+  void *q = (void *)(0x70000000 + MB);
+  CHECK(sceKernelMapNamedFlexibleMemory(ctx, &q, MB, 3, 0x10, "in_reservation") == 0 && q == (void *)(0x70000000 + MB),
+        "map into the reservation");
+  CHECK(!in_unmapped(ctx, 0x70000000 + MB + 0x1000, &g3) && g3 != g2, "the part mapped into the reservation is mapped");
+  CHECK(in_unmapped(ctx, 0x70000000 + 3 * MB, &g3), "the rest of the reservation is unmapped");
+  CHECK(recomp_vm_free(ctx, 0x62000000, 8 * MB) == 0 && in_unmapped(ctx, 0x62000000 + 4 * MB, &g3),
+        "freed memory is unmapped again");
+  CHECK(recomp_vm_free(ctx, 0x70000000, 4 * MB) == 0, "free the reservation");
+}
+
 int main(void) {
   GuestContext *ctx = new_ctx();
   test_all_operations(ctx);
@@ -258,6 +295,7 @@ int main(void) {
   test_fixed_address_taken(ctx);
   test_mtypeprotect_split(ctx);
   test_shim(ctx);
+  test_unmapped_ranges(ctx);
   fflush(stdout);
   if (g_failures) {
     printf("kernel_batchmap_test: %d FAILED\n", g_failures);

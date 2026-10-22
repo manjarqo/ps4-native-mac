@@ -24,6 +24,11 @@ class EmitContext;
 Id EmitPhi(EmitContext& ctx, IR::Inst* inst);
 void EmitVoid(EmitContext& ctx);
 Id EmitConditionRef(EmitContext& ctx, const IR::Value& value);
+void EmitPredicatedBegin(EmitContext& ctx, Id cond);
+void EmitPredicatedEnd(EmitContext& ctx);
+Id EmitPredicatedEndU32(EmitContext& ctx, Id value);
+Id EmitPredicatedEndU64(EmitContext& ctx, Id value);
+Id EmitPredicatedEndF32(EmitContext& ctx, Id value);
 void EmitGetScc(EmitContext& ctx);
 void EmitGetExec(EmitContext& ctx);
 void EmitGetVcc(EmitContext& ctx);
@@ -45,6 +50,7 @@ void EmitDebugPrint(EmitContext& ctx, IR::Inst* inst, Id arg0, Id arg1, Id arg2,
 Id EmitMemtime(EmitContext& ctx);
 void EmitBarrier(EmitContext& ctx);
 void EmitSubgroupBarrier(EmitContext& ctx);
+void EmitLdsBarrier(EmitContext& ctx);
 void EmitWorkgroupMemoryBarrier(EmitContext& ctx);
 void EmitDeviceMemoryBarrier(EmitContext& ctx);
 Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg);
@@ -488,6 +494,8 @@ Id EmitBallot(EmitContext& ctx, Id bit);
 Id EmitBallotFindLsb(EmitContext& ctx, Id mask);
 Id EmitInverseBallot(EmitContext& ctx, Id mask);
 Id EmitGroupAny(EmitContext& ctx, Id bit);
+Id EmitWorkgroupAny(EmitContext& ctx, Id bit);
+Id EmitWaveAny(EmitContext& ctx, Id bit);
 Id EmitDataAppend(EmitContext& ctx, Id gds_dw_offset, Id exec);
 Id EmitDataConsume(EmitContext& ctx, Id gds_dw_offset, Id exec);
 

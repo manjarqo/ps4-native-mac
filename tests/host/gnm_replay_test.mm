@@ -138,6 +138,36 @@ void TestDispatchReplay(const std::string& root) {
     CHECK(!r.ran && r.error.find("meta clear") != std::string::npos, "skipped pass: %s", r.error.c_str());
 }
 
+// The extractor's output is a frame the replay accepts: tools/gnm_capture_extract.py cuts the
+// dispatch of WriteCapture out of its frame (pass 0 of 2), and the extracted frame replays like
+// the original, byte for byte with --keep-outputs and with nothing compared without.
+void TestExtractedFixture(const std::string& root) {
+    const std::string tool = std::string(PS4_REPO_ROOT) + "/tools/gnm_capture_extract.py"; // set by build.sh
+    const std::string src = WriteCapture(root + "/ex_src", -1);
+    for (int keep = 1; keep >= 0; --keep) {
+        const std::string out = root + (keep ? "/ex_keep" : "/ex_drop");
+        const std::string cmd = "python3 '" + tool + "' '" + src + "' 0 '" + out + "'" + (keep ? " --keep-outputs" : "") +
+                                " > /dev/null";
+        CHECK(system(cmd.c_str()) == 0, "extractor failed: %s", cmd.c_str());
+        ps4replay::Options o;
+        o.frame_dir = out;
+        o.pass = 0;
+        o.keep_outputs = true;
+        const ps4replay::Result r = ps4replay::ReplayPass(o);
+        CHECK(r.ran, "extracted frame not replayed: %s", r.error.c_str());
+        if (keep) {
+            CHECK(r.outputs.size() == 1 && r.AllMatch(), "extracted frame differs from its capture");
+            uint32_t v[64];
+            CHECK(r.outputs.size() == 1 && r.outputs[0].bytes.size() == 256 &&
+                      (memcpy(v, r.outputs[0].bytes.data(), 256), v[0] == 0 && v[63] == 63),
+                  "extracted frame output");
+        } else {
+            CHECK(r.outputs.size() == 1 && !r.outputs[0].compared && r.outputs[0].bytes.size() == 256,
+                  "fixture without outputs: replayed output missing or compared");
+        }
+    }
+}
+
 void TestTextureSeeding() {
     // a color target with two mip levels
     GpuTextureId c;
@@ -370,26 +400,90 @@ void TestDrawReplay(const std::string& root) {
                     got[2], got[3], exp[0], exp[1], exp[2], exp[3]);
         }
     }
+    // the target's contents after the pass did not fit the raw budget (no post file, readback
+    // "budget") while its contents before the pass were stored: the pass still replays, and that
+    // output is reported as not captured
+    std::vector<uint8_t> want;
+    const std::string dir = WriteDrawCapture(root + "/draw_budget", 0, &want);
+    FrameRec f;
+    std::string err;
+    CHECK(LoadFrame(dir, &f, &err) && !f.passes.empty(), "draw_budget manifest: %s", err.c_str());
+    if (f.passes.empty()) return;
+    bool budgeted = false;
+    for (TextureRec& t : f.passes[0].textures)
+        if (t.written && !t.pre_file.empty()) {
+            t.post_file.clear();
+            t.readback = kReadbackBudget;
+            budgeted = true;
+        }
+    const std::string text = WriteManifest(f);
+    CHECK(budgeted && WriteFile(dir + "/manifest.json", text.data(), text.size()), "draw_budget: no written target");
+    ps4replay::Options o;
+    o.frame_dir = dir;
+    o.pass = f.passes[0].index;
+    const ps4replay::Result r = ps4replay::ReplayPass(o);
+    CHECK(r.ran, "draw whose target after the pass was over budget not replayed: %s", r.error.c_str());
+    const ps4replay::OutputResult* c = replay_props::Find(r, "_color0");
+    CHECK(c && !c->compared, "draw_budget: the target is compared although nothing was captured after the pass");
+    // any other reason (the contents could not be read back) refuses the pass, pre file or not
+    for (TextureRec& t : f.passes[0].textures)
+        if (t.readback == kReadbackBudget) t.readback = "readback failed";
+    const std::string text2 = WriteManifest(f);
+    CHECK(WriteFile(dir + "/manifest.json", text2.data(), text2.size()), "draw_budget: manifest");
+    const ps4replay::Result r2 = ps4replay::ReplayPass(o);
+    CHECK(!r2.ran && r2.error.find("readback failed") != std::string::npos,
+          "a target whose contents could not be read back replayed: %s", r2.error.c_str());
 }
 
 // ScanGcnStores (the replay's note on passes with no recorded output) on the programs above:
 // the dispatch's buffer_store_dword is found; the pixel shader (image_sample_lz, export) and the
-// vertex shader (buffer_load_format) write no memory; an image_store is found as one.
+// vertex shader (buffer_load_format) write no memory; an image_store is found as one. The scan is
+// given the code without the footer, as the replay does (code_size).
 void TestStoreScan() {
+    constexpr size_t kFooter = 8; // dwords of OrbShdr footer WithFooter appends
     const auto cs = WithFooter({0x34040082, 0x7E020300, 0xE0701000, 0x80010102, kEnd}, 1);
     const auto ps = WithFooter({0x7E0002FF, 0x3EA00000, 0x7E0202FF, 0x3EA00000, 0xF09C0F00, 0x00400000, 0xBF8C0F70,
                                 0xF800180F, 0x03020100, kEnd}, 2);
     const auto vs = WithFooter({0xE00C2000, 0x80000100, 0xBF8C0F70, 0xF800020F, 0x04030201, 0xF80008CF, 0x04030201,
                                 kEnd}, 3);
     const auto st = WithFooter({0xF0200F00, 0x00000000, kEnd}, 4); // image_store v[0:3], v[0:1], s[0:7]
-    const ps4replay::GcnStores a = ps4replay::ScanGcnStores(cs.data(), cs.size());
-    const ps4replay::GcnStores b = ps4replay::ScanGcnStores(ps.data(), ps.size());
-    const ps4replay::GcnStores c = ps4replay::ScanGcnStores(vs.data(), vs.size());
-    const ps4replay::GcnStores d = ps4replay::ScanGcnStores(st.data(), st.size());
+    const ps4replay::GcnStores a = ps4replay::ScanGcnStores(cs.data(), cs.size() - kFooter);
+    const ps4replay::GcnStores b = ps4replay::ScanGcnStores(ps.data(), ps.size() - kFooter);
+    const ps4replay::GcnStores c = ps4replay::ScanGcnStores(vs.data(), vs.size() - kFooter);
+    const ps4replay::GcnStores d = ps4replay::ScanGcnStores(st.data(), st.size() - kFooter);
     CHECK(a.complete && a.buffer == 1 && a.Total() == 1, "dispatch: %s", a.Describe().c_str());
     CHECK(b.complete && b.Total() == 0, "pixel shader: %s", b.Describe().c_str());
     CHECK(c.complete && c.Total() == 0, "vertex shader: %s", c.Describe().c_str());
     CHECK(d.complete && d.image == 1 && d.Total() == 1, "image_store: %s", d.Describe().c_str());
+
+    // opcode ranges: the last MIMG atomic (31) and the last FLAT store (31) count; the opcodes
+    // next to the ranges do not (MIMG 14 and 32, FLAT 23 and 32). Each program is one instruction.
+    auto mimg = [](uint32_t op) { return std::vector<uint32_t>{(0x3Cu << 26) | (op << 18) | 0xF00, 0u, kEnd}; };
+    auto flat = [](uint32_t op) { return std::vector<uint32_t>{(0x37u << 26) | (op << 18), 0u, kEnd}; };
+    auto mubuf = [](uint32_t op) { return std::vector<uint32_t>{(0x38u << 26) | (op << 18), 0u, kEnd}; };
+    auto scan = [](const std::vector<uint32_t>& v) { return ps4replay::ScanGcnStores(v.data(), v.size()); };
+    CHECK(scan(mimg(15)).image == 1 && scan(mimg(31)).image == 1, "MIMG atomics 15 and 31 counted");
+    CHECK(scan(mimg(14)).image == 0 && scan(mimg(32)).image == 0, "MIMG 14 and 32 not counted");
+    CHECK(scan(flat(24)).flat == 1 && scan(flat(31)).flat == 1, "FLAT stores 24 and 31 counted");
+    CHECK(scan(flat(23)).flat == 0 && scan(flat(32)).flat == 0, "FLAT 23 and 32 not counted");
+
+    // CI ISA: the atomics run 48-64 and 80-96 (FMIN_X2 95, FMAX_X2 96); 47, 97 are not atomics
+    CHECK(scan(mubuf(48)).buffer == 1 && scan(mubuf(95)).buffer == 1 && scan(mubuf(96)).buffer == 1,
+          "MUBUF atomics 48, 95 and 96 counted");
+    CHECK(scan(mubuf(47)).buffer == 0 && scan(mubuf(97)).buffer == 0, "MUBUF 47 and 97 not counted");
+    CHECK(scan(flat(48)).flat == 1 && scan(flat(95)).flat == 1 && scan(flat(96)).flat == 1,
+          "FLAT atomics 48, 95 and 96 counted");
+    CHECK(scan(flat(47)).flat == 0 && scan(flat(97)).flat == 0, "FLAT 47 and 97 not counted");
+
+    // a program with several s_endpgm (a branch to an early exit): the stores behind the first
+    // one are found, and the scan reports it reached the end of the code
+    const std::vector<uint32_t> two = {kEnd, 0xE0701000, 0x80010102, kEnd, 0xF0200F00, 0x00000000, kEnd};
+    const ps4replay::GcnStores t = scan(two);
+    CHECK(t.complete && t.buffer == 1 && t.image == 1, "stores behind the first s_endpgm: %s", t.Describe().c_str());
+    // an unknown encoding stops the scan and is reported as incomplete
+    const std::vector<uint32_t> bad = {0xE0701000, 0x80010102, 0xFFFFFFFF, 0xE0701000, 0x80010102};
+    const ps4replay::GcnStores u = scan(bad);
+    CHECK(!u.complete && u.buffer == 1, "unknown encoding: %s", u.Describe().c_str());
 }
 
 // replay_props (the fix tests' view of replayed outputs) on a known 2x2 RGBA16Float output:
@@ -435,6 +529,7 @@ int main() {
         const char* root = mkdtemp(tmpl);
         if (!root) return 1;
         TestDispatchReplay(root);
+        TestExtractedFixture(root);
         TestDrawReplay(root);
         TestTextureSeeding();
         TestProps();

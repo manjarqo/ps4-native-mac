@@ -450,10 +450,14 @@ static void LowerDynamicReadConst(Info& info, IR::Inst& readconst, u16 ptr_slot,
         info.buffers.push_back(DynamicReadBuffer(ptr_slot));
         it = buffers.emplace(ptr_slot, static_cast<u32>(info.buffers.size() - 1)).first;
     }
-    IR::IREmitter ir{*readconst.GetParent(), IR::Block::InstructionList::s_iterator_to(readconst)};
-    const IR::U32 value =
-        ir.ReadConstBuffer(ir.Imm32(it->second), IR::U32{readconst.Arg(1)}, IR::BufferInstInfo{});
-    readconst.ReplaceUsesWith(value);
+    // In place, so that the sharp references resource discovery took through this read stay
+    // valid: a T# loaded from a table at an offset only the shader knows is then seen as a read
+    // of this buffer (LowerDynamicImageTable).
+    const IR::Value offset = readconst.Arg(1);
+    readconst.ReplaceOpcode(IR::Opcode::ReadConstBuffer);
+    readconst.SetArg(0, IR::Value{it->second});
+    readconst.SetArg(1, offset);
+    readconst.SetFlags(IR::BufferInstInfo{});
 }
 
 } // Anonymous namespace
@@ -591,6 +595,67 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
 namespace Shader {
 
 SrtDirectMemory g_srt_direct;
+ImageAddressCheck g_image_address_check;
+
+void ForEachSrtTableRead(std::span<const u32> program, const u32* flat,
+                         const std::function<void(u64, u64)>& fn) {
+    const auto base_of = [&](u32 vs) {
+        return u64(flat[vs]) | (u64(flat[vs + 1] & 0xFFFu) << 32);
+    };
+    size_t pc = 0;
+    while (pc < program.size()) {
+        const auto op = static_cast<SrtOp>(program[pc++]);
+        switch (op) {
+        case SrtOp::End:
+            return;
+        case SrtOp::PushPtrUd:
+        case SrtOp::PushPtrImm:
+        case SrtOp::CopyDyn:
+        case SrtOp::LoadFlat:
+        case SrtOp::Imm:
+        case SrtOp::StorePtr:
+            pc += 1;
+            break;
+        case SrtOp::CopyImm:
+            pc += 2;
+            break;
+        case SrtOp::CopyBufferDwords: {
+            const u32* a = &program[pc];
+            pc += 7;
+            const u32 vs = a[0], byte_off = a[2], count = a[3];
+            const u64 base = base_of(vs), size = SrtBufferBytes(&flat[vs], a[1]);
+            if (base != 0 && byte_off < size) {
+                fn(base + byte_off, std::min<u64>(u64(count) * 4, size - byte_off));
+            }
+            break;
+        }
+        case SrtOp::CollectIndices: {
+            const u32* a = &program[pc];
+            pc += 6;
+            const u32 ivs = a[0], ibyte = a[2], istride = a[3], dst = a[5];
+            const u64 ibase = base_of(ivs), isize = SrtBufferBytes(&flat[ivs], a[1]);
+            if (ibase != 0 && flat[dst] != ~0u && u64(ibyte) + 4 <= isize && istride) {
+                const u64 records = (isize - ibyte - 4) / istride + 1;
+                fn(ibase + ibyte, (records - 1) * istride + 4);
+            }
+            break;
+        }
+        case SrtOp::CopyIndexedDwords: {
+            const u32* a = &program[pc];
+            pc += 8;
+            const u32 tvs = a[0], count = a[5], cmp = a[7];
+            const u64 tbase = base_of(tvs), tsize = SrtBufferBytes(&flat[tvs], a[1]);
+            const u64 off = u64(flat[cmp]) * 4;
+            if (tbase != 0 && off < tsize) {
+                fn(tbase + off, std::min<u64>(u64(count) * 4, tsize - off));
+            }
+            break;
+        }
+        default: // value ops without operands
+            break;
+        }
+    }
+}
 
 bool RunSrtProgram(std::span<const u32> program, const u32* user_data, u32* flat_dst,
                    SrtReadFn read, void* read_ctx) {
@@ -680,6 +745,84 @@ bool RunSrtProgram(std::span<const u32> program, const u32* user_data, u32* flat
             // V# dwords 0-1: base address bits 0..43; the stride field above them stays 0
             flat_dst[dst] = static_cast<u32>(cur);
             flat_dst[dst + 1] = static_cast<u32>(cur >> 32) & 0xFFFu;
+            break;
+        }
+        case SrtOp::CopyBufferDwords: {
+            const u32 vs = program[pc++];
+            const u32 size_imm = program[pc++];
+            const u32 byte_off = program[pc++];
+            const u32 count = program[pc++];
+            const u32 dst = program[pc++];
+            const u32 guard = program[pc++];
+            const u32 k = program[pc++];
+            const u32* v = &flat_dst[vs];
+            const u64 base = u64(v[0]) | (u64(v[1] & 0xFFFu) << 32);
+            const u64 size = SrtBufferBytes(v, size_imm);
+            const bool used =
+                guard == 0 || k < DynamicLoopEntries(flat_dst[guard & 0xFFFFu],
+                                                     static_cast<LoopCompare>(guard >> 16));
+            for (u32 i = 0; i < count; ++i) {
+                const u64 off = u64(byte_off) + 4ull * i;
+                flat_dst[dst + i] = (used && base != 0 && off + 4 <= size) ? read32(base + off) : 0u;
+            }
+            break;
+        }
+        case SrtOp::CollectIndices: {
+            const u32 ivs = program[pc++];
+            const u32 isize_imm = program[pc++];
+            const u32 ibyte = program[pc++];
+            const u32 istride = program[pc++];
+            const u32 max_records = program[pc++];
+            const u32 dst = program[pc++];
+            const u32* iv = &flat_dst[ivs];
+            const u64 ibase = u64(iv[0]) | (u64(iv[1] & 0xFFFu) << 32);
+            const u64 isize = ibase != 0 ? SrtBufferBytes(iv, isize_imm) : 0;
+            const u64 records =
+                isize >= u64(ibyte) + 4 && istride ? (isize - ibyte - 4) / istride + 1 : 0;
+            u32 found[SrtMaxTableIndices] = {0};
+            u32 n = 1; // index 0
+            if (records > max_records) {
+                n = ~0u;
+            } else {
+                for (u64 k = 0; k < records && n <= SrtMaxTableIndices; ++k) {
+                    const u32 t = read32(ibase + ibyte + istride * k);
+                    bool seen = false;
+                    for (u32 i = 0; i < std::min(n, SrtMaxTableIndices); ++i) {
+                        seen |= found[i] == t;
+                    }
+                    if (!seen) {
+                        if (n < SrtMaxTableIndices) {
+                            found[n] = t;
+                        }
+                        ++n;
+                    }
+                }
+            }
+            flat_dst[dst] = n;
+            for (u32 i = 0; i < SrtMaxTableIndices; ++i) {
+                flat_dst[dst + 1 + i] = n != ~0u && i < n ? found[i] : 0u;
+            }
+            break;
+        }
+        case SrtOp::CopyIndexedDwords: {
+            const u32 tvs = program[pc++];
+            const u32 tsize_imm = program[pc++];
+            const u32 tfirst = program[pc++];
+            const u32 tstride = program[pc++];
+            const u32 idx = program[pc++];
+            const u32 count = program[pc++];
+            const u32 dst = program[pc++];
+            const u32 cmp = program[pc++];
+            const u32 first_dw = tfirst + tstride * flat_dst[idx];
+            flat_dst[cmp] = first_dw;
+            const u32* tv = &flat_dst[tvs];
+            const u64 tbase = u64(tv[0]) | (u64(tv[1] & 0xFFFu) << 32);
+            const u64 tsize = SrtBufferBytes(tv, tsize_imm);
+            for (u32 i = 0; i < count; ++i) {
+                // a dword index, as the shader's ReadConstBuffer reads it
+                const u64 off = u64(first_dw + i) * 4;
+                flat_dst[dst + i] = (tbase != 0 && off + 4 <= tsize) ? read32(tbase + off) : 0u;
+            }
             break;
         }
         case SrtOp::BfeU: {

@@ -4,6 +4,7 @@
 #include "ps4_log.h"
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -1035,10 +1036,12 @@ uint64_t recomp_vm_alloc_named_aligned(GuestContext *ctx, size_t size,
     best->name[0] = '\0';
   }
   uint64_t res = best->addr;
+  recomp_vm_note_change();
+  pthread_mutex_unlock(&proc->vm_mutex);
+  // printed after the unlock: stdout may block, and vm_mutex is also taken by the renderer
   printf("[ps4-vm] recomp_vm_alloc_named_aligned SUCCESS: addr=0x%llx\n",
          (unsigned long long)res);
   fflush(stdout);
-  pthread_mutex_unlock(&proc->vm_mutex);
   return res;
 }
 
@@ -1135,6 +1138,7 @@ uint64_t recomp_vm_alloc_fixed(GuestContext *ctx, uint64_t desired_addr,
   } else {
     curr->name[0] = '\0';
   }
+  recomp_vm_note_change();
 
   pthread_mutex_unlock(&proc->vm_mutex);
   return aligned_addr;
@@ -1155,6 +1159,69 @@ GuestVMExtent *recomp_vm_find(GuestContext *ctx, uint64_t addr) {
   }
   pthread_mutex_unlock(&proc->vm_mutex);
   return NULL;
+}
+
+// ---- Provably unmapped guest ranges, for readers that must not take vm_mutex per query ----
+// The GPU renderer treats a T# table entry whose T# starts in such a range as unbound. A range is
+// provably unmapped when it is inside a free extent or inside a reservation that nothing was
+// mapped into (an extent named "reserved": sceKernelReserveVirtualRange; mapping into it splits it
+// and renames the mapped part). Everything else is mapped as far as this classification goes:
+// module images and the other memory the runtime places outside the extent windows have no extent
+// at all, and the protection of an extent (sceKernelMprotect may set PROT_NONE on a whole extent
+// for one guard page) says nothing about whether memory is there.
+// g_vm_generation changes, with vm_mutex held, whenever an extent becomes free or mapped or is
+// renamed, so a reader can keep a copy of the ranges and refresh it only when it changed.
+static _Atomic uint64_t g_vm_generation = 1;
+
+void recomp_vm_note_change(void) {
+  atomic_fetch_add_explicit(&g_vm_generation, 1, memory_order_release);
+}
+
+uint64_t recomp_vm_generation(void) {
+  return atomic_load_explicit(&g_vm_generation, memory_order_acquire);
+}
+
+static bool vm_extent_unmapped(const GuestVMExtent *e) {
+  return e->is_free || strcmp(e->name, "reserved") == 0;
+}
+
+size_t recomp_vm_unmapped_ranges(GuestContext *ctx, uint64_t (*out)[2], size_t max, uint64_t *gen) {
+  if (!ctx)
+    return 0;
+  GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
+  size_t n = 0;
+  uint64_t cur_start = 0, cur_end = 0;
+  bool open = false;
+  pthread_mutex_lock(&proc->vm_mutex);
+  if (gen)
+    *gen = atomic_load_explicit(&g_vm_generation, memory_order_acquire);
+  for (const GuestVMExtent *e = proc->vm_extents; e; e = e->next) {
+    if (!vm_extent_unmapped(e) || e->size == 0)
+      continue;
+    if (open && e->addr == cur_end) {
+      cur_end = e->addr + e->size; // adjacent: merge
+      continue;
+    }
+    if (open) {
+      if (n < max) {
+        out[n][0] = cur_start;
+        out[n][1] = cur_end;
+      }
+      n++;
+    }
+    cur_start = e->addr;
+    cur_end = e->addr + e->size;
+    open = true;
+  }
+  if (open) {
+    if (n < max) {
+      out[n][0] = cur_start;
+      out[n][1] = cur_end;
+    }
+    n++;
+  }
+  pthread_mutex_unlock(&proc->vm_mutex);
+  return n;
 }
 
 void ps4_direct_mem_on_unmap(GuestContext *ctx, uint64_t addr, size_t size);
@@ -1270,6 +1337,7 @@ int recomp_vm_free(GuestContext *ctx, uint64_t addr, size_t size) {
       if (!e->is_free && e->addr >= ranges[i].addr && e->addr + e->size <= ranges[i].addr + ranges[i].size)
         e->is_free = true;
   vm_coalesce_free(proc, start, end);
+  recomp_vm_note_change();
   pthread_mutex_unlock(&proc->vm_mutex);
   free(ranges);
   return 0;

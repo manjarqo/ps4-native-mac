@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <zlib.h>
@@ -116,6 +117,133 @@ std::vector<std::pair<uint64_t, uint64_t>> ClampReadable(const uint8_t* mem_base
     return out;
 }
 
+namespace {
+// (addr, size) ranges -> sorted, merged [lo, hi) intervals; empty ranges are dropped.
+void MergeIntervals(const std::vector<ShaderSelection::Range>& in, std::vector<ShaderSelection::Range>* out) {
+    out->clear();
+    out->reserve(in.size());
+    for (const auto& [a, n] : in)
+        if (n) out->push_back({a, a + n < a ? UINT64_MAX : a + n});
+    std::sort(out->begin(), out->end());
+    size_t k = 0;
+    for (size_t i = 0; i < out->size(); ++i) {
+        if (k && (*out)[i].first <= (*out)[k - 1].second) (*out)[k - 1].second = std::max((*out)[k - 1].second, (*out)[i].second);
+        else (*out)[k++] = (*out)[i];
+    }
+    out->resize(k);
+}
+
+// Whether the sorted, merged intervals a and b (both [lo, hi)) overlap.
+bool Overlaps(const std::vector<ShaderSelection::Range>& a, const std::vector<ShaderSelection::Range>& b) {
+    for (size_t i = 0, j = 0; i < a.size() && j < b.size();) {
+        if (a[i].second <= b[j].first) ++i;
+        else if (b[j].second <= a[i].first) ++j;
+        else return true;
+    }
+    return false;
+}
+
+// rest minus the sorted, merged intervals w (both [lo, hi)); true when w overlapped rest.
+bool Subtract(std::vector<ShaderSelection::Range>* rest, const std::vector<ShaderSelection::Range>& w,
+              std::vector<ShaderSelection::Range>* scratch) {
+    scratch->clear();
+    bool hit = false;
+    size_t j = 0;
+    for (auto [lo, hi] : *rest) {
+        while (j < w.size() && w[j].second <= lo) ++j;
+        for (size_t k = j; k < w.size() && w[k].first < hi; ++k) {
+            hit = true;
+            if (w[k].first > lo) scratch->push_back({lo, w[k].first});
+            lo = std::max(lo, w[k].second);
+            if (lo >= hi) break;
+        }
+        if (lo < hi) scratch->push_back({lo, hi});
+    }
+    rest->swap(*scratch);
+    return hit;
+}
+} // namespace
+
+bool ShaderSelection::Parse(const std::string& list, std::string* err) {
+    shaders_.clear();
+    pgms_.clear();
+    static constexpr char kPgm[] = "pgm:";
+    size_t i = 0;
+    while (i <= list.size()) {
+        const size_t e = std::min(list.find(',', i), list.size());
+        const bool pgm = list.compare(i, sizeof(kPgm) - 1, kPgm) == 0;
+        const std::string item = list.substr(i, e - i);
+        const char* num = item.c_str() + (pgm ? sizeof(kPgm) - 1 : 0);
+        char* end = nullptr;
+        errno = 0;
+        // strtoull would take a sign or leading spaces ("-1" -> UINT64_MAX): only digits
+        const bool digits = *num >= '0' && *num <= '9';
+        const unsigned long long v = digits ? strtoull(num, &end, 0) : 0;
+        if (!digits || errno || !end || *end || !v) {
+            *err = std::string(pgm ? "not a program hash" : "not a shader code address") + ": \"" + item + "\"";
+            shaders_.clear();
+            pgms_.clear();
+            return false;
+        }
+        (pgm ? pgms_ : shaders_).push_back(v);
+        i = e + 1;
+    }
+    for (std::vector<uint64_t>* v : {&shaders_, &pgms_}) {
+        std::sort(v->begin(), v->end());
+        v->erase(std::unique(v->begin(), v->end()), v->end());
+    }
+    return true;
+}
+
+SelectKey ShaderSelection::Next(uint64_t code0, uint64_t code1, uint64_t pgm0, uint64_t pgm1) {
+    SelectKey k;
+    k.code[0] = code0;
+    k.code[1] = code1;
+    k.pgm[0] = pgm0;
+    k.pgm[1] = pgm1;
+    k.occurrence = counts_[{code0, code1}]++;
+    return k;
+}
+
+bool ShaderSelection::UsesShader(const SelectKey& k) const {
+    for (int i = 0; i < 2; ++i) {
+        if (k.code[i] && std::binary_search(shaders_.begin(), shaders_.end(), k.code[i])) return true;
+        if (k.pgm[i] && std::binary_search(pgms_.begin(), pgms_.end(), k.pgm[i])) return true;
+    }
+    return false;
+}
+
+void ShaderSelection::Learn(const SelectKey& k, const std::vector<Range>& reads, const std::vector<Range>& exact_writes,
+                            const std::vector<Range>& may_writes) {
+    known_.insert(k);
+    Learned l;
+    l.key = k;
+    l.reader = UsesShader(k);
+    if (l.reader) MergeIntervals(reads, &l.reads);
+    MergeIntervals(exact_writes, &l.exact);
+    MergeIntervals(may_writes, &l.may);
+    if (l.reader || !l.exact.empty() || !l.may.empty()) learned_.push_back(std::move(l));
+}
+
+void ShaderSelection::FinishLearning() {
+    producers_.clear();
+    readers_ = 0;
+    std::vector<Range> rest, scratch;
+    for (size_t i = 0; i < learned_.size(); ++i) {
+        if (!learned_[i].reader) continue;
+        ++readers_;
+        // walking back from the reader, each pass that wrote, or may have written, some of the bytes
+        // no later pass wrote exactly
+        rest = learned_[i].reads;
+        for (size_t j = i; j-- > 0 && !rest.empty();) {
+            const bool may = Overlaps(rest, learned_[j].may);
+            if (Subtract(&rest, learned_[j].exact, &scratch) || may) producers_.insert(learned_[j].key);
+        }
+    }
+    learned_.clear();
+    learned_.shrink_to_fit();
+}
+
 bool ReadFile(const std::string& path, std::vector<uint8_t>* out) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -168,6 +296,19 @@ void Writer::Failed(const std::string& path) {
     if (failures_++ == 0)
         fprintf(stderr, "[gnm-capture] cannot write %s: %s (further write failures are only counted)\n", path.c_str(),
                 strerror(errno));
+}
+
+std::vector<std::string> ChangedInputs(const uint8_t* mem_base, const std::vector<BlobRef>& inputs,
+                                       const std::vector<BlobRef>& outputs) {
+    std::vector<std::string> r;
+    for (const BlobRef& b : inputs) {
+        if (b.file.empty() || b.size == 0) continue; // recorded, not stored
+        bool written = false;
+        for (const BlobRef& o : outputs) written |= b.addr < o.addr + o.size && o.addr < b.addr + b.size;
+        if (written || Fnv64(mem_base + b.addr, b.size) == b.hash) continue;
+        r.push_back("input " + Hex(b.addr) + "+" + Hex(b.size));
+    }
+    return r;
 }
 
 BlobRef Writer::Snapshot(const uint8_t* mem_base, uint64_t addr, uint64_t size) {
@@ -474,6 +615,10 @@ void WritePass(Out& o, const PassRec& p) {
         o.U("tile_mode", i.tile_mode);
         o.B("storage", i.storage);
         o.B("depth_image", i.depth_image);
+        if (i.table >= 0) {
+            o.U("table", (uint64_t)i.table);
+            o.U("entry", (uint64_t)i.entry);
+        }
         o.Arr("textures", i.textures.data(), i.textures.size());
         o.U("guest_bytes", i.guest_bytes);
         o.Close('}');
@@ -513,6 +658,13 @@ void WritePass(Out& o, const PassRec& p) {
     for (uint64_t a : p.meta_cleared) {
         o.Elem();
         o.Str(Hex(a));
+    }
+    o.Close(']');
+    o.Key("unstable");
+    o.Open('[');
+    for (const std::string& u : p.unstable) {
+        o.Elem();
+        o.Str(u);
     }
     o.Close(']');
     o.Key("inputs");
@@ -809,6 +961,10 @@ PassRec Pass(const J& j) {
             i.tile_mode = (uint32_t)U(e, "tile_mode");
             i.storage = B(e, "storage");
             i.depth_image = B(e, "depth_image");
+            if (e.Get("table")) {
+                i.table = (int32_t)U(e, "table");
+                i.entry = (int32_t)U(e, "entry");
+            }
             Vec(e, "textures", &i.textures);
             i.guest_bytes = U(e, "guest_bytes");
             p.images.push_back(i);
@@ -837,6 +993,9 @@ PassRec Pass(const J& j) {
             p.textures.push_back(t);
         }
     Vec(j, "meta_cleared", &p.meta_cleared);
+    if (const J* a = j.Get("unstable"))
+        for (const J& e : a->a)
+            if (e.t == J::Str) p.unstable.push_back(e.s);
     if (const J* a = j.Get("inputs"))
         for (const J& e : a->a) p.inputs.push_back(Blob(e));
     if (const J* a = j.Get("outputs"))

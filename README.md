@@ -9,7 +9,8 @@ that renders with Metal. There is no JIT, no interpreter, no Rosetta and no Molt
 
 **The Last of Us Remastered** is playable on Mac from boot to gameplay, at 78–114 fps in 1080p in
 the measured scenes on an M1 Pro. **Uncharted 4: A Thief's End** is in progress: it boots and
-reaches gameplay in chapter 1, with visible rendering issues still being fixed. See
+reaches gameplay in chapter 1 at about 20 fps, with visible rendering differences from a PS4 still
+open. See
 [Supported games](#supported-games-on-mac) for the exact status.
 
 **Based on:** forked from [PS4Recomp](https://github.com/wie-project/PS4Recomp) by its authors, and
@@ -49,7 +50,7 @@ not measured yet.
 | Game | Stage | fps | Resolution | Notes |
 | --- | --- | --- | --- | --- |
 | The Last of Us Remastered (CUSA00557) | Playable: boot, menus, movies, gameplay, saves | Walking (330 s scripted routes): chapter 1 courtyard 89.7 fps, spore corridor 99.6 fps, 0 frames > 100 ms. Standing: courtyard 78.5–78.9 fps, Sarah's house 113.7–114.5 fps. | 1920x1080 (base PS4 mode, `PS4_PRO=0`), MetalFX off. Pro mode: TBD | 30-minute courtyard soak: no fatal errors, no hangs, memory footprint flat at ~3.5 GB. Exit: 3/3 by closing the window, 3/3 by terminate, no crash reports. |
-| Uncharted 4: A Thief's End (CUSA04529) | In progress: boots, menus, New Game, chapter 1 (boat cutscene and boat gameplay), saves, audio | TBD (being re-measured after the guest-memory dispatch fix); before the lighting fix: menu 43 fps, boat gameplay 33–34 fps (`PS4_PRO=0`), Pro mode 24–26 fps | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Title screen: the scene is lit, but fog and light shafts are missing. Boat cutscene: Drake and Sully lit; a motion-blur smear remains (fix in progress). Gameplay still shows red streaks and flat water. Base mode is recommended: Pro mode stays under 30 fps. |
+| Uncharted 4: A Thief's End (CUSA04529) | In progress: boots, menus, New Game, chapter 1 (boat cutscene and boat gameplay), saves, audio | Title screen about 21–22 fps, boat gameplay about 20–21 fps (`PS4_PRO=0`, 1080p, measured while other work ran on the machine). Pro mode: not re-measured (TBD) | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Title screen: the scene is lit, but fog and light shafts are missing. Boat cutscene: Drake and Sully are lit and the motion-blur smear is fixed. Gameplay: water colour and foam differ from a PS4 and the sky is too dark. Base mode is recommended. |
 
 How the TLOU numbers were taken:
 
@@ -70,17 +71,21 @@ How the TLOU numbers were taken:
 ## Known issues
 
 - **Uncharted 4.**
-  - Gameplay: red streaks and flat, blocky water; the sky is dark.
-  - Boat cutscene: a motion-blur smear remains; its fix is in progress.
   - The title screen has no fog and no light shafts.
-  - Images read through descriptors (T#) loaded at run time read a null image (counted and logged
-    per shader).
+  - In gameplay the water colour and foam differ from a PS4, and the sky is too dark.
+  - Red streaks seen in boat gameplay look like the game's own damage-direction indicator (a PS4
+    video of the same scene shows them too); this is not confirmed.
+  - Image descriptor (T#) tables that a shader indexes at run time are bound when a bound visible
+    to the CPU gives at most 8 entries. Larger tables, and indices that only the GPU knows (for
+    example in the reflection-probe culling shader), read a null image; each case is counted and
+    logged once per shader.
   - Decals are not applied (CMASK is not emulated).
   - The shadow cube map is resolved from a 2D target ("texture type mismatch" in the log).
-  - `v_writelane` returns 0 (a counted, logged gap): its correct form makes one async compute
-    shader exceed the GPU watchdog, under investigation.
-  - Inside per-lane EXEC scopes, `v_readfirstlane` and `v_mbcnt` of a wave64 shader act per
-    32-lane half (expected failures in `gcn_wave_exec_test`).
+  - Frame rate is below a PS4's 30 fps: about 21–22 fps on the title screen and 20–21 fps in boat
+    gameplay in base mode.
+  - The faster guest-memory dispatch path (`PS4_GNM_GUEST_MEMORY_FAST=1`, about 3 fps more in boat gameplay) is
+    opt-in: in long runs it showed rare anomalies (a stalled dispatch, a GPU memory blow-up, one
+    crash) that the default path did not show, not yet explained.
 - **x87.** 80-bit values are kept as doubles, which loses 11 mantissa bits.
 - **Misaligned atomics.** A LOCK operation on an operand that crosses a 16-byte boundary raises
   SIGBUS. TLOU has none.
@@ -332,11 +337,15 @@ your own from your own game copy.
 | `PS4_RECOMP_HEADLESS=1`, `PS4_BACKGROUND_WINDOW=1`, `PS4_PAD_SCRIPT=...` | Automated test runs |
 | `PS4_PRESENT_MODE=uncapped\|vsync\|mailbox` | Frame pacing (default `uncapped`; see [docs/present-pacing.md](docs/present-pacing.md)) |
 | `PS4_GNM_CAPTURE_FRAME=<n>`, `PS4_GNM_CAPTURE_DIR=<dir>` | Capture frame `n` (see [Debugging the renderer](#debugging-the-renderer)) |
+| `PS4_GNM_CAPTURE_REPLAY=<a>-<b>,...`, `PS4_GNM_CAPTURE_REPLAY_SHADER=<addr>\|pgm:<hash>,...` | Store the captured passes in a range, or the passes using a shader and the passes that produced their inputs, replayable (see [docs/gnm-capture.md](docs/gnm-capture.md)) |
+| `PS4_GNM_GUEST_MEMORY_FAST=1` | Opt-in fast path for shaders that access guest memory through descriptors they load at run time (no CPU wait per dispatch; see Known issues) |
 | `PS4_GNM_SYNC_ENCODE=1`, `PS4_GNM_SYNC_COMPILE=1` | Encode and compile synchronously (captures, debugging) |
 | `PS4_DUMP_SHADERS=<dir>` | Write every distinct VS/PS/CS program and its registers (see [Debugging the renderer](#debugging-the-renderer)) |
 
-Host unit tests: `tests/host/run_host_tests.sh`. A few cases need shaders dumped from your own
-game; without them they are reported as SKIP (see [tests/host/README.md](tests/host/README.md)).
+Host unit tests: `tests/host/run_host_tests.sh`. Some cases need shaders dumped from your own
+game (local fixtures in `tests/host/data/game/` or `PS4_HOST_GAME_FIXTURES`, never committed);
+without them they are reported as SKIP and the run ends with the number of skipped cases (see
+[tests/host/README.md](tests/host/README.md)).
 The benchmark scripts behind the supported-games table (walking routes, A/B runs) are not in the
 repository yet.
 
@@ -349,6 +358,11 @@ repository yet.
   order with thumbnails, to find the first pass that goes wrong.
 - **Replay.** `tools/gnm_replay` runs one captured pass through the same shader translation and
   Metal code as the game and compares the result byte for byte with the capture.
+  `PS4_GNM_CAPTURE_REPLAY_SHADER` selects the passes to store replayable by shader, together with
+  the passes that produced their inputs, since pass indices drift between runs.
+- **Fixtures.** `tools/gnm_capture_extract.py` cuts one replayable pass out of a capture as a
+  minimal frame for a host test. A pass from a game's capture is game data: keep it as a local
+  fixture (see [tests/host/README.md](tests/host/README.md)).
 - **Reference comparison.** `tools/refcompare.py <frame.png> <reference.png>` compares mean colour
   and luminance on a 4x4 grid plus a luminance histogram.
 - **Shader dumps.** `PS4_DUMP_SHADERS=<dir>` writes each distinct VS/PS/CS program as
@@ -448,7 +462,23 @@ The table also covers what Uncharted 4 needs: AAC decoding (`libSceAudiodec`, Au
 - Buffer accesses through descriptors (V#) that a shader loads at run time read and write guest
   memory directly, through a page table of zero-copy windows. Uncharted 4 builds its per-draw
   matrices this way.
+- A compute shader that reads and writes guest memory through descriptors it loads at run time
+  is probed first for the guest pages it touches, which are then mapped for it. By default the
+  command processor waits for each such dispatch, so later reads of guest memory see its writes.
+  With the opt-in fast path (`PS4_GNM_GUEST_MEMORY_FAST=1`) it does not wait; after a barrier it
+  waits for such dispatches before it reads guest memory they may have written (resource tables,
+  textures), and a dispatch whose probe meets a new page runs again.
+- Buffer stores over a texture the GPU owns (a render target or storage image): a store
+  that covers the whole surface makes the GPU copy guest memory into the texture before it is next
+  sampled; a partial store keeps the GPU-only contents.
+- Image descriptor (T#) tables that a shader indexes at run time (light records, texture arrays
+  behind an SRT pointer, loops over N records) are bound as separate images when the CPU can
+  bound the index to at most 8 entries. A table entry written by GPU work that is still pending
+  when the command processor copies the tables is read again after that work.
 - GPU texture memory has a budget; unused textures are evicted.
+- `sceGnmSubmitAndFlipCommandBuffers` and `sceVideoOutSubmitFlip` do not wait for the display:
+  frames the presenter has not taken yet are held (at most `min(3, display buffers - 1)`), and
+  their flips complete when they are shown, as on a PS4.
 - A separate presenter thread shows the frames. By default (`PS4_PRESENT_MODE=uncapped`) every
   frame is shown at the next display refresh; `vsync` holds each frame for the guest's flip
   interval (`sceVideoOutSetFlipRate`). See [docs/present-pacing.md](docs/present-pacing.md).
@@ -467,11 +497,14 @@ GCN bytecode (from guest memory)
   start, so known pipelines do not compile mid-frame.
 - New shaders compile in the background.
 - GCN runs 64 lanes per wave; Apple GPUs run 32-lane simdgroups, so a wave64 shader runs as two
-  simdgroups. In wave-uniform control flow, cross-lane operations (readlane, readfirstlane,
-  ballots, 64-bit masks such as EXEC) see the whole wave. Inside per-lane EXEC scopes they still
-  act per 32-lane half (see Known issues).
-- The known translation gaps (image reads through T#s loaded at run time, `v_writelane`) are
-  counted and logged once per shader, also when the shader comes from the on-disk cache.
+  simdgroups. Cross-lane operations (`v_readlane`, `v_writelane`, `v_readfirstlane`, ballots,
+  64-bit masks such as EXEC) see the whole wave. Code under a per-lane EXEC mask that needs the
+  whole wave (cross-lane operations, workgroup memory, barriers) runs predicated on both halves,
+  so every thread reaches every barrier.
+- The known translation gaps are counted and logged once per shader, also when the shader comes
+  from the on-disk cache: image reads of the null image (T#s loaded at run time, T# tables without
+  a bound), wave64 regions the predication could not handle (left per 32-lane half), and
+  `s_endpgm` in per-lane code that ends only the lanes that reach it.
 
 ### Third-party components
 
@@ -506,7 +539,7 @@ Boost subset (BSL-1.0). Its README lists every change made to the shadPS4 source
 │       ├── kernel/          # memory, threading, sync, vfs, aio, equeue, syscalls
 │       └── modules/         # libSce* HLE modules (GnmDriver, VideoOut, AudioOut, Ajm, ...)
 ├── tests/                   # host unit tests and runtime test programs
-├── tools/                   # capture viewer, pass replay, reference comparison
+├── tools/                   # capture viewer, pass replay, fixture extraction, reference comparison
 ├── docs/                    # renderer notes (capture, GPU memory budget, present pacing), plans
 └── 3rdparty/                # see "Third-party components"
 ```

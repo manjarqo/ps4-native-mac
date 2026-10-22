@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "gcn_recompiler.h"
+#include "msl_barrier_check.h"
 
 namespace {
 
@@ -122,6 +123,25 @@ void Run(id<MTLDevice> dev, const std::string& dir, const std::string& name, uin
     if (!sh) return;
     const char* msl = gcn_shader_msl(sh);
     CHECK(msl, "%s: no MSL", name.c_str());
+    if (const char* dir = std::getenv("GCN_U4_CS_TEST_MSL_DIR"); msl && dir) { // for inspection
+        if (FILE* f = std::fopen((std::string(dir) + "/" + name + ".metal").c_str(), "w")) {
+            std::fputs(msl, f);
+            std::fclose(f);
+        }
+    }
+    if (msl && hw == GCN_HW_CS) { // no barrier that part of the workgroup may not reach (a GPU hang)
+        const auto errors = msl_check::BarrierErrors(msl);
+        for (size_t i = 0; i < errors.size() && i < 4; i++) std::fprintf(stderr, "  %s: %s\n", name.c_str(), errors[i].c_str());
+        CHECK(errors.empty(), "%s: %zu barrier(s) part of the workgroup may not reach", name.c_str(), errors.size());
+        // every EXEC-divergent region predicated, no lane read left per subgroup: u4_cs_spill had
+        // 58 regions and 145 lane reads per subgroup (registers of vector type in its regions),
+        // and 56 barriers under per-subgroup conditions
+        gcn_shader_info info;
+        gcn_shader_get_info(sh, &info);
+        CHECK(info.unpredicated_wave_regions == 0 && info.per_subgroup_lane_ops == 0,
+              "%s: %u region(s) not predicated, %u lane read(s) per subgroup", name.c_str(),
+              info.unpredicated_wave_regions, info.per_subgroup_lane_ops);
+    }
     if (msl && hw == GCN_HW_VS)
         CHECK(std::strstr(msl, "[[position, invariant]]"), "%s: the position output is not invariant", name.c_str());
     if (msl) {

@@ -8,6 +8,7 @@
 
 #include <boost/container/set.hpp>
 #include <boost/container/small_vector.hpp>
+#include <functional>
 #include <span>
 #include <vector>
 #include "common/types.h"
@@ -37,7 +38,67 @@ enum class SrtOp : u32 {
     // 0-1 with stride 0). The pointer becomes the base of a guest buffer for reads whose
     // offset only the shader knows.
     StorePtr,
+    // PS4Recomp: vs, size, byte_off, count, dst, guard, k: flat[dst + i] = the dword at byte
+    // byte_off + 4 * i of the guest buffer whose V# is flat[vs..vs + 3], for i < count, as
+    // s_buffer_load reads it: 0 for a dword at or past the buffer's size (`size` bytes if not 0,
+    // else the V#'s: stride * num_records, num_records bytes when stride is 0; with `size` set
+    // only V# dwords 0-1 are read). With `guard` (SrtTableGuard) not 0, entry k of a table
+    // indexed by a loop counter is copied only if k < the loop's entry count (all 0 otherwise).
+    // Copies entry k of a T# table the shader indexes at run time (LowerDynamicImageTable).
+    CopyBufferDwords,
+    // PS4Recomp: ivs, isize, ibyte, istride, max, dst: the distinct indices an index buffer
+    // holds (Uncharted 4's reflection probes: record j of a constant buffer holds the T# table
+    // index t of probe j). The index of record k is the dword at byte ibyte + istride * k of the
+    // buffer whose V# is flat[ivs..] (size as in CopyBufferDwords), for every record whose dword
+    // lies below its size. 0 is always one of them (an index read past the buffer reads 0).
+    // flat[dst] = how many distinct indices (counted up to SrtMaxTableIndices + 1), or ~0u if
+    // the buffer has more than `max` records; flat[dst + 1 + i] = the i-th distinct index in
+    // record order (index 0 first), 0 for i at or past the count, i < SrtMaxTableIndices.
+    CollectIndices,
+    // PS4Recomp: tvs, tsize, tfirst, tstride, idx, count, dst, cmp: the T# table entry of index
+    // t = flat[idx]: flat[cmp] = tfirst + tstride * t (the dword offset the shader loads it
+    // from, mod 2^32); flat[dst + i] = the dword at dword offset flat[cmp] + i of the table
+    // buffer (V# flat[tvs..], size as in CopyBufferDwords: 0 past it), for i < count.
+    CopyIndexedDwords,
 };
+
+// Distinct indices CollectIndices keeps (the entries of a table bound at most).
+constexpr u32 SrtMaxTableIndices = 8;
+
+// How a loop compares its counter (k + 1) with its bound N to run again.
+enum class LoopCompare : u32 {
+    ULess = 1,    // k + 1 < N, unsigned
+    SLess = 2,    // k + 1 < N, signed
+    NotEqual = 3, // k + 1 != N
+};
+// Iterations of a loop `k = 0; do { ...; } while (k + 1 <compare> N);` (at least one): the
+// entries of a T# table it indexes with k.
+inline u64 DynamicLoopEntries(u32 n, LoopCompare compare) {
+    switch (compare) {
+    case LoopCompare::SLess:
+        return static_cast<s32>(n) <= 0 ? 1 : n;
+    case LoopCompare::NotEqual:
+        return n == 0 ? (1ull << 32) : n;
+    case LoopCompare::ULess:
+    default:
+        return n == 0 ? 1 : n;
+    }
+}
+// CopyBufferDwords guard: bits 0..15 the flatbuf dword holding the bound N, bits 16..17 the
+// LoopCompare; 0: no guard.
+constexpr u32 SrtTableGuard(u32 count_dw, LoopCompare compare) {
+    return count_dw | static_cast<u32>(compare) << 16;
+}
+
+// Bytes of a guest buffer as s_buffer_load bounds it: `size_imm` if not 0, else from its V#
+// (dwords 1-2: stride * num_records, num_records bytes when stride is 0).
+inline u64 SrtBufferBytes(const u32* vsharp, u32 size_imm) {
+    if (size_imm) {
+        return size_imm;
+    }
+    const u32 stride = (vsharp[1] >> 16) & 0x3FFFu;
+    return stride ? u64(stride) * vsharp[2] : vsharp[2];
+}
 
 // Guest memory reader: copy `size` bytes at guest address `addr` into `dst`.
 // Return false if the address is not mapped (the destination is then treated as zero).
@@ -63,6 +124,13 @@ inline bool SrtRead(SrtReadFn read, void* ctx, u64 addr, void* dst, u64 size) {
     }
     return read && read(ctx, addr, dst, size);
 }
+
+// PS4Recomp: the guest memory the T# table copies of an SRT program read for a draw whose
+// flattened user data (built by RunSrtProgram) is `flat`: fn(addr, bytes) for the records an
+// index buffer scan reads (CollectIndices) and every entry copied (CopyBufferDwords,
+// CopyIndexedDwords) inside its buffer's size.
+void ForEachSrtTableRead(std::span<const u32> program, const u32* flat,
+                         const std::function<void(u64, u64)>& fn);
 
 // Runs the walker. flat_dst must hold flattened_bufsize_dw dwords with the user data
 // already copied to the first NUM_USER_DATA_REGS dwords. Returns false if any read failed.

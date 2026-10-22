@@ -92,6 +92,9 @@ struct StageSpecialization {
     SmallVector<ImageSpecialization, 16> images;
     SmallVector<FMaskSpecialization, 8> fmasks;
     SmallVector<SamplerSpecialization, 16> samplers;
+    // PS4Recomp: the entry-count bucket (ImageTableBucket) of every bound of every T# table
+    // (Info::image_tables), in order: the entries the SRT program copies depend on it
+    SmallVector<u8, 8> image_tables;
     Backend::Bindings start{};
 
     StageSpecialization() = default;
@@ -157,6 +160,12 @@ struct StageSpecialization {
                          spec.force_unnormalized = sharp.force_unnormalized;
                          spec.force_degamma = sharp.force_degamma;
                      });
+        for (const auto& table : info->image_tables) {
+            for (u32 i = 0; i < table.num_bounds; ++i) {
+                image_tables.push_back(
+                    ImageTableBucket(table.bounds[i].Entries(info->flattened_ud_buf.data())));
+            }
+        }
 
         // Initialize runtime_info fields that rely on analysis in tessellation passes
         if (info->sw_stage == SwStage::TessellationControl ||
@@ -213,6 +222,10 @@ struct StageSpecialization {
         }
 
         if (fmasks != other.fmasks) {
+            return false;
+        }
+
+        if (image_tables != other.image_tables) {
             return false;
         }
 

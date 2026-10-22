@@ -35,6 +35,11 @@ public:
     [[nodiscard]] Dest BitCast(const Source& value);
 
     U1 ConditionRef(const U1& value);
+    // PS4Recomp (predicate_wave64_pass.cpp): the instructions emitted between them run only where
+    // `cond` is true. The value form returns `value` there and 0 elsewhere.
+    void PredicatedBegin(const U1& cond);
+    void PredicatedEnd();
+    [[nodiscard]] Value PredicatedEnd(const Value& value);
 
     void Prologue();
     void Epilogue();
@@ -46,6 +51,7 @@ public:
     void WorkgroupMemoryBarrier();
     void DeviceMemoryBarrier();
     void SubgroupBarrier();
+    void LdsBarrier();
 
     [[nodiscard]] U32 GetUserData(IR::ScalarReg reg);
 
@@ -186,6 +192,8 @@ public:
     [[nodiscard]] U32 BallotFindLsb(const U64& mask);
     [[nodiscard]] U1 InverseBallot(const U64& mask);
     [[nodiscard]] U1 GroupAny(const U1& bit);
+    [[nodiscard]] U1 WorkgroupAny(const U1& bit);
+    [[nodiscard]] U1 WaveAny(const U1& bit);
 
     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2);
     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2, const Value& e3);

@@ -232,7 +232,7 @@ static ps4_present_stats *pstats(void) {
 static void pstats_presented(id<MTLDrawable> d) {
     ps4_present_stats *s = pstats();
     ps4_present_stats_on_presented(s, d.presentedTime);
-    char line[512];
+    char line[768];
     if (ps4_present_stats_report(s, line, sizeof(line))) fprintf(stderr, "[metal-screen] present: %s\n", line);
 }
 
@@ -256,60 +256,119 @@ static id<CAMetalDrawable> next_drawable_timed(void) {
 // Set by debug tooling (PS4_PAD_CTL "shot") to save the next presented frame.
 volatile int g_ps4_screenshot_request;
 
+// Called once per flip, in flip order, from the renderer (for presented, held and dropped
+// frames) and from the CPU present paths: the counter and the debug request are atomic.
 static long screenshot_due(void) {
-    static int init;
+    static dispatch_once_t once;
     static const char *dir;
     static long every = 600;
-    static long frame;
-    if (!init) {
-        init = 1;
+    static _Atomic long frame;
+    dispatch_once(&once, ^{
         dir = getenv("PS4_SCREENSHOT_DIR");
         const char *e = getenv("PS4_SCREENSHOT_EVERY");
         if (e && atol(e) > 0) every = atol(e);
-    }
-    long n = frame++;
-    if (dir && g_ps4_screenshot_request) {
-        g_ps4_screenshot_request = 0;
-        return n;
-    }
+    });
+    const long n = atomic_fetch_add(&frame, 1);
+    if (dir && __atomic_exchange_n(&g_ps4_screenshot_request, 0, __ATOMIC_ACQ_REL)) return n;
     if (!dir || n % every != 0) return -1;
     return n;
 }
 
-static void save_screenshot(id<MTLTexture> tex, long n) {
+// Screenshots are encoded and written on a background queue: the PNG encode and the file write
+// take tens of milliseconds, and on the presenter path they used to run in the completion
+// handler of the frame's command buffer, ahead of the handler that frees its present slot, so
+// every saved frame held up the display (and with it the renderer) for that long. At most
+// kShotMaxPending images wait for the writer; a frame due while it is that far behind is not
+// saved (counted and logged), so a slow disk cannot grow memory without limit.
+enum { kShotMaxPending = 4 };
+static _Atomic int g_shot_pending;
+static _Atomic uint64_t g_shot_dropped;
+
+static dispatch_queue_t shot_queue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("ps4.screenshot",
+                                  dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    });
+    return q;
+}
+
+// Encodes buf (BGRA8, w x h, `row` bytes per row) as <dir>/frame_<n>.png and frees it.
+static void write_screenshot_png(uint8_t *buf, size_t w, size_t h, size_t row, long n) {
     const char *dir = getenv("PS4_SCREENSHOT_DIR");
-    if (!dir || !tex || n < 0) return;
-    NSUInteger w = tex.width, h = tex.height;
-    size_t row = w * 4;
-    uint8_t *buf = malloc(row * h);
-    if (!buf) return;
-    [tex getBytes:buf bytesPerRow:row fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef bc = CGBitmapContextCreate(buf, w, h, 8, row, cs,
-        kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
-    CGImageRef img = bc ? CGBitmapContextCreateImage(bc) : NULL;
-    if (img) {
-        NSString *path = [NSString stringWithFormat:@"%s/frame_%06ld.png", dir, n];
-        CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
-            (__bridge CFURLRef)[NSURL fileURLWithPath:path], CFSTR("public.png"), 1, NULL);
-        if (dst) {
-            CGImageDestinationAddImage(dst, img, NULL);
-            CGImageDestinationFinalize(dst);
-            CFRelease(dst);
-            fprintf(stderr, "[metal-screen] saved %s\n", path.UTF8String);
+    @autoreleasepool {
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef bc = CGBitmapContextCreate(buf, w, h, 8, row, cs,
+            kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+        CGImageRef img = bc ? CGBitmapContextCreateImage(bc) : NULL;
+        if (img && dir) {
+            NSString *path = [NSString stringWithFormat:@"%s/frame_%06ld.png", dir, n];
+            CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
+                (__bridge CFURLRef)[NSURL fileURLWithPath:path], CFSTR("public.png"), 1, NULL);
+            if (dst) {
+                CGImageDestinationAddImage(dst, img, NULL);
+                CGImageDestinationFinalize(dst);
+                CFRelease(dst);
+                fprintf(stderr, "[metal-screen] saved %s\n", path.UTF8String);
+            }
         }
-        CGImageRelease(img);
+        if (img) CGImageRelease(img);
+        if (bc) CGContextRelease(bc);
+        CGColorSpaceRelease(cs);
     }
-    if (bc) CGContextRelease(bc);
-    CGColorSpaceRelease(cs);
     free(buf);
 }
 
+// Reserves a writer slot for frame n; false (frame counted as not saved) when the writer is
+// kShotMaxPending images behind.
+static bool shot_reserve(long n) {
+    if (atomic_fetch_add(&g_shot_pending, 1) >= kShotMaxPending) {
+        atomic_fetch_sub(&g_shot_pending, 1);
+        const uint64_t d = atomic_fetch_add(&g_shot_dropped, 1) + 1;
+        if ((d & (d - 1)) == 0)
+            fprintf(stderr, "[metal-screen] screenshot writer %d images behind: frame %ld not saved (%llu not saved so far)\n",
+                    kShotMaxPending, n, (unsigned long long)d);
+        return false;
+    }
+    return true;
+}
+
+// Saves `tex` (BGRA8, CPU-readable) as frame n. copy_now: the texture is reused after this call
+// (the CPU present paths' screen texture), so its bytes are read here; otherwise the caller hands
+// the texture over (the presenter's per-frame capture texture) and the read happens on the writer.
+static void save_screenshot(id<MTLTexture> tex, long n, bool copy_now) {
+    if (!getenv("PS4_SCREENSHOT_DIR") || !tex || n < 0) return;
+    if (!shot_reserve(n)) return;
+    const NSUInteger w = tex.width, h = tex.height;
+    const size_t row = w * 4;
+    uint8_t *buf = NULL;
+    if (copy_now) {
+        buf = malloc(row * h);
+        if (buf) [tex getBytes:buf bytesPerRow:row fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    }
+    if (copy_now && !buf) {
+        atomic_fetch_sub(&g_shot_pending, 1);
+        return;
+    }
+    dispatch_async(shot_queue(), ^{
+        uint8_t *b = buf;
+        if (!b) {
+            b = malloc(row * h);
+            if (b) [tex getBytes:b bytesPerRow:row fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+        }
+        if (b) write_screenshot_png(b, w, h, row, n);
+        atomic_fetch_sub(&g_shot_pending, 1);
+    });
+}
+
 static void maybe_save_screenshot(id<MTLTexture> tex) {
-    save_screenshot(tex, screenshot_due());
+    save_screenshot(tex, screenshot_due(), true);
 }
 
 static void presenter_drain(void);
+
+static void presented_one(void); // counts a frame put on a drawable (see the presenter)
 
 int ps4_metal_screen_present_frame(const void *pixels, size_t pitch, int width, int height) {
     if (!g_inited) {
@@ -366,6 +425,7 @@ int ps4_metal_screen_present_frame(const void *pixels, size_t pitch, int width, 
             [commandBuffer presentDrawable:drawable];
             ps4_present_stats_on_submit(pstats(), CACurrentMediaTime());
             [commandBuffer commit];
+            presented_one();
             [commandBuffer waitUntilScheduled];
             maybe_save_screenshot(g_screenTexture);
         }
@@ -429,6 +489,7 @@ int ps4_metal_screen_present_texture(void *texture) {
             ps4_present_stats_on_submit(pstats(), CACurrentMediaTime());
         }
         [commandBuffer commit];
+        if (drawable) presented_one();
         [commandBuffer waitUntilCompleted];
         maybe_save_screenshot(g_screenTexture);
     }
@@ -845,7 +906,7 @@ static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long sho
         if (shot) {
             [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
                 (void)done;
-                save_screenshot(shot, shot_idx);
+                save_screenshot(shot, shot_idx, false); // queued: the slot is released right after
             }];
         }
     }
@@ -879,7 +940,7 @@ static struct {
     ps4_present_mode mode;
     _Atomic uint64_t display_hz; // refresh rate of the window's screen, 0 = unknown
     _Atomic bool hz_query_queued;
-    uint64_t presented; // presenter thread only
+    _Atomic uint64_t presented; // frames the presenter has put on a drawable
 } g_pr;
 
 static _Atomic int g_guest_flip_rate = 0;
@@ -911,6 +972,12 @@ static bool slot_texture(PresentSlot *ps, NSUInteger w, NSUInteger h) {
     return ps->tex != nil;
 }
 
+// Held frames (see "Held frames" below): the presenter takes them straight from their textures.
+static int held_take(void);
+static void present_held(int h, id<CAMetalDrawable> drawable);
+static void held_init(void);
+static void presented_one(void);
+
 static void present_slot(int s, id<CAMetalDrawable> drawable) {
     PresentSlot *ps = &g_pr.slot[s];
     id<MTLCommandBuffer> cb = [g_pr.queue commandBuffer];
@@ -924,7 +991,11 @@ static void present_slot(int s, id<CAMetalDrawable> drawable) {
         ps4_pq_release(&g_pr.q, s);
     }];
     [cb commit];
-    if ((++g_pr.presented % 120) == 0 && !atomic_exchange(&g_pr.hz_query_queued, true)) {
+    presented_one();
+}
+
+static void presented_one(void) {
+    if ((atomic_fetch_add(&g_pr.presented, 1) + 1) % 120 == 0 && !atomic_exchange(&g_pr.hz_query_queued, true)) {
         // the window may have moved to another screen
         dispatch_async(dispatch_get_main_queue(), ^{
             atomic_store(&g_pr.display_hz, query_display_hz_main());
@@ -947,9 +1018,21 @@ static void *presenter_main(void *arg) {
             // display keeps releasing them.
             id<CAMetalDrawable> drawable = next_drawable_timed();
             if (g_pr.mode != PS4_PRESENT_MAILBOX) ps4_pq_grant(&g_pr.q);
-            const int s = ps4_pq_take(&g_pr.q);
-            if (s < 0) return NULL;
-            present_slot(s, drawable);
+            // the next frame: a queued slot (always older than any held frame), else a held frame
+            // once no slot frame is ahead of it (presented straight from its texture, at the
+            // point where a slot would have taken it)
+            int s = -1, h = -1;
+            pthread_mutex_lock(&g_pr.q.mu);
+            for (;;) {
+                if (g_pr.q.stop) break;
+                if ((s = ps4_pq_try_take_locked(&g_pr.q)) >= 0) break;
+                if ((h = held_take()) >= 0) break;
+                pthread_cond_wait(&g_pr.q.cv, &g_pr.q.mu);
+            }
+            pthread_mutex_unlock(&g_pr.q.mu);
+            if (s >= 0) present_slot(s, drawable);
+            else if (h >= 0) present_held(h, drawable);
+            else return NULL;
         }
     }
 }
@@ -964,6 +1047,7 @@ static void presenter_start(void) {
         g_pr.queue = [g_device newCommandQueue];
         g_pr.queue.label = @"present";
         g_pr.ready = [g_device newSharedEvent];
+        held_init();
         __block uint64_t hz = 0;
         run_on_main(^{
             hz = query_display_hz_main();
@@ -999,26 +1083,27 @@ static void presenter_drain(void) {
     if (idle) atomic_store(&g_pr.drain_timed_out, false);
 }
 
-void *ps4_metal_screen_acquire_frame(int width, int height) {
+void *ps4_metal_screen_try_acquire_frame(int width, int height) {
     if (width <= 0 || height <= 0) return NULL;
     if (!g_inited && ps4_metal_screen_init(width, height, "PS4Recomp - Native Metal Display") != 0) return NULL;
     presenter_start();
     int superseded = 0;
-    double waited = 0;
-    const int s = ps4_pq_acquire(&g_pr.q, 1.0, &superseded, &waited);
-    ps4_present_stats_on_backpressure(pstats(), waited * 1000.0);
+    const int s = ps4_pq_acquire(&g_pr.q, 0, &superseded, NULL);
     if (superseded) ps4_present_stats_on_superseded(pstats());
-    if (s < 0) {
-        static _Atomic bool logged;
-        if (!atomic_exchange(&logged, true))
-            fprintf(stderr, "[metal-screen] no present slot became free within 1 s (presenter or GPU stuck)\n");
-        return NULL;
-    }
+    if (s < 0) return NULL;
     if (!slot_texture(&g_pr.slot[s], (NSUInteger)width, (NSUInteger)height)) {
         ps4_pq_cancel(&g_pr.q, s);
         return NULL;
     }
     return (__bridge void *)g_pr.slot[s].tex;
+}
+
+void ps4_metal_screen_note_backpressure(double wait_ms) {
+    ps4_present_stats_on_backpressure(pstats(), wait_ms);
+}
+
+uint64_t ps4_metal_screen_presented_count(void) {
+    return atomic_load(&g_pr.presented);
 }
 
 int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
@@ -1072,6 +1157,349 @@ int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
     }
     ps4_metal_screen_pump_events();
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Held frames (docs/present-pacing.md, "No waiting on the display"). A frame that finds every
+// present slot taken is converted by the renderer into one of these textures; the renderer's
+// command buffer signals g_held.ev once it is written, and nothing waits for the display. The
+// presenter takes held frames where it would take a queued slot (after any queued slot, which is
+// older), and presents straight from the held texture: its command buffer waits for g_held.ev on
+// the GPU, then copies into the drawable as for a slot. The flip completes when that command
+// buffer completes. At most g_hold_depth frames are held (the guest's display buffers minus one,
+// at most kHeldMax): one more drops the oldest; a frame held for kHeldTimeoutS (the presenter is
+// stuck) is dropped and its flip completed at once. When the renderer's GPU work is given up
+// (ps4_metal_screen_release_held), every held frame's flip completes without waiting.
+// ---------------------------------------------------------------------------
+enum { kHeldMax = 3, kHeldTextures = kHeldMax + 1 };
+static const double kHeldTimeoutS = 1.0;
+enum { HELD_FREE = 0, HELD_RENDERING, HELD_QUEUED, HELD_PRESENTING, HELD_DROPPING };
+static _Atomic int g_hold_depth = kHeldMax;
+
+typedef struct HeldFrame {
+    id<MTLTexture> tex;
+    int state;
+    uint64_t ready;  // g_held.ev value the renderer's command buffer signals once tex is written
+    uint64_t order;  // queue order; identifies this use of the texture
+    long shot_idx;   // screenshot index (taken when queued, in flip order)
+    double since;    // when it was queued (monotonic seconds)
+    bool completed;  // its flip completion (done) has run or is running
+    ps4_metal_screen_held_done_fn done;
+    void *arg;
+} HeldFrame;
+
+static struct {
+    pthread_mutex_t mu;
+    HeldFrame f[kHeldTextures];
+    uint64_t next_order;
+    id<MTLSharedEvent> ev;
+    _Atomic uint64_t ev_value;
+    MTLSharedEventListener *listener;
+    dispatch_queue_t q; // drop listeners and the timeout timer; set once in held_init
+    _Atomic bool timer_armed;
+} g_held = {.mu = PTHREAD_MUTEX_INITIALIZER};
+
+static double held_now(void) {
+    return CACurrentMediaTime();
+}
+
+// presenter_start (dispatch_once): before the presenter thread or any renderer call uses it.
+static void held_init(void) {
+    g_held.q = dispatch_queue_create(
+        "ps4.present-held", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    g_held.ev = [g_device newSharedEvent];
+    g_held.listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:g_held.q];
+}
+
+static int held_oldest_locked(int state) {
+    int best = -1;
+    for (int i = 0; i < kHeldTextures; i++)
+        if (g_held.f[i].state == state && (best < 0 || g_held.f[i].order < g_held.f[best].order)) best = i;
+    return best;
+}
+
+// Marks frame i's flip as completing and returns its callback (NULL if that already happened or
+// the texture now holds another frame). The caller runs it without g_held.mu.
+static ps4_metal_screen_held_done_fn held_claim_locked(int i, uint64_t order, void **arg) {
+    HeldFrame *h = &g_held.f[i];
+    if (h->order != order || h->completed) return NULL;
+    h->completed = true;
+    *arg = h->arg;
+    return h->done;
+}
+
+// Frame i (with this order) is no longer read by the GPU: its texture is free again.
+static void held_free(int i, uint64_t order) {
+    pthread_mutex_lock(&g_held.mu);
+    if (g_held.f[i].order == order && g_held.f[i].state != HELD_RENDERING) g_held.f[i].state = HELD_FREE;
+    pthread_mutex_unlock(&g_held.mu);
+}
+
+static void held_complete(int i, uint64_t order, int shown) {
+    void *arg = NULL;
+    pthread_mutex_lock(&g_held.mu);
+    ps4_metal_screen_held_done_fn done = held_claim_locked(i, order, &arg);
+    pthread_mutex_unlock(&g_held.mu);
+    if (done) done(arg, shown);
+}
+
+typedef struct HeldDrop {
+    int i;
+    uint64_t order, ready;
+    bool now; // complete the flip now (timeout), else once the renderer has written the frame
+} HeldDrop;
+
+// Drops frame i (QUEUED). The caller registers the drop with held_finish_drop after releasing
+// g_held.mu: an already signalled event runs the listener's block at once.
+static HeldDrop held_drop_locked(int i, bool now, const char *why) {
+    HeldFrame *h = &g_held.f[i];
+    h->state = HELD_DROPPING;
+    ps4_present_stats_on_held_dropped(pstats());
+    static _Atomic uint64_t drops;
+    const uint64_t n = atomic_fetch_add(&drops, 1) + 1;
+    if ((n & (n - 1)) == 0) fprintf(stderr, "[metal-screen] held frame dropped: %s (%llu so far)\n", why, (unsigned long long)n);
+    return (HeldDrop){i, h->order, h->ready, now};
+}
+
+static void held_finish_drop(HeldDrop d) {
+    if (d.now) held_complete(d.i, d.order, 0);
+    const int i = d.i;
+    const uint64_t order = d.order;
+    [g_held.ev notifyListener:g_held.listener
+                      atValue:d.ready
+                        block:^(id<MTLSharedEvent> ev, uint64_t value) {
+                            (void)ev;
+                            (void)value;
+                            held_complete(i, order, 0); // the renderer has written it (a no-op after a timeout)
+                            held_free(i, order);
+                        }];
+}
+
+// Drops the frames held longer than kHeldTimeoutS: the presenter (or the GPU) is stuck.
+static void held_timeout(void) {
+    HeldDrop drops[kHeldTextures];
+    int n = 0;
+    pthread_mutex_lock(&g_held.mu);
+    atomic_store(&g_held.timer_armed, false);
+    const double now = held_now();
+    double next = 0;
+    for (int k = 0; k < kHeldTextures; k++) {
+        HeldFrame *h = &g_held.f[k];
+        if (h->state != HELD_QUEUED) continue;
+        if (now - h->since >= kHeldTimeoutS) drops[n++] = held_drop_locked(k, true, "the display did not take it within 1 s");
+        else if (!next || h->since < next) next = h->since;
+    }
+    if (next && !atomic_exchange(&g_held.timer_armed, true)) {
+        const double left = next + kHeldTimeoutS - now + 0.005;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(left * 1e9)), g_held.q, ^{
+            held_timeout();
+        });
+    }
+    pthread_mutex_unlock(&g_held.mu);
+    for (int k = 0; k < n; k++) held_finish_drop(drops[k]);
+}
+
+// Presenter thread, under g_pr.q.mu: the oldest held frame goes to the screen, unless a slot
+// frame (older: it was acquired before any frame was held) is still being rendered or queued.
+static int held_take(void) {
+    pthread_mutex_lock(&g_held.mu);
+    int i = held_oldest_locked(HELD_QUEUED);
+    if (i >= 0 && !ps4_pq_claim_drawable_locked(&g_pr.q)) i = -1;
+    if (i >= 0) g_held.f[i].state = HELD_PRESENTING;
+    pthread_mutex_unlock(&g_held.mu);
+    return i;
+}
+
+static void present_held(int i, id<CAMetalDrawable> drawable) {
+    HeldFrame *h = &g_held.f[i]; // PRESENTING: only this thread changes it now
+    pthread_mutex_lock(&g_held.mu);
+    id<MTLTexture> tex = h->tex;
+    const uint64_t ready = h->ready, order = h->order;
+    const long shot = h->shot_idx;
+    const double waited = held_now() - h->since;
+    pthread_mutex_unlock(&g_held.mu);
+    id<MTLCommandBuffer> cb = [g_pr.queue commandBuffer];
+    [cb encodeWaitForEvent:g_held.ev value:ready]; // the renderer has written the frame
+    const double min_duration =
+        ps4_present_min_duration(g_pr.mode, atomic_load(&g_guest_flip_rate), atomic_load(&g_guest_flip_mode),
+                                 (double)atomic_load(&g_pr.display_hz));
+    present_encode(cb, tex, shot, min_duration, drawable);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        (void)c;
+        held_complete(i, order, 1); // the flip completes once its image is in the drawable
+        held_free(i, order);
+    }];
+    [cb commit];
+    ps4_present_stats_on_backpressure(pstats(), waited * 1000.0);
+    presented_one();
+}
+
+static void presenter_wake(void) {
+    pthread_mutex_lock(&g_pr.q.mu);
+    pthread_cond_broadcast(&g_pr.q.cv);
+    pthread_mutex_unlock(&g_pr.q.mu);
+}
+
+bool ps4_metal_screen_frames_held(void) {
+    pthread_mutex_lock(&g_held.mu);
+    const bool held = held_oldest_locked(HELD_QUEUED) >= 0;
+    pthread_mutex_unlock(&g_held.mu);
+    return held;
+}
+
+void ps4_metal_screen_set_hold_depth(int display_buffers) {
+    const int d = display_buffers - 1 < 1 ? 1 : display_buffers - 1 > kHeldMax ? kHeldMax : display_buffers - 1;
+    if (atomic_exchange(&g_hold_depth, d) != d)
+        fprintf(stderr, "[metal-screen] up to %d frames held for the display (%d display buffers)\n", d, display_buffers);
+}
+
+void *ps4_metal_screen_hold_texture(int width, int height) {
+    if (width <= 0 || height <= 0 || !g_inited) return NULL;
+    presenter_start();
+    HeldDrop drop = {-1, 0, 0, false};
+    pthread_mutex_lock(&g_held.mu);
+    int queued = 0;
+    for (int k = 0; k < kHeldTextures; k++) queued += g_held.f[k].state == HELD_QUEUED;
+    if (queued >= atomic_load(&g_hold_depth)) {
+        // the guest flips faster than the display takes frames and does not wait for its flips
+        drop = held_drop_locked(held_oldest_locked(HELD_QUEUED), false, "more frames flipped than the display can take");
+    }
+    const int i = held_oldest_locked(HELD_FREE);
+    void *tex = NULL;
+    if (i >= 0) {
+        HeldFrame *h = &g_held.f[i];
+        if (!h->tex || h->tex.width != (NSUInteger)width || h->tex.height != (NSUInteger)height) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                          width:(NSUInteger)width
+                                                                                         height:(NSUInteger)height
+                                                                                      mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            h->tex = [g_device newTextureWithDescriptor:td];
+        }
+        if (h->tex) {
+            h->state = HELD_RENDERING;
+            tex = (__bridge void *)h->tex;
+        }
+    }
+    pthread_mutex_unlock(&g_held.mu);
+    if (drop.i >= 0) held_finish_drop(drop);
+    return tex;
+}
+
+int ps4_metal_screen_queue_held(void *command_buffer, void *texture, ps4_metal_screen_held_done_fn done, void *arg) {
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)command_buffer;
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
+    if (!cb || !tex || !g_held.ev) return -1;
+    pthread_mutex_lock(&g_held.mu);
+    int i = -1;
+    for (int k = 0; k < kHeldTextures; k++)
+        if (g_held.f[k].state == HELD_RENDERING && g_held.f[k].tex == tex) i = k;
+    if (i < 0) {
+        pthread_mutex_unlock(&g_held.mu);
+        return -1;
+    }
+    const uint64_t v = atomic_fetch_add(&g_held.ev_value, 1) + 1;
+    [cb encodeSignalEvent:g_held.ev value:v];
+    id<MTLSharedEvent> ev = g_held.ev;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        // a failed command buffer may not have reached its signal: nothing may wait for it forever
+        // (only while v is the newest value: a later GPU signal must not be lowered)
+        if (c.status == MTLCommandBufferStatusError && atomic_load(&g_held.ev_value) == v && ev.signaledValue < v)
+            ev.signaledValue = v;
+    }];
+    HeldFrame *h = &g_held.f[i];
+    h->state = HELD_QUEUED;
+    h->ready = v;
+    h->order = ++g_held.next_order;
+    h->shot_idx = screenshot_due();
+    h->since = held_now();
+    h->completed = false;
+    h->done = done;
+    h->arg = arg;
+    ps4_present_stats_on_held(pstats());
+    const bool arm = !atomic_exchange(&g_held.timer_armed, true);
+    pthread_mutex_unlock(&g_held.mu);
+    if (arm)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((kHeldTimeoutS + 0.005) * 1e9)), g_held.q, ^{
+            held_timeout();
+        });
+    presenter_wake();
+    return 0;
+}
+
+void ps4_metal_screen_note_held_drop(void) {
+    ps4_present_stats_on_held_dropped(pstats());
+    (void)screenshot_due(); // keeps the per-flip numbering
+}
+
+void ps4_metal_screen_release_held(void) {
+    if (!g_held.ev) return; // the presenter never started: nothing waits
+    typedef struct {
+        ps4_metal_screen_held_done_fn done;
+        void *arg;
+    } Done;
+    Done dones[kHeldTextures];
+    HeldDrop drops[kHeldTextures];
+    int nd = 0, nq = 0;
+    pthread_mutex_lock(&g_held.mu);
+    for (int k = 0; k < kHeldTextures; k++) {
+        HeldFrame *h = &g_held.f[k];
+        if (h->state == HELD_QUEUED) {
+            drops[nq++] = held_drop_locked(k, false, "the renderer's GPU work was given up");
+        }
+        if (h->state == HELD_PRESENTING || h->state == HELD_DROPPING) {
+            void *arg = NULL;
+            ps4_metal_screen_held_done_fn done = held_claim_locked(k, h->order, &arg);
+            if (done) dones[nd++] = (Done){done, arg};
+        }
+    }
+    const uint64_t v = atomic_load(&g_held.ev_value);
+    pthread_mutex_unlock(&g_held.mu);
+    // the renderer's command buffers that would signal these values may never complete
+    if (g_held.ev.signaledValue < v) g_held.ev.signaledValue = v;
+    // the same for slot frames: a presenter command buffer waiting for a hung slot frame (and every
+    // one queued behind it) would keep its drawable for good, and no later frame could be shown
+    if (g_pr.ready) {
+        const uint64_t r = atomic_load(&g_pr.ready_value);
+        if (g_pr.ready.signaledValue < r) g_pr.ready.signaledValue = r;
+    }
+    fprintf(stderr, "[metal-screen] renderer GPU work given up: %d held frames' flips completed\n", nd);
+    for (int k = 0; k < nd; k++) dones[k].done(dones[k].arg, 0); // in order through the renderer's flip sequence
+    for (int k = 0; k < nq; k++) held_finish_drop(drops[k]);
+}
+
+uint64_t ps4_metal_screen_held_drop_count(void) {
+    pthread_mutex_lock(&pstats()->mu);
+    const uint64_t n = pstats()->total_held_dropped;
+    pthread_mutex_unlock(&pstats()->mu);
+    return n;
+}
+
+bool ps4_metal_screen_slot_ready(void) {
+    if (!atomic_load(&g_pr.started)) return false;
+    pthread_mutex_lock(&g_pr.q.mu);
+    const bool ready = ps4_pq_can_acquire_locked(&g_pr.q);
+    pthread_mutex_unlock(&g_pr.q.mu);
+    return ready;
+}
+
+bool ps4_metal_screen_presenter_idle(void) {
+    if (!atomic_load(&g_pr.started)) return true;
+    pthread_mutex_lock(&g_pr.q.mu);
+    const bool slots = ps4_pq_idle_locked(&g_pr.q);
+    pthread_mutex_unlock(&g_pr.q.mu);
+    pthread_mutex_lock(&g_held.mu);
+    const bool held = held_oldest_locked(HELD_QUEUED) < 0 && held_oldest_locked(HELD_PRESENTING) < 0;
+    pthread_mutex_unlock(&g_held.mu);
+    return slots && held;
+}
+
+uint64_t ps4_metal_screen_held_count(void) {
+    pthread_mutex_lock(&pstats()->mu);
+    const uint64_t n = pstats()->total_held;
+    pthread_mutex_unlock(&pstats()->mu);
+    return n;
 }
 
 static void metal_screen_pump_events_main(void);

@@ -133,6 +133,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
 
     // Run optimization passes on structured graph
     Shader::Optimization::SsaRepairPass(program);
+    Shader::Optimization::PredicateWave64Pass(program, runtime_info, profile);
     Shader::Optimization::SsaRewritePass(program);
     Shader::Optimization::SharedMemoryBarrierPass(program, runtime_info, profile);
     Shader::Optimization::DeadCodeEliminationPass(program);

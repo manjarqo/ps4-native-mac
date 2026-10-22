@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
@@ -23,10 +25,27 @@ namespace Shader::Optimization {
 IR::Value SpilledLaneValue(const IR::Value& value);
 
 
+// PS4Recomp: the VGPR a cross-lane read (ReadLane, QuadBroadcast, Shuffle, ShuffleXor) reads,
+// recorded by the translator in the instruction's flags (index + 1; 0: not recorded). A lane
+// outside EXEC keeps that register's old value: predicate_wave64_pass.cpp reads it there.
+inline void SetLaneSourceVgpr(const IR::Value& read, IR::VectorReg vgpr) {
+    read.Inst()->SetFlags<u32>(static_cast<u32>(vgpr) + 1);
+}
+inline std::optional<IR::VectorReg> LaneSourceVgpr(const IR::Inst& read) {
+    const u32 flags = read.Flags<u32>();
+    return flags == 0 ? std::nullopt : std::optional{static_cast<IR::VectorReg>(flags - 1)};
+}
+
 void SsaRewritePass(IR::Program& program);
 void SsaRepairPass(IR::Program& program);
 void PhiSimplificationPass(IR::Program& program);
 void InverseBallotEliminationPass(IR::Program& program);
+// PS4Recomp (predicate_wave64_pass.cpp): runs the EXEC-divergent ifs and loops of a wave64
+// compute shader on 32-wide subgroups in predicated mode where their code needs the whole wave
+// (cross-lane operations, barriers, LDS of a one-wave workgroup). Structured program, before
+// SsaRewritePass.
+void PredicateWave64Pass(IR::Program& program, const RuntimeInfo& runtime_info,
+                         const Profile& profile);
 void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
                       const Profile& profile);
 // PS4Recomp (lower_wave64_pass.cpp): the GCN lane (0..63) of a compute invocation. A compute wave

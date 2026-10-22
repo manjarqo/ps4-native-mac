@@ -59,10 +59,14 @@ void SetRegDefaults(uint32_t* regs);
 // Returns false only for an indirect draw that cannot take its arguments from GPU memory
 // (nothing was encoded; the caller reads the arguments on the CPU and draws directly).
 bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args);
+// The queues whose synchronization points order the CP's reads (ComputeBarrier, Dispatch): the
+// graphics ring and the compute (asc) rings.
+enum { kQueueGfx = 0, kQueueCompute = 1 };
 // Compute dispatch with the COMPUTE_* registers in `regs`. indirect_addr != 0: read the group
-// counts from guest memory at that address (GPU side).
+// counts from guest memory at that address (GPU side). name: the queue in logs ("gfx", "asc",
+// "asc-indirect"); queue: kQueueGfx or kQueueCompute.
 void Dispatch(GuestContext* ctx, const uint32_t* regs, uint32_t dim_x, uint32_t dim_y,
-              uint32_t dim_z, uint64_t indirect_addr, const char* queue);
+              uint32_t dim_z, uint64_t indirect_addr, const char* name, int queue);
 
 // Run `fn` once all GPU work encoded so far has completed (fences/labels/interrupts: EOP,
 // RELEASE_MEM, EOS). Commits the open command buffer. Actions run in submission order, on the
@@ -83,14 +87,18 @@ void WaitKernelCompiles();
 bool HasPendingWork();
 // Guest dispatches run concurrently (as consecutive dispatches do on GCN); the command
 // processor calls this where the guest synchronizes (cache flushes, partial flushes, fences,
-// waits, CP writes), so later dispatches see the memory written by earlier ones.
-void ComputeBarrier();
+// waits, CP writes), so later dispatches see the memory written by earlier ones. `queue`: the
+// queue whose packet it is; from here on the CP reads that queue does for its later draws and
+// dispatches see what the guest memory dispatches handed out so far write.
+void ComputeBarrier(int queue);
 // Commit the open command buffer; wait for all submitted work to finish when `wait`.
 void Flush(bool wait);
 
 // CP DMA fill / CPU-side writes of guest memory (fast-clear metadata tracking, texture
 // invalidation).
-void NotifyGuestWrite(uint64_t addr, uint64_t size, bool is_fill, uint32_t fill_value);
+// cp_dma: the write is a CP DMA done on the CPU (exact bytes written by GPU work; see
+// TextureCache::NoteBufferWrite).
+void NotifyGuestWrite(uint64_t addr, uint64_t size, bool is_fill, uint32_t fill_value, bool cp_dma = false);
 
 // 64 KiB GDS backing store, shared between CP DMA (CPU) and shaders (GPU).
 uint8_t* Gds();
@@ -100,13 +108,16 @@ uint8_t* Gds();
 // copies on the CPU.
 bool GpuDma(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, bool dst_gds, uint64_t dst, uint32_t n);
 
-// Presentation: if the display buffer at `addr` is (or was produced from) a GPU render target,
-// render it into a BGRA8 texture and hand it to the Metal screen behind the frame's GPU work,
-// without waiting for the GPU. Returns true on success; `on_done` (if any) then runs once the
-// GPU has executed the presentation (like AfterGpu). On false, all GPU work has completed and
-// `on_done` is not called.
+// Presentation: the display buffer at `addr` (a GPU render target, or guest memory copied on the
+// GPU behind the frame's work) is rendered into a BGRA8 texture and handed to the Metal screen
+// without waiting for the GPU or for the display (a frame that finds no free present slot is
+// held by the screen and handed over later). `on_done` (the flip completion) runs once the frame
+// has reached a present slot, or was dropped, in the order of the Present calls. Returns false
+// only without a renderer; the caller then presents on the CPU and `on_done` is not called.
 bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
              uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done);
+// Test hook: the GPU work encoded from now on waits for an event that is never signalled (a hung GPU).
+void DebugStallGpu();
 
 // ---- Pass replay (tools/gnm_replay, docs/gnm-capture.md). Call after Init, like Draw. ----
 // A GPU-owned texture-cache entry with the captured identity (created if missing), filled with
@@ -118,6 +129,44 @@ bool ReplayReadTexture(const ps4gnm_capture::GpuTextureId& gid, std::vector<uint
 void ReplaySetMetaCleared(uint64_t cmask_address);
 // Draws and dispatches skipped so far (a replayed pass must not add one).
 uint64_t SkippedCount();
+
+// Guest memory dispatches (shaders with gcn_shader_info.uses_guest_memory) so far: on the sync
+// path (waited for) and on the fast path (no CPU wait), fast ones re-run after their probe met an
+// unmapped page or a page outside the prediction, fast ones skipped for a status, dispatches that
+// wrote outside their prediction, CP waits for fast ones (and their time); and the CPU waits for
+// the GPU (WaitAll and re-runs).
+struct GuestMemoryStats {
+    uint64_t sync = 0, fast = 0, reruns = 0, refused = 0, mispredicted = 0;
+    uint64_t cp_waits = 0, cp_wait_us = 0, waits = 0;
+    uint64_t chains = 0;            // points where the GPU waits for the CPU's verdict on fast ones
+    uint64_t rerun_wait_us = 0;     // from a miss's verdict to its re-run, summed
+    uint64_t rerun_wait_max_us = 0; // the longest of them
+    uint64_t no_slot = 0, no_indirect = 0, pass_failed = 0; // skipped: no fault buffer, no
+                                                            // indirect argument buffer, binding failed
+    uint64_t final_ticket = 0; // the last fast dispatch whose result is final
+};
+GuestMemoryStats GetGuestMemoryStats();
+// Renderer gave up on the GPU (a GPU watchdog fired): nothing more is rendered.
+bool Hung();
+// Tests: the result of the next fast guest memory dispatch is never made final (as if the CPU
+// never got its verdict), to test the waits that would otherwise never end.
+void TestWithholdNextTicket();
+// Tests: locks (hold) or unlocks the texture cache's lock on the calling thread.
+void TestHoldTextureCacheLock(bool hold);
+
+// T# tables a shader indexes at run time (gcn_image_table): their entries as bound so far.
+// bound: a texture was bound; empty: the entry's T# is all zero (past the table, or an unused
+// loop entry); rejected: a T# was there but no texture could be bound for it (not a valid T#, or
+// not one Metal can create); unmapped: a T# at a provably unmapped guest address.
+// hazard_drains: draws / dispatches whose table reads overlapped GPU writes that had not completed
+// when the CP copied the tables (the GPU was drained if they were still pending, and the tables of
+// every stage read again), one per draw or dispatch; hazard_skips: of those, the ones skipped
+// because the tables read again no longer fit a stage's specialization. Guest memory dispatches
+// count their entries once per probe (their pass binds what the probe bound).
+struct ImageTableStats {
+    uint64_t bound = 0, empty = 0, rejected = 0, unmapped = 0, hazard_drains = 0, hazard_skips = 0;
+};
+ImageTableStats GetImageTableStats();
 
 void Shutdown();
 // Quit (ps4_host_quit): a frame capture whose frame has not presented writes its manifest.

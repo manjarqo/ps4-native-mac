@@ -50,6 +50,10 @@ int ps4_gnm_metal_present(GuestContext *ctx, uint64_t addr, uint32_t width, uint
 
 // Synchronize / wait for GPU to become idle
 void ps4_gnm_metal_wait_gpu_idle(void);
+// Test hook: the renderer's GPU work from now on hangs (ps4draw::DebugStallGpu). Only when the
+// process started with PS4_TEST_HOOKS=1 (read once, by ps4_gnm_metal_init); otherwise it refuses.
+// Returns 0 when the GPU was stalled, -1 when refused.
+int ps4_gnm_metal_debug_stall_gpu(void);
 
 // Shut down Metal Command Processor
 void ps4_gnm_metal_destroy(void);

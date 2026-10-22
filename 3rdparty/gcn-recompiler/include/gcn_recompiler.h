@@ -276,6 +276,10 @@ GCN_API void gcn_msl_options_default(gcn_msl_options* out);
 enum {
     GCN_COMPILE_EMIT_MSL = 1u << 0, /* also run SPIRV-Cross (if the library was built with it) */
     GCN_COMPILE_ALLOW_NO_FOOTER = 1u << 1, /* code_size given, don't require OrbShdr footer */
+    /* testing: the wave64 predication takes its fallback path, as for a shader it cannot
+     * predicate (counted per subgroup; a barrier there fails the translation). Not part of any
+     * shader cache key: for direct compiles in tests only. */
+    GCN_COMPILE_WAVE64_FALLBACK = 1u << 2,
 };
 
 typedef struct gcn_compile_desc {
@@ -331,8 +335,18 @@ typedef struct gcn_shader_info {
                                          GCN_GUEST_* (bind the page table and fault buffer) */
     uint32_t null_image_reads;        /* image reads through a T# loaded at run time: they read the
                                          null image (no binding can stand for that T#) */
-    uint32_t zeroed_write_lanes;      /* v_writelane results emitted as 0 for the whole register (a
-                                         known gap: the select hung a U4 compute shader) */
+    uint32_t num_image_tables;        /* T# tables indexed at run time (gcn_shader_get_image_table) */
+    uint32_t zeroed_write_lanes;      /* always 0: v_writelane results used to be emitted as 0 (a
+                                         known gap, closed: a per-lane select, LowerWaveOpsPass);
+                                         kept for the API and the cache format */
+    uint32_t unpredicated_wave_regions; /* wave64 CS: EXEC-divergent ifs and loops that need the
+                                         whole wave but stay per 32-wide subgroup (known gap:
+                                         the predication fell back) */
+    uint32_t per_subgroup_lane_ops;   /* wave64 CS: v_readlane / v_readfirstlane / v_mbcnt left per
+                                         subgroup in non-uniform control flow (known gap) */
+    uint32_t per_lane_ends;           /* wave64 CS: s_endpgm in EXEC-divergent code that ends only
+                                         the lanes that reach it, not their whole wave (known gap:
+                                         kept so where nothing after it needs the wave) */
     bool translation_failed;          /* some instructions were unknown (shader may be wrong) */
     uint32_t shared_memory_size;      /* CS: bytes of threadgroup memory used (incl. scratch) */
     uint32_t workgroup_size[3];
@@ -453,7 +467,40 @@ typedef struct gcn_image_binding {
     uint32_t post_op;
     gcn_sharp_fetch sharp;     /* 8 dwords (4 when is_r128) */
     uint32_t msl_texture;      /* [[texture(n)]] (first of num_bindings) */
+    /* Entry table_entry of T# table `table` (gcn_shader_get_image_table): a T# the SRT walker
+     * copies from a table the shader indexes at run time; UINT32_MAX (both) for other images.
+     * Entries that hold no T# Metal can create fetch as false (gcn_shader_fetch_image_sharp). */
+    uint32_t table, table_entry;
 } gcn_image_binding;
+
+/* A T# table a shader indexes at run time (dword i of the T# at dword first + i + stride *
+ * index of a guest buffer). Its entries a draw can reach are images (gcn_image_binding.table);
+ * the shader uses the entry whose offset it loaded the T# from. */
+typedef enum gcn_image_table_kind {
+    GCN_IMAGE_TABLE_NONE = 0,    /* no bound fits (more than 8 entries): its reads read the null
+                                    image (counted in gcn_shader_info.null_image_reads) */
+    GCN_IMAGE_TABLE_RECORDS = 1, /* the table buffer's V# bounds it */
+    GCN_IMAGE_TABLE_INDEXED = 2, /* the index is read from a bounded buffer (index_buffer) */
+    GCN_IMAGE_TABLE_LOOP = 3,    /* the index is a loop counter with a count in the user data */
+} gcn_image_table_kind;
+
+typedef struct gcn_image_table {
+    uint32_t kind;          /* gcn_image_table_kind */
+    uint32_t table_buffer;  /* gcn_shader_get_buffer index of the buffer holding the T#s */
+    uint32_t index_buffer;  /* INDEXED: buffer index holding the indices, else UINT32_MAX */
+    uint32_t first_dw, stride_dw, num_dwords;
+    uint32_t num_entries;   /* images bound for it */
+    uint32_t reached;       /* entries the draw the shader was compiled for reaches */
+    uint32_t num_sites;     /* image instructions reading it */
+} gcn_image_table;
+
+GCN_API bool gcn_shader_get_image_table(const gcn_shader* s, uint32_t index, gcn_image_table* out);
+/* The guest memory the SRT walker reads for the T# tables of a draw whose flattened user data is
+ * flatbuf (gcn_shader_build_flatbuf): (address, bytes) of every table entry and index it copied,
+ * the first `max` into out. Returns their number. A renderer that runs GPU work out of order with
+ * the CPU's reads checks them against pending GPU writes: the flattened data is a CPU snapshot. */
+GCN_API uint32_t gcn_shader_image_table_reads(const gcn_shader* s, const uint32_t* flatbuf,
+                                              uint64_t (*out)[2], uint32_t max);
 
 typedef struct gcn_sampler_binding {
     uint32_t spirv_binding;
@@ -648,6 +695,15 @@ GCN_API const char* gcn_shader_cache_id(void);
  * reader (SRT walks, sharps, fetch shaders) are then done directly. Call once, before any
  * other thread uses the recompiler; read == NULL disables it. */
 GCN_API void gcn_set_direct_guest_memory(gcn_read_guest_fn read, void* ctx, const void* base, uint64_t size);
+
+/* Optional: `mapped(ctx, addr)` tells whether guest address addr is mapped. An entry of a T#
+ * table (gcn_image_binding.table) whose T# starts at an unmapped address is then unbound (the
+ * null image), in the specialization and in gcn_shader_fetch_image_sharp alike: the unused
+ * records of a table hold data that is no T# and often decodes to a far-off address. Call once,
+ * before any other thread uses the recompiler; mapped == NULL (the default) counts every
+ * address as mapped. */
+typedef bool (*gcn_guest_mapped_fn)(void* ctx, uint64_t addr);
+GCN_API void gcn_set_image_address_check(gcn_guest_mapped_fn mapped, void* ctx);
 
 /* Serialize a shader. On GCN_OK *out_data is a malloc'd buffer of *out_size bytes (free with
  * gcn_free). The output depends only on the translation result, not on the draw that

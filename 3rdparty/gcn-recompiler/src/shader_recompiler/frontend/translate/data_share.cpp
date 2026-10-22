@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/frontend/translate/translate.h"
+#include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/reg.h"
 #include "shader_recompiler/runtime_info.h"
 
@@ -109,7 +110,9 @@ void Translator::V_READLANE_B32(const GcnInst& inst) {
     ASSERT(inst.src[0].field == OperandField::VectorGPR);
     const IR::U32 value{GetSrc(inst.src[0])};
     const IR::U32 lane{GetSrc(inst.src[1])};
-    SetDst(inst.dst[0], ir.ReadLane(value, lane));
+    const IR::U32 result = ir.ReadLane(value, lane);
+    Optimization::SetLaneSourceVgpr(result, IR::VectorReg(inst.src[0].code));
+    SetDst(inst.dst[0], result);
 }
 
 void Translator::V_WRITELANE_B32(const GcnInst& inst) {
@@ -308,6 +311,13 @@ void Translator::DS_SWIZZLE_B32(const GcnInst& inst) {
     const u8 offset0 = inst.control.ds.offset0;
     const u8 offset1 = inst.control.ds.offset1;
     const IR::U32 src{GetSrc(inst.src[0])};
+    // the lane read is recorded with the source VGPR (predicate_wave64_pass.cpp)
+    const auto SetDst = [&](const InstOperand& dst, const IR::U32& value) {
+        if (inst.src[0].field == OperandField::VectorGPR) {
+            Optimization::SetLaneSourceVgpr(value, IR::VectorReg(inst.src[0].code));
+        }
+        Translator::SetDst(dst, value);
+    };
     if (offset1 & 0x80) {
         if (offset0 == 0x0 || offset0 == 0x55 || offset0 == 0xAA || offset0 == 0xFF) {
             SetDst(inst.dst[0], ir.QuadBroadcast(src, ir.Imm32(offset0 & 3)));

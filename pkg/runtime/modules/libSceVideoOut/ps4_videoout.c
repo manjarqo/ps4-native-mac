@@ -15,15 +15,23 @@ int ps4_gnm_read_display_cpu(GuestContext *ctx, uint64_t addr, uint32_t width, u
 #include <time.h>
 
 #define MAX_VIDEO_HANDLES 8
-#define MAX_FRAME_BUFFERS 16
+#define MAX_FRAME_BUFFERS PS4_VIDEO_OUT_MAX_BUFFERS
 #define MAX_EQUEUES_PER_PORT 16
+
+// One sceVideoOutRegisterBuffers call: buffers that share an attribute (a buffer set). Its index
+// is the call's return value and the argument of sceVideoOutUnregisterBuffers.
+typedef struct {
+    int count; // registered buffers of the set; 0 = free
+    OrbisVideoOutBufferAttribute attr;
+} VideoOutBufferSet;
 
 typedef struct {
     int in_use;
     int32_t handle;
-    OrbisVideoOutBufferAttribute attr;
-    int bufferCount;
+    OrbisVideoOutBufferAttribute attr; // of the latest registered set
     uint64_t buffers[MAX_FRAME_BUFFERS];
+    int8_t bufferSet[MAX_FRAME_BUFFERS]; // set of each buffer index, -1 = not registered
+    VideoOutBufferSet sets[PS4_VIDEO_OUT_MAX_BUFFER_SETS];
     OrbisKernelEqueue flipQueues[MAX_EQUEUES_PER_PORT];
     void *flipQueueUdatas[MAX_EQUEUES_PER_PORT];
     int flipQueueCount;
@@ -126,7 +134,9 @@ int32_t sceVideoOutOpen(int32_t userId, int32_t busType, int32_t index, const vo
 
     vh->handle = g_next_video_handle++;
     vh->in_use = 1;
-    vh->bufferCount = 0;
+    memset(vh->buffers, 0, sizeof(vh->buffers));
+    memset(vh->bufferSet, -1, sizeof(vh->bufferSet));
+    memset(vh->sets, 0, sizeof(vh->sets));
     vh->flipQueueCount = 0;
     memset(vh->flipQueues, 0, sizeof(vh->flipQueues));
     memset(vh->flipQueueUdatas, 0, sizeof(vh->flipQueueUdatas));
@@ -204,31 +214,54 @@ void sceVideoOutSetBufferAttribute(OrbisVideoOutBufferAttribute *attr, uint32_t 
 }
 
 int32_t sceVideoOutRegisterBuffers(int32_t handle, int32_t startIndex, void * const *bufferArray, int32_t bufferCount, const OrbisVideoOutBufferAttribute *attr) {
+    if (!bufferArray || !attr) return (int32_t)ORBIS_VIDEO_OUT_ERROR_INVALID_ADDRESS;
     pthread_mutex_lock(&g_video_table_mutex);
     VideoOutHandle *vh = find_video_handle_locked(handle);
     if (!vh) {
         pthread_mutex_unlock(&g_video_table_mutex);
-        return -EINVAL;
+        return (int32_t)ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
-
     pthread_mutex_lock(&vh->mutex);
     pthread_mutex_unlock(&g_video_table_mutex);
 
-    if (attr) {
-        vh->attr = *attr;
+    // the checks in the order of the system library
+    uint32_t err = 0;
+    int set = -1;
+    for (int k = 0; k < PS4_VIDEO_OUT_MAX_BUFFER_SETS && set < 0; k++)
+        if (vh->sets[k].count == 0) set = k;
+    if (set < 0) {
+        err = ORBIS_VIDEO_OUT_ERROR_NO_EMPTY_SLOT;
+    } else if (startIndex < 0 || bufferCount <= 0 || startIndex >= MAX_FRAME_BUFFERS || bufferCount > MAX_FRAME_BUFFERS ||
+               startIndex + bufferCount > MAX_FRAME_BUFFERS) {
+        err = ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
+    } else {
+        for (int i = 0; i < bufferCount && !err; i++)
+            if (vh->bufferSet[startIndex + i] >= 0) err = ORBIS_VIDEO_OUT_ERROR_SLOT_OCCUPIED;
     }
-
-    if (bufferArray && bufferCount > 0) {
-        for (int i = 0; i < bufferCount && (startIndex + i) < MAX_FRAME_BUFFERS; i++) {
-            vh->buffers[startIndex + i] = (uint64_t)bufferArray[i];
-        }
-        if (startIndex + bufferCount > vh->bufferCount) {
-            vh->bufferCount = startIndex + bufferCount;
-        }
+    if (!err) {
+        if (attr->reserved[0] || attr->reserved[1]) err = ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
+        else if (attr->aspect != 0) err = ORBIS_VIDEO_OUT_ERROR_INVALID_ASPECT_RATIO;
+        else if (attr->width > attr->pixelPitch) err = ORBIS_VIDEO_OUT_ERROR_INVALID_PITCH;
+        else if (attr->tmode < 0 || attr->tmode > 1) err = ORBIS_VIDEO_OUT_ERROR_INVALID_TILING_MODE;
     }
-
+    if (err) {
+        pthread_mutex_unlock(&vh->mutex);
+        fprintf(stderr, "[videoout] RegisterBuffers(handle=%d, start=%d, count=%d) failed: 0x%08x\n", handle, startIndex,
+                bufferCount, err);
+        return (int32_t)err;
+    }
+    for (int i = 0; i < bufferCount; i++) {
+        vh->buffers[startIndex + i] = (uint64_t)bufferArray[i];
+        vh->bufferSet[startIndex + i] = (int8_t)set;
+    }
+    vh->sets[set].count = bufferCount;
+    vh->sets[set].attr = *attr;
+    vh->attr = *attr;
     pthread_mutex_unlock(&vh->mutex);
-    return 0;
+    fprintf(stderr, "[videoout] RegisterBuffers(handle=%d, start=%d, count=%d): set %d, %ux%u pitch %u, fmt 0x%x, tmode %d\n",
+            handle, startIndex, bufferCount, set, attr->width, attr->height, attr->pixelPitch, (unsigned)attr->format,
+            attr->tmode);
+    return set;
 }
 
 int32_t sceVideoOutSetFlipRate(int32_t handle, int32_t fliprate) {
@@ -330,21 +363,26 @@ int32_t sceVideoOutSubmitFlip(GuestContext *ctx, int32_t handle, int32_t bufferI
     VideoOutHandle *vh = find_video_handle_locked(handle);
     if (!vh) {
         pthread_mutex_unlock(&g_video_table_mutex);
-        return -EINVAL;
+        return (int32_t)ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
     pthread_mutex_lock(&vh->mutex);
     // bufferIndex -1 is a flip without a display buffer (blank frame): it only completes the flip.
-    if (bufferIndex != -1 && (bufferIndex < 0 || bufferIndex >= vh->bufferCount)) {
+    if (bufferIndex != -1 && (bufferIndex < 0 || bufferIndex >= MAX_FRAME_BUFFERS || vh->bufferSet[bufferIndex] < 0)) {
         pthread_mutex_unlock(&vh->mutex);
         pthread_mutex_unlock(&g_video_table_mutex);
-        return -EINVAL;
+        return (int32_t)ORBIS_VIDEO_OUT_ERROR_INVALID_INDEX;
     }
     const uint64_t guest_buf_vaddr = bufferIndex >= 0 ? vh->buffers[bufferIndex] : 0;
-    const OrbisVideoOutBufferAttribute attr = vh->attr;
+    const VideoOutBufferSet *bset = bufferIndex >= 0 ? &vh->sets[vh->bufferSet[bufferIndex]] : NULL;
+    const OrbisVideoOutBufferAttribute attr = bset ? bset->attr : vh->attr;
+    // the frames the display may hold follow the flipped buffer's own set
+    const int set_buffers = bset ? bset->count : 0;
     vh->flipStatus.numFlipPending++;
     vh->flipStatus.numGpuFlipPending++;
     pthread_mutex_unlock(&vh->mutex);
     pthread_mutex_unlock(&g_video_table_mutex);
+
+    if (set_buffers > 0) ps4_metal_screen_set_hold_depth(set_buffers);
 
     PendingFlip *pf = (PendingFlip *)malloc(sizeof(PendingFlip));
     if (pf) {
@@ -536,8 +574,26 @@ int32_t sceVideoOutIsFlipPending(int32_t handle) {
 }
 
 int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t setIndex) {
-    (void)handle;
-    (void)setIndex;
+    pthread_mutex_lock(&g_video_table_mutex);
+    VideoOutHandle *vh = find_video_handle_locked(handle);
+    if (!vh) {
+        pthread_mutex_unlock(&g_video_table_mutex);
+        return (int32_t)ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
+    }
+    pthread_mutex_lock(&vh->mutex);
+    pthread_mutex_unlock(&g_video_table_mutex);
+    if (setIndex < 0 || setIndex >= PS4_VIDEO_OUT_MAX_BUFFER_SETS || vh->sets[setIndex].count == 0) {
+        pthread_mutex_unlock(&vh->mutex);
+        return (int32_t)ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
+    }
+    for (int i = 0; i < MAX_FRAME_BUFFERS; i++)
+        if (vh->bufferSet[i] == setIndex) {
+            vh->bufferSet[i] = -1;
+            vh->buffers[i] = 0;
+        }
+    vh->sets[setIndex].count = 0;
+    pthread_mutex_unlock(&vh->mutex);
+    fprintf(stderr, "[videoout] UnregisterBuffers(handle=%d, set=%d)\n", handle, setIndex);
     return 0;
 }
 
@@ -881,9 +937,6 @@ typedef struct {
     float gamma[3];
     uint32_t reserved[3];
 } OrbisVideoOutColorSettings;
-
-#define ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE 0x80290001u
-#define ORBIS_VIDEO_OUT_ERROR_INVALID_ADDRESS 0x80290002u
 
 void shim_sceVideoOutColorSettingsSetGamma_(GuestContext *ctx) {
     const uint64_t guest = ctx->rdi;

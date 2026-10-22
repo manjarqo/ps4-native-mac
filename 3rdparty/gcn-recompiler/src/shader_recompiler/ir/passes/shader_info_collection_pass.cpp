@@ -143,11 +143,6 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::ShuffleXor:
         info.uses_group_shuffle = true;
         break;
-    case IR::Opcode::WriteLane:
-        // PS4Recomp: the emitter writes 0 for it (see EmitWriteLane); counted, and logged once per
-        // shader (CollectShaderInfoPass, and by the renderer also for shaders from the cache)
-        info.zeroed_write_lanes++;
-        [[fallthrough]];
     case IR::Opcode::ReadLane:
     case IR::Opcode::ReadFirstLane:
         info.uses_group_ballot = true;
@@ -221,10 +216,23 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
             Visit(info, inst);
         }
     }
-    if (info.zeroed_write_lanes) {
+    if (info.unpredicated_wave_regions) {
         LOG_WARNING(Render_Recompiler,
-                    "shader {:#x}: {} v_writelane result(s) emitted as 0 (known gap, EmitWriteLane)",
-                    info.pgm_hash, info.zeroed_write_lanes);
+                    "shader {:#x}: {} wave64 EXEC-divergent if(s)/loop(s) left per subgroup (known "
+                    "gap, predicate_wave64_pass.cpp)",
+                    info.pgm_hash, info.unpredicated_wave_regions);
+    }
+    if (info.per_subgroup_lane_ops) {
+        LOG_WARNING(Render_Recompiler,
+                    "shader {:#x}: {} wave64 cross-lane read(s) left per subgroup in non-uniform "
+                    "control flow (known gap)",
+                    info.pgm_hash, info.per_subgroup_lane_ops);
+    }
+    if (info.per_lane_ends) {
+        LOG_WARNING(Render_Recompiler,
+                    "shader {:#x}: {} wave64 end(s) in EXEC-divergent code end only the lanes that "
+                    "reach them, not the whole wave (known gap)",
+                    info.pgm_hash, info.per_lane_ends);
     }
 
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {

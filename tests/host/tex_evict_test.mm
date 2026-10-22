@@ -466,6 +466,91 @@ static void test_superseded(id<MTLDevice> dev) {
     munmap(base, size);
 }
 
+// Buffer writes over GPU-owned surfaces (TextureCache::NoteBufferWrite): a surface is marked guest
+// newer only when exactly known writes since its last GPU write cover all of it; a GPU write in
+// between starts the cover again; a mark is taken once; an evicted or cleared marked surface does
+// not leave the marked count behind (the renderer's fast path checks it before every lookup).
+static void test_guest_newer(id<MTLDevice> dev) {
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    const uint64_t size = 256 * MiB; // several 64 MiB hint granules
+    uint8_t* base = (uint8_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    TextureCache tc(dev, q, base, size);
+    auto at = [&](uint64_t seq) { tc.SetUse(seq, seq * 1000 * MS); };
+    const uint64_t K16 = 64 * 64 * 4, H = K16 / 2;
+    @autoreleasepool {
+        const uint64_t A = 0x100000, B = 0x200000, C = 0x300000;
+        at(1);
+        id<MTLTexture> ta = tc.GetColorTarget(Rt(A), false);
+        id<MTLTexture> tb = tc.GetColorTarget(Rt(B), false);
+        tc.GetColorTarget(Rt(C), false);
+        // A: two halves, the second starting before the first ends, cover it together
+        tc.NoteBufferWrite(A, H + 16, 1);
+        check(tc.GuestNewerCount() == 0 && tc.GetGuestNewerStats().partial == 1, "half of A: not marked, partial");
+        tc.NoteBufferWrite(A + H, H, 2);
+        check(tc.GuestNewerCount() == 1 && tc.GetGuestNewerStats().marked == 1, "both halves of A: marked");
+        // B: a draw between the halves: the first half no longer describes its contents
+        tc.NoteBufferWrite(B, H, 3);
+        tc.GetColorTarget(Rt(B), false);
+        tc.NoteBufferWrite(B + H, H, 4);
+        check(tc.GuestNewerCount() == 1, "B drawn between its halves: not marked");
+        // one write covering B and C marks both
+        tc.NoteBufferWrite(B - 0x1000, C + K16 - B + 0x2000, 5);
+        check(tc.GuestNewerCount() == 3, "one write over B and C: both marked");
+        // the refresh is handed out with the surface's own layout; the mark goes only once the copy
+        // was encoded, a copy that could not be encoded leaves it marked
+        TextureCache::GpuUpload up;
+        check(tc.TakeGuestNewer(A, ta, &up) && up.tex == ta && up.width == 64 && up.height == 64 &&
+                  up.layout.total_size == K16,
+              "A's refresh handed out");
+        tc.FinishGuestNewer(A, ta, false, false);
+        check(tc.GuestNewerCount() == 3 && tc.GetGuestNewerStats().failed == 1,
+              "A's copy not encoded before a read-only use: still marked");
+        check(tc.TakeGuestNewer(A, ta, &up) && up.tex == ta, "A's refresh handed out again");
+        tc.FinishGuestNewer(A, ta, true, false);
+        check(!tc.TakeGuestNewer(A, ta, &up) && up.tex == nil && tc.GuestNewerCount() == 2 &&
+                  tc.GetGuestNewerStats().refreshed == 1,
+              "A's mark gone once its copy was encoded");
+        check(!tc.TakeGuestNewer(B, ta, &up), "B's mark not taken for another texture");
+        check(tc.TakeGuestNewer(B, nil, &up) && up.tex == tb, "B's mark taken for any texture at B");
+        // B's copy cannot be encoded before a GPU write of B (a render-target bind): the mark goes, so
+        // no later refresh attempt copies the older guest bytes over what the GPU wrote
+        tc.FinishGuestNewer(B, tb, false, true);
+        check(tc.GuestNewerCount() == 1 && tc.GetGuestNewerStats().failed == 2 &&
+                  tc.GetGuestNewerStats().refreshed == 1,
+              "B's copy not encoded before a GPU write: unmarked, counted as failed");
+        check(!tc.TakeGuestNewer(B, nil, &up) && up.tex == nil, "B: a later refresh attempt has nothing to copy");
+        // a write nowhere near a GPU-owned surface (another 64 MiB granule) is dropped before the lock
+        const uint64_t partial = tc.GetGuestNewerStats().partial;
+        tc.NoteBufferWrite(0x8000000, K16, 7);
+        check(tc.GetGuestNewerStats().partial == partial && tc.GuestNewerCount() == 1, "a write far from every surface");
+        // a surface created in a granule no surface was in before: its creation sets the granule's
+        // hint, so a write over it is not dropped before the lock
+        const uint64_t D = 0xc100000;
+        id<MTLTexture> td = tc.GetColorTarget(Rt(D), false);
+        tc.NoteBufferWrite(D, K16, 8);
+        check(td != nil && tc.GuestNewerCount() == 2 && tc.TakeGuestNewer(D, td, &up) && up.tex == td,
+              "a surface in a fresh granule: marked");
+        tc.FinishGuestNewer(D, td, true, false);
+        // C stays marked and is superseded (a newer surface at C cleared after C's last use): evicting
+        // it drops its mark
+        at(2);
+        id<MTLTexture> c2 = tc.GetColorTarget(Rt(C, 64, MTLPixelFormatBGRA8Unorm), false);
+        at(3);
+        check(tc.NoteExactWrite(C, c2, C, C + K16), "the newer surface at C cleared");
+        check(tc.GuestNewerCount() == 1, "C still marked before the eviction");
+        check(tc.EvictSuperseded(1000 * MS, 10000 * MS, 3).count == 1, "C evicted");
+        check(tc.GuestNewerCount() == 0, "evicted marked surface: marked count back to 0");
+        // Clear drops every mark
+        tc.NoteBufferWrite(A, K16, 6);
+        check(tc.GuestNewerCount() == 1, "A marked again");
+        std::vector<id<MTLTexture>> retired;
+        tc.TakeRetired(&retired);
+        tc.Clear();
+        check(tc.GuestNewerCount() == 0, "Clear: marked count 0");
+    }
+    munmap(base, size);
+}
+
 int main() {
     test_policy_init();
     test_select();
@@ -477,6 +562,7 @@ int main() {
         }
         test_cache(dev);
         test_superseded(dev);
+        test_guest_newer(dev);
     }
     printf("tex_evict_test: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;

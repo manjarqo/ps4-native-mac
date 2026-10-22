@@ -38,6 +38,9 @@ static void summarize_test(void) {
     CHECK(s.over50 == 50); // 51..100
     CHECK(s.over100 == 0);
     CHECK(s.under6 == 5); // 1..5
+    // buckets <=10, <=14, <=20, <=27, <=33.4, <=50, <=100, >100
+    const int want[PS4_PRESENT_HIST_BUCKETS] = {10, 4, 6, 7, 6, 17, 50, 0};
+    for (int b = 0; b < PS4_PRESENT_HIST_BUCKETS; b++) CHECK(s.hist[b] == want[b]);
     float one = 8.3f;
     ps4_present_summarize(&one, 1, &s);
     CHECK(s.frames == 1 && s.p50 == one && s.p99 == one && s.max == one);
@@ -84,6 +87,11 @@ static void report_test(void) {
     ps4_present_stats_on_acquire(&st, 20.0);
     ps4_present_stats_on_backpressure(&st, 3.0);
     ps4_present_stats_on_superseded(&st);
+    ps4_present_stats_on_held(&st);
+    ps4_present_stats_on_held(&st);
+    ps4_present_stats_on_held(&st);
+    ps4_present_stats_on_held_dropped(&st);
+    ps4_present_stats_on_held_dropped(&st);
     ps4_present_stats_on_submit(&st, 1.000);
     ps4_present_stats_on_submit(&st, 1.001); // 1 ms after the previous: a burst
     ps4_present_stats_on_submit(&st, 1.010);
@@ -97,6 +105,8 @@ static void report_test(void) {
     CHECK(field(line, ">50ms ") == 0); // 50.0 is not over 50
     CHECK(field(line, "dropped ") == 1);
     CHECK(field(line, "superseded ") == 1);
+    CHECK(field(line, "held ") == 3);         // frames held for a slot
+    CHECK(field(line, "held-dropped ") == 2); // counted apart from mailbox replacements
     NEAR(field(line, "nextDrawable avg "), 25.5 / 3, 0.01);
     NEAR(field(line, "nextDrawable avg 8.50 max "), 20.0, 0.01);
     CHECK(field(line, "(>4ms ") == 2);
@@ -104,13 +114,18 @@ static void report_test(void) {
     NEAR(field(line, "backpressure avg "), 3.0, 0.01);
     CHECK(field(line, "submits ") == 3);
     CHECK(field(line, "bursts <2ms ") == 1);
+    CHECK(field(line, "hist <=10 ") == 597); // the 120 Hz frames
+    CHECK(field(line, " <=33.4 ") == 0);
+    CHECK(field(line, " <=50 ") == 1); // the hitch
+    CHECK(field(line, " >100 ") == 0);
     // the next window starts empty but keeps the chain: its first frame has an interval
     CHECK(!ps4_present_stats_report(&st, line, sizeof(line)));
     CHECK(st.n_window == 0 && st.n_interval == 0 && st.dropped == 0 && st.acquire_n == 0 && st.submits == 0);
     ps4_present_stats_on_presented(&st, t + 1.0 / 60.0);
     CHECK(st.n_interval == 1);
     NEAR(st.interval_ms[0], 16.667, 0.01);
-    CHECK(st.total_presented == 600 && st.total_dropped == 1 && st.total_superseded == 1);
+    CHECK(st.total_presented == 600 && st.total_dropped == 1 && st.total_superseded == 1 &&
+          st.total_held == 3 && st.total_held_dropped == 2);
 }
 
 // Presented handlers run on Metal's threads: concurrent updates must not be lost.

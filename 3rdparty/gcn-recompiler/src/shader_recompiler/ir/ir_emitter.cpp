@@ -86,6 +86,27 @@ U1 IREmitter::ConditionRef(const U1& value) {
     return Inst<U1>(Opcode::ConditionRef, value);
 }
 
+void IREmitter::PredicatedBegin(const U1& cond) {
+    Inst(Opcode::PredicatedBegin, cond);
+}
+
+void IREmitter::PredicatedEnd() {
+    Inst(Opcode::PredicatedEnd);
+}
+
+Value IREmitter::PredicatedEnd(const Value& value) {
+    switch (value.Type()) {
+    case Type::U32:
+        return Inst(Opcode::PredicatedEndU32, value);
+    case Type::U64:
+        return Inst(Opcode::PredicatedEndU64, value);
+    case Type::F32:
+        return Inst(Opcode::PredicatedEndF32, value);
+    default:
+        UNREACHABLE_MSG("Invalid type {}", value.Type());
+    }
+}
+
 void IREmitter::Prologue() {
     Inst(Opcode::Prologue);
 }
@@ -108,6 +129,10 @@ void IREmitter::Barrier() {
 
 void IREmitter::SubgroupBarrier() {
     Inst(Opcode::SubgroupBarrier);
+}
+
+void IREmitter::LdsBarrier() {
+    Inst(Opcode::LdsBarrier);
 }
 
 void IREmitter::WorkgroupMemoryBarrier() {
@@ -699,6 +724,14 @@ U1 IREmitter::InverseBallot(const U64& mask) {
 
 U1 IREmitter::GroupAny(const U1& bit) {
     return Inst<U1>(Opcode::GroupAny, bit);
+}
+
+U1 IREmitter::WorkgroupAny(const U1& bit) {
+    return Inst<U1>(Opcode::WorkgroupAny, bit);
+}
+
+U1 IREmitter::WaveAny(const U1& bit) {
+    return Inst<U1>(Opcode::WaveAny, bit);
 }
 
 F32F64 IREmitter::FPAdd(const F32F64& a, const F32F64& b) {

@@ -41,7 +41,13 @@ bool Inst::MayHaveSideEffects() const {
     case Opcode::WorkgroupMemoryBarrier:
     case Opcode::DeviceMemoryBarrier:
     case Opcode::SubgroupBarrier:
+    case Opcode::LdsBarrier:
     case Opcode::ConditionRef:
+    case Opcode::PredicatedBegin:
+    case Opcode::PredicatedEnd:
+    case Opcode::PredicatedEndU32:
+    case Opcode::PredicatedEndU64:
+    case Opcode::PredicatedEndF32:
     case Opcode::Prologue:
     case Opcode::Epilogue:
     case Opcode::Discard:

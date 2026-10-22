@@ -15,7 +15,7 @@ GR="$R/3rdparty/gcn-recompiler"
 mkdir -p "$OUT/obj"
 INC=(-I "$R/tools/gnm_replay" -I "$R/tests/host" -I "$GR/include")
 while IFS= read -r d; do INC+=(-I "$d"); done < <(find "$R/pkg/runtime" -type d)
-MM=(-x objective-c++ -std=c++20 -fobjc-arc -O1 -g -Wall -Wno-deprecated-declarations -Wno-unused-function)
+MM=(-x objective-c++ -std=c++20 -fobjc-arc -O1 -g -Wall -Wno-deprecated-declarations -Wno-unused-function "-DPS4_REPO_ROOT=\"$R\"")
 for f in "$G/ps4_gnm_draw.mm" "$G/ps4_gnm_resources.mm" "$G/ps4_gnm_shader_cache.mm" "$G/ps4_gnm_library_store.mm" \
          "$G/ps4_gnm_pipeline_archive.mm" "$G/ps4_gnm_kernel_compile.mm" "$R/tools/gnm_replay/gnm_replay_lib.mm"; do
   clang++ "${MM[@]}" "${INC[@]}" -c "$f" -o "$OUT/obj/$(basename "$f").o"

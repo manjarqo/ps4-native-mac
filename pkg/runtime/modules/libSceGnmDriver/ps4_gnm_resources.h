@@ -394,6 +394,9 @@ struct ImageDesc {
     uint32_t NumViewLayers(bool is_array) const;
 };
 bool DecodeImage(const uint32_t* dwords, uint32_t num_dwords, ImageDesc* out);
+// T#s DecodeImage found valid but no Metal texture can be made of (decoded as invalid: a null
+// binding). The unused entries of T# tables decode to such T#s.
+uint64_t UncreatableImageCount();
 
 // V# (buffer resource, 4 dwords)
 struct BufferDesc {
@@ -804,8 +807,42 @@ public:
         uint64_t addr, size, epoch;
     };
     void InvalidateWrites(std::vector<WriteRange>& writes);
+
+    // ---- Buffer writes over GPU-owned color surfaces ----
+    // A GPU-owned surface's contents exist only in its texture: guest memory under it is stale.
+    // When GPU work stores to its memory as a buffer (a written V# with an exact range, or a CP DMA),
+    // on the PS4 those bytes are the surface's new contents.
+    // GPU work at write epoch `epoch` writes exactly guest [addr, addr + size). A color surface whose
+    // whole range [address, address + size) such writes cover since its last GPU write is marked
+    // "guest newer" (its texture is refreshed from guest memory before its next GPU use). Partial
+    // cover accumulates and never marks: the uncovered bytes may exist only in the texture (logged
+    // once per surface). Walks only the GPU-owned entries overlapping the range; a range no GPU-owned
+    // surface comes near (64 MiB granules, checked without the lock) returns at once.
+    // Call it only for work that has really been encoded (or, for CPU-side DMA, done).
+    void NoteBufferWrite(uint64_t addr, uint64_t size, uint64_t epoch);
+    // The marked color surface at `address` whose texture is `tex` (or a view of it; nil: any marked
+    // color surface at the address): fills `up` to copy guest memory into its texture (its own
+    // layout). The mark stays until FinishGuestNewer. False when nothing is marked there (up->tex nil).
+    bool TakeGuestNewer(uint64_t address, id<MTLTexture> tex, GpuUpload* up);
+    // The copy of TakeGuestNewer's `up` was encoded (copied: unmark the surface, make its alias copies
+    // stale, credit the copy as an exactly known write of its whole range) or could not be (counted
+    // as a failed refresh). A failed refresh before a read-only use leaves the surface marked, so
+    // the next use tries again; before a GPU write (write_site: render-target or storage bind, fast
+    // clear, resolve or copy destination) it drops the mark: the write makes the texture the newer
+    // copy, and a later refresh would overwrite it with the older guest bytes.
+    void FinishGuestNewer(uint64_t address, id<MTLTexture> tex, bool copied, bool write_site);
+    // Marked surfaces right now (cheap: checked before any lookup).
+    size_t GuestNewerCount() const { return guest_newer_n_.load(std::memory_order_relaxed); }
+    // Totals since start: surfaces marked, refreshes handed out, surfaces partly covered (logged).
+    struct GuestNewerStats {
+        uint64_t marked = 0, refreshed = 0, partial = 0, failed = 0;
+    };
+    GuestNewerStats GetGuestNewerStats() const;
+
     // Drop everything (e.g. on device reset).
     void Clear();
+    // Tests: the cache's lock, to hold it from outside (a thread that must not need it goes on).
+    std::mutex& TestMutex() { return mutex_; }
 
     // Copy a GPU-owned render target back into guest memory (retiled), e.g. before the CPU or a
     // non-cached consumer reads it. Waits for the queue to drain.
@@ -925,6 +962,14 @@ private:
     static void EntryId(const Entry& e, ps4gnm_capture::GpuTextureId* out);
     static bool SameIdentity(const Entry& e, const ps4gnm_capture::GpuTextureId& gid);
     void ExactWriteLocked(const Entry* e, uint64_t lo, uint64_t hi, uint64_t seq = 0) const;
+    // A GPU write to the surface (render-target or storage bind, copy, clear): buffer writes
+    // recorded before it no longer describe its contents.
+    void GpuWroteLocked(const Entry* e) const;
+    // Drops the entry's guest-newer mark (before it is deleted).
+    void UnmarkLocked(const Entry* e);
+    // GPU-owned entries overlapping [addr, addr + size), from the sorted range index.
+    void GpuEntriesOverlappingLocked(uint64_t addr, uint64_t size, std::vector<Entry*>* out) const;
+    void RebuildGpuIndexLocked() const;
     void RetireLocked(id<MTLTexture> t);
     std::vector<id<MTLTexture>> retired_;
     std::atomic<bool> retired_pending_{false};
@@ -941,6 +986,17 @@ private:
     // version. (The entry count is no such signal: sampled entries are evicted.)
     mutable std::vector<std::pair<uint64_t, uint64_t>> gpu_ranges_;
     mutable std::vector<uint64_t> gpu_max_end_;
+    mutable std::vector<Entry*> gpu_entries_; // the entry of each gpu_ranges_ element
+    std::vector<Entry*> overlap_scratch_;     // NoteBufferWrite, kept to avoid allocations
+    std::atomic<size_t> guest_newer_n_{0};    // entries with a guest-newer mark
+    std::atomic<uint64_t> guest_newer_marked_{0}, guest_newer_refreshed_{0}, guest_newer_partial_{0},
+        guest_newer_failed_{0};
+    // GPU-owned entries by 64 MiB guest granule (a bit per granule below 256 GiB; set when an entry is
+    // added, recomputed with the range index): NoteBufferWrite's check without the lock
+    static constexpr uint32_t kHintShift = 26, kHintWords = 64;
+    mutable std::atomic<uint64_t> gpu_hint_[kHintWords] = {};
+    void HintAddLocked(uint64_t addr, uint64_t size) const;
+    bool HintNear(uint64_t addr, uint64_t size) const;
     uint64_t gpu_version_ = 0;
     mutable uint64_t gpu_index_version_ = ~0ull;
     std::atomic<uint64_t> sampled_count_{0}, sampled_bytes_{0}, gpu_count_{0}, gpu_bytes_{0};

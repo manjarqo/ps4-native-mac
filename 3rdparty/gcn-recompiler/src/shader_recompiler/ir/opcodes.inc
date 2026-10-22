@@ -11,6 +11,14 @@ OPCODE(Prologue,                                            Void,               
 OPCODE(Epilogue,                                            Void,                                                                                           )
 OPCODE(Discard,                                             Void,                                                                                           )
 OPCODE(DiscardCond,                                         Void,           U1,                                                                             )
+// PS4Recomp (predicate_wave64_pass.cpp): the instructions between PredicatedBegin and the next
+// PredicatedEnd* of the block run only where the condition is true; a PredicatedEnd* with a value
+// is that value there and 0 elsewhere
+OPCODE(PredicatedBegin,                                     Void,           U1,                                                                             )
+OPCODE(PredicatedEnd,                                       Void,                                                                                           )
+OPCODE(PredicatedEndU32,                                    U32,            U32,                                                                            )
+OPCODE(PredicatedEndU64,                                    U64,            U64,                                                                            )
+OPCODE(PredicatedEndF32,                                    F32,            F32,                                                                            )
 OPCODE(DebugPrint,                                          Void,           StringLiteral,  Opaque,          Opaque,        Opaque,         Opaque,         )
 
 // Constant memory operations
@@ -22,6 +30,7 @@ OPCODE(Barrier,                                             Void,               
 OPCODE(WorkgroupMemoryBarrier,                              Void,                                                                                           )
 OPCODE(DeviceMemoryBarrier,                                 Void,                                                                                           )
 OPCODE(SubgroupBarrier,                                     Void,                                                                                           )
+OPCODE(LdsBarrier,                                          Void,                                                                                           )
 
 // Geometry shader specific
 OPCODE(EmitVertex,                                          Void,                                                                                           )
@@ -477,6 +486,12 @@ OPCODE(InverseBallot,                                       U1,             U64,
 OPCODE(DataAppend,                                          U32,            U32,            U1                                                              )
 OPCODE(DataConsume,                                         U32,            U32,            U1                                                              )
 OPCODE(GroupAny,                                            U1,             U1,                                                                             )
+// PS4Recomp: true in every invocation when the value is true in any invocation of the workgroup;
+// reached by every invocation (lowered in LowerWaveOpsPass)
+OPCODE(WorkgroupAny,                                        U1,             U1,                                                                             )
+// PS4Recomp: true in every invocation of a wave when the value is true in any invocation of that
+// wave (both subgroups of a wave64); reached by every invocation (lowered in LowerWaveOpsPass)
+OPCODE(WaveAny,                                             U1,             U1,                                                                             )
 
 // Time operations
 OPCODE(Memtime,                                             U64,                                                                                            )

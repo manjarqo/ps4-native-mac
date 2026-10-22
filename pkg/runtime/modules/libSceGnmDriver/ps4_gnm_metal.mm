@@ -476,7 +476,7 @@ static void HandleDmaData(GuestContext *ctx, const uint32_t *p, uint32_t payload
     if (src_sel == 2) {
         uint32_t v = p[1];
         for (uint32_t i = 0; i + 4 <= n; i += 4) memcpy(d + i, &v, 4);
-        if (!dst_gds) ps4draw::NotifyGuestWrite(dst, n, true, v);
+        if (!dst_gds) ps4draw::NotifyGuestWrite(dst, n, true, v, true);
         return;
     }
     const uint8_t *sp;
@@ -488,7 +488,7 @@ static void HandleDmaData(GuestContext *ctx, const uint32_t *p, uint32_t payload
         sp = ctx->mem_base + src;
     }
     memmove(d, sp, n);
-    if (!dst_gds) ps4draw::NotifyGuestWrite(dst, n, false, 0);
+    if (!dst_gds) ps4draw::NotifyGuestWrite(dst, n, false, 0, true);
 }
 
 // Full Liverpool register file, indexed by dword register offset (config
@@ -835,24 +835,24 @@ static bool ProcessGfxPackets(GuestContext *ctx, GfxStream &st) {
                 break;
             }
             case PM4_OP_EVENT_WRITE_EOP:
-                if (!g_min_barriers) ps4draw::ComputeBarrier();
+                if (!g_min_barriers) ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
                 HandleEventWriteEop(ctx, payload, payload_dw, PS4_GNM_EVENT_GFX_EOP);
                 break;
             case PM4_OP_RELEASE_MEM:
-                if (!g_min_barriers) ps4draw::ComputeBarrier();
+                if (!g_min_barriers) ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
                 HandleReleaseMem(ctx, payload, payload_dw, PS4_GNM_EVENT_GFX_EOP);
                 break;
             case PM4_OP_EVENT_WRITE_EOS:
-                if (!g_min_barriers) ps4draw::ComputeBarrier();
+                if (!g_min_barriers) ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
                 HandleEventWriteEos(ctx, payload, payload_dw);
                 break;
             case PM4_OP_ACQUIRE_MEM:
-                ps4draw::ComputeBarrier();
+                ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
                 break;
             case PM4_OP_EVENT_WRITE:
                 // Cache flushes / VS/PS/CS partial flushes: Metal tracks hazards between encoders;
                 // concurrent dispatches get a barrier.
-                ps4draw::ComputeBarrier();
+                ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
                 // Occlusion queries (ZPASS_DONE / PIXEL_PIPE_STAT_DUMP): report fake, growing
                 // pixel counts like shadPS4 (liverpool.cpp EventWrite) so queries never read 0.
                 if (payload_dw >= 3 && ((payload[0] >> 8) & 0xF) == 1 && (payload[0] & 0x3F) == 57) {
@@ -869,18 +869,18 @@ static bool ProcessGfxPackets(GuestContext *ctx, GfxStream &st) {
                 }
                 break;
             case PM4_OP_WAIT_REG_MEM:
-                ps4draw::ComputeBarrier();
+                ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
                 if (!HandleWaitRegMem(ctx, payload, payload_dw, true)) {
                     f.pc = pc; // re-evaluate this packet when the stream resumes
                     return false;
                 }
                 break;
             case PM4_OP_WRITE_DATA:
-                if (!g_min_barriers) ps4draw::ComputeBarrier();
+                if (!g_min_barriers) ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
                 HandleWriteData(ctx, payload, payload_dw);
                 break;
             case PM4_OP_DMA_DATA:
-                ps4draw::ComputeBarrier();
+                ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
                 HandleDmaData(ctx, payload, payload_dw);
                 break;
             case PM4_OP_INDIRECT_BUFFER: {
@@ -996,13 +996,13 @@ static bool ProcessGfxPackets(GuestContext *ctx, GfxStream &st) {
             case PM4_OP_DISPATCH_DIRECT:
                 DumpShadersForDraw(ctx, "DISPATCH_DIRECT", true);
                 if (payload_dw >= 4 && (payload[3] & 1) && (ps4draw::Enabled() || ps4draw::Init(ctx)))
-                    ps4draw::Dispatch(ctx, g_liverpool_regs, payload[0], payload[1], payload[2], 0, "gfx");
+                    ps4draw::Dispatch(ctx, g_liverpool_regs, payload[0], payload[1], payload[2], 0, "gfx", ps4draw::kQueueGfx);
                 break;
             case PM4_OP_DISPATCH_INDIRECT:
                 DumpShadersForDraw(ctx, "DISPATCH_INDIRECT", true);
                 if (payload_dw >= 2 && (payload[1] & 1) && g_draw.indirect_base &&
                     (ps4draw::Enabled() || ps4draw::Init(ctx)))
-                    ps4draw::Dispatch(ctx, g_liverpool_regs, 0, 0, 0, g_draw.indirect_base + payload[0], "gfx");
+                    ps4draw::Dispatch(ctx, g_liverpool_regs, 0, 0, 0, g_draw.indirect_base + payload[0], "gfx", ps4draw::kQueueGfx);
                 break;
             default:
                 break;
@@ -1030,7 +1030,7 @@ static void ComputeDispatch(GuestContext *ctx, uint32_t slot, uint32_t x, uint32
     memcpy(saved, &g_liverpool_regs[CS_REG_BLOCK_BASE], sizeof(saved));
     memcpy(&g_liverpool_regs[CS_REG_BLOCK_BASE], g_cs_regs[slot], sizeof(saved));
     DumpShadersForDraw(ctx, name, true);
-    ps4draw::Dispatch(ctx, g_liverpool_regs, x, y, z, indirect, name);
+    ps4draw::Dispatch(ctx, g_liverpool_regs, x, y, z, indirect, name, ps4draw::kQueueCompute); // the asc rings
     memcpy(&g_liverpool_regs[CS_REG_BLOCK_BASE], saved, sizeof(saved));
 }
 
@@ -1078,27 +1078,27 @@ static bool ProcessComputePackets(ComputeSubmit &sub, bool skip_wait) {
         pk.step = 1 + payload_dw;
         switch (opcode) {
         case PM4_OP_RELEASE_MEM:
-            if (!g_min_barriers) ps4draw::ComputeBarrier();
+            if (!g_min_barriers) ps4draw::ComputeBarrier(ps4draw::kQueueCompute);
             HandleReleaseMem(ctx, payload, payload_dw, pipe_id);
             break;
         case PM4_OP_EVENT_WRITE_EOP: // not expected on MEC, but harmless
-            if (!g_min_barriers) ps4draw::ComputeBarrier();
+            if (!g_min_barriers) ps4draw::ComputeBarrier(ps4draw::kQueueCompute);
             HandleEventWriteEop(ctx, payload, payload_dw, pipe_id);
             break;
         case PM4_OP_EVENT_WRITE_EOS:
-            if (!g_min_barriers) ps4draw::ComputeBarrier();
+            if (!g_min_barriers) ps4draw::ComputeBarrier(ps4draw::kQueueCompute);
             HandleEventWriteEos(ctx, payload, payload_dw);
             break;
         case PM4_OP_EVENT_WRITE:
         case PM4_OP_ACQUIRE_MEM:
-            ps4draw::ComputeBarrier(); // CS partial flush / cache flushes
+            ps4draw::ComputeBarrier(ps4draw::kQueueCompute); // CS partial flush / cache flushes
             break;
         case PM4_OP_WRITE_DATA:
-            if (!g_min_barriers) ps4draw::ComputeBarrier();
+            if (!g_min_barriers) ps4draw::ComputeBarrier(ps4draw::kQueueCompute);
             HandleWriteData(ctx, payload, payload_dw);
             break;
         case PM4_OP_WAIT_REG_MEM:
-            ps4draw::ComputeBarrier();
+            ps4draw::ComputeBarrier(ps4draw::kQueueCompute);
             if (skip_wait) {
                 skip_wait = false; // timed out: continue as before suspension existed
             } else if (!HandleWaitRegMem(ctx, payload, payload_dw, true)) {
@@ -1107,7 +1107,7 @@ static bool ProcessComputePackets(ComputeSubmit &sub, bool skip_wait) {
             }
             break;
         case PM4_OP_DMA_DATA:
-            ps4draw::ComputeBarrier();
+            ps4draw::ComputeBarrier(ps4draw::kQueueCompute);
             HandleDmaData(ctx, payload, payload_dw);
             break;
         case PM4_OP_SET_SH_REG: {
@@ -1322,8 +1322,16 @@ static void StartGfxWatchdog() {
 
 } // namespace
 
+// PS4_TEST_HOOKS=1 enables the host tests' hooks (ps4_gnm_metal_debug_stall_gpu). Read once, at init.
+static std::atomic<bool> g_test_hooks{false};
+
 int ps4_gnm_metal_init(GuestContext *ctx) {
     std::scoped_lock lock(g_state.mutex);
+    static std::once_flag hooks_once;
+    std::call_once(hooks_once, [] {
+        const char *e = getenv("PS4_TEST_HOOKS");
+        g_test_hooks.store(e && strcmp(e, "1") == 0, std::memory_order_relaxed);
+    });
     return ps4draw::Init(ctx) ? 0 : -1;
 }
 
@@ -1428,6 +1436,16 @@ int ps4_gnm_metal_present(GuestContext *ctx, uint64_t addr, uint32_t width, uint
         return 1;
     }
     return ps4draw::Present(ctx, addr, width, height, pitch, tiling_mode, pixel_format, std::move(fn)) ? 1 : 0;
+}
+
+int ps4_gnm_metal_debug_stall_gpu(void) {
+    if (!g_test_hooks.load(std::memory_order_relaxed)) {
+        fprintf(stderr, "[gnm-metal] debug GPU stall refused: the process did not start with PS4_TEST_HOOKS=1\n");
+        return -1;
+    }
+    std::scoped_lock lock(g_state.mutex);
+    ps4draw::DebugStallGpu();
+    return 0;
 }
 
 void ps4_gnm_metal_wait_gpu_idle(void) {

@@ -29,10 +29,31 @@ int32_t sceKernelIsNeoMode(void) { return g_replay_neo; }
 
 // ps4_metal_screen.m: no window in a replay
 void *ps4_metal_screen_get_device(void) { return NULL; }
-void *ps4_metal_screen_acquire_frame(int width, int height) {
+void *ps4_metal_screen_try_acquire_frame(int width, int height) {
     (void)width; (void)height;
-    NotInReplay("ps4_metal_screen_acquire_frame (Present)");
+    NotInReplay("ps4_metal_screen_try_acquire_frame (Present)");
     return NULL;
+}
+bool ps4_metal_screen_frames_held(void) {
+    NotInReplay("ps4_metal_screen_frames_held (Present)");
+    return false;
+}
+void *ps4_metal_screen_hold_texture(int width, int height) {
+    (void)width; (void)height;
+    NotInReplay("ps4_metal_screen_hold_texture (Present)");
+    return NULL;
+}
+int ps4_metal_screen_queue_held(void *command_buffer, void *texture, void (*done)(void *, int), void *arg) {
+    (void)command_buffer; (void)texture; (void)done; (void)arg;
+    NotInReplay("ps4_metal_screen_queue_held (Present)");
+    return -1;
+}
+// the GPU watchdog (WaitAll) can give a replay up too; a replay never holds frames for the display
+void ps4_metal_screen_release_held(void) {}
+void ps4_metal_screen_note_held_drop(void) { NotInReplay("ps4_metal_screen_note_held_drop (Present)"); }
+void ps4_metal_screen_note_backpressure(double wait_ms) {
+    (void)wait_ms;
+    NotInReplay("ps4_metal_screen_note_backpressure (Present)");
 }
 int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
     (void)command_buffer; (void)texture;

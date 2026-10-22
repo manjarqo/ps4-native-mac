@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <deque>
 #include <memory>
@@ -69,7 +70,6 @@
 #include "ps4_metal_screen.h"
 #include "ps4_hitch.h"
 
-extern "C" void* ps4_metal_screen_acquire_frame(int width, int height);
 extern "C" int ps4_metal_screen_encode_present(void* command_buffer, void* texture);
 extern "C" uint64_t ps4_gnm_take_cp_ns(void);
 extern "C" void ps4_gnm_print_sync_stats(void);
@@ -161,6 +161,67 @@ struct RegSnap {
 };
 
 // =====================================================================================
+// Guest memory dispatch tickets (see "Guest memory dispatches" below). A guest memory dispatch
+// encoded without a CPU wait is ticket t: the GPU signals ev = 2t - 1 once it ran, the CPU
+// signals 2t once the dispatch's result is final, and work encoded after it waits for 2t. Every
+// wait of the CPU for the GPU sleeps on cv, fed by the command buffer completion handlers and
+// the ticket listener (state changes are published with GmNotify).
+// =====================================================================================
+struct GmTicket;
+struct GmSync {
+    id<MTLSharedEvent> ev = nil;
+    MTLSharedEventListener* listener = nil;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::mutex signal_mu;           // the CPU's signals of ev
+    std::atomic<bool> miss{false};  // a ticket waits for the encoder (GmService)
+    std::atomic<bool> released{false}; // the GPU was given up on: every ticket is final
+    std::atomic<bool> withhold_next{false}; // tests: TestWithholdNextTicket
+    // the CPU's last signal of ev (2t: ticket t final), stored after the signal with release:
+    // what happened before a ticket was published (its queued texture invalidations) happens
+    // before whatever a thread does after it saw the ticket final (GmResolved, acquire). The GPU
+    // only signals 2t - 1, which publishes nothing.
+    std::atomic<uint64_t> cpu_signaled{0};
+    uint64_t encoded = 0;           // encoder thread: last ticket encoded
+    uint64_t committed = 0;         // encoder thread: last ticket in a committed command buffer
+    std::vector<std::shared_ptr<GmTicket>> cmd_tickets; // encoder thread: tickets in S.cmd
+    std::atomic<uint64_t> issued{0}; // CP thread: last ticket handed out
+    // encoder thread: fast dispatches are encoded back to back into the open compute encoder as
+    // a chain, whose signal and wait are encoded by GmCloseChain, before any other work
+    bool chain_open = false;
+    bool chain_member = false;  // a chain member is being encoded (its encoders do not close it)
+    bool chain_closing = false;
+};
+GmSync g_gms;
+
+void GmNotify() {
+    { std::lock_guard<std::mutex> lk(g_gms.mu); }
+    g_gms.cv.notify_all();
+}
+
+// Last ticket whose result is final (every ticket while there is no event yet).
+uint64_t GmResolved() {
+    if (!g_gms.ev || g_gms.released.load(std::memory_order_acquire)) return ~0ull;
+    return g_gms.cpu_signaled.load(std::memory_order_acquire) / 2;
+}
+
+// Raises ev to v (any thread; never lowers it).
+void GmSignal(uint64_t v);
+// Encoder state: every unfinished ticket counts as final and skipped (the GPU was given up on).
+void GmReleaseAll();
+// Encoder state: logs where the guest memory tickets stand (GPU watchdogs).
+void GmLogState();
+
+// Encoder thread: re-runs missed tickets and finishes resolved ones (defined below).
+void GmService();
+// Encoder state: aborts if it is released (encq::Unlocked) inside a guest memory dispatch's encoding.
+void GmCheckUnlockable();
+// Encoder thread: ends the open chain of fast guest memory dispatches (their signal and the wait
+// of everything after them); due before any other work is encoded. EndEncoders, BeginPass and
+// ComputeEncoder (but for a chain member) call it: no other encoder can start before.
+void GmCloseChain();
+
+// =====================================================================================
 // Encoder thread. The CP thread parses the command stream and prepares draws and dispatches
 // (render state, shader lookup, resource table walks: work that only reads registers and guest
 // memory); everything that touches Metal or the texture cache runs here, in stream order.
@@ -175,7 +236,49 @@ bool busy = false, sleeping = false;
 std::atomic<uint64_t> pushed{0}, done{0}, busy_ns{0};
 std::atomic<bool> async{false};
 thread_local bool t_worker = false;
+thread_local bool t_in_job = false; // running encoder work inline (PS4_GNM_SYNC_ENCODE)
 constexpr size_t kMaxQueued = 16384;
+
+// The encoder's state (S, g_gmem: everything encoder work touches) belongs to whoever holds
+// this lock: the encoder thread while it runs a chunk of jobs, the CP thread while it runs one inline
+// (PS4_GNM_SYNC_ENCODE), the guest memory service thread while it re-runs missed dispatches
+// (GmServiceThread). Recursive per thread. Released (Unlocked) only while its holder blocks in
+// a wait that may need a re-run to end (WaitAll, the command buffer throttle).
+std::mutex state_mu;
+thread_local int t_depth = 0;
+struct Locked {
+    Locked() {
+        if (t_depth++ == 0) state_mu.lock();
+    }
+    ~Locked() {
+        if (--t_depth == 0) state_mu.unlock();
+    }
+    Locked(const Locked&) = delete;
+    Locked& operator=(const Locked&) = delete;
+};
+// Where it is released mid-operation (Unlocked): WaitAll's and the command buffer throttle's
+// waits (PresentImpl does not wait for the display: a frame without a slot is held, see
+// docs/present-pacing.md).
+// None of them is inside the encoding of a guest memory dispatch (a slot bound as the fault
+// buffer, a chain member being encoded): checked (GmCheckUnlockable).
+struct Unlocked {
+    int depth = t_depth;
+    Unlocked() {
+        if (depth) GmCheckUnlockable();
+        if (depth) {
+            t_depth = 0;
+            state_mu.unlock();
+        }
+    }
+    ~Unlocked() {
+        if (depth) {
+            state_mu.lock();
+            t_depth = depth;
+        }
+    }
+    Unlocked(const Unlocked&) = delete;
+    Unlocked& operator=(const Unlocked&) = delete;
+};
 
 inline bool Inline() {
     return t_worker || !async.load(std::memory_order_relaxed);
@@ -204,9 +307,11 @@ void Worker() {
         size_t n = 0;
         while (n < batch.size()) {
             @autoreleasepool {
+                Locked lk; // free for the service thread between chunks of jobs
                 for (size_t k = 0; k < 64 && n < batch.size(); ++k, ++n) {
                     batch[n]();
                     batch[n] = nullptr;
+                    if (g_gms.miss.load(std::memory_order_relaxed)) GmService();
                 }
             }
         }
@@ -220,7 +325,25 @@ void Worker() {
     }
 }
 
+// Guest memory service thread: re-runs a missed dispatch as soon as the encoder's state is free
+// (between chunks of jobs, while the encoder is idle or blocked in WaitAll / the throttle, or, inline,
+// while the CP is not encoding), instead of after the encoder's next job (which may be long, or
+// not come at all while the CP waits for the guest).
+void ServiceLoop() {
+    pthread_setname_np("GNM Guest Memory");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(g_gms.mu);
+            g_gms.cv.wait(lk, [] { return g_gms.miss.load(std::memory_order_acquire); });
+        }
+        Locked lk;
+        GmService();
+    }
+}
+
 void Start() {
+    std::thread(ServiceLoop).detach();
     if (getenv("PS4_GNM_SYNC_ENCODE")) {
         fprintf(stderr, "[gnm-draw] encoder thread disabled (PS4_GNM_SYNC_ENCODE)\n");
         return;
@@ -234,7 +357,12 @@ void Start() {
 
 void Defer(std::function<void()> f) {
     if (Inline()) {
+        Locked lk;
+        const bool was = t_in_job;
+        t_in_job = true;
         f();
+        t_in_job = was;
+        if (g_gms.miss.load(std::memory_order_relaxed)) GmService();
         return;
     }
     bool wake;
@@ -255,10 +383,26 @@ void Sync() {
     cv_idle.wait(lk, [] { return q.empty() && !busy; });
 }
 
+// Wakes the encoder thread (any thread): it services guest memory tickets after every job.
+void Nudge() {
+    if (!async.load(std::memory_order_relaxed) || t_worker) return;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        q.push_back([] {});
+        pushed.fetch_add(1, std::memory_order_relaxed);
+    }
+    cv_work.notify_one();
+}
+
 // Runs f on the encoder after the queued work and returns once it ran.
 void Run(const std::function<void()>& f) {
     if (Inline()) {
+        Locked lk;
+        const bool was = t_in_job;
+        t_in_job = true;
         f();
+        t_in_job = was;
+        if (g_gms.miss.load(std::memory_order_relaxed)) GmService();
         return;
     }
     Defer(f);
@@ -355,6 +499,8 @@ struct Shader {
     std::vector<gcn_image_binding> imgs;
     std::vector<gcn_sampler_binding> samps;
     std::vector<gcn_vertex_attrib> attrs;
+    std::vector<gcn_image_table> tables; // T# tables indexed at run time (imgs[i].table)
+    mutable std::atomic<bool> tables_logged{false}; // their entries were logged at the first binding
     // VS only: the two vertex shaders of RectList draws (ps4_gnm_rectlist.h), made by the first
     // RectList draw that uses this shader. They only carry fn / uid / msl_hash / code_addr.
     // compiling / failed (ps4gnm_rect::LibraryStatus): Metal libraries still compiling (their fn
@@ -437,7 +583,7 @@ struct GuestWin {
 struct State {
     bool init_tried = false;
     bool enabled = false;
-    bool hung = false;
+    std::atomic<bool> hung{false}; // set by any thread (GPU watchdogs), read by all
     GuestContext* ctx = nullptr;
     id<MTLDevice> dev = nil;
     id<MTLCommandQueue> queue = nil;
@@ -467,7 +613,16 @@ struct State {
     uint32_t gpu_written_slot[64] = {}; // NoteGpuWrite: index of a range in gpu_written, by hash
     // ranges written by committed command buffers, by sequence number (dropped once completed)
     std::deque<std::pair<uint64_t, std::vector<GpuWrite>>> inflight_written;
+    // The same, kept for the T# table hazard check (ResolveTableHazards) until no draw or dispatch
+    // whose tables the CP copied before they completed is left to encode (PruneTableWrites).
+    std::deque<std::pair<uint64_t, std::shared_ptr<const std::vector<GpuWrite>>>> table_written;
+    // completed_seq when the CP copied the tables of the draw or dispatch encoded last
+    // (TableReadEncoded): every one still to be encoded copied them later
+    uint64_t table_floor = 0;
     uint64_t write_epoch = 0; // last epoch handed out by NoteGpuWrite
+    // exactly known buffer stores of the draw or dispatch being bound (NoteBufferStore), handed to
+    // the texture cache once its work is really encoded (FlushBufferStores)
+    std::vector<std::pair<uint64_t, uint64_t>> buffer_stores;
     // first write epoch of the work recorded since the last Commit (S.cmd): copies in upload_cmd
     // run before all of it, so they are current only for writes with smaller epochs
     uint64_t cmd_start_epoch = 1;
@@ -591,6 +746,9 @@ struct State {
     // present
     id<MTLRenderPipelineState> present_pso = nil;
     id<MTLTexture> present_tex = nil;
+    // display buffers that are not GPU targets, copied from guest memory (GuestDisplayTexture)
+    id<MTLTexture> guest_display_tex = nil;
+    CompMapping guest_display_swizzle;
 
     // stats
     uint64_t submit_idx = 0;
@@ -602,12 +760,14 @@ struct State {
     std::atomic<uint64_t> n_skipped{0}; // both threads (see EncodeQueue)
     double gpu_timeout_ms = 4000;
     uint64_t n_waits = 0, n_commits = 0;
+    std::atomic<uint64_t> n_waits_total{0}; // CPU waits for the GPU (never reset; read by any thread)
     // GPU-timeline fence actions
     std::mutex fence_mu;
     std::recursive_mutex fence_run_mu;
     std::deque<std::pair<uint64_t, std::function<void()>>> fence_q;
     uint64_t committed_seq = 0;            // guarded by fence_mu
     uint64_t completed_seq = 0;            // guarded by fence_mu
+    std::atomic<uint64_t> completed_pub{0}; // completed_seq, for readers without fence_mu (TableReadBegin)
     double wait_ms = 0;
     std::atomic<uint64_t> gpu_ns{0}; // GPU busy time (union of command buffer execution intervals)
     std::mutex gpu_time_mu;
@@ -696,6 +856,215 @@ bool ReadGuest(void* c, uint64_t addr, void* dst, uint64_t size) {
     memcpy(dst, ctx->mem_base + addr, size);
     if (g_trace_reads) fprintf(stderr, "[gnm-trace]      read 0x%llx +%llu\n", (unsigned long long)addr, (unsigned long long)size);
     return true;
+}
+
+using GmPages = std::vector<uint32_t>; // sorted page numbers
+// The textures a dispatch bound (Metal slot, texture), for a re-run that must bind the same ones.
+using GmTextures = std::vector<std::pair<uint32_t, id<MTLTexture>>>;
+
+// Counters (since the start; the perf line prints the change per frame).
+struct GmStats {
+    std::atomic<uint64_t> sync{0}, fast{0}, reruns{0}, refused{0}, mispredicted{0};
+    std::atomic<uint64_t> cp_waits{0}, cp_wait_us{0};
+    std::atomic<uint64_t> chains{0};          // signal-and-wait points of fast dispatches
+    // from a miss's verdict (the listener) to the start of the first re-run it made due: the
+    // time a re-run waits for someone to run it; summed, and the longest (reset by the perf line)
+    std::atomic<uint64_t> rerun_wait_us{0};
+    std::atomic<uint64_t> rerun_wait_max_us{0};
+    // from that verdict to the end of the last re-run it made due (a chain's members after the
+    // missed one re-run too, one after the other): the longest (reset by the perf line)
+    std::atomic<uint64_t> rerun_chain_max_us{0};
+    std::atomic<uint64_t> no_slot{0};         // dispatches without a fault buffer (skipped)
+    std::atomic<uint64_t> no_indirect{0};     // passes whose indirect arguments had no buffer (skipped)
+    std::atomic<uint64_t> pass_failed{0};     // passes whose binding failed after their probe ran
+} g_gm_stats;
+
+// ---- Sampled textures over guest memory a fast dispatch's pass wrote outside its prediction ----
+// (its predicted pages were noted as pending GPU writes of its command buffer when it was
+// encoded). Found once its result is known, before the result is published (2t): by the ticket
+// listener or the re-run. They must not take the texture cache's lock there (it is held while
+// the cache waits for the GPU, which may be waiting for that very 2t), so the ranges are queued
+// and the encoder applies them before it looks up any sampled texture (GmApplyInvalidations):
+// work ordered after the dispatch is encoded only after its 2t.
+// The exact buffer stores of a fast dispatch's pass (NoteBufferStore) are queued the same way once
+// the pass is known to have run, and handed to the texture cache there (NoteBufferWrite): the
+// cache's guest-newer marks then come from work that really ran, as on the sync path.
+struct GmInvalidations {
+    std::mutex mu; // held only to append or take the lists
+    std::vector<GpuWrite> ranges;
+    std::vector<std::pair<uint64_t, uint64_t>> stores;
+    std::atomic<bool> any{false};
+} g_gm_inval;
+
+struct GmResult;
+void GmInvalidateOutside(const GmResult& res, const GmPages* pred);
+
+// Encoder: applies the queued invalidations. The ranges of a ticket are queued (any = true,
+// under mu) before its result is published (GmSignal, release); work ordered after the ticket is
+// encoded after its CP saw the ticket final (GmResolved, acquire) and handed the work over
+// through encq's queue: so this load sees them. A load that misses ranges queued later only
+// misses tickets the work is not ordered after.
+void GmApplyInvalidations() {
+    if (!g_gm_inval.any.load(std::memory_order_acquire) || !S.tex) return;
+    thread_local std::vector<GpuWrite> w;
+    thread_local std::vector<std::pair<uint64_t, uint64_t>> st;
+    {
+        std::lock_guard<std::mutex> lk(g_gm_inval.mu);
+        w.swap(g_gm_inval.ranges);
+        st.swap(g_gm_inval.stores);
+        g_gm_inval.any.store(false, std::memory_order_relaxed);
+    }
+    if (!w.empty()) S.tex->InvalidateWrites(w);
+    for (const auto& [a, n] : st) S.tex->NoteBufferWrite(a, n, S.write_epoch);
+    w.clear();
+    st.clear();
+}
+
+// Queues the exact buffer stores of a fast dispatch's pass that ran (any thread; never blocks on
+// the texture cache), before its result is published.
+void GmQueueStores(const std::vector<std::pair<uint64_t, uint64_t>>& stores) {
+    if (stores.empty()) return;
+    std::lock_guard<std::mutex> lk(g_gm_inval.mu);
+    g_gm_inval.stores.insert(g_gm_inval.stores.end(), stores.begin(), stores.end());
+    g_gm_inval.any.store(true, std::memory_order_release);
+}
+
+// ---- CP thread: ordering of the CP's reads after fast guest memory dispatches ----
+// The CP reads guest memory for later draws and dispatches (resource table walks, the choice of
+// a shader permutation, vertex fetch sharps) and the encoder uploads sampled textures from it.
+// On GCN all of that is read on the GPU, after the dispatches the queue synchronized with. Here
+// it is read on the CPU when the work is prepared, and what it read is encoded: a later re-run
+// cannot undo it. So once a synchronization (ComputeBarrier) made pending tickets visible to a
+// queue, the first draw or dispatch prepared for that queue that reads guest memory on the CPU
+// waits for all of them, whatever pages they predicted: a pass can write pages outside its
+// prediction (its probe could not know them), and its result is known only once it ran.
+// Without a synchronization the two are not ordered on GCN either, and the CP goes on.
+struct GmCpState {
+    std::deque<uint64_t> pending; // tickets handed out and not yet final, oldest first
+    uint64_t visible[2] = {};     // per queue (kQueueGfx / kQueueCompute): tickets it waits for
+    int queue = kQueueGfx;        // the queue of the draw / dispatch being prepared
+} g_gm_cp;
+
+// CP thread: the queue synchronizes (ComputeBarrier).
+void GmCpSync(int queue) {
+    g_gm_cp.visible[queue] = g_gms.issued.load(std::memory_order_relaxed);
+}
+
+// CP thread: the draw / dispatch prepared next is for this queue.
+void GmCpQueue(int queue) {
+    g_gm_cp.queue = queue;
+}
+
+void GmCpPrune() {
+    auto& c = g_gm_cp;
+    if (c.pending.empty()) return;
+    const uint64_t done = GmResolved();
+    while (!c.pending.empty() && c.pending.front() <= done) c.pending.pop_front();
+}
+
+// The renderer gives up on the GPU (any thread): every ticket counts as final (and skipped), the
+// waits for them end and the existing hang handling (S.hung) takes over.
+void GmGiveUp(const char* why) {
+    fprintf(stderr, "[gnm-draw] GPU watchdog: %s; disabling GPU rendering\n", why);
+    S.hung = true;
+    ps4_metal_screen_release_held(); // as in WaitAll's watchdog: held frames' flips complete
+    g_gms.released.store(true, std::memory_order_release);
+    if (g_gms.ev) GmSignal(1ull << 62);
+    GmNotify();
+}
+
+// CP thread: waits until ticket t's result is final. Gives up on the GPU (GmGiveUp) when no
+// ticket becomes final within the GPU timeout.
+void GmCpWait(uint64_t t) {
+    const double t0 = CFAbsoluteTimeGetCurrent();
+    g_gm_stats.cp_waits++;
+    Flush(false); // the dispatch may still be in the open command buffer
+    const auto timeout = std::chrono::duration<double, std::milli>(S.gpu_timeout_ms);
+    uint64_t seen = GmResolved();
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    // re-runs due are made by the service thread (and the encoder); inline (no encoder thread)
+    // this thread services them too while it waits
+    const bool inline_enc = encq::Inline();
+    while (GmResolved() < t && !S.hung) {
+        if (inline_enc) {
+            encq::Locked lk;
+            GmService();
+        }
+        {
+            std::unique_lock<std::mutex> lk(g_gms.mu);
+            g_gms.cv.wait_until(lk, deadline, [&] {
+                return GmResolved() >= t || (inline_enc && g_gms.miss.load(std::memory_order_acquire)) || S.hung;
+            });
+        }
+        const uint64_t now = GmResolved();
+        if (now != seen) {
+            seen = now;
+            deadline = std::chrono::steady_clock::now() + timeout;
+        } else if (now < t && std::chrono::steady_clock::now() >= deadline) {
+            char why[160];
+            snprintf(why, sizeof(why), "the CP waited %.0f ms for guest memory dispatch %llu (final up to %llu)",
+                     S.gpu_timeout_ms, (unsigned long long)t, (unsigned long long)now);
+            GmGiveUp(why);
+        }
+    }
+    g_gm_stats.cp_wait_us += (uint64_t)((CFAbsoluteTimeGetCurrent() - t0) * 1e6);
+    GmCpPrune();
+}
+
+// CP thread: the draw / dispatch being prepared reads guest memory on the CPU (or has the encoder
+// read it: sampled textures). Waits for the tickets visible to its queue (see GmCpState).
+void GmCpOrder() {
+    auto& c = g_gm_cp;
+    if (encq::t_worker || encq::t_in_job) return; // encoder work: ordered by the encoder
+    GmCpPrune();
+    if (c.pending.empty() || c.pending.front() > c.visible[c.queue]) return;
+    uint64_t t = 0; // the newest pending ticket visible to the queue (they become final in order)
+    for (auto it = c.pending.rbegin(); it != c.pending.rend(); ++it)
+        if (*it <= c.visible[c.queue]) {
+            t = *it;
+            break;
+        }
+    GmCpWait(t);
+}
+
+// CP thread: runs f(reader) with a reader of guest memory, ordered after the tickets the queue
+// synchronized with.
+template <class F>
+auto GmCpGuarded(F&& f) {
+    GmCpOrder();
+    return f(&ReadGuest);
+}
+
+
+// gcn_set_image_address_check: false only for an address that is provably unmapped (in a free
+// extent or an untouched reservation, recomp_vm_unmapped_ranges, or past guest memory). The check
+// runs for every table entry of every specialization and binding, on the CP and encoder threads:
+// each thread keeps its own copy of the unmapped ranges and refreshes it only when the VM
+// generation changed, so a query is an atomic load and a binary search, without vm_mutex.
+struct UnmappedRanges {
+    uint64_t gen = 0;
+    std::vector<std::array<uint64_t, 2>> r; // sorted, disjoint [start, end)
+};
+bool GuestAddressMapped(void* c, uint64_t addr) {
+    GuestContext* ctx = (GuestContext*)c;
+    if (!ctx || addr == 0 || addr >= ctx->mem_size) return false;
+    static thread_local UnmappedRanges u;
+    const uint64_t gen = recomp_vm_generation();
+    if (gen != u.gen) {
+        for (;;) {
+            uint64_t got = 0;
+            const size_t n = recomp_vm_unmapped_ranges(ctx, reinterpret_cast<uint64_t(*)[2]>(u.r.data()), u.r.size(), &got);
+            if (n <= u.r.size()) {
+                u.r.resize(n);
+                u.gen = got;
+                break;
+            }
+            u.r.resize(n + 16); // grew since the count: ask again
+        }
+    }
+    auto it = std::upper_bound(u.r.begin(), u.r.end(), addr,
+                               [](uint64_t a, const std::array<uint64_t, 2>& x) { return a < x[0]; });
+    return it == u.r.begin() || addr >= (it - 1)->at(1);
 }
 
 // =====================================================================================
@@ -1140,9 +1509,53 @@ id<MTLTexture> DepthCompanion(id<MTLTexture> dt, bool encode);
 bool HasStencil(MTLPixelFormat f);
 id<MTLTexture> DepthFromMemory(const ImageDesc& img, bool encode);
 id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode);
-uint32_t MipChainSources(const ImageDesc& img, id<MTLTexture> base, __strong id<MTLTexture> (&srcs)[kMaxMips]);
+uint32_t MipChainSources(const ImageDesc& img, id<MTLTexture> base, __strong id<MTLTexture> (&srcs)[kMaxMips],
+                         uint64_t* addrs = nullptr);
 id<MTLComputeCommandEncoder> ComputeEncoder();
 id<MTLTexture> SampledTexture(const ImageDesc& img);
+
+// The draw or dispatch being bound stores exactly guest [addr, addr + size) as a buffer (a written
+// V# with a known size): GPU-owned color surfaces such stores cover completely are refreshed from
+// guest memory before their next GPU use (TextureCache::NoteBufferWrite). Recorded here and handed
+// to the cache only once the work is encoded (FlushBufferStores): a bind that fails later, a draw
+// whose pixel shader does not bind, a guest memory probe pass or a skipped dispatch write nothing.
+// Stores through V#s a guest memory dispatch loads at run time are only known as the 1 MiB pages
+// they touch (GCN_GUEST_WRITTEN), not as exact ranges: they never mark a surface.
+void NoteBufferStore(uint64_t addr, uint64_t size) {
+    if (size) S.buffer_stores.emplace_back(addr, size);
+}
+
+void FlushBufferStores() {
+    if (S.tex)
+        for (const auto& [a, n] : S.buffer_stores) S.tex->NoteBufferWrite(a, n, S.write_epoch);
+    S.buffer_stores.clear();
+}
+
+bool EncodeGpuUploadAt(uint64_t address, const SurfaceDesc& sd, const TextureCache::GpuUpload& up,
+                       id<MTLCommandBuffer> side);
+
+// Before a GPU use of the color surface at `address` (texture `tex`, or nil: any surface there):
+// a surface marked guest newer gets guest memory copied into its texture on the GPU, behind the
+// writing work and before the use is encoded. Must run while no encoder of the use is open.
+// write_site: the use writes the surface (render-target or storage bind, fast clear, resolve or
+// copy destination); a copy that cannot be encoded then drops the mark (FinishGuestNewer).
+void RefreshGuestNewer(uint64_t address, id<MTLTexture> tex, bool write_site) {
+    GmApplyInvalidations(); // marks from fast guest memory dispatches that ran (GmQueueStores)
+    if (!S.tex || !S.tex->GuestNewerCount()) return;
+    TextureCache::GpuUpload up;
+    // tex nil: every marked surface at the address (several surfaces can share it)
+    while (S.tex->TakeGuestNewer(address, tex, &up)) {
+        const bool ok = EncodeGpuUploadAt(address, up.surf, up, nil);
+        S.tex->FinishGuestNewer(address, up.tex, ok, write_site);
+        if (!ok) {
+            RLog("guest-newer", "GPU target 0x%llx (%ux%u) written by buffer stores: the copy from guest memory could "
+                 "not be encoded; %s", (unsigned long long)address, up.width, up.height,
+                 write_site ? "the GPU write that follows supersedes it (unmarked)" : "it stays marked");
+            if (!write_site) return; // the surface is still marked: TakeGuestNewer would hand it out again
+        }
+        if (tex) return;
+    }
+}
 
 void NoteGpuWrite(uint64_t addr, uint64_t size) {
     if (!size) return;
@@ -1169,6 +1582,67 @@ void PruneCompletedWrites() {
     while (!S.inflight_written.empty() && S.inflight_written.front().first <= done) S.inflight_written.pop_front();
 }
 
+// ---- What GPU work was pending when the CP copied a draw's or dispatch's T# tables ----
+// The CP copies the tables (the flattened user data) when it prepares the draw; the hazard check
+// (ResolveTableHazards) runs when the encoder encodes it, which can be much later: with the
+// encoder thread the CP runs ahead, and in a captured frame every pass starts its encoding with
+// the GPU drained. So the check judges a write by whether it had completed when the CP read the
+// tables: a draw or dispatch takes completed_seq first (TableReadBegin), and every write of a
+// command buffer committed after that (or still being recorded) counts, completed since or not.
+// S.table_written keeps those writes until no draw or dispatch that may need them is left: while
+// some are open, back to the snapshot of the last one encoded (later ones took theirs later: CP
+// calls are serialized and encoded in order). Ordering: the CP counts itself open, then reads
+// completed_pub; PruneTableWrites reads completed_pub, then the open count. If it sees none open,
+// a CP that opens later reads a completed_pub at least as new as the one it pruned to.
+std::atomic<uint64_t> g_table_reads_open{0};
+
+uint64_t TableReadBegin() {
+    g_table_reads_open.fetch_add(1);
+    return S.completed_pub.load();
+}
+// CP thread: the draw or dispatch is not handed to the encoder after all.
+struct TableReadCp {
+    bool armed = true;
+    ~TableReadCp() {
+        if (armed) g_table_reads_open.fetch_sub(1);
+    }
+};
+// Encoder thread, for the draw or dispatch being encoded: on every return path.
+struct TableReadEncoded {
+    uint64_t snap;
+    explicit TableReadEncoded(uint64_t s) : snap(s) {}
+    ~TableReadEncoded() {
+        if (snap > S.table_floor) S.table_floor = snap;
+        g_table_reads_open.fetch_sub(1);
+    }
+};
+
+void PruneTableWrites() {
+    if (S.table_written.empty()) return;
+    uint64_t floor = S.completed_pub.load();
+    if (g_table_reads_open.load() != 0) floor = std::min(floor, S.table_floor);
+    while (!S.table_written.empty() && S.table_written.front().first <= floor) S.table_written.pop_front();
+}
+
+// A write to [addr, addr + size) the CP could not have seen when it took `snap`: one recorded
+// in the open command buffer, or of a command buffer committed after `snap` completed. *hit:
+// one of them; *pending_seq: the newest command buffer among them (UINT64_MAX: the open one).
+bool OverlapsWriteAfter(uint64_t addr, uint64_t size, uint64_t snap, GpuWrite* hit, uint64_t* pending_seq) {
+    bool any = false;
+    auto check = [&](const GpuWrite& r, uint64_t seq) {
+        if (r.addr < addr + size && addr < r.addr + r.size) {
+            if (!any) *hit = r;
+            any = true;
+            *pending_seq = std::max(*pending_seq, seq);
+        }
+    };
+    for (auto& r : S.gpu_written) check(r, UINT64_MAX);
+    for (auto& [seq, w] : S.table_written)
+        if (seq > snap)
+            for (auto& r : *w) check(r, seq);
+    return any;
+}
+
 // `hit` (optional) receives an overlapping write with the latest epoch among the overlaps.
 bool OverlapsPendingWrite(uint64_t addr, uint64_t size, GpuWrite* hit = nullptr) {
     bool any = false;
@@ -1190,6 +1664,10 @@ bool OverlapsPendingWrite(uint64_t addr, uint64_t size, GpuWrite* hit = nullptr)
 void ResolveEqaaPass();
 
 void EndEncoders() {
+    if (g_gms.chain_open && !g_gms.chain_closing) {
+        GmCloseChain(); // ends the encoders itself
+        return;
+    }
     if (S.renc) {
         [S.renc endEncoding];
         S.renc = nil;
@@ -1228,8 +1706,65 @@ void LogEncoderStatus(id<MTLCommandBuffer> done) {
     }
 }
 
+// S.queue holds at most kMaxCommandBuffers command buffers that have not completed; creating
+// one more blocks until one completes. While a missed guest memory dispatch holds the GPU at its
+// 2t, none completes until it was re-run: so while committed tickets are not final, the encoder
+// never blocks there but waits here, with its state free for the re-run (encq::Unlocked) and
+// re-running missed dispatches itself too. (Upload command buffers, at most one per S.cmd, are
+// within the margin.) Without such tickets nothing needs the CPU, and the queue's own limit
+// applies as before (TLOU measured: a throttle at all times cost 8 % fps, the encoder waiting
+// here with GPU work to spare). No command buffer completing within the GPU timeout: the GPU is
+// given up on (GmGiveUp).
+constexpr uint64_t kMaxCommandBuffers = 64;
+constexpr uint64_t kThrottleAt = kMaxCommandBuffers / 2 - 4;
+void ThrottleCommandBuffers() {
+    const auto completed = [] {
+        std::lock_guard<std::mutex> lk(S.fence_mu);
+        return S.completed_seq;
+    };
+    const auto outstanding = [] {
+        std::lock_guard<std::mutex> lk(S.fence_mu);
+        return S.committed_seq - std::min(S.completed_seq, S.committed_seq);
+    };
+    const auto pending = [] { return g_gms.committed && GmResolved() < g_gms.committed; };
+    if (outstanding() < kThrottleAt || !pending()) return;
+    const auto timeout = std::chrono::duration<double, std::milli>(S.gpu_timeout_ms);
+    uint64_t seen = completed();
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!S.hung && outstanding() >= kThrottleAt && pending()) {
+        GmService();
+        {
+            encq::Unlocked free_state;
+            std::unique_lock<std::mutex> lk(g_gms.mu);
+            g_gms.cv.wait_until(lk, deadline, [&] {
+                return g_gms.miss.load(std::memory_order_relaxed) || outstanding() < kThrottleAt || !pending() || S.hung;
+            });
+        }
+        if (completed() != seen) {
+            seen = completed();
+            deadline = std::chrono::steady_clock::now() + timeout;
+        } else if (std::chrono::steady_clock::now() >= deadline && outstanding() >= kThrottleAt && pending()) {
+            char why[128];
+            snprintf(why, sizeof(why), "no command buffer of %llu outstanding completed in %.0f ms",
+                     (unsigned long long)outstanding(), S.gpu_timeout_ms);
+            GmGiveUp(why);
+            GmLogState();
+            GmReleaseAll();
+        }
+    }
+}
+
+// A new command buffer starts after the result of every guest memory dispatch committed so far
+// is final. (A ticket encoded into the open S.cmd is waited for there, right after it: a wait
+// here for a ticket of a command buffer committed later would never end.)
+void GmWaitForCommitted(id<MTLCommandBuffer> cb) {
+    if (!g_gms.committed || GmResolved() >= g_gms.committed) return;
+    [cb encodeWaitForEvent:g_gms.ev value:2 * g_gms.committed];
+}
+
 void EnsureCmd() {
     if (!S.cmd) {
+        ThrottleCommandBuffers();
         if (EncoderStatusEnabled()) {
             MTLCommandBufferDescriptor* d = [MTLCommandBufferDescriptor new];
             d.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
@@ -1240,6 +1775,7 @@ void EnsureCmd() {
         g_cmd_open.store(true, std::memory_order_release);
         S.cmd.label = [NSString stringWithFormat:@"gnm-%llu", (unsigned long long)S.n_cmdbufs++];
         S.cmd_log = std::make_shared<WorkLog>();
+        GmWaitForCommitted(S.cmd);
     }
 }
 
@@ -1259,7 +1795,10 @@ void RunFences(uint64_t upto) {
         std::function<void()> fn;
         {
             std::lock_guard<std::mutex> lk(S.fence_mu);
-            if (upto > S.completed_seq) S.completed_seq = upto;
+            if (upto > S.completed_seq) {
+                S.completed_seq = upto;
+                S.completed_pub.store(upto);
+            }
             if (S.fence_q.empty() || S.fence_q.front().first > S.completed_seq) return;
             fn = std::move(S.fence_q.front().second);
             S.fence_q.pop_front();
@@ -1267,6 +1806,8 @@ void RunFences(uint64_t upto) {
         if (fn) fn();
     }
 }
+
+void GmCommandBufferFailed(const std::vector<std::shared_ptr<GmTicket>>& tickets);
 
 void Commit() {
     EndEncoders();
@@ -1314,8 +1855,15 @@ void Commit() {
         written = std::make_shared<std::vector<GpuWrite>>(S.gpu_written);
         S.inflight_written.push_back({seq, std::move(S.gpu_written)});
         S.gpu_written.clear();
+        S.table_written.push_back({seq, written});
     }
+    PruneTableWrites();
     TextureCache* tex_cache = S.tex;
+    std::shared_ptr<std::vector<std::shared_ptr<GmTicket>>> tickets;
+    if (!g_gms.cmd_tickets.empty()) {
+        tickets = std::make_shared<std::vector<std::shared_ptr<GmTicket>>>(std::move(g_gms.cmd_tickets));
+        g_gms.cmd_tickets.clear();
+    }
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         if (written && tex_cache) tex_cache->InvalidateWrites(*written);
         {
@@ -1332,13 +1880,17 @@ void Commit() {
                     done.error.localizedDescription.UTF8String);
             if (EncoderStatusEnabled()) LogEncoderStatus(done);
             if (log) log->Print("work", EncoderStatusEnabled() ? WorkLog::kAll : 12);
+            // its guest memory dispatches may not have signaled: they count as skipped
+            if (tickets) GmCommandBufferFailed(*tickets);
         }
+        GmNotify();
         std::lock_guard<std::mutex> lk(arena->free_mu);
         for (auto& b : *chunks)
             if (b.length == UploadArena::kChunk && arena->free_list.size() < 16)
                 arena->free_list.push_back(b);
     }];
     [cb commit];
+    g_gms.committed = g_gms.encoded;
     S.n_commits++;
     // PS4_GNM_HANG_REPORT_MS=<ms> (debug): name the work of a command buffer that has not
     // completed that long after its commit. A shader that never ends shows no error until
@@ -1366,28 +1918,53 @@ void Commit() {
     S.inflight_logs[(__bridge void*)cb] = log;
 }
 
+// Waits until every committed command buffer has completed and the guest memory dispatches in
+// them have final results (re-running missed ones meanwhile). Sleeps on g_gms.cv, which the
+// completion handlers and the ticket listener notify. Watchdog: S.gpu_timeout_ms without any
+// command buffer completing (a GPU hang can never block the guest forever).
 void WaitAll() {
     const double t0 = CFAbsoluteTimeGetCurrent();
-    if (!S.inflight.empty()) S.n_waits++;
-    for (auto& cb : S.inflight) {
-        if (cb.status >= MTLCommandBufferStatusCompleted) continue;
-        if (S.hung) continue;
-        // watchdog: poll with timeout so a GPU hang can never block the guest forever
-        const double deadline_ms = S.gpu_timeout_ms;
-        double waited = 0;
-        while (cb.status < MTLCommandBufferStatusCompleted && waited < deadline_ms) {
-            usleep(200);
-            waited += 0.2;
+    if (!S.inflight.empty()) S.n_waits++, S.n_waits_total++;
+    const auto n_done = [] {
+        size_t n = 0;
+        for (auto& cb : S.inflight) n += cb.status >= MTLCommandBufferStatusCompleted;
+        return n;
+    };
+    while (!S.hung) {
+        GmService();
+        const size_t done = n_done();
+        const auto finished = [&] { return done == S.inflight.size() && GmResolved() >= g_gms.committed; };
+        if (finished()) break;
+        bool progressed;
+        {
+            encq::Unlocked free_state; // a re-run may be what it waits for
+            std::unique_lock<std::mutex> lk(g_gms.mu);
+            progressed = g_gms.cv.wait_for(lk, std::chrono::duration<double, std::milli>(S.gpu_timeout_ms), [&] {
+                return g_gms.miss.load(std::memory_order_relaxed) || n_done() != done ||
+                       (done == S.inflight.size() && GmResolved() >= g_gms.committed);
+            });
         }
-        if (cb.status < MTLCommandBufferStatusCompleted) {
-            fprintf(stderr,
-                    "[gnm-draw] GPU watchdog: command buffer %s did not complete in %.0f ms; "
-                    "disabling GPU rendering (fences keep being signaled)\n",
-                    cb.label.UTF8String, deadline_ms);
-            S.hung = true;
-            auto lit = S.inflight_logs.find((__bridge void*)cb);
+        if (progressed) continue;
+        id<MTLCommandBuffer> stuck = nil;
+        for (auto& cb : S.inflight)
+            if (cb.status < MTLCommandBufferStatusCompleted) {
+                stuck = cb;
+                break;
+            }
+        fprintf(stderr,
+                "[gnm-draw] GPU watchdog: command buffer %s did not complete in %.0f ms; "
+                "disabling GPU rendering (fences keep being signaled)\n",
+                stuck ? stuck.label.UTF8String : "(guest memory dispatch result)", S.gpu_timeout_ms);
+        S.hung = true;
+        // frames held for the display wait on conversions that may never complete: their
+        // flips complete now, so CompleteFlip does not queue every later flip behind them
+        ps4_metal_screen_release_held();
+        GmLogState();
+        if (stuck) {
+            auto lit = S.inflight_logs.find((__bridge void*)stuck);
             if (lit != S.inflight_logs.end() && lit->second) lit->second->Print("hung work", WorkLog::kAll);
         }
+        GmReleaseAll();
     }
     S.inflight.clear();
     S.inflight_logs.clear();
@@ -1408,6 +1985,7 @@ void WaitAll() {
     }
     S.inflight_written.clear();
     S.pending = false;
+    GmService(); // finish the guest memory dispatches whose results came in
     g_hitch.wait_ms += (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
     S.wait_ms += (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
 }
@@ -1802,12 +2380,23 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
         RLog(k, "shader 0x%llx (hw %u): %u v_writelane result(s) emitted as 0 (known translator gap)",
              (unsigned long long)code_addr, (unsigned)hw, s->info.zeroed_write_lanes);
     }
+    if (s->info.unpredicated_wave_regions || s->info.per_subgroup_lane_ops || s->info.per_lane_ends) {
+        // known translator gaps of wave64 compute shaders on 32-wide simdgroups
+        char k[64];
+        snprintf(k, sizeof(k), "wave64-gap-%llx-%u", (unsigned long long)code_addr, (unsigned)hw);
+        RLog(k, "shader 0x%llx (hw %u): %u EXEC-divergent if/loop(s) and %u cross-lane read(s) left per "
+                "32-wide subgroup, %u end(s) in divergent code ending only their lanes (known translator gap)",
+             (unsigned long long)code_addr, (unsigned)hw, s->info.unpredicated_wave_regions,
+             s->info.per_subgroup_lane_ops, s->info.per_lane_ends);
+    }
     s->bufs.resize(s->info.num_buffers);
     for (uint32_t i = 0; i < s->info.num_buffers; ++i) gcn_shader_get_buffer(sh, i, &s->bufs[i]);
     s->imgs.resize(s->info.num_images);
     for (uint32_t i = 0; i < s->info.num_images; ++i) gcn_shader_get_image(sh, i, &s->imgs[i]);
     s->samps.resize(s->info.num_samplers);
     for (uint32_t i = 0; i < s->info.num_samplers; ++i) gcn_shader_get_sampler(sh, i, &s->samps[i]);
+    s->tables.resize(s->info.num_image_tables);
+    for (uint32_t i = 0; i < s->info.num_image_tables; ++i) gcn_shader_get_image_table(sh, i, &s->tables[i]);
     s->attrs.resize(s->info.num_vertex_attribs);
     for (uint32_t i = 0; i < s->info.num_vertex_attribs; ++i)
         gcn_shader_get_vertex_attrib(sh, i, &s->attrs[i]);
@@ -2015,10 +2604,14 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
             // the binding of the draw
             BuildFlat(vec[base], ud, &S.flat_scratch[fi]);
             S.flat_from[fi] = vec[base];
-            hit = gcn_shader_find_compatible_flat(list, n, ud, S.flat_scratch[fi].data(), S.flat_scratch[fi].size(),
-                                                  &rt, ReadGuest, S.ctx);
+            hit = GmCpGuarded([&](gcn_read_guest_fn read) {
+                return gcn_shader_find_compatible_flat(list, n, ud, S.flat_scratch[fi].data(),
+                                                       S.flat_scratch[fi].size(), &rt, read, S.ctx);
+            });
         } else {
-            hit = gcn_shader_find_compatible(list, n, ud, &rt, ReadGuest, S.ctx);
+            hit = GmCpGuarded([&](gcn_read_guest_fn read) {
+                return gcn_shader_find_compatible(list, n, ud, &rt, read, S.ctx);
+            });
         }
         if (hit >= 0) return vec[order[hit]];
         static std::set<uint64_t> explained; // once per program and count
@@ -2297,7 +2890,13 @@ struct Binder {
     Stage stage;
     id<MTLRenderCommandEncoder> r;
     id<MTLComputeCommandEncoder> c;
+    // an encoder g_cstate / g_rstate do not describe (a re-run on the second queue; its object may
+    // even reuse the address of the encoder they describe)
+    bool untracked = false;
+    GmTextures* textures_out = nullptr;      // records every texture bound
+    const GmTextures* textures_in = nullptr; // BindStage binds these instead of looking images up
     EncoderState* Tracked() const {
+        if (untracked) return nullptr;
         if (stage == Stage::Compute) return g_cstate.Tracks(c) ? &g_cstate : nullptr;
         return g_rstate.Tracks(r) ? &g_rstate : nullptr;
     }
@@ -2351,6 +2950,7 @@ struct Binder {
     }
     void Texture(id<MTLTexture> t, uint32_t slot) {
         if (slot > 127) return;
+        if (textures_out) textures_out->push_back({slot, t});
         if (EncoderState* es = Tracked(); es && es->Same(es->tex[(int)stage][slot], (__bridge const void*)t)) return;
         if (stage == Stage::Vertex) [r setVertexTexture:t atIndex:slot];
         else if (stage == Stage::Fragment) [r setFragmentTexture:t atIndex:slot];
@@ -2511,10 +3111,13 @@ void StageFlat(int fi, const Shader* s, const uint32_t ud[16]) {
 }
 
 void BuildFlat(const Shader* s, const uint32_t ud[16], std::vector<uint32_t>* flat) {
-    flat->assign(std::max<uint32_t>(s->info.flatbuf_size_dw, 16), 0);
     static const bool dumpflat = getenv("PS4_GNM_TRACE_BUFS") != nullptr;
     g_trace_reads = dumpflat && ShouldTrace();
-    gcn_shader_build_flatbuf(s->sh, ud, ReadGuest, S.ctx, flat->data(), flat->size());
+    GmCpGuarded([&](gcn_read_guest_fn read) {
+        flat->assign(std::max<uint32_t>(s->info.flatbuf_size_dw, 16), 0);
+        gcn_shader_build_flatbuf(s->sh, ud, read, S.ctx, flat->data(), flat->size());
+        return true;
+    });
     g_trace_reads = false;
 }
 
@@ -2529,6 +3132,11 @@ uint64_t ApproxImageBytes(const ImageDesc& img);
 // PS4_GNM_CAPTURE_DIR=<dir>      default ./gnm_captures; the frame goes to <dir>/frame_<n>
 // PS4_GNM_CAPTURE_REPLAY=<a>-<b>[,<c>-<d>...] | all   passes stored replayable (guest inputs,
 //                                raw texture contents before and after); default none
+// PS4_GNM_CAPTURE_REPLAY_SHADER=<addr>|pgm:<hash>[,...]  also stored replayable: the passes with
+//                                a stage at one of these code addresses or with one of these
+//                                program hashes (StageRec::pgm_hash), and the passes of the frame
+//                                that may have written what they read (ShaderSelection); the frame before
+//                                the captured one is then a learning frame (recorded, not written)
 // PS4_GNM_CAPTURE_RAW_MB=<n>     budget of the raw texture files (default 8192); textures that do
 //                                not fit have no raw file ("budget") but keep their view PNG;
 //                                guest memory blobs are not counted
@@ -2595,12 +3203,21 @@ std::vector<id<MTLTexture>> g_tex;                  // texture of g_pass->textur
 // storage textures g_pass binds (BindStage): index of their ImageRec in g_pass->images, texture
 std::vector<std::pair<size_t, id<MTLTexture>>> g_storage;
 uint32_t g_next = 0;
-// a guest memory dispatch (GuestMemoryDispatch): its inputs were stored after its probe, before
+// PS4_GNM_CAPTURE_REPLAY_SHADER: g_learning while g_pass belongs to the learning frame (nothing
+// is written, committed or waited for); g_keyed once g_pass has its SelectKey
+ShaderSelection g_select;
+bool g_learning = false, g_keyed = false;
+SelectKey g_learn_key;
+uint32_t g_unknown = 0; // selected passes of the captured frame whose key the learning frame had not
+std::vector<ShaderSelection::Range> g_learn_reads, g_learn_writes;
+// a guest memory dispatch (GmRunSync): its inputs were stored after its probe, before
 // it ran; the guest ranges it wrote are outputs
 bool g_inputs_taken = false;
 std::vector<std::pair<uint64_t, uint64_t>> g_guest_written;
 
-bool InFrame() { return g_writer && S.present_idx == g_writer->Frame(); }
+// The frame before the captured one, when passes are selected by shader address.
+bool LearnFrame() { return g_writer && !g_select.Empty() && g_writer->Frame() > 0 && S.present_idx + 1 == g_writer->Frame(); }
+bool InFrame() { return g_writer && (S.present_idx == g_writer->Frame() || LearnFrame()); }
 
 const char* StageName(Stage st) { return st == Stage::Vertex ? "vs" : st == Stage::Fragment ? "ps" : "cs"; }
 
@@ -2628,6 +3245,14 @@ void Setup(uint64_t frame, uint64_t mem_size) {
             c = (e && *e == ',') ? e + 1 : "";
         }
     }
+    if (const char* sh = getenv("PS4_GNM_CAPTURE_REPLAY_SHADER"); sh && *sh) {
+        std::string err;
+        if (!g_select.Parse(sh, &err))
+            fprintf(stderr, "[gnm-capture] PS4_GNM_CAPTURE_REPLAY_SHADER: %s; no passes selected by shader\n", err.c_str());
+        else if (frame == 0)
+            fprintf(stderr, "[gnm-capture] PS4_GNM_CAPTURE_REPLAY_SHADER: frame 0 has no learning frame; only the passes "
+                            "using the shaders are selected, not their producers\n");
+    }
     if (const char* mb = getenv("PS4_GNM_CAPTURE_RAW_MB")) g_budget.limit = strtoull(mb, nullptr, 10) << 20;
     if (const char* t = getenv("PS4_GNM_CAPTURE_THUMB")) g_thumb = (uint32_t)strtoul(t, nullptr, 10);
     mkdir(base.c_str(), 0755);
@@ -2652,12 +3277,16 @@ bool Replayable(uint32_t idx) {
 // CP thread, start of Draw / Dispatch (a pass of the captured frame).
 void Begin(const char* type, const char* queue, const char* name, const uint32_t* regs) {
     g_pass = new PassRec();
-    g_pass->index = g_next++;
-    g_pass->replayable = Replayable(g_pass->index);
+    g_learning = S.present_idx != g_writer->Frame();
+    g_keyed = false;
     g_pass->type = type;
     g_pass->queue = queue;
     g_pass->name = name;
-    g_pass->regs_file = g_writer->SaveRegs(regs, &g_pass->regs_hash);
+    if (!g_learning) {
+        g_pass->index = g_next++;
+        g_pass->replayable = Replayable(g_pass->index);
+        g_pass->regs_file = g_writer->SaveRegs(regs, &g_pass->regs_hash);
+    }
     g_encoded = false;
     g_reads.clear();
     g_tex.clear();
@@ -2759,8 +3388,30 @@ int AddTexture(const GpuTextureId& gid, id<MTLTexture> t, const char* role, bool
     return (int)g_tex.size() - 1;
 }
 
+// The pass's SelectKey, once its stages are noted (StartEncode, or Finish for a pass that never
+// reached the encoder); in the captured frame, a pass ShaderSelection selects becomes replayable
+// (before any of its textures is recorded).
+void KeyPass(PassRec* p) {
+    if (g_select.Empty() || g_keyed) return;
+    g_keyed = true;
+    uint64_t code[2] = {}, pgm[2] = {};
+    for (size_t i = 0; i < p->stages.size() && i < 2; ++i) {
+        code[i] = p->stages[i].code_addr;
+        pgm[i] = p->stages[i].pgm_hash;
+    }
+    const SelectKey k = g_select.Next(code[0], code[1], pgm[0], pgm[1]);
+    if (g_learning) {
+        g_learn_key = k;
+    } else if (g_select.Selects(k)) {
+        p->replayable = true;
+        if (!g_select.Known(k)) g_unknown++;
+    }
+}
+
 // Encoder thread, top of DrawEncode / DispatchEncode: everything before the pass has completed.
 void StartEncode() {
+    KeyPass(g_pass);
+    if (g_learning) return;
     Commit();
     WaitAll();
 }
@@ -2777,8 +3428,10 @@ void AddTwin(id<MTLTexture> t, const std::string& role, bool written) {
 }
 
 void NoteTargets(const PassKey& key, const RenderState& rs, bool clear_depth, bool clear_stencil) {
-    Commit(); // e.g. the slice copy of a grown depth array (encoded above) is part of the "before"
-    WaitAll();
+    if (!g_learning) {
+        Commit(); // e.g. the slice copy of a grown depth array (encoded above) is part of the "before"
+        WaitAll();
+    }
     for (int i = 0; i < 8; ++i) {
         if (!key.color[i]) continue;
         GpuTextureId gid;
@@ -2836,10 +3489,13 @@ void NoteBuffer(Stage st, uint32_t index, const uint32_t v[4], uint64_t base, ui
 }
 
 // BindStage: an image before the renderer resolves it to a texture.
-void NoteImage(Stage st, uint32_t index, const ImageDesc& img, bool storage, bool depth_image) {
+void NoteImage(Stage st, uint32_t index, const ImageDesc& img, bool storage, bool depth_image, int32_t table,
+               int32_t entry) {
     ImageRec r;
     r.stage = StageName(st);
     r.index = index;
+    r.table = table;
+    r.entry = entry;
     r.addr = img.address;
     memcpy(r.tsharp, img.raw, sizeof(r.tsharp));
     r.dfmt = img.raw_dfmt;
@@ -2911,6 +3567,31 @@ void Encoded(uint64_t indirect_addr) {
     if (indirect_addr) ReadGuest(S.ctx, indirect_addr, g_pass->indirect_args, sizeof(g_pass->indirect_args));
 }
 
+// Finish of a learning-frame pass, for ShaderSelection: what it read (guest ranges; sampled and
+// storage textures it does not write) and wrote. A guest memory dispatch's probed writes are
+// exact; a written texture or bound V# range is a write that may cover only part of the range.
+// The pass's own render and depth targets are not followed: their contents before the pass are
+// its "pre" contents, and every earlier draw into them would be a producer.
+void Learn(PassRec* p) {
+    g_learn_reads.assign(g_reads.begin(), g_reads.end());
+    g_learn_writes.clear();
+    for (const TextureRec& t : p->textures) {
+        if (!t.id.size) continue; // EQAA twin
+        if (t.written) g_learn_writes.push_back({t.id.address, t.id.size});
+        else if (t.role.find("_color") == std::string::npos && t.role.find("_depth") == std::string::npos)
+            g_learn_reads.push_back({t.id.address, t.id.size});
+    }
+    for (const BufferRec& b : p->buffers)
+        if (b.written) g_learn_writes.push_back({b.addr, b.size});
+    if (g_keyed) g_select.Learn(g_learn_key, g_learn_reads, g_guest_written, g_learn_writes);
+    delete p;
+    g_inputs_taken = false;
+    g_guest_written.clear();
+    g_tex.clear();
+    g_reads.clear();
+    g_storage.clear();
+}
+
 // End of the pass: inputs (before the GPU runs it), then its outputs once it completed.
 void Finish() {
     PassRec* p = g_pass;
@@ -2938,6 +3619,11 @@ void Finish() {
             if (std::find(links.begin(), links.end(), k) == links.end()) links.push_back(k);
         }
     }
+    KeyPass(p);
+    if (g_learning) {
+        Learn(p);
+        return;
+    }
     // estimated lengths (fetch shaders, ApproxImageBytes) may reach into guard pages: only readable
     // guest memory is stored
     if (p->replayable && !g_inputs_taken)
@@ -2955,6 +3641,20 @@ void Finish() {
     }
     g_inputs_taken = false;
     g_guest_written.clear();
+    if (p->replayable) {
+        // the pass has completed: what it read must still be what was stored (a guest thread
+        // rewriting a buffer, or other GPU work writing a sampled texture, would make the stored
+        // pass differ from the one that ran)
+        p->unstable = ChangedInputs(S.ctx->mem_base, p->inputs, p->outputs);
+        for (size_t i = 0; i < p->textures.size(); ++i) {
+            TextureRec& tr = p->textures[i];
+            std::vector<uint8_t> again;
+            if (tr.written || tr.pre_file.empty() || !ReadForPass(g_tex[i], &tr, &again)) continue;
+            if (Fnv64(again.data(), again.size()) != tr.pre_hash) p->unstable.push_back("texture " + tr.role);
+        }
+        for (const std::string& u : p->unstable)
+            fprintf(stderr, "[gnm-capture] pass %u: %s changed while the pass ran\n", p->index, u.c_str());
+    }
     for (size_t i = 0; i < p->textures.size(); ++i) {
         TextureRec& tr = p->textures[i];
         // contents that cannot be read (msaa, format, EQAA twin) have no view either; the budget only
@@ -2971,7 +3671,7 @@ void Finish() {
     g_storage.clear();
 }
 
-// GuestMemoryDispatch, after the probe found every page the dispatch accesses and before the
+// GmRunSync, after the probe found every page the dispatch accesses and before the
 // dispatch runs: what it reads (resource tables and buffers noted so far, the guest ranges it
 // reads or writes, read before it writes them) is stored now; what it writes is stored as its
 // output in Finish.
@@ -2990,7 +3690,18 @@ void NoteGuestMemory(const std::vector<std::pair<uint64_t, uint64_t>>& accessed,
 
 // PresentImpl, before S.present_idx moves past the captured frame.
 void EndFrame() {
+    if (LearnFrame()) {
+        g_select.FinishLearning();
+        g_select.BeginFrame();
+        fprintf(stderr, "[gnm-capture] learning frame %llu: %zu passes use the selected shaders, %zu producers selected\n",
+                (unsigned long long)S.present_idx, g_select.NumReaders(), g_select.NumProducers());
+        return;
+    }
     if (!g_writer || S.present_idx != g_writer->Frame()) return;
+    if (g_unknown)
+        fprintf(stderr, "[gnm-capture] frame %llu: %u selected passes had no matching pass in the learning frame (the "
+                        "frames differ: occurrences shifted, producers of those passes may be missing or wrong)\n",
+                (unsigned long long)g_writer->Frame(), g_unknown);
     std::string err;
     if (g_writer->Finish(&err))
         fprintf(stderr, "[gnm-capture] frame %llu: %zu passes written to %s (%llu MiB raw, %llu write failures)\n",
@@ -3007,6 +3718,12 @@ void AtShutdown() {
     if (!g_writer) return;
     delete g_pass;
     g_pass = nullptr;
+    if (S.present_idx != g_writer->Frame()) { // the captured frame never started
+        fprintf(stderr, "[gnm-capture] quit before frame %llu started; nothing written\n",
+                (unsigned long long)g_writer->Frame());
+        g_writer.reset();
+        return;
+    }
     std::string err;
     if (g_writer->Finish(&err))
         fprintf(stderr, "[gnm-capture] frame %llu did not present: %zu passes written to %s at shutdown (%llu MiB raw, "
@@ -3046,36 +3763,304 @@ struct EncodeScope {
 // A compute shader that reads or writes buffers through V#s it loads at run time (Uncharted 4's
 // GPU copy shader: a table of source and destination V#s) cannot have them bound: it reaches
 // guest memory through a page table of 64 MiB guest windows (the no-copy MTLBuffers of
-// GuestBuffer). Which windows it needs is only known in the shader, so the dispatch first runs
-// as a probe that writes nothing and reports the windows it would access; those are mapped and
-// the probe repeats until it finds none missing, then the dispatch runs. Both passes are waited
-// for: the CP thread reads guest memory the dispatch may have written (resource tables of later
-// draws), and the written 1 MiB pages are known only afterwards.
+// GuestBuffer). Which windows it needs is only known in the shader, so every such dispatch is
+// four kernels in one compute encoder, with buffer barriers between them, using a fault buffer
+// slot of its own (GmSlot):
+//  1. the probe: the shader with the slot in mode 1. It writes nothing and records the unmapped
+//     64 MiB pages it would access, the 1 MiB pages it would read and write, and the accesses it
+//     could not make (GCN_GUEST_STATUS_*);
+//  2. the gate (gm_gate): it passes if the probe found every page mapped, no status bit and
+//     (fast path) no written page outside the prediction. Then it switches the slot to mode 0
+//     and writes the dispatch's size as indirect arguments; otherwise a size of zero;
+//  3. the pass: the shader again, dispatched with the gate's arguments, so a refused dispatch
+//     runs no thread and has no effect;
+//  4. the harvest (gm_harvest): moves the slot's non-zero fault words into its summary and
+//     resets the slot, so the CPU neither clears nor scans it.
+// Sync path (no prediction for the shader yet, a shader with storage or depth images, a captured
+// frame): commit and wait once. A dispatch refused for unmapped pages has them mapped and runs again (up to 8
+// times); one refused for another status is skipped (logged). The CP thread waits for it, as
+// it reads guest memory for later draws (resource tables) that the dispatch may have written.
+// Fast path (the 1 MiB pages the shader writes are predicted from its earlier dispatches): the
+// dispatch is ticket t (GmSync). Nothing waits for it on the CPU:
+//  - fast dispatches encoded back to back form a chain in the open compute encoder; the gate of
+//    each also refuses it when the one before it is to run again. Before any other work
+//    (GmCloseChain) the GPU signals 2t - 1 of the chain's last ticket and waits for 2t;
+//  - a listener reads the gates' verdicts and signals 2t. If a probe met an unmapped page or a
+//    written page outside the prediction, the encoder thread instead maps the pages and runs that
+//    dispatch and the ones after it again, in order, on a second queue (the GPU holds every later
+//    work at 2t), then signals 2t;
+//  - the predicted pages are pending GPU writes for the texture hazard checks, and the CP thread
+//    waits for t only before it reads one of them for a queue that synchronized after t was
+//    handed out (GmCpGuarded), as GCN orders such reads.
+// A shader with storage or depth images, or without a prediction yet, takes the sync path.
 // =====================================================================================
+struct GmSlot {
+    id<MTLBuffer> buf = nil;
+    uint32_t* f = nullptr;
+};
+
+// The slot's summary, after its GCN_GUEST_FAULT_DWORDS fault dwords (written by gm_gate and
+// gm_harvest).
+constexpr uint32_t kGmSum = GCN_GUEST_FAULT_DWORDS;
+constexpr uint32_t kGmGate = 0;     // 0: no gate ran, 1: passed, 2: refused (kGmWhy* bits in kGmWhy)
+constexpr uint32_t kGmWhy = 1;
+constexpr uint32_t kGmStatus = 2;   // GCN_GUEST_STATUS after the pass (after the probe if refused)
+constexpr uint32_t kGmCount = 3;    // non-zero fault words the harvest found
+constexpr uint32_t kGmOverflow = 4; // 1: more than kGmMaxEntries (the rest stays in the slot)
+constexpr uint32_t kGmArgs = 8;     // the pass's threadgroups x, y, z (indirect dispatch arguments)
+constexpr uint32_t kGmEntries = 12; // (fault dword index, value) pairs
+constexpr uint32_t kGmMaxEntries = 4096;
+constexpr uint32_t kGmSlotDwords = kGmSum + kGmEntries + 2 * kGmMaxEntries;
+constexpr uint32_t kGmWhyUnmapped = 1, kGmWhyStatus = 2, kGmWhyWritten = 4, kGmWhyForced = 8, kGmWhyChain = 16;
+// refusals that make the dispatch run again (the others skip it, as on the sync path)
+constexpr uint32_t kGmWhyRerun = kGmWhyUnmapped | kGmWhyWritten | kGmWhyChain;
+// gm_gate flags
+constexpr uint32_t kGmGateIndirect = 1, kGmGateCheckWritten = 2, kGmGateRefuse = 4, kGmGateChain = 8;
+// Predicted pages per shader (gm_gate gets them as bytes: at most 4 KiB).
+constexpr uint32_t kGmMaxPredicted = 1024;
+static_assert(kGmSum % 4 == 0, "the indirect arguments must be 16-byte aligned");
+
+// A dispatch's result, read from its slot's summary.
+struct GmResult {
+    uint32_t gate = 0, why = 0, status = 0;
+    GmPages unmapped;      // 64 MiB pages
+    GmPages read, written; // 1 MiB pages
+};
+
 struct GuestMemoryState {
-    id<MTLBuffer> table = nil; // GCN_GUEST_PAGES uint64 (shared)
-    id<MTLBuffer> fault = nil; // GCN_GUEST_FAULT_DWORDS uint32 (shared)
+    // GCN_GUEST_PAGES uint64 (shared). Once bound it is not changed but replaced (a dispatch that
+    // has not run yet may use it); replaced tables are kept until their command buffers completed.
+    id<MTLBuffer> table = nil;
+    bool table_bound = false;
+    std::vector<std::pair<uint64_t, id<MTLBuffer>>> old_tables; // (command buffer sequence, table)
     std::vector<uint32_t> pages;     // mapped 64 MiB pages
     std::vector<uint64_t> last_used; // per page: present index of its last access (0: not mapped)
-    uint64_t wrong_guesses = 0;      // real dispatches that met a page their probes had not reported
+    uint64_t wrong_guesses = 0;      // passes that met a page their probe had not reported
+    id<MTLComputePipelineState> gate_pso = nil, harvest_pso = nil;
+    id<MTLCommandQueue> queue2 = nil; // re-runs of missed tickets
+    id<MTLBuffer> cur_slot = nil;     // the slot BindStage binds as the fault buffer
+    std::vector<GmSlot> free_slots;
+    std::deque<std::shared_ptr<GmTicket>> tickets; // encoded, not finished (ticket order)
+    std::vector<std::shared_ptr<GmTicket>> chain;  // the open chain (g_gms.chain_open)
+    id<MTLBuffer> chain_prev = nil;                // the slot of its last dispatch
+    bool servicing = false;
 } g_gmem;
+
 
 // A mapped page no dispatch accessed for this many presents is dropped from the table (its
 // window is then released by the usual idle sweep unless something else uses it).
 constexpr uint64_t kGuestPageIdlePresents = 600;
 
+// One threadgroup each; fault words and summary as above. GM_* come from GmLibrarySource.
+static const char* kGmKernels = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct GateParams { uint dims[3]; uint flags; uint npred; };
+// Passes the dispatch if its probe found every page mapped, no status bit and (flag 2) no
+// written page outside pred (sorted). Refused (or flag 4): the pass gets zero threadgroups.
+// Flag 8: also refused if the previous dispatch of the chain (prev) is to run again.
+kernel void gm_gate(device uint* f [[buffer(0)]], constant GateParams& p [[buffer(1)]],
+                    constant uint* pred [[buffer(2)]], device const uint* guest_args [[buffer(3)]],
+                    device const uint* prev [[buffer(4)]],
+                    uint tid [[thread_index_in_threadgroup]], uint nt [[threads_per_threadgroup]]) {
+    threadgroup atomic_uint bad;
+    if (tid == 0) atomic_store_explicit(&bad, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint b = 0;
+    for (uint i = tid; i < GM_PAGES / 32; i += nt)
+        if (f[GM_UNMAPPED + i]) b |= 1u;
+    if ((p.flags & 2u) != 0) {
+        for (uint i = tid; i < GM_TRACK / 32 && (b & 4u) == 0; i += nt) {
+            for (uint w = f[GM_WRITTEN + i]; w != 0; w &= w - 1) {
+                const uint page = i * 32 + ctz(w);
+                uint lo = 0, hi = p.npred;
+                while (lo < hi) {
+                    const uint mid = (lo + hi) / 2;
+                    if (pred[mid] < page) lo = mid + 1;
+                    else hi = mid;
+                }
+                if (lo == p.npred || pred[lo] != page) {
+                    b |= 4u;
+                    break;
+                }
+            }
+        }
+    }
+    if (b != 0) atomic_fetch_or_explicit(&bad, b, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
+    uint why = atomic_load_explicit(&bad, memory_order_relaxed);
+    if (f[GM_STATUS] != 0) why |= 2u;
+    if ((p.flags & 4u) != 0) why |= 8u;
+    if ((p.flags & 8u) != 0 && prev[GM_SUM + GM_S_GATE] == 2 && (prev[GM_SUM + GM_S_WHY] & GM_WHY_RERUN) != 0)
+        why |= 16u;
+    device uint* s = f + GM_SUM;
+    s[GM_S_WHY] = why;
+    if (why == 0) {
+        const bool ind = (p.flags & 1u) != 0;
+        s[GM_S_ARGS + 0] = ind ? guest_args[0] : p.dims[0];
+        s[GM_S_ARGS + 1] = ind ? guest_args[1] : p.dims[1];
+        s[GM_S_ARGS + 2] = ind ? guest_args[2] : p.dims[2];
+        f[GM_MODE] = 0;
+        s[GM_S_GATE] = 1;
+    } else {
+        s[GM_S_ARGS + 0] = 0;
+        s[GM_S_ARGS + 1] = 0;
+        s[GM_S_ARGS + 2] = 0;
+        s[GM_S_GATE] = 2;
+    }
+}
+// Moves the non-zero fault words (bitmaps) into the summary list and zeroes them, copies the
+// status, and resets the slot to a probe.
+kernel void gm_harvest(device uint* f [[buffer(0)]], uint tid [[thread_index_in_threadgroup]],
+                       uint nt [[threads_per_threadgroup]]) {
+    device uint* s = f + GM_SUM;
+    device atomic_uint* count = reinterpret_cast<device atomic_uint*>(s + GM_S_COUNT);
+    if (tid == 0) {
+        s[GM_S_STATUS] = f[GM_STATUS];
+        s[GM_S_OVERFLOW] = 0;
+        atomic_store_explicit(count, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint i = GM_UNMAPPED + tid; i < GM_SUM; i += nt) {
+        const uint w = f[i];
+        if (w == 0) continue;
+        const uint k = atomic_fetch_add_explicit(count, 1u, memory_order_relaxed);
+        if (k < GM_MAX_ENTRIES) {
+            s[GM_S_ENTRIES + 2 * k] = i;
+            s[GM_S_ENTRIES + 2 * k + 1] = w;
+            f[i] = 0;
+        } else {
+            s[GM_S_OVERFLOW] = 1;
+        }
+    }
+    if (tid == 0) {
+        f[GM_MODE] = 1;
+        f[GM_STATUS] = 0;
+    }
+}
+)";
+
+std::string GmLibrarySource() {
+    char defs[1024];
+    snprintf(defs, sizeof(defs),
+             "#define GM_PAGES %uu\n#define GM_TRACK %uu\n#define GM_MODE %uu\n#define GM_STATUS %uu\n"
+             "#define GM_UNMAPPED %uu\n#define GM_WRITTEN %uu\n#define GM_SUM %uu\n#define GM_S_GATE %uu\n"
+             "#define GM_S_WHY %uu\n#define GM_S_STATUS %uu\n#define GM_S_COUNT %uu\n#define GM_S_OVERFLOW %uu\n"
+             "#define GM_S_ARGS %uu\n#define GM_S_ENTRIES %uu\n#define GM_MAX_ENTRIES %uu\n#define GM_WHY_RERUN %uu\n",
+             GCN_GUEST_PAGES, GCN_GUEST_TRACK_PAGES, GCN_GUEST_MODE, GCN_GUEST_STATUS, GCN_GUEST_UNMAPPED,
+             GCN_GUEST_WRITTEN, kGmSum, kGmGate, kGmWhy, kGmStatus, kGmCount, kGmOverflow, kGmArgs, kGmEntries,
+             kGmMaxEntries, kGmWhyRerun);
+    return std::string(defs) + kGmKernels;
+}
+
 bool EnsureGuestMemoryState() {
     if (g_gmem.table) return true;
-    g_gmem.table = [S.dev newBufferWithLength:GCN_GUEST_PAGES * sizeof(uint64_t) options:MTLResourceStorageModeShared];
-    g_gmem.fault = [S.dev newBufferWithLength:GCN_GUEST_FAULT_DWORDS * sizeof(uint32_t)
-                                      options:MTLResourceStorageModeShared];
-    if (!g_gmem.table || !g_gmem.fault) {
-        g_gmem.table = g_gmem.fault = nil;
+    if (!g_gms.ev) return false;
+    NSError* err = nil;
+    id<MTLLibrary> lib = [S.dev newLibraryWithSource:[NSString stringWithUTF8String:GmLibrarySource().c_str()]
+                                             options:nil
+                                               error:&err];
+    id<MTLFunction> gate = [lib newFunctionWithName:@"gm_gate"], harvest = [lib newFunctionWithName:@"gm_harvest"];
+    if (gate) g_gmem.gate_pso = [S.dev newComputePipelineStateWithFunction:gate error:&err];
+    if (harvest) g_gmem.harvest_pso = [S.dev newComputePipelineStateWithFunction:harvest error:&err];
+    if (!g_gmem.gate_pso || !g_gmem.harvest_pso) {
+        fprintf(stderr, "[gnm-draw] guest memory kernels failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "no function");
+        g_gmem.gate_pso = g_gmem.harvest_pso = nil;
         return false;
     }
+    g_gmem.table = [S.dev newBufferWithLength:GCN_GUEST_PAGES * sizeof(uint64_t) options:MTLResourceStorageModeShared];
+    if (!g_gmem.table) return false;
     memset(g_gmem.table.contents, 0, g_gmem.table.length);
     g_gmem.last_used.assign(GCN_GUEST_PAGES, 0);
     return true;
+}
+
+GmSlot GmAcquireSlot() {
+    if (!g_gmem.free_slots.empty()) {
+        GmSlot s = g_gmem.free_slots.back();
+        g_gmem.free_slots.pop_back();
+        return s;
+    }
+    GmSlot s;
+    s.buf = [S.dev newBufferWithLength:kGmSlotDwords * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    if (!s.buf) return s;
+    s.f = (uint32_t*)s.buf.contents;
+    memset(s.f, 0, kGmSlotDwords * sizeof(uint32_t));
+    s.f[GCN_GUEST_MODE] = 1;
+    return s;
+}
+
+// Back to the pool once the GPU is done with it (its harvest ran) and its summary was read.
+void GmReleaseSlot(GmSlot& s) {
+    if (s.buf) g_gmem.free_slots.push_back(s);
+    s = GmSlot{};
+}
+
+// Reads a slot's summary after its harvest ran, and makes the slot ready for reuse.
+void GmReadSlot(const GmSlot& slot, GmResult* r) {
+    uint32_t* f = slot.f;
+    uint32_t* s = f + kGmSum;
+    r->gate = s[kGmGate];
+    r->why = s[kGmWhy];
+    r->status = s[kGmStatus];
+    r->unmapped.clear();
+    r->read.clear();
+    r->written.clear();
+    const auto add = [r](uint32_t i, uint32_t w) {
+        GmPages* to = nullptr;
+        uint32_t base = 0;
+        if (i >= GCN_GUEST_WRITTEN) to = &r->written, base = GCN_GUEST_WRITTEN;
+        else if (i >= GCN_GUEST_READ) to = &r->read, base = GCN_GUEST_READ;
+        else if (i >= GCN_GUEST_UNMAPPED) to = &r->unmapped, base = GCN_GUEST_UNMAPPED;
+        if (!to) return;
+        for (; w; w &= w - 1) to->push_back((i - base) * 32 + (uint32_t)__builtin_ctz(w));
+    };
+    const uint32_t n = std::min(s[kGmCount], kGmMaxEntries);
+    for (uint32_t k = 0; k < n; ++k) add(s[kGmEntries + 2 * k], s[kGmEntries + 2 * k + 1]);
+    if (s[kGmOverflow]) {
+        // the harvest's list was full: the rest is still in the bitmaps
+        for (uint32_t i = GCN_GUEST_UNMAPPED; i < kGmSum; ++i)
+            if (f[i]) {
+                add(i, f[i]);
+                f[i] = 0;
+            }
+    }
+    for (GmPages* v : {&r->unmapped, &r->read, &r->written}) {
+        std::sort(v->begin(), v->end());
+        v->erase(std::unique(v->begin(), v->end()), v->end());
+    }
+    s[kGmGate] = s[kGmWhy] = s[kGmStatus] = s[kGmCount] = s[kGmOverflow] = 0;
+}
+
+// Consecutive pages as (address, bytes) ranges.
+std::vector<std::pair<uint64_t, uint64_t>> GmRanges(const GmPages& pages, uint32_t shift) {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    for (uint32_t p : pages) {
+        const uint64_t a = (uint64_t)p << shift;
+        if (!out.empty() && out.back().first + out.back().second == a) out.back().second += 1ull << shift;
+        else out.push_back({a, 1ull << shift});
+    }
+    return out;
+}
+
+bool GmSubset(const GmPages& a, const GmPages& b) {
+    return std::includes(b.begin(), b.end(), a.begin(), a.end());
+}
+
+// Queues the invalidation of sampled textures over the pages res's pass wrote outside pred (all
+// it wrote without one: the sync path). Any thread; never blocks on the texture cache.
+void GmInvalidateOutside(const GmResult& res, const GmPages* pred) {
+    if (res.written.empty()) return;
+    thread_local GmPages extra;
+    extra.clear();
+    if (pred) std::set_difference(res.written.begin(), res.written.end(), pred->begin(), pred->end(), std::back_inserter(extra));
+    const GmPages& stale = pred ? extra : res.written;
+    if (stale.empty()) return;
+    std::lock_guard<std::mutex> lk(g_gm_inval.mu);
+    for (auto [a, n] : GmRanges(stale, GCN_GUEST_TRACK_SHIFT)) g_gm_inval.ranges.push_back({a, n, ~0ull});
+    g_gm_inval.any.store(true, std::memory_order_release);
 }
 
 // The no-copy window holding guest page p and the table entry for it: the GPU address of guest
@@ -3094,45 +4079,75 @@ bool GuestPageWindow(uint32_t p, __strong id<MTLBuffer>* mb, uint64_t* entry) {
     return true;
 }
 
+// Adds the 64 MiB pages to the mapped set (their table entries are written by the next bind).
+bool GmMapPages(const GmPages& pages, const char* queue, uint64_t code_addr) {
+    for (uint32_t p : pages) {
+        id<MTLBuffer> mb = nil;
+        uint64_t entry = 0;
+        if (!GuestPageWindow(p, &mb, &entry)) {
+            RLog("guestmem", "%s CS 0x%llx skipped: guest page 0x%llx (64 MiB) cannot be mapped", queue,
+                 (unsigned long long)code_addr, (unsigned long long)((uint64_t)p << GCN_GUEST_PAGE_SHIFT));
+            return false;
+        }
+        if (!g_gmem.last_used[p]) g_gmem.pages.push_back(p);
+        g_gmem.last_used[p] = std::max<uint64_t>(S.present_idx, 1);
+    }
+    return true;
+}
+
 // The page table with an entry for every mapped page; each window is (re)created through
 // GuestBuffer (windows idle for a while are released) and made resident on the encoder. Pages
-// idle for kGuestPageIdlePresents are dropped first.
+// idle for kGuestPageIdlePresents are dropped first. A table that changes after it was bound is
+// copied first (passes encoded earlier keep theirs).
 bool BindGuestPageTable(Binder& b, __strong id<MTLBuffer>* out) {
     if (!EnsureGuestMemoryState()) return false;
-    uint64_t* table = (uint64_t*)g_gmem.table.contents;
+    {
+        const uint64_t done = CompletedSeq();
+        size_t k = 0;
+        for (auto& t : g_gmem.old_tables)
+            if (t.first > done) g_gmem.old_tables[k++] = t;
+        g_gmem.old_tables.resize(k);
+    }
+    static std::vector<std::pair<uint32_t, uint64_t>> want; // (page, entry); encoder thread only
+    static std::vector<id<MTLBuffer>> windows;
+    want.clear();
+    windows.clear();
+    const uint64_t* cur = (const uint64_t*)g_gmem.table.contents;
+    bool change = false;
     size_t n = 0;
     for (uint32_t p : g_gmem.pages) {
         if (S.present_idx > g_gmem.last_used[p] + kGuestPageIdlePresents) {
-            table[p] = 0;
             g_gmem.last_used[p] = 0;
+            want.push_back({p, 0});
+            change |= cur[p] != 0;
             continue;
         }
         g_gmem.pages[n++] = p;
         id<MTLBuffer> mb = nil;
         uint64_t entry = 0;
-        if (!GuestPageWindow(p, &mb, &entry)) {
-            table[p] = 0; // the next probe reports it again
-            continue;
-        }
-        table[p] = entry;
-        b.Use(mb, true);
+        if (!GuestPageWindow(p, &mb, &entry)) entry = 0; // the next probe reports it again
+        else windows.push_back(mb);
+        want.push_back({p, entry});
+        change |= cur[p] != entry;
     }
     g_gmem.pages.resize(n);
+    if (change) {
+        if (g_gmem.table_bound) {
+            id<MTLBuffer> t = [S.dev newBufferWithLength:g_gmem.table.length options:MTLResourceStorageModeShared];
+            if (!t) return false;
+            memcpy(t.contents, g_gmem.table.contents, g_gmem.table.length);
+            g_gmem.old_tables.push_back({S.committed_seq + 1, g_gmem.table});
+            g_gmem.table = t;
+            g_gmem.table_bound = false;
+        }
+        uint64_t* table = (uint64_t*)g_gmem.table.contents;
+        for (auto [p, e] : want) table[p] = e;
+    }
+    for (id<MTLBuffer> mb : windows) b.Use(mb, true);
+    windows.clear();
+    g_gmem.table_bound = true;
     *out = g_gmem.table;
     return true;
-}
-
-// Ranges of the set bits of a page bitmap of `nbits` pages of 1 << shift bytes, merged.
-std::vector<std::pair<uint64_t, uint64_t>> BitmapRanges(const uint32_t* bits, uint32_t nbits, uint32_t shift) {
-    std::vector<std::pair<uint64_t, uint64_t>> out;
-    for (uint32_t w = 0; w < nbits / 32; ++w) {
-        for (uint32_t m = bits[w]; m; m &= m - 1) {
-            const uint64_t a = ((uint64_t)w * 32 + (uint32_t)__builtin_ctz(m)) << shift;
-            if (!out.empty() && out.back().first + out.back().second == a) out.back().second += 1ull << shift;
-            else out.push_back({a, 1ull << shift});
-        }
-    }
-    return out;
 }
 
 std::string GuestStatusText(uint32_t st) {
@@ -3150,94 +4165,231 @@ std::string GuestStatusText(uint32_t st) {
     return t;
 }
 
-// Marks the 64 MiB pages of the 1 MiB read / written bitmaps as used now.
-void TouchGuestPages(const uint32_t* f) {
-    for (uint32_t base : {GCN_GUEST_READ, GCN_GUEST_WRITTEN})
-        for (auto [a, n] : BitmapRanges(f + base, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT))
-            for (uint64_t p = a >> GCN_GUEST_PAGE_SHIFT; p <= (a + n - 1) >> GCN_GUEST_PAGE_SHIFT; ++p)
-                if (g_gmem.last_used[p]) g_gmem.last_used[p] = std::max<uint64_t>(S.present_idx, 1);
+// Marks the 64 MiB pages of the 1 MiB pages read / written as used now.
+void TouchGuestPages(const GmResult& r) {
+    for (const GmPages* v : {&r.read, &r.written})
+        for (uint32_t t : *v) {
+            const uint32_t p = t >> (GCN_GUEST_PAGE_SHIFT - GCN_GUEST_TRACK_SHIFT);
+            if (g_gmem.last_used[p]) g_gmem.last_used[p] = std::max<uint64_t>(S.present_idx, 1);
+        }
 }
 
-// Runs the probes and the dispatch (encode binds and encodes one pass). False: nothing ran
-// (logged). A probe that found missing pages maps them and probes again: what else it reported
-// may come from values it read as 0 from those pages (a V# loaded from one, say), so the other
-// status bits are judged only on a probe that found every page mapped.
-bool GuestMemoryDispatch(const Shader* cs, const char* queue, const std::function<bool()>& encode) {
-    if (!EnsureGuestMemoryState()) {
-        RLog("guestmem", "%s CS 0x%llx skipped: no guest memory buffers", queue, (unsigned long long)cs->code_addr);
-        S.n_skipped++;
-        return false;
-    }
-    uint32_t* f = (uint32_t*)g_gmem.fault.contents;
-    const auto run = [&](uint32_t mode) -> bool {
-        memset(f, 0, GCN_GUEST_FAULT_DWORDS * sizeof(uint32_t));
-        f[GCN_GUEST_MODE] = mode;
-        if (!encode()) return false;
-        EndEncoders();
-        Commit();
-        WaitAll();
-        return !S.hung;
-    };
-    constexpr int kMaxProbes = 8;
-    for (int probe = 0;; ++probe) {
-        if (!run(1)) return false;
-        const auto missing = BitmapRanges(f + GCN_GUEST_UNMAPPED, GCN_GUEST_PAGES, GCN_GUEST_PAGE_SHIFT);
-        if (missing.empty()) {
-            if (const uint32_t st = f[GCN_GUEST_STATUS] & ~GCN_GUEST_STATUS_UNMAPPED) {
-                RLog("guestmem", "%s CS 0x%llx skipped: it accesses guest memory through %s", queue,
-                     (unsigned long long)cs->code_addr, GuestStatusText(st).c_str());
-                S.n_skipped++;
-                return false;
-            }
-            break;
-        }
-        if (probe + 1 == kMaxProbes) {
-            RLog("guestmem", "%s CS 0x%llx skipped: guest pages still missing after %d probes", queue,
-                 (unsigned long long)cs->code_addr, kMaxProbes);
-            S.n_skipped++;
-            return false;
-        }
-        for (auto [a, n] : missing) {
-            for (uint64_t at = a; at < a + n; at += 1ull << GCN_GUEST_PAGE_SHIFT) {
-                const uint32_t p = (uint32_t)(at >> GCN_GUEST_PAGE_SHIFT);
-                id<MTLBuffer> mb = nil;
-                uint64_t entry = 0;
-                if (!GuestPageWindow(p, &mb, &entry)) {
-                    RLog("guestmem", "%s CS 0x%llx skipped: guest page 0x%llx (64 MiB) cannot be mapped", queue,
-                         (unsigned long long)cs->code_addr, (unsigned long long)at);
-                    S.n_skipped++;
-                    return false;
-                }
-                if (!g_gmem.last_used[p]) g_gmem.pages.push_back(p);
-                g_gmem.last_used[p] = std::max<uint64_t>(S.present_idx, 1);
-            }
-        }
-    }
-    TouchGuestPages(f);
-    const auto written = BitmapRanges(f + GCN_GUEST_WRITTEN, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT);
-    if (cap::g_pass) {
-        auto accessed = BitmapRanges(f + GCN_GUEST_READ, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT);
-        accessed.insert(accessed.end(), written.begin(), written.end());
-        cap::NoteGuestMemory(accessed, written);
-    }
-    if (!run(0)) return false;
-    if (const uint32_t st = f[GCN_GUEST_STATUS]) {
-        // the probes predicted other pages than the dispatch accessed (an address depending on
-        // a value the probe could not produce, e.g. an atomic's result)
-        if (st & GCN_GUEST_STATUS_UNMAPPED) g_gmem.wrong_guesses++;
-        RLog("guestmem", "%s CS 0x%llx: accesses through %s were not made (wrong probe guesses so far: %llu)", queue,
-             (unsigned long long)cs->code_addr, GuestStatusText(st).c_str(), (unsigned long long)g_gmem.wrong_guesses);
-    }
-    TouchGuestPages(f);
-    // sampled textures over the written pages are stale
-    std::vector<GpuWrite> w;
-    for (auto [a, n] : BitmapRanges(f + GCN_GUEST_WRITTEN, GCN_GUEST_TRACK_PAGES, GCN_GUEST_TRACK_SHIFT))
-        w.push_back({a, n, ++S.write_epoch});
-    if (S.tex && !w.empty()) S.tex->InvalidateWrites(w);
-    return true;
+// ---- Predictions: the 1 MiB pages each shader (permutation) wrote so far ----
+struct GmPredictions {
+    std::mutex mu;
+    std::unordered_map<uint64_t, std::shared_ptr<const GmPages>> by_shader;
+} g_gm_pred;
+
+std::shared_ptr<const GmPages> GmPredict(uint64_t uid) {
+    std::lock_guard<std::mutex> lk(g_gm_pred.mu);
+    auto it = g_gm_pred.by_shader.find(uid);
+    return it == g_gm_pred.by_shader.end() ? nullptr : it->second;
+}
+
+// Adds pages a dispatch of the shader wrote (a union that only grows; it starts over from these
+// pages if it would exceed kGmMaxPredicted).
+void GmLearn(uint64_t uid, const GmPages& written) {
+    std::lock_guard<std::mutex> lk(g_gm_pred.mu);
+    auto& cur = g_gm_pred.by_shader[uid];
+    if (cur && GmSubset(written, *cur)) return;
+    auto next = std::make_shared<GmPages>();
+    if (cur) std::set_union(cur->begin(), cur->end(), written.begin(), written.end(), std::back_inserter(*next));
+    else *next = written;
+    if (next->size() > kGmMaxPredicted) *next = written;
+    if (next->size() > kGmMaxPredicted) next->resize(kGmMaxPredicted + 1); // too many: no fast path
+    cur = std::move(next);
 }
 
 uint64_t GuestMemoryWrongGuesses() { return g_gmem.wrong_guesses; }
+
+} // namespace
+
+GuestMemoryStats GetGuestMemoryStats() {
+    GuestMemoryStats st;
+    st.sync = g_gm_stats.sync.load();
+    st.fast = g_gm_stats.fast.load();
+    st.reruns = g_gm_stats.reruns.load();
+    st.refused = g_gm_stats.refused.load();
+    st.mispredicted = g_gm_stats.mispredicted.load();
+    st.cp_waits = g_gm_stats.cp_waits.load();
+    st.cp_wait_us = g_gm_stats.cp_wait_us.load();
+    st.chains = g_gm_stats.chains.load();
+    st.rerun_wait_us = g_gm_stats.rerun_wait_us.load();
+    st.rerun_wait_max_us = g_gm_stats.rerun_wait_max_us.load();
+    st.no_slot = g_gm_stats.no_slot.load();
+    st.no_indirect = g_gm_stats.no_indirect.load();
+    st.pass_failed = g_gm_stats.pass_failed.load();
+    st.waits = S.n_waits_total.load();
+    st.final_ticket = std::min<uint64_t>(GmResolved(), g_gms.issued.load());
+    return st;
+}
+
+bool Hung() { return S.hung; }
+
+void TestWithholdNextTicket() { g_gms.withhold_next.store(true); }
+
+void TestHoldTextureCacheLock(bool hold) {
+    if (!S.tex) return;
+    if (hold) S.tex->TestMutex().lock();
+    else S.tex->TestMutex().unlock();
+}
+
+namespace {
+
+// ---- T# tables a shader indexes at run time (gcn_image_table) ----
+// Written by the encoder thread, read by GetImageTableStats from any thread.
+struct AtomicTableStats {
+    std::atomic<uint64_t> bound{0}, empty{0}, rejected{0}, unmapped{0}, hazard_drains{0}, hazard_skips{0};
+} g_table_stats;
+bool g_address_check = false; // gcn_set_image_address_check installed (Init)
+struct StageImages;
+void DecodeStageImages(const Shader* s, const std::vector<uint32_t>& flat, StageImages* out);
+
+// Entries of the tables of one binding of a stage, per table (bound / empty / rejected /
+// unmapped, with the first unmapped T# address).
+struct TableEntryCounts {
+    static constexpr uint32_t kMax = 8;
+    uint32_t bound[kMax] = {}, empty[kMax] = {}, rejected[kMax] = {}, unmapped[kMax] = {};
+    uint64_t first_unmapped[kMax] = {};
+};
+
+// One table entry as BindStage bound it: a texture, an all-zero T# (past the table, or a loop
+// entry the draw does not reach), or a T# for which no texture could be bound.
+void NoteTableEntry(const Shader* s, const std::vector<uint32_t>& flat, uint32_t i, bool bound, TableEntryCounts& c) {
+    const gcn_image_binding& ib = s->imgs[i];
+    const uint32_t t = std::min(ib.table, TableEntryCounts::kMax - 1);
+    if (bound) {
+        c.bound[t]++;
+        g_table_stats.bound.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // the raw dwords the SRT program copied (SingleLoad: consecutive flatbuf dwords)
+    bool zero = true;
+    const uint32_t nd = ib.is_r128 ? 4 : 8;
+    for (uint32_t k = 0; k < nd; ++k) {
+        const uint32_t at = ib.sharp.offsets[k];
+        if (at < flat.size() && flat[at] != 0) zero = false;
+    }
+    if (zero) {
+        c.empty[t]++;
+        g_table_stats.empty.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // a T# at a provably unmapped address (gcn_set_image_address_check) is told apart from one no
+    // texture could be made of, so a real texture hidden by the address check would show
+    const uint32_t d0 = ib.sharp.offsets[0] < flat.size() ? flat[ib.sharp.offsets[0]] : 0;
+    const uint32_t d1 = ib.sharp.offsets[1] < flat.size() ? flat[ib.sharp.offsets[1]] : 0;
+    // base_address is T# bits 0-37 (dword 1 bits 6-7: mtype_l2, then min_lod)
+    const uint64_t addr = ((uint64_t)d0 | (uint64_t)(d1 & 0x3F) << 32) << 8;
+    if (g_address_check && !GuestAddressMapped(S.ctx, addr)) {
+        if (!c.unmapped[t]) c.first_unmapped[t] = addr;
+        c.unmapped[t]++;
+        g_table_stats.unmapped.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        c.rejected[t]++;
+        g_table_stats.rejected.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// Once per shader, at its first binding: what its tables' entries held.
+void LogTableEntries(const Shader* s, const TableEntryCounts& c) {
+    if (s->tables_logged.exchange(true, std::memory_order_relaxed)) return;
+    static const char* const kinds[] = {"none", "records", "indexed", "loop"};
+    for (uint32_t t = 0; t < s->tables.size(); ++t) {
+        const gcn_image_table& tb = s->tables[t];
+        const uint32_t k = std::min(t, TableEntryCounts::kMax - 1);
+        fprintf(stderr,
+                "[gnm-draw] shader 0x%llx (hw %u) T# table %u (%s, buffer %u dword %u + %u * index, %u site(s)): "
+                "%u entries bound for %u reached: %u texture(s), %u empty, %u rejected, %u unmapped (first 0x%llx)\n",
+                (unsigned long long)s->code_addr, s->hw, t, kinds[tb.kind < 4 ? tb.kind : 0], tb.table_buffer,
+                tb.first_dw, tb.stride_dw, tb.num_sites, tb.num_entries, tb.reached, c.bound[k], c.empty[k],
+                c.rejected[k], c.unmapped[k], (unsigned long long)c.first_unmapped[k]);
+    }
+}
+
+// The SRT walker copied the tables' entries from guest memory when the CP prepared the draw or
+// dispatch. If GPU work that had not completed by then writes that memory, the copy is stale
+// (the same limitation the flattened user data has elsewhere; Uncharted 4's tables are written
+// by the CPU). Whether a write had completed is judged at the CP's copy (`snap`, TableReadBegin),
+// not here: by the time the encoder runs this the write may have completed (the CP ran ahead of
+// the encoder, a captured pass drained the GPU when it started encoding, or an earlier check
+// drained it). One check per draw or dispatch, over the table reads of all its stages: on a hit
+// the GPU is drained if the write may still be pending, and every stage with tables copies its
+// tables again. Each stage's permutation was chosen from the stale tables (entry-count bucket,
+// entry image types), so each is checked against the tables read again: false when one no longer
+// fits, and the caller skips the draw (counted, logged once per shader). Encoder thread, before
+// the stages' images are used.
+// cap::SetSkipped reason of a pass ResolveTableHazards refuses. Reachable in a captured frame
+// too: the drain at the start of a captured pass's encoding does not make the CP's copy current.
+const char* const kCapTableHazardSkip = "T# tables written by pending GPU work no longer fit the permutation";
+
+struct TableStage {
+    const Shader* s = nullptr; // nullptr: no such stage
+    const uint32_t* ud = nullptr;
+    const gcn_runtime_info* rt = nullptr;
+    std::vector<uint32_t>* flat = nullptr;
+    StageImages* img = nullptr;
+};
+
+bool ResolveTableHazards(const TableStage* st, uint32_t n, uint64_t snap) {
+    bool tables = false;
+    for (uint32_t k = 0; k < n; ++k) tables |= st[k].s && !st[k].s->tables.empty();
+    if (!tables) return true;
+    PruneTableWrites();
+    if (S.gpu_written.empty() && S.table_written.empty()) return true;
+    static thread_local std::vector<std::array<uint64_t, 2>> reads;
+    const Shader* hit_s = nullptr;
+    GpuWrite hit{};
+    uint64_t hit_read[2] = {}, pending_seq = 0;
+    for (uint32_t k = 0; k < n && !hit_s; ++k) {
+        const Shader* s = st[k].s;
+        if (!s || s->tables.empty()) continue;
+        std::vector<uint32_t>& flat = *st[k].flat;
+        uint32_t nr = gcn_shader_image_table_reads(s->sh, flat.data(), reinterpret_cast<uint64_t(*)[2]>(reads.data()),
+                                                   (uint32_t)reads.size());
+        if (nr > reads.size()) {
+            reads.resize(nr);
+            nr = gcn_shader_image_table_reads(s->sh, flat.data(), reinterpret_cast<uint64_t(*)[2]>(reads.data()), nr);
+        }
+        for (uint32_t i = 0; i < nr; ++i) {
+            if (!OverlapsWriteAfter(reads[i][0], reads[i][1], snap, &hit, &pending_seq)) continue;
+            hit_s = s;
+            hit_read[0] = reads[i][0];
+            hit_read[1] = reads[i][1];
+            break;
+        }
+    }
+    if (!hit_s) return true;
+    g_table_stats.hazard_drains.fetch_add(1, std::memory_order_relaxed);
+    char key[64];
+    snprintf(key, sizeof(key), "table-hazard-%llx", (unsigned long long)hit_s->code_addr);
+    RLog(key, "shader 0x%llx: T# table read 0x%llx+0x%llx written by GPU work pending when the CP read it "
+              "(0x%llx+0x%llx): draining, tables read again",
+         (unsigned long long)hit_s->code_addr, (unsigned long long)hit_read[0], (unsigned long long)hit_read[1],
+         (unsigned long long)hit.addr, (unsigned long long)hit.size);
+    if (pending_seq > CompletedSeq()) {
+        Commit();
+        WaitAll();
+    }
+    for (uint32_t k = 0; k < n; ++k) {
+        const Shader* s = st[k].s;
+        if (!s || s->tables.empty()) continue;
+        BuildFlat(s, st[k].ud, st[k].flat);
+        if (st[k].img) DecodeStageImages(s, *st[k].flat, st[k].img);
+    }
+    for (uint32_t k = 0; k < n; ++k) {
+        const Shader* s = st[k].s;
+        if (!s || s->tables.empty() || gcn_shader_is_compatible(s->sh, st[k].ud, st[k].rt, ReadGuest, S.ctx)) continue;
+        g_table_stats.hazard_skips.fetch_add(1, std::memory_order_relaxed);
+        char why[256];
+        gcn_shader_explain_mismatch(s->sh, st[k].ud, st[k].rt, ReadGuest, S.ctx, why, sizeof(why));
+        snprintf(key, sizeof(key), "table-hazard-skip-%llx", (unsigned long long)s->code_addr);
+        RLog(key, "shader 0x%llx: the T# tables written by the GPU no longer fit its permutation (%s): skipped",
+             (unsigned long long)s->code_addr, why);
+        return false;
+    }
+    return true;
+}
 
 bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_t>& flat, Binder& b,
                const BindCtx& bc, const gcn_push_data& push, std::string* why) {
@@ -3290,7 +4442,8 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                             (unsigned long long)s->code_addr, i, (unsigned long long)bd.base_address, bd.size_bytes,
                             bd.stride, bd.num_records, bb.is_written ? " written" : "");
             }
-            if (bd.size_bytes >= 0x80000000u) bd.size_bytes = 64u << 20; // "unbounded" V#
+            const bool unbounded = bd.size_bytes >= 0x80000000u;
+            if (unbounded) bd.size_bytes = 64u << 20; // "unbounded" V#: a guess, never an exact write
             if (base & 3) {
                 // Bound at the dword below: the shader is specialized on base & 3 and reads its
                 // dwords shifted by that many bytes (gcn BufferSpecialization::misalign); the
@@ -3346,6 +4499,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             }
             if (bb.is_written) {
                 NoteGpuWrite(base, bd.size_bytes);
+                if (!unbounded) NoteBufferStore(bd.base_address, bd.size_bytes);
                 auto mit = S.meta.find(base);
                 if (mit != S.meta.end() && b.stage == Stage::Compute) {
                     mit->second.cleared = true;
@@ -3368,7 +4522,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             }
             break;
         case GCN_BUFFER_FAULT_BUFFER:
-            if (!(mb = g_gmem.fault)) {
+            if (!(mb = g_gmem.cur_slot)) {
                 if (why) *why = "no guest memory fault buffer";
                 return false;
             }
@@ -3406,13 +4560,22 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
     }
     if (!argtab.empty()) b.Bytes(argtab.data(), argtab.size() * sizeof(uint64_t), (uint32_t)s->info.msl_argument_buffer);
 
-    for (uint32_t i = 0; i < s->imgs.size(); ++i) {
+    TableEntryCounts table_counts;
+    // textures_in (the pass of every guest memory dispatch, which binds what its probe bound, and a
+    // re-run): no image lookups; the table entries were counted where they were looked up (at the
+    // probe, so a guest memory dispatch counts them once per probe)
+    if (b.textures_in)
+        for (auto& [slot, t] : *b.textures_in) b.Texture(t, slot);
+    for (uint32_t i = 0; !b.textures_in && i < s->imgs.size(); ++i) {
         const gcn_image_binding& ib = s->imgs[i];
         const uint32_t nb = std::max(1u, ib.num_bindings);
         id<MTLTexture> tex = nil;
         ImageDesc img;
         const bool have = StageImage(s, flat, i, &img) && img.valid && img.address && img.address < S.ctx->mem_size;
-        if (cap::g_pass && have) cap::NoteImage(b.stage, i, img, ib.is_storage, ib.is_depth);
+        if (cap::g_pass && have)
+            cap::NoteImage(b.stage, i, img, ib.is_storage, ib.is_depth,
+                           ib.table == UINT32_MAX ? -1 : (int32_t)ib.table,
+                           ib.table == UINT32_MAX ? -1 : (int32_t)ib.table_entry);
         if (have) {
             if (ib.is_depth) {
                 tex = S.tex->FindDepthTarget(img.address);
@@ -3476,6 +4639,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                     ib.is_storage ? "storage" : "sampled", ib.is_depth ? " depth" : "", (unsigned long long)img.address,
                     img.raw_dfmt, img.raw_nfmt, img.width, img.height, (uint32_t)img.type, (uint32_t)img.tile_mode,
                     tex ? "ok" : "nil");
+        if (ib.table != UINT32_MAX) NoteTableEntry(s, flat, i, tex != nil, table_counts);
         const MTLTextureType want = ShaderTextureType(ib);
         for (uint32_t k = 0; k < nb; ++k) {
             id<MTLTexture> v = nil;
@@ -3496,6 +4660,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
         }
     }
 
+    if (!s->tables.empty() && !b.textures_in) LogTableEntries(s, table_counts);
     for (uint32_t i = 0; i < s->samps.size(); ++i) {
         const gcn_sampler_binding& sb = s->samps[i];
         uint32_t ss[4] = {};
@@ -3850,8 +5015,9 @@ uint64_t MipChainKey(const ImageDesc& img) {
 // The render targets a mip chain of `img` is assembled from (MipChainFor), given `base`, the
 // color target at img.address (FindColorTarget): srcs[m] is the one at level m's address (nil:
 // none; srcs[0] = base). Returns the number of levels, 0 if `img` is not a mipmapped 2D texture
-// whose base level is a GPU render target of its size.
-uint32_t MipChainSources(const ImageDesc& img, id<MTLTexture> base, __strong id<MTLTexture> (&srcs)[kMaxMips]) {
+// whose base level is a GPU render target of its size. addrs (optional, kMaxMips): level m's address.
+uint32_t MipChainSources(const ImageDesc& img, id<MTLTexture> base, __strong id<MTLTexture> (&srcs)[kMaxMips],
+                         uint64_t* addrs) {
     if (img.mtl_texture_type != MTLTextureType2D || img.NumViewLevels() < 2 || img.pixel.compressed) return 0;
     if (!base || base.sampleCount > 1 || base.width != img.width || base.height != img.height) return 0;
     SurfaceLayout layout;
@@ -3859,6 +5025,8 @@ uint32_t MipChainSources(const ImageDesc& img, id<MTLTexture> base, __strong id<
     const uint32_t levels = std::min<uint32_t>(std::min<uint32_t>(img.NumViewLevels(), layout.num_mips), kMaxMips);
     srcs[0] = base;
     for (uint32_t m = 1; m < levels; ++m) srcs[m] = S.tex->FindColorTarget(img.address + layout.mips[m].offset);
+    if (addrs)
+        for (uint32_t m = 0; m < levels; ++m) addrs[m] = img.address + layout.mips[m].offset;
     return levels;
 }
 
@@ -3875,8 +5043,12 @@ id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode) {
     State::MipChain& mc = S.mip_chains[key];
     if (mc.tex && mc.built_submit == S.submit_idx + (S.n_draws << 20)) return mc.tex;
     id<MTLTexture> srcs[kMaxMips];
-    const uint32_t levels = MipChainSources(img, base, srcs);
+    uint64_t addrs[kMaxMips] = {};
+    const uint32_t levels = MipChainSources(img, base, srcs, addrs);
     if (!levels) return nil;
+    // the targets of the other levels are read by the blits below (level 0: ResolveTextureHazards)
+    for (uint32_t m = 1; m < levels; ++m)
+        if (srcs[m]) RefreshGuestNewer(addrs[m], srcs[m], false);
     if (!mc.tex || mc.tex.mipmapLevelCount != levels) {
         MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:base.pixelFormat
                                                                                       width:img.width
@@ -3910,6 +5082,7 @@ id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode) {
 // the game loaded or wrote itself. Metal needs a depth pixel format for depth2d bindings, so
 // the sampled texture from guest memory is converted into a depth texture (once per frame).
 id<MTLTexture> DepthFromMemory(const ImageDesc& img, bool encode) {
+    GmApplyInvalidations();
     static std::unordered_map<uint64_t, std::pair<id<MTLTexture>, uint64_t>> cache;
     const uint64_t key = img.address ^ ((uint64_t)img.width << 40) ^ ((uint64_t)img.height << 52) ^
                          ((uint64_t)img.raw_dfmt << 32);
@@ -3987,19 +5160,25 @@ void PrepareDepthCompanions(const Shader* s, const std::vector<uint32_t>& flat) 
 // a barrier orders the detile after the writing dispatches). side != nil: into that command
 // buffer with its own encoders; the current encoders stay open.
 bool EncodeGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up, id<MTLCommandBuffer> side) {
-    if (!S.detile_pso || !up.tex || img.address >= S.ctx->mem_size) return false;
-    const SurfaceDesc sd = img.ToSurfaceDesc();
+    return EncodeGpuUploadAt(img.address, img.ToSurfaceDesc(), up, side);
+}
+
+// The copy itself: guest memory at `address` with surface `sd` (a T#'s, or the cached surface's
+// own for a refresh) into up.tex.
+bool EncodeGpuUploadAt(uint64_t address, const SurfaceDesc& sd, const TextureCache::GpuUpload& up,
+                       id<MTLCommandBuffer> side) {
+    if (!S.detile_pso || !up.tex || address >= S.ctx->mem_size) return false;
     SurfaceLayout layout;
     if (sd.bpp == 0 || (sd.bpp & 7) || !ComputeSurfaceLayout(sd, &layout) || !layout.total_size) return false;
-    const uint64_t avail = std::min<uint64_t>(layout.total_size, S.ctx->mem_size - img.address);
+    const uint64_t avail = std::min<uint64_t>(layout.total_size, S.ctx->mem_size - address);
     id<MTLBuffer> gbuf = nil;
     uint64_t goff = 0;
-    if (!GuestBuffer(img.address, avail, GuestAccess::Read, &gbuf, &goff)) return false;
+    if (!GuestBuffer(address, avail, GuestAccess::Read, &gbuf, &goff)) return false;
     const bool tiled = sd.tile_mode != TileMode::DisplayLinearAligned && sd.tile_mode != TileMode::DisplayLinearGeneral;
     const uint32_t bpe = sd.bpp / 8;
     id<MTLTexture> tex = up.tex;
     if (up.surf.bpp != sd.bpp || up.layout.total_size != layout.total_size) {
-        RLog("gpu-upload", "texture 0x%llx: cached layout differs from the T#", (unsigned long long)img.address);
+        RLog("gpu-upload", "texture 0x%llx: cached layout differs from the T#", (unsigned long long)address);
     }
     // validate every copy before encoding anything: a surface the copies cannot cover completely
     // is left to the CPU path (the caller marks the texture stale) instead of being marked
@@ -4030,7 +5209,7 @@ bool EncodeGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up, id
             if (warned++ < 16)
                 fprintf(stderr, "[gnm-tex] GPU upload of 0x%llx mip %u out of bounds (fmt %u %ux%u levels %u/%u row %llu "
                                 "rowbytes %llu rows %llu need %llu have %llu); CPU upload\n",
-                        (unsigned long long)img.address, m, img.pixel.mtl_format, up.width, up.height, up.levels,
+                        (unsigned long long)address, m, (unsigned)up.tex.pixelFormat, up.width, up.height, up.levels,
                         up.layout.num_mips, (unsigned long long)row, (unsigned long long)rowbytes,
                         (unsigned long long)rows, (unsigned long long)need, (unsigned long long)src_size);
             return false;
@@ -4224,6 +5403,7 @@ void VerifyGpuUpload(const ImageDesc& img, const TextureCache::GpuUpload& up) {
 // (GpuUploadTexture, for memory with GPU writes still pending) still copies on the GPU through
 // the shared staging pool (S.detile_staging) with EncodeGpuUpload's up-front bounds check.
 id<MTLTexture> SampledTexture(const ImageDesc& img) {
+    GmApplyInvalidations();
     static const int64_t min_kb = [] {
         const char* v = getenv("PS4_GNM_GPU_UPLOAD_MIN_KB");
         return v ? (int64_t)atoll(v) : (int64_t)256;
@@ -4245,6 +5425,7 @@ id<MTLTexture> SampledTexture(const ImageDesc& img) {
     if (!S.upload_cmd) {
         S.upload_cmd = [S.queue commandBuffer];
         S.upload_cmd.label = @"texture uploads";
+        GmWaitForCommitted(S.upload_cmd);
         [S.upload_cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
             if (done.status == MTLCommandBufferStatusError)
                 fprintf(stderr, "[gnm-draw] texture upload command buffer failed: %s\n",
@@ -4265,6 +5446,15 @@ id<MTLTexture> SampledTexture(const ImageDesc& img) {
 // is not possible, the GPU is drained first). Must run before encoding starts.
 void ResolveTextureHazards(const Shader* s, const std::vector<uint32_t>& flat) {
     if (s->imgs.empty()) return;
+    GmApplyInvalidations();
+    if (S.tex->GuestNewerCount()) {
+        // sampled and storage images of a GPU-owned surface that buffer stores overwrote
+        for (uint32_t i = 0; i < s->imgs.size(); ++i) {
+            if (s->imgs[i].is_depth) continue;
+            ImageDesc img;
+            if (StageImage(s, flat, i, &img) && img.valid) RefreshGuestNewer(img.address, nil, s->imgs[i].is_storage);
+        }
+    }
     PruneCompletedWrites();
     if (S.gpu_written.empty() && S.inflight_written.empty()) return;
     for (uint32_t i = 0; i < s->imgs.size(); ++i) {
@@ -4449,6 +5639,7 @@ void ResolveEqaaPass() {
 }
 
 id<MTLRenderCommandEncoder> BeginPass(const PassKey& key, const ClearReq& clr, id<MTLTexture> const* hold) {
+    if (g_gms.chain_open) GmCloseChain();
     if (S.cenc) {
         [S.cenc endEncoding];
         S.cenc = nil;
@@ -4541,6 +5732,7 @@ id<MTLRenderCommandEncoder> BeginPass(const PassKey& key, const ClearReq& clr, i
 }
 
 id<MTLComputeCommandEncoder> ComputeEncoder() {
+    if (g_gms.chain_open && !g_gms.chain_member) GmCloseChain();
     if (S.renc) {
         [S.renc endEncoding];
         S.renc = nil;
@@ -4827,6 +6019,7 @@ void EliminateFastClear(const RenderState& rs) {
     if (!TakeMetaCleared(c.cmask_address, &clear_seq)) return;
     id<MTLTexture> t = S.tex->GetColorTarget(c);
     if (!t) return;
+    RefreshGuestNewer(c.address, t, true); // the clear of a slice keeps the rest
     ClearReq clr;
     if (!ClearColorFor(t.pixelFormat, c.clear_word0, c.clear_word1, &clr.color_value[0])) {
         RLog("clear-fmt", "fast clear: unsupported format %lu", (unsigned long)t.pixelFormat);
@@ -4850,6 +6043,8 @@ void ResolvePass(const RenderState& rs) {
     id<MTLTexture> s = S.tex->GetColorTarget(src);
     id<MTLTexture> d = S.tex->GetColorTarget(dst);
     if (!s || !d) return;
+    RefreshGuestNewer(src.address, s, false);
+    RefreshGuestNewer(dst.address, d, true);
     EndEncoders();
     EnsureCmd();
     if (s.sampleCount > 1 && d.sampleCount == 1 && s.pixelFormat == d.pixelFormat) {
@@ -5121,6 +6316,15 @@ bool Init(GuestContext* ctx) {
     // ReadGuest is a bounds-checked copy from mem_base: let the recompiler read directly
     // (pointer walks of resource tables run for every draw); not while tracing the reads
     if (!getenv("PS4_GNM_TRACE_BUFS")) gcn_set_direct_guest_memory(ReadGuest, proc, proc->mem_base, proc->mem_size);
+    // the unused records of T# tables hold data that is no T#: an entry starting at an unmapped
+    // address is unbound (Uncharted 4's light records: floats decoding to 1D textures at
+    // 0x3f2b800000 and the like, each a new shader permutation otherwise)
+    // A process without a VM extent list (a harness that sets up guest memory by itself) has no
+    // mapping to consult: every address counts as mapped there.
+    if (proc->vm_extents) {
+        gcn_set_image_address_check(GuestAddressMapped, proc);
+        g_address_check = true;
+    }
     @autoreleasepool {
         S.dev = (__bridge id<MTLDevice>)ps4_metal_screen_get_device();
         if (!S.dev) S.dev = MTLCreateSystemDefaultDevice();
@@ -5144,8 +6348,14 @@ bool Init(GuestContext* ctx) {
                                                                    n > 0 && n <= 64 ? (unsigned)n : 4u);
         }
         StartGpuMemSampler(proc->mem_size);
-        S.queue = [S.dev newCommandQueueWithMaxCommandBufferCount:64];
+        S.queue = [S.dev newCommandQueueWithMaxCommandBufferCount:kMaxCommandBuffers];
         S.queue.label = @"gnm";
+        // guest memory dispatch tickets (GmSync); the listener runs on its own serial queue
+        g_gms.ev = [S.dev newSharedEvent];
+        g_gms.listener = [[MTLSharedEventListener alloc]
+            initWithDispatchQueue:dispatch_queue_create("gnm.guest-memory", dispatch_queue_attr_make_with_qos_class(
+                                                                                  DISPATCH_QUEUE_SERIAL,
+                                                                                  QOS_CLASS_USER_INTERACTIVE, 0))];
         S.tex = new TextureCache(S.dev, S.queue, proc->mem_base, proc->mem_size);
         g_mem_tex.store(S.tex, std::memory_order_release);
         S.dummy = [S.dev newBufferWithLength:65536 options:MTLResourceStorageModeShared];
@@ -5328,7 +6538,8 @@ void ComputeBarrierImpl() {
     if (S.cenc) [S.cenc memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures], S.n_cbarriers++;
 }
 
-void ComputeBarrier() {
+void ComputeBarrier(int queue) {
+    GmCpSync(queue);
     encq::Defer([] { ComputeBarrierImpl(); });
 }
 
@@ -5369,7 +6580,10 @@ bool GpuDmaImpl(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, 
         [bl copyFromBuffer:sb sourceOffset:soff toBuffer:db destinationOffset:doff size:n];
     [bl endEncoding];
     LogWork("dma");
-    if (!dst_gds) NoteGpuWrite(dst, n);
+    if (!dst_gds) {
+        NoteGpuWrite(dst, n);
+        if (S.tex) S.tex->NoteBufferWrite(dst, n, S.write_epoch); // encoded above
+    }
     return true;
 }
 
@@ -5485,6 +6699,20 @@ void OnSubmit() {
     S.submit_idx++;
 }
 
+// Test hook (tests/host/gnm_submit_flip_nonblocking_test.mm): the open command buffer waits on
+// the GPU for an event nothing signals, as with a hung GPU. Everything encoded after it waits too,
+// until the watchdog (WaitAll, PS4_GNM_GPU_TIMEOUT) gives the renderer up.
+void DebugStallGpu() {
+    encq::Run([] {
+        if (!S.enabled) return;
+        EndEncoders();
+        EnsureCmd();
+        static id<MTLSharedEvent> never = [S.dev newSharedEvent];
+        [S.cmd encodeWaitForEvent:never value:1];
+        S.pending = true;
+    });
+}
+
 bool HasPendingWork() {
     if (encq::Pending() || g_cmd_open.load(std::memory_order_acquire)) return true;
     std::lock_guard<std::mutex> lk(S.fence_mu);
@@ -5507,16 +6735,18 @@ void Flush(bool wait) {
     else encq::Defer([] { FlushImpl(false); });
 }
 
-void NotifyGuestWriteImpl(uint64_t addr, uint64_t size, bool is_fill, uint32_t fill_value);
+void NotifyGuestWriteImpl(uint64_t addr, uint64_t size, bool is_fill, uint32_t fill_value, bool cp_dma);
 
 // The guest memory was just written by the CPU: the texture cache must see it before any
 // later draw, and after the earlier ones (the callers drained the GPU first).
-void NotifyGuestWrite(uint64_t addr, uint64_t size, bool is_fill, uint32_t fill_value) {
-    encq::Run([=] { NotifyGuestWriteImpl(addr, size, is_fill, fill_value); });
+void NotifyGuestWrite(uint64_t addr, uint64_t size, bool is_fill, uint32_t fill_value, bool cp_dma) {
+    encq::Run([=] { NotifyGuestWriteImpl(addr, size, is_fill, fill_value, cp_dma); });
 }
 
-void NotifyGuestWriteImpl(uint64_t addr, uint64_t size, bool is_fill, uint32_t fill_value) {
+void NotifyGuestWriteImpl(uint64_t addr, uint64_t size, bool is_fill, uint32_t fill_value, bool cp_dma) {
     if (!S.enabled) return;
+    // a CP DMA done on the CPU is GPU work writing exactly these bytes, as on the GPU path (GpuDmaImpl)
+    if (cp_dma && S.tex) S.tex->NoteBufferWrite(addr, size, ++S.write_epoch);
     (void)fill_value;
     if (is_fill) {
         auto it = S.meta.find(addr);
@@ -5542,6 +6772,8 @@ struct DrawRec {
     Shader* ps = nullptr;
     uint64_t vs_addr = 0, ps_addr = 0;
     uint32_t vs_ud[16] = {}, ps_ud[16] = {};
+    gcn_runtime_info vs_rt{}, ps_rt{}; // the stages' runtime state (ResolveTableHazards)
+    uint64_t table_snap = 0;           // TableReadBegin when the CP read guest memory for it
     std::vector<uint32_t> vs_flat, ps_flat;
     std::vector<VtxIn> vtx;
     StageImages vs_img, ps_img;
@@ -5611,11 +6843,17 @@ constexpr const char* kCapIndirectFallback = "indirect draw replaced by a direct
 
 bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
     if (!Init(ctx) || S.hung) return true;
+    GmCpQueue(kQueueGfx);
+    // a draw reads guest memory on the CPU (resource tables, vertex fetch sharps, index buffers,
+    // indirect arguments, sampled textures): after the tickets its queue synchronized with
+    GmCpOrder();
     @autoreleasepool {
         cap::CpScope cap_scope("draw", "gfx", args.name, regs);
         if (cap::g_pass) cap::NoteDraw(args);
         std::unique_ptr<DrawRec, RecPool<DrawRec>::Back> rp(g_draw_recs.Get(), {&g_draw_recs});
         DrawRec& r = *rp;
+        TableReadCp table_read; // before anything here reads guest memory
+        r.table_snap = TableReadBegin();
         r.args = args;
         RenderState& rs = r.rs;
         DecodeRenderState(regs, &rs);
@@ -5759,7 +6997,9 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
         for (uint32_t i = 0; i < vs->attrs.size(); ++i) {
             VtxIn& vi = r.vtx[i];
             uint32_t v[4] = {};
-            gcn_shader_fetch_vertex_attrib_sharp(vs->sh, i, vs_ud, ReadGuest, S.ctx, v);
+            GmCpGuarded([&](gcn_read_guest_fn read) {
+                return gcn_shader_fetch_vertex_attrib_sharp(vs->sh, i, vs_ud, read, S.ctx, v);
+            });
             DecodeBuffer(v, &vi.bd);
             vi.vf = GetVertexFormat(vi.bd.raw_dfmt, vi.bd.raw_nfmt);
             const uint32_t slot = vb_first + i;
@@ -5786,12 +7026,15 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
         DecodeStageImages(vs, r.vs_flat, &r.vs_img);
         if (ps) DecodeStageImages(ps, r.ps_flat, &r.ps_img);
         r.vs = vs;
+        r.vs_rt = vs_rt;
+        r.ps_rt = ps_rt;
         r.ps = ps;
         if (cap::g_pass) {
             cap::NoteStage("vs", vs, vs_ud);
             if (ps) cap::NoteStage("ps", ps, ps_ud);
         }
         r.regs.Capture(regs);
+        table_read.armed = false; // DrawEncode ends it
         encq::Defer([rec = rp.release()] {
             DrawEncode(*rec);
             g_draw_recs.Put(rec);
@@ -5808,6 +7051,7 @@ void CommitEachForDebug() {
 }
 
 void DrawEncode(DrawRec& r) {
+    const TableReadEncoded table_read(r.table_snap);
     CommitEachForDebug();
     if (S.hung) return;
     cap::EncodeScope cap_scope;
@@ -6175,7 +7419,16 @@ void DrawEncode(DrawRec& r) {
         // ---- encode
         std::vector<uint32_t>& vs_flat = r.vs_flat;
         std::vector<uint32_t>& ps_flat = r.ps_flat;
+        for (int i = 0; i < 8; ++i)
+            if (key.color[i]) RefreshGuestNewer(rs.color[i].address, key.color[i], true);
         if (cap::g_pass) cap::NoteTargets(key, rs, clr.depth, clr.stencil);
+        const TableStage table_stages[2] = {{vs, vs_ud, &r.vs_rt, &vs_flat, &r.vs_img},
+                                            {ps, ps_ud, &r.ps_rt, &ps_flat, &r.ps_img}};
+        if (!ResolveTableHazards(table_stages, 2, r.table_snap)) {
+            cap::SetSkipped(kCapTableHazardSkip);
+            S.n_skipped++;
+            return;
+        }
         ResolveTextureHazards(vs, vs_flat);
         if (ps) ResolveTextureHazards(ps, ps_flat);
         PrepareDepthCompanions(vs, vs_flat);
@@ -6244,6 +7497,7 @@ void DrawEncode(DrawRec& r) {
         BindCtx bc{&regs, 1};
         std::string why;
         Binder vb{Stage::Vertex, enc, nil};
+        S.buffer_stores.clear();
         if (!BindStage(vs, vs_ud, vs_flat, vb, bc, push, &why)) {
             RLog("bind", "%s: VS bind failed: %s", args.name, why.c_str());
             S.n_skipped++;
@@ -6296,6 +7550,7 @@ void DrawEncode(DrawRec& r) {
         }
         S.pending = true;
         S.n_draws++;
+        FlushBufferStores(); // the draw is encoded: its buffer stores happen
         if (cap::g_pass) cap::Encoded(args.indirect_addr);
         {
             WorkRec wr;
@@ -6350,6 +7605,7 @@ void DrawEncode(DrawRec& r) {
 // A dispatch prepared by the CP thread for the encoder thread.
 struct DispatchRec {
     gcn_runtime_info rt{};
+    uint64_t table_snap = 0; // TableReadBegin when the CP read guest memory for it
     RegSnap regs;
     uint64_t addr = 0;
     uint32_t ud[16] = {};
@@ -6359,6 +7615,9 @@ struct DispatchRec {
     const char* queue = "";
     std::vector<uint32_t> flat;
     StageImages img;
+    // guest memory fast path (GmPlan): the ticket and the shader's predicted written pages
+    uint64_t gm_ticket = 0;
+    std::shared_ptr<const GmPages> gm_pred;
     // ready for the next dispatch (Dispatch() sets rt, addr, ud, regs), keeping the vectors
     void Recycle() {
         cs = nullptr;
@@ -6367,20 +7626,717 @@ struct DispatchRec {
         queue = "";
         flat.clear();
         img.Clear();
+        gm_ticket = 0;
+        gm_pred.reset();
     }
 };
-void DispatchEncode(DispatchRec& r);
+void DispatchEncode(DispatchRec*& rp);
 RecPool<DispatchRec> g_dispatch_recs;
 
+namespace { // with the declarations of the guest memory section above
+// ---- Guest memory dispatches: encoding, the sync and fast paths, tickets (see above) ----
+void PutDispatchRec(DispatchRec* r) { g_dispatch_recs.Put(r); }
+
+constexpr int kGmEncoded = 0, kGmFinal = 1, kGmMiss = 2; // GmTicket::state
+
+struct GmTicket {
+    uint64_t t = 0;
+    GmSlot slot;                // no buffer: a ticket consumed without a dispatch
+    DispatchRec* rec = nullptr; // owned until GmFinish
+    id<MTLComputePipelineState> pso = nil;
+    MTLSize tg{};
+    std::shared_ptr<const GmPages> pred;
+    GmTextures textures; // what the dispatch bound (a re-run binds the same)
+    std::vector<std::pair<uint64_t, uint64_t>> stores; // its pass's exact buffer stores (GmQueueStores once it ran)
+    std::atomic<int> state{kGmEncoded};
+    std::atomic<bool> failed{false}; // its command buffer failed or the GPU hung: counts as skipped
+    bool rerun = false;       // re-run after a miss (res holds the re-run's result)
+    bool ran = false;         // the re-run's pass ran
+    bool pass_failed = false; // the pass could not be bound (EncodeCs counted it as skipped)
+    bool withhold = false;    // tests (TestWithholdNextTicket): never made final
+    double miss_at = 0;       // when the listener found it missed (CFAbsoluteTime)
+    GmResult res;             // its result (read by the listener once final, or by the re-run)
+    bool have_res = false;
+};
+
+void GmSignal(uint64_t v) {
+    std::lock_guard<std::mutex> lk(g_gms.signal_mu);
+    // given up on: the GPU's own 2t - 1 signals (of command buffers committed before) may have
+    // lowered it; the waits on 2t of the work after them must still end
+    if (g_gms.released.load(std::memory_order_acquire)) v = std::max<uint64_t>(v, 1ull << 62);
+    if (g_gms.ev.signaledValue < v) g_gms.ev.signaledValue = v;
+    if (g_gms.cpu_signaled.load(std::memory_order_relaxed) < v) g_gms.cpu_signaled.store(v, std::memory_order_release);
+}
+
+void GmCheckUnlockable() {
+    if (!g_gmem.cur_slot && !g_gms.chain_member) return;
+    fprintf(stderr, "[gnm-draw] FATAL: the encoder's state released while a guest memory dispatch is encoded "
+                    "(fault buffer bound %d, chain member %d)\n", g_gmem.cur_slot != nil, (int)g_gms.chain_member);
+    abort();
+}
+
+void GmLogState() {
+    const GmTicket* k = g_gmem.tickets.empty() ? nullptr : g_gmem.tickets.front().get();
+    fprintf(stderr, "[gnm-draw] guest memory tickets: event %llu (final up to %llu), issued %llu, encoded %llu, committed %llu, "
+                    "%zu unfinished (oldest %llu, state %d), re-run due %d, chain open %d\n",
+            g_gms.ev ? (unsigned long long)g_gms.ev.signaledValue : 0ull, (unsigned long long)GmResolved(),
+            (unsigned long long)g_gms.issued.load(), (unsigned long long)g_gms.encoded, (unsigned long long)g_gms.committed,
+            g_gmem.tickets.size(), k ? (unsigned long long)k->t : 0ull, k ? k->state.load() : -1, (int)g_gms.miss.load(),
+            (int)g_gms.chain_open);
+}
+
+void GmReleaseAll() {
+    g_gms.released.store(true, std::memory_order_release);
+    if (g_gms.ev) GmSignal(1ull << 62);
+    for (auto& k : g_gmem.tickets) {
+        k->failed = true;
+        k->state.store(kGmFinal, std::memory_order_release);
+    }
+    GmNotify();
+}
+
+// Completion handler of a failed command buffer (any thread).
+void GmCommandBufferFailed(const std::vector<std::shared_ptr<GmTicket>>& tickets) {
+    fprintf(stderr, "[gnm-draw] the failed command buffer had guest memory dispatches %llu..%llu (states %d..%d); "
+                    "final up to %llu, a re-run pending: %d\n",
+            (unsigned long long)tickets.front()->t, (unsigned long long)tickets.back()->t,
+            tickets.front()->state.load(), tickets.back()->state.load(), (unsigned long long)GmResolved(),
+            (int)g_gms.miss.load());
+    for (auto& k : tickets) {
+        if (k->state.load(std::memory_order_acquire) == kGmFinal) continue;
+        k->failed = true;
+        k->state.store(kGmFinal, std::memory_order_release);
+    }
+    if (!tickets.empty()) GmSignal(2 * tickets.back()->t);
+    GmNotify();
+}
+
+// Binds and encodes one dispatch of r's shader: on `forced` (a re-run on the second queue) or on
+// the open compute encoder (nil). args: indirect arguments to dispatch with instead of r's size
+// (a guest memory pass: the gate's). tex_out: records the textures bound; tex_in: binds these
+// textures instead of looking the images up.
+bool EncodeCs(DispatchRec& r, id<MTLComputePipelineState> pso, MTLSize tg, id<MTLComputeCommandEncoder> forced,
+              id<MTLBuffer> args, NSUInteger args_off, GmTextures* tex_out = nullptr,
+              const GmTextures* tex_in = nullptr) {
+    static const bool labels = getenv("PS4_GNM_LABELS") != nullptr;
+    const RegSnap& regs = r.regs;
+    if (!forced && labels && S.cenc) { // profiling aid: one encoder per dispatch, named after the shader
+        [S.cenc endEncoding];
+        S.cenc = nil;
+    }
+    id<MTLComputeCommandEncoder> enc = forced ? forced : ComputeEncoder();
+    if (!forced && labels)
+        enc.label = [NSString stringWithFormat:@"CS 0x%llx %ux%ux%u x %lux%lux%lu%s", (unsigned long long)r.addr, r.dim_x,
+                                               r.dim_y, r.dim_z, (unsigned long)tg.width, (unsigned long)tg.height,
+                                               (unsigned long)tg.depth, r.indirect_addr ? " indirect" : ""];
+    if (forced || !g_cstate.Tracks(enc) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)pso))
+        [enc setComputePipelineState:pso];
+    gcn_push_data push = MakePushData(regs);
+    BindCtx bc{&regs, r.indirect_addr ? 1024u : r.dim_x * r.dim_y * r.dim_z};
+    Binder b{Stage::Compute, nil, enc, forced != nil, tex_out, tex_in};
+    std::string why;
+    if (!forced) S.storage_bound.clear();
+    S.buffer_stores.clear();
+    if (cap::g_pass) cap::ForgetBindings(Stage::Compute);
+    if (!BindStage(r.cs, r.ud, r.flat, b, bc, push, &why)) {
+        RLog("bind", "%s CS 0x%llx bind failed: %s", r.queue, (unsigned long long)r.addr, why.c_str());
+        S.n_skipped++;
+        return false;
+    }
+    if (!forced && S.cenc != enc) { // hazard flush inside BindStage
+        enc = ComputeEncoder();
+        if (!g_cstate.Tracks(enc) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)pso))
+            [enc setComputePipelineState:pso];
+        if (tex_out) tex_out->clear();
+        Binder b2{Stage::Compute, nil, enc, false, tex_out, tex_in};
+        if (cap::g_pass) cap::ForgetBindings(Stage::Compute);
+        S.buffer_stores.clear();
+        if (!BindStage(r.cs, r.ud, r.flat, b2, bc, push, &why)) {
+            RLog("bind", "%s CS 0x%llx bind failed: %s", r.queue, (unsigned long long)r.addr, why.c_str());
+            S.n_skipped++;
+            return false;
+        }
+    }
+    if (args) {
+        [enc dispatchThreadgroupsWithIndirectBuffer:args indirectBufferOffset:args_off threadsPerThreadgroup:tg];
+    } else if (r.indirect_addr) {
+        id<MTLBuffer> ab;
+        uint64_t off;
+        if (!GuestBuffer(r.indirect_addr, 12, GuestAccess::Read, &ab, &off)) {
+            RLog("bind", "%s CS 0x%llx skipped: no buffer for its indirect arguments at 0x%llx", r.queue,
+                 (unsigned long long)r.addr, (unsigned long long)r.indirect_addr);
+            S.n_skipped++;
+            return false;
+        }
+        [enc dispatchThreadgroupsWithIndirectBuffer:ab indirectBufferOffset:off threadsPerThreadgroup:tg];
+    } else {
+        [enc dispatchThreadgroups:MTLSizeMake(r.dim_x, r.dim_y, r.dim_z) threadsPerThreadgroup:tg];
+    }
+    if (!forced) S.pending = true;
+    // the dispatch is encoded: its buffer stores happen. A guest memory dispatch's stores happen
+    // only if its pass ran (the gate's verdict): GmRunSync and GmDispatchFast hand them on then.
+    if (!r.cs->info.uses_guest_memory) FlushBufferStores();
+    return true;
+}
+
+NSUInteger GmThreads(id<MTLComputePipelineState> pso) {
+    return std::min<NSUInteger>(1024, pso.maxTotalThreadsPerThreadgroup);
+}
+
+// gm_gate for r's dispatch. pred: check the probe's written pages against it (fast path).
+// refuse: refuse in any case (a captured frame: its inputs are stored between probe and pass).
+bool GmEncodeGate(id<MTLComputeCommandEncoder> enc, const GmSlot& slot, const DispatchRec& r, const GmPages* pred,
+                  bool refuse, id<MTLBuffer> prev) {
+    struct {
+        uint32_t dims[3];
+        uint32_t flags;
+        uint32_t npred;
+    } p = {{r.dim_x, r.dim_y, r.dim_z}, 0, 0};
+    id<MTLBuffer> ab = S.dummy;
+    uint64_t aoff = 0;
+    if (r.indirect_addr) {
+        if (!GuestBuffer(r.indirect_addr, 12, GuestAccess::Read, &ab, &aoff)) {
+            // no gate: no pass (counted as refused with the reason by the caller)
+            g_gm_stats.no_indirect++;
+            RLog("guestmem", "%s CS 0x%llx: no buffer for its indirect arguments at 0x%llx", r.queue,
+                 (unsigned long long)r.cs->code_addr, (unsigned long long)r.indirect_addr);
+            return false;
+        }
+        p.flags |= kGmGateIndirect;
+    }
+    if (pred) {
+        p.flags |= kGmGateCheckWritten;
+        p.npred = (uint32_t)pred->size();
+    }
+    if (refuse) p.flags |= kGmGateRefuse;
+    if (prev) p.flags |= kGmGateChain;
+    static const uint32_t none = 0;
+    [enc setComputePipelineState:g_gmem.gate_pso];
+    [enc setBuffer:slot.buf offset:0 atIndex:0];
+    [enc setBytes:&p length:sizeof(p) atIndex:1];
+    if (pred && !pred->empty()) [enc setBytes:pred->data() length:pred->size() * sizeof(uint32_t) atIndex:2];
+    else [enc setBytes:&none length:sizeof(none) atIndex:2];
+    [enc setBuffer:ab offset:aoff atIndex:3];
+    [enc setBuffer:prev ? prev : slot.buf offset:0 atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(GmThreads(g_gmem.gate_pso), 1, 1)];
+    return true;
+}
+
+void GmEncodeHarvest(id<MTLComputeCommandEncoder> enc, const GmSlot& slot) {
+    [enc setComputePipelineState:g_gmem.harvest_pso];
+    [enc setBuffer:slot.buf offset:0 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(GmThreads(g_gmem.harvest_pso), 1, 1)];
+}
+
+// Where a guest memory dispatch is encoded: S.cmd, or a command buffer of the second queue.
+struct GmTarget {
+    bool second = false;
+    id<MTLCommandBuffer> cb = nil;
+    id<MTLComputeCommandEncoder> enc = nil;
+};
+
+id<MTLComputeCommandEncoder> GmEncoder(GmTarget& t) {
+    if (!t.second) return ComputeEncoder();
+    if (!t.enc) {
+        if (!g_gmem.queue2) {
+            g_gmem.queue2 = [S.dev newCommandQueue];
+            g_gmem.queue2.label = @"gnm guest memory re-runs";
+        }
+        t.cb = [g_gmem.queue2 commandBuffer];
+        t.cb.label = @"guest memory re-run";
+        t.enc = [t.cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+    }
+    return t.enc;
+}
+
+// Probe, gate, pass and harvest of r's dispatch with `slot`. False: nothing was encoded (the
+// probe could not be bound; logged). textures: filled with the probe's textures (the pass binds
+// the same); replay: textures recorded earlier, bound by both (a re-run). pass_ok: false if the
+// pass could not be bound (EncodeCs logged and counted it as skipped).
+bool GmEncodeDispatch(GmTarget& t, DispatchRec& r, id<MTLComputePipelineState> pso, MTLSize tg, GmSlot& slot,
+                      const GmPages* pred, bool refuse, bool* pass_ok, GmTextures* textures = nullptr,
+                      const GmTextures* replay = nullptr, id<MTLBuffer> prev = nil) {
+    *pass_ok = true;
+    const auto barrier = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (!t.second) S.n_cbarriers++;
+    };
+    // S.cmd first: creating it may wait in the command buffer throttle with the encoder's state
+    // free (encq::Unlocked), which must not happen once the slot is bound or a chain member is
+    // being encoded (GmCheckUnlockable)
+    if (!t.second) EnsureCmd();
+    id<MTLComputeCommandEncoder> enc = GmEncoder(t);
+    barrier(enc); // the probe sees what the work before it wrote, as the pass does
+    g_gmem.cur_slot = slot.buf;
+    if (textures) textures->clear();
+    if (!EncodeCs(r, pso, tg, t.second ? enc : nil, nil, 0, replay ? nullptr : textures, replay)) {
+        g_gmem.cur_slot = nil;
+        return false;
+    }
+    const GmTextures* same = replay ? replay : textures;
+    enc = GmEncoder(t);
+    barrier(enc);
+    const bool gate = GmEncodeGate(enc, slot, r, pred, refuse, prev);
+    if (!t.second) g_cstate.Reset(enc);
+    if (gate) {
+        barrier(enc);
+        *pass_ok = EncodeCs(r, pso, tg, t.second ? enc : nil, slot.buf, (kGmSum + kGmArgs) * sizeof(uint32_t), nullptr, same);
+        enc = GmEncoder(t);
+    }
+    barrier(enc);
+    GmEncodeHarvest(enc, slot);
+    if (!t.second) g_cstate.Reset(enc);
+    g_gmem.cur_slot = nil;
+    return true;
+}
+
+// Commits t and waits for it. False: the GPU failed or hung.
+bool GmSubmitWait(GmTarget& t) {
+    if (!t.second) {
+        EndEncoders();
+        Commit();
+        WaitAll();
+        return !S.hung;
+    }
+    if (!t.cb) return true;
+    [t.enc endEncoding];
+    id<MTLCommandBuffer> cb = t.cb;
+    t.cb = nil;
+    t.enc = nil;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer>) { GmNotify(); }];
+    [cb commit];
+    S.n_waits++, S.n_waits_total++;
+    const double t0 = CFAbsoluteTimeGetCurrent();
+    bool done;
+    {
+        std::unique_lock<std::mutex> lk(g_gms.mu);
+        done = g_gms.cv.wait_for(lk, std::chrono::duration<double, std::milli>(S.gpu_timeout_ms),
+                                 [&] { return cb.status >= MTLCommandBufferStatusCompleted; });
+    }
+    S.wait_ms += (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+    if (!done) {
+        fprintf(stderr, "[gnm-draw] GPU watchdog: guest memory re-run did not complete in %.0f ms; "
+                        "disabling GPU rendering\n", S.gpu_timeout_ms);
+        S.hung = true;
+        ps4_metal_screen_release_held(); // as in WaitAll's watchdog: held frames' flips complete
+        GmReleaseAll();
+        return false;
+    }
+    if (cb.status == MTLCommandBufferStatusError) {
+        fprintf(stderr, "[gnm-draw] guest memory re-run failed: %s\n", cb.error.localizedDescription.UTF8String);
+        return false;
+    }
+    return true;
+}
+
+// The dispatch, waited for: maps the pages its probe reports missing (res: the result of an
+// earlier run, or empty) and runs it again until no page is missing (up to 8 times). True: the
+// pass ran (res is its result; stores, if given: the pass's exact buffer stores, NoteBufferStore).
+// False: skipped (logged, counted) or the GPU failed.
+bool GmRunSync(bool second, DispatchRec& r, id<MTLComputePipelineState> pso, MTLSize tg, GmSlot& slot,
+               GmResult* res, const GmTextures* replay = nullptr,
+               std::vector<std::pair<uint64_t, uint64_t>>* stores = nullptr) {
+    constexpr int kMaxRuns = 8;
+    const bool capture = !second && cap::g_pass;
+    for (int run = 0;; ++run) {
+        if (!res->unmapped.empty()) {
+            if (run == kMaxRuns) {
+                RLog("guestmem", "%s CS 0x%llx skipped: guest pages still missing after %d probes", r.queue,
+                     (unsigned long long)r.cs->code_addr, kMaxRuns);
+                S.n_skipped++;
+                return false;
+            }
+            if (!GmMapPages(res->unmapped, r.queue, r.cs->code_addr)) {
+                S.n_skipped++;
+                return false;
+            }
+        }
+        GmTarget t;
+        t.second = second;
+        bool pass_ok;
+        const bool encoded = GmEncodeDispatch(t, r, pso, tg, slot, nullptr, capture, &pass_ok, nullptr, replay);
+        // the pass's stores (its EncodeCs bound last), noted only if the gate let it run
+        std::vector<std::pair<uint64_t, uint64_t>> st;
+        st.swap(S.buffer_stores);
+        if (!encoded) {
+            if (t.second) GmSubmitWait(t);
+            return false;
+        }
+        if (!GmSubmitWait(t)) return false;
+        GmReadSlot(slot, res);
+        if (res->gate == 1) {
+            if (!pass_ok) g_gm_stats.pass_failed++; // skipped (counted), nothing learned
+            else if (stores) stores->swap(st);
+            return pass_ok;
+        }
+        // what else a probe that met missing pages reported may come from values it read as 0
+        // from them (a V# loaded from one, say): judged only once every page is mapped
+        if (!res->unmapped.empty()) continue;
+        if (res->status) {
+            RLog("guestmem", "%s CS 0x%llx skipped: it accesses guest memory through %s", r.queue,
+                 (unsigned long long)r.cs->code_addr, GuestStatusText(res->status).c_str());
+            S.n_skipped++;
+            return false;
+        }
+        if (capture && res->why == kGmWhyForced) {
+            // a captured pass: its inputs are stored now, before the pass runs (mode 0, direct)
+            auto accessed = GmRanges(res->read, GCN_GUEST_TRACK_SHIFT);
+            const auto written = GmRanges(res->written, GCN_GUEST_TRACK_SHIFT);
+            accessed.insert(accessed.end(), written.begin(), written.end());
+            cap::NoteGuestMemory(accessed, written);
+            slot.f[GCN_GUEST_MODE] = 0;
+            g_gmem.cur_slot = slot.buf;
+            const bool ok = EncodeCs(r, pso, tg, nil, nil, 0, nullptr, replay);
+            st.clear();
+            st.swap(S.buffer_stores);
+            id<MTLComputeCommandEncoder> enc = ComputeEncoder();
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            GmEncodeHarvest(enc, slot);
+            g_cstate.Reset(enc);
+            g_gmem.cur_slot = nil;
+            GmTarget t2;
+            if (!GmSubmitWait(t2)) return false;
+            GmReadSlot(slot, res);
+            res->gate = ok ? 1 : 0;
+            if (ok && stores) stores->swap(st);
+            return ok;
+        }
+        RLog("guestmem", "%s CS 0x%llx skipped: its indirect dispatch size cannot be read", r.queue,
+             (unsigned long long)r.cs->code_addr);
+        S.n_skipped++;
+        return false;
+    }
+}
+
+// After a pass ran: page use, the stale sampled textures over the written pages (sync path; the
+// fast path's were invalidated before its result was published, GmInvalidateOutside) and what
+// the shader's prediction learns. pred: the fast path's prediction.
+void GmAfterPass(const DispatchRec& r, const GmResult& res, const GmPages* pred) {
+    TouchGuestPages(res);
+    if (res.status) {
+        // the probe predicted other pages than the pass accessed (an address depending on a
+        // value the probe could not produce, e.g. an atomic's result)
+        if (res.status & GCN_GUEST_STATUS_UNMAPPED) g_gmem.wrong_guesses++;
+        RLog("guestmem", "%s CS 0x%llx: accesses through %s were not made (wrong probe guesses so far: %llu)", r.queue,
+             (unsigned long long)r.cs->code_addr, GuestStatusText(res.status).c_str(),
+             (unsigned long long)g_gmem.wrong_guesses);
+    }
+    if (!pred) {
+        GmInvalidateOutside(res, nullptr);
+    } else if (!GmSubset(res.written, *pred)) {
+        // written outside the prediction (its probe could not know the pages): the CP's reads
+        // after it waited for its result all the same (GmCpOrder); the prediction learns them
+        g_gm_stats.mispredicted++;
+        size_t n = 0;
+        uint32_t first = 0;
+        for (uint32_t p : res.written)
+            if (!std::binary_search(pred->begin(), pred->end(), p)) {
+                if (!n++) first = p;
+            }
+        char key[64];
+        snprintf(key, sizeof(key), "guestmem-pred-%llx", (unsigned long long)r.cs->code_addr);
+        RLog(key, "%s CS 0x%llx wrote %zu MiB outside its predicted pages (first 0x%llx); learned", r.queue,
+             (unsigned long long)r.cs->code_addr, n, (unsigned long long)((uint64_t)first << GCN_GUEST_TRACK_SHIFT));
+    }
+    GmLearn(r.cs->uid, res.written);
+}
+
+// Sync path (the CP thread waits for it in encq::Run).
+bool GmDispatchSync(DispatchRec& r, id<MTLComputePipelineState> pso, MTLSize tg) {
+    g_gm_stats.sync++;
+    GmSlot slot = GmAcquireSlot();
+    if (!slot.buf) {
+        g_gm_stats.no_slot++;
+        RLog("guestmem", "%s CS 0x%llx skipped: no fault buffer", r.queue, (unsigned long long)r.cs->code_addr);
+        S.n_skipped++;
+        return false;
+    }
+    GmResult res;
+    std::vector<std::pair<uint64_t, uint64_t>> stores;
+    const bool ran = GmRunSync(false, r, pso, tg, slot, &res, nullptr, &stores);
+    if (!S.hung) GmReleaseSlot(slot);
+    if (ran) {
+        GmAfterPass(r, res, nullptr);
+        S.buffer_stores.swap(stores);
+        FlushBufferStores(); // the pass ran: its buffer stores happened
+    }
+    return ran;
+}
+
+// The listener: the GPU ran a chain of tickets (2t - 1 of its last). Final up to the first one
+// whose gate refused it for a re-run (an unmapped page, a written page outside the prediction,
+// or a re-run of the dispatch before it); that one and those after it are re-run by the encoder.
+void GmListenChain(const std::shared_ptr<std::vector<std::shared_ptr<GmTicket>>>& members) {
+    std::shared_ptr<std::vector<std::shared_ptr<GmTicket>>> m = members;
+    [g_gms.ev notifyListener:g_gms.listener
+                     atValue:2 * m->back()->t - 1
+                       block:^(id<MTLSharedEvent>, uint64_t) {
+                           // members up to `end` (tests: a withheld one ends the chain unfinished)
+                           size_t end = m->size(), miss;
+                           for (size_t i = 0; i < m->size(); ++i)
+                               if ((*m)[i]->withhold) {
+                                   end = i;
+                                   break;
+                               }
+                           miss = end;
+                           for (size_t i = 0; i < end && miss == end; ++i) {
+                               const GmTicket& k = *(*m)[i];
+                               if (!k.slot.f) continue;
+                               const uint32_t* s = k.slot.f + kGmSum;
+                               if (s[kGmGate] == 2 && (s[kGmWhy] & kGmWhyRerun)) miss = i;
+                           }
+                           const double now = CFAbsoluteTimeGetCurrent();
+                           for (size_t i = 0; i < end; ++i) {
+                               GmTicket& k = *(*m)[i];
+                               if (i < miss && k.slot.f) {
+                                   GmReadSlot(k.slot, &k.res);
+                                   k.have_res = true;
+                                   if (k.res.gate == 1) {
+                                       GmInvalidateOutside(k.res, k.pred.get());
+                                       GmQueueStores(k.stores);
+                                   }
+                               }
+                               if (i >= miss) k.miss_at = now;
+                               k.state.store(i < miss ? kGmFinal : kGmMiss, std::memory_order_release);
+                           }
+                           if (miss) GmSignal(2 * (*m)[miss - 1]->t);
+                           if (miss < end) {
+                               g_gms.miss.store(true, std::memory_order_release);
+                               encq::Nudge();
+                           }
+                           GmNotify();
+                       }];
+}
+
+// Appends a ticket to the chain in S.cmd (its dispatch, if any, is encoded).
+void GmEncodeTicket(const std::shared_ptr<GmTicket>& k) {
+    EnsureCmd();
+    g_gmem.chain.push_back(k);
+    if (k->slot.buf) g_gmem.chain_prev = k->slot.buf;
+    g_gms.chain_open = true;
+    g_gms.encoded = k->t;
+    g_gms.cmd_tickets.push_back(k);
+    g_gmem.tickets.push_back(k);
+    S.pending = true;
+}
+
+void GmCloseChain() {
+    if (!g_gms.chain_open || g_gms.chain_closing) return;
+    g_gms.chain_closing = true;
+    EndEncoders();
+    auto members = std::make_shared<std::vector<std::shared_ptr<GmTicket>>>(std::move(g_gmem.chain));
+    g_gmem.chain.clear();
+    g_gmem.chain_prev = nil;
+    const uint64_t t = members->back()->t;
+    [S.cmd encodeSignalEvent:g_gms.ev value:2 * t - 1];
+    [S.cmd encodeWaitForEvent:g_gms.ev value:2 * t];
+    GmListenChain(members);
+    g_gm_stats.chains++;
+    g_gms.chain_open = false;
+    g_gms.chain_closing = false;
+}
+
+// A ticket whose dispatch was not encoded (skipped): it still gets a final result, in order.
+void GmConsumeEmpty(uint64_t t) {
+    if (S.hung || !g_gms.ev) return;
+    auto k = std::make_shared<GmTicket>();
+    k->t = t;
+    GmEncodeTicket(k);
+}
+
+// Fast path. Takes over rp (null afterwards) when it encoded the dispatch.
+bool GmDispatchFast(DispatchRec*& rp, id<MTLComputePipelineState> pso, MTLSize tg) {
+    DispatchRec& r = *rp;
+    GmService();
+    GmSlot slot = GmAcquireSlot();
+    if (!slot.buf) {
+        g_gm_stats.no_slot++;
+        RLog("guestmem", "%s CS 0x%llx skipped: no fault buffer", r.queue, (unsigned long long)r.cs->code_addr);
+        S.n_skipped++;
+        return false;
+    }
+    GmTarget t;
+    auto k = std::make_shared<GmTicket>();
+    k->withhold = g_gms.withhold_next.exchange(false);
+    EnsureCmd(); // before chain_member: it may wait in the throttle (see GmEncodeDispatch)
+    if (S.hung) { // the throttle gave up on the GPU
+        GmReleaseSlot(slot);
+        return false;
+    }
+    g_gms.chain_member = true;
+    bool pass_ok;
+    const bool encoded = GmEncodeDispatch(t, r, pso, tg, slot, r.gm_pred.get(), false, &pass_ok, &k->textures, nullptr,
+                                          g_gms.chain_open ? g_gmem.chain_prev : nil);
+    g_gms.chain_member = false;
+    k->pass_failed = !pass_ok;
+    if (pass_ok) k->stores.swap(S.buffer_stores);
+    S.buffer_stores.clear();
+    if (!encoded) {
+        GmReleaseSlot(slot);
+        return false;
+    }
+    for (auto [a, n] : GmRanges(*r.gm_pred, GCN_GUEST_TRACK_SHIFT)) NoteGpuWrite(a, n);
+    k->t = r.gm_ticket;
+    k->slot = slot;
+    k->rec = rp;
+    k->pso = pso;
+    k->tg = tg;
+    k->pred = r.gm_pred;
+    GmEncodeTicket(k);
+    rp = nullptr;
+    g_gm_stats.fast++;
+    return true;
+}
+
+// A missed ticket: the GPU holds every later work at 2t, so the dispatch runs again now as on
+// the sync path, on the second queue, before 2t is signaled.
+void GmStatMax(std::atomic<uint64_t>& m, uint64_t v) {
+    uint64_t cur = m.load(std::memory_order_relaxed);
+    while (v > cur && !m.compare_exchange_weak(cur, v)) {}
+}
+
+void GmRerun(GmTicket& k) {
+    g_gm_stats.reruns++;
+    static double last_verdict = 0; // the listener's time of the verdict re-run last
+    if (k.miss_at > 0 && k.miss_at != last_verdict) {
+        last_verdict = k.miss_at;
+        const uint64_t us = (uint64_t)std::max(0.0, (CFAbsoluteTimeGetCurrent() - k.miss_at) * 1e6);
+        g_gm_stats.rerun_wait_us += us;
+        GmStatMax(g_gm_stats.rerun_wait_max_us, us);
+    }
+    if (!S.hung && k.rec && k.slot.buf && !k.failed) {
+        GmReadSlot(k.slot, &k.res); // the fast run's probe: its unmapped pages
+        k.have_res = true;
+        k.rerun = true;
+        std::vector<std::pair<uint64_t, uint64_t>> stores;
+        k.ran = GmRunSync(true, *k.rec, k.pso, k.tg, k.slot, &k.res, &k.textures, &stores);
+        if (k.ran) {
+            GmInvalidateOutside(k.res, k.pred.get());
+            GmQueueStores(stores);
+        }
+    }
+    if (k.miss_at > 0)
+        GmStatMax(g_gm_stats.rerun_chain_max_us, (uint64_t)std::max(0.0, (CFAbsoluteTimeGetCurrent() - k.miss_at) * 1e6));
+    GmSignal(2 * k.t);
+    k.state.store(kGmFinal, std::memory_order_release);
+    GmNotify();
+}
+
+void GmFinish(GmTicket& k) {
+    if (k.slot.buf) {
+        if (!k.have_res) GmReadSlot(k.slot, &k.res);
+        if (k.failed) {
+            S.n_skipped++;
+            RLog("guestmem", "%s CS 0x%llx skipped: its command buffer failed", k.rec->queue,
+                 (unsigned long long)k.rec->cs->code_addr);
+        } else if (k.pass_failed && !k.rerun) {
+            // its binding failed after the probe ran (EncodeCs counted it as skipped): what the
+            // slot reports is not the pass's, nothing is learned from it
+            g_gm_stats.pass_failed++;
+        } else if (k.rerun ? k.ran : k.res.gate == 1) {
+            GmAfterPass(*k.rec, k.res, k.pred.get());
+        } else if (!k.rerun) {
+            // refused for a status (GmRunSync logs and counts its own skips)
+            g_gm_stats.refused++;
+            S.n_skipped++;
+            if (k.res.gate == 2 && (k.res.why & kGmWhyStatus))
+                RLog("guestmem", "%s CS 0x%llx skipped: it accesses guest memory through %s", k.rec->queue,
+                     (unsigned long long)k.rec->cs->code_addr, GuestStatusText(k.res.status).c_str());
+            else
+                RLog("guestmem", "%s CS 0x%llx skipped: its indirect dispatch size cannot be read", k.rec->queue,
+                     (unsigned long long)k.rec->cs->code_addr);
+        }
+        if (!k.failed) GmReleaseSlot(k.slot); // a failed command buffer may have left it dirty
+    }
+    if (k.rec) {
+        PutDispatchRec(k.rec);
+        k.rec = nullptr;
+    }
+}
+
+void GmService() {
+    if (g_gmem.servicing) return;
+    g_gmem.servicing = true;
+    // Taken with acquire: the listener stores the missed tickets' states, then miss (release).
+    // A plain store could land after the listener's and still read the states from before, so
+    // the miss was cleared and never serviced (the CP then waited for it until the watchdog:
+    // "the CP waited 4000 ms for guest memory dispatch 68267 (final up to 68250)").
+    g_gms.miss.exchange(false, std::memory_order_acq_rel);
+    if (g_gms.released.load(std::memory_order_acquire)) { // given up on (GmGiveUp)
+        static bool logged = false;
+        if (!logged) logged = true, GmLogState();
+        GmReleaseAll();
+    }
+    while (!g_gmem.tickets.empty()) {
+        std::shared_ptr<GmTicket> k = g_gmem.tickets.front();
+        const int st = k->state.load(std::memory_order_acquire);
+        if (st == kGmMiss) {
+            GmRerun(*k);
+            continue;
+        }
+        if (st != kGmFinal) break;
+        g_gmem.tickets.pop_front();
+        GmSignal(2 * k->t); // (final: its result is; a chain may end with it after a re-run)
+        GmFinish(*k);
+    }
+    g_gmem.servicing = false;
+}
+
+// CP thread: the fast path for a guest memory dispatch whose shader has a prediction.
+// Opt-in: PS4_GNM_GUEST_MEMORY_FAST=1. By default every guest memory dispatch takes the sync path
+// (waited for): in U4 soak runs the fast path showed anomalies the sync path did not (a guest
+// indirect call through a non-code pointer, a ticket stall, a GPU memory blow-up; 3 in about 35
+// runs against 0 in about 30 sync / base runs), not yet explained. PS4_GNM_GUEST_MEMORY_SYNC=1
+// forces the sync path even with the fast path requested (A/B runs).
+void GmPlan(DispatchRec& r) {
+    static const bool sync_only = [] {
+        const char* fast = getenv("PS4_GNM_GUEST_MEMORY_FAST");
+        const char* sync = getenv("PS4_GNM_GUEST_MEMORY_SYNC");
+        return !(fast && fast[0] == '1') || (sync && sync[0] == '1');
+    }();
+    if (sync_only || cap::g_pass || !g_gms.ev) return;
+    // Sampled images only: a re-run binds the textures the dispatch bound (their uploads ran
+    // before it). Storage and depth images have effects after the pass on the CPU side
+    // (SyncStorageToDepth, depth companions) that a later re-run could not redo in place.
+    char key[64];
+    uint32_t storage = 0, depth = 0;
+    for (const gcn_image_binding& ib : r.cs->imgs) storage += ib.is_storage, depth += ib.is_depth;
+    if (storage || depth) {
+        snprintf(key, sizeof(key), "guestmem-sync-img-%llx", (unsigned long long)r.cs->code_addr);
+        RLog(key, "%s CS 0x%llx: guest memory dispatch waited for (the shader has %u storage, %u depth images)",
+             r.queue, (unsigned long long)r.cs->code_addr, storage, depth);
+        return;
+    }
+    std::shared_ptr<const GmPages> pred = GmPredict(r.cs->uid);
+    if (!pred) return; // its first dispatch
+    if (pred->size() > kGmMaxPredicted) {
+        snprintf(key, sizeof(key), "guestmem-sync-big-%llx", (unsigned long long)r.cs->code_addr);
+        RLog(key, "%s CS 0x%llx: guest memory dispatch waited for (it wrote more than %u MiB)", r.queue,
+             (unsigned long long)r.cs->code_addr, kGmMaxPredicted);
+        return;
+    }
+    r.gm_ticket = g_gms.issued.fetch_add(1, std::memory_order_relaxed) + 1;
+    r.gm_pred = pred;
+    g_gm_cp.pending.push_back(r.gm_ticket);
+}
+} // namespace
+
 void Dispatch(GuestContext* ctx, const uint32_t* regs, uint32_t dim_x, uint32_t dim_y, uint32_t dim_z,
-              uint64_t indirect_addr, const char* queue) {
+              uint64_t indirect_addr, const char* queue, int queue_kind) {
     if (!Init(ctx) || S.hung) return;
+    GmCpQueue(queue_kind);
+    // a dispatch reads guest memory on the CPU (the translation of a new shader specializes on
+    // sharps it reads, the permutation choice, resource tables, sampled textures): after the
+    // tickets its queue synchronized with
+    GmCpOrder();
     @autoreleasepool {
         if (!indirect_addr && (dim_x == 0 || dim_y == 0 || dim_z == 0)) return;
         cap::CpScope cap_scope("dispatch", queue, queue, regs);
         if (cap::g_pass) cap::NoteDispatch(dim_x, dim_y, dim_z, indirect_addr);
         std::unique_ptr<DispatchRec, RecPool<DispatchRec>::Back> rp(g_dispatch_recs.Get(), {&g_dispatch_recs});
         DispatchRec& r = *rp;
+        TableReadCp table_read; // before anything here reads guest memory
+        r.table_snap = TableReadBegin();
         gcn_runtime_info& rt = r.rt;
         gcn_runtime_info_from_regs(regs, 0x10000, GCN_HW_CS, GCN_SW_COMPUTE, &S.profile, &rt);
         uint64_t& addr = r.addr;
@@ -6406,13 +8362,20 @@ void Dispatch(GuestContext* ctx, const uint32_t* regs, uint32_t dim_x, uint32_t 
         r.regs.Capture(regs);
         if (cs->kjob && !cs->kjob->Done()) S.kernels_open.push_back(cs->kjob);
         const bool guest_memory = cs->info.uses_guest_memory;
+        if (guest_memory) GmPlan(r);
+        const bool cp_waits = guest_memory && !r.gm_ticket;
         auto job = [rec = rp.release()] {
-            DispatchEncode(*rec);
-            g_dispatch_recs.Put(rec);
+            DispatchRec* p = rec;
+            DispatchEncode(p); // a guest memory ticket may keep the record
+            if (!p) return;
+            if (p->gm_ticket) GmConsumeEmpty(p->gm_ticket);
+            g_dispatch_recs.Put(p);
         };
-        // a guest memory dispatch may write any guest memory: the CP goes on (and reads resource
-        // tables for the next draws) once it ran (GuestMemoryDispatch waits for the GPU)
-        if (guest_memory) encq::Run(job);
+        // A guest memory dispatch may write any guest memory. Sync path: the CP goes on (and
+        // reads resource tables for the next draws) once it ran. Fast path: the CP goes on; it
+        // waits for the result before it reads guest memory for work ordered after it (GmCpOrder).
+        table_read.armed = false; // DispatchEncode ends it
+        if (cp_waits) encq::Run(job);
         else encq::Defer(std::move(job));
     }
 }
@@ -6439,14 +8402,15 @@ void WaitKernelCompiles() {
     }
 }
 
-void DispatchEncode(DispatchRec& r) {
+void DispatchEncode(DispatchRec*& rp) {
+    DispatchRec& r = *rp;
+    const TableReadEncoded table_read(r.table_snap);
     CommitEachForDebug();
     if (S.hung) return;
     cap::EncodeScope cap_scope;
     const RegSnap& regs = r.regs;
     const gcn_runtime_info& rt = r.rt;
     const uint64_t addr = r.addr;
-    const uint32_t* const ud = r.ud;
     Shader* const cs = r.cs;
     const uint32_t dim_x = r.dim_x, dim_y = r.dim_y, dim_z = r.dim_z;
     const uint64_t indirect_addr = r.indirect_addr;
@@ -6559,6 +8523,8 @@ void DispatchEncode(DispatchRec& r) {
                     wr.base_address && rd.size_bytes > 4096) {
                     id<MTLTexture> src = nil, dst = nil;
                     int kind = 0;
+                    RefreshGuestNewer(rd.base_address, nil, false); // the copy reads the source surface
+                    RefreshGuestNewer(wr.base_address, nil, true);
                     if (S.tex->CloneGpuTexture(rd.base_address, wr.base_address, wr.size_bytes, &src, &dst, &kind)) {
                         EndEncoders();
                         EnsureCmd();
@@ -6597,55 +8563,27 @@ void DispatchEncode(DispatchRec& r) {
             }
         }
 
+        const TableStage table_stage = {cs, r.ud, &r.rt, &flat, &r.img};
+        if (!ResolveTableHazards(&table_stage, 1, r.table_snap)) {
+            cap::SetSkipped(kCapTableHazardSkip);
+            S.n_skipped++;
+            return;
+        }
         ResolveTextureHazards(cs, flat);
         PrepareDepthCompanions(cs, flat);
-        static const bool labels = getenv("PS4_GNM_LABELS") != nullptr;
         const MTLSize tg = MTLSizeMake(wx, wy, wz);
-        // binds and encodes the dispatch (once, or once per pass of a guest memory dispatch)
-        const auto encode = [&]() -> bool {
-            if (labels && S.cenc) { // profiling aid: one encoder per dispatch, named after the shader
-                [S.cenc endEncoding];
-                S.cenc = nil;
-            }
-            id<MTLComputeCommandEncoder> enc = ComputeEncoder();
-            if (labels)
-                enc.label = [NSString stringWithFormat:@"CS 0x%llx %ux%ux%u x %ux%ux%u%s", (unsigned long long)addr,
-                                                       dim_x, dim_y, dim_z, wx, wy, wz, indirect_addr ? " indirect" : ""];
-            if (!g_cstate.Tracks(enc) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)pso))
-                [enc setComputePipelineState:pso];
-            gcn_push_data push = MakePushData(regs);
-            BindCtx bc{&regs, indirect_addr ? 1024u : dim_x * dim_y * dim_z};
-            Binder b{Stage::Compute, nil, enc};
-            std::string why;
-            S.storage_bound.clear();
-            if (cap::g_pass) cap::ForgetBindings(Stage::Compute);
-            if (!BindStage(cs, ud, flat, b, bc, push, &why)) {
-                RLog("bind", "%s CS 0x%llx bind failed: %s", queue, (unsigned long long)addr, why.c_str());
-                S.n_skipped++;
-                return false;
-            }
-            if (S.cenc != enc) { // hazard flush inside BindStage
-                enc = ComputeEncoder();
-                if (!g_cstate.Tracks(enc) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)pso))
-                    [enc setComputePipelineState:pso];
-                Binder b2{Stage::Compute, nil, enc};
-                if (cap::g_pass) cap::ForgetBindings(Stage::Compute);
-                if (!BindStage(cs, ud, flat, b2, bc, push, &why)) return false;
-            }
-            if (indirect_addr) {
-                id<MTLBuffer> ab;
-                uint64_t off;
-                if (!GuestBuffer(indirect_addr, 12, GuestAccess::Read, &ab, &off)) return false;
-                [enc dispatchThreadgroupsWithIndirectBuffer:ab indirectBufferOffset:off threadsPerThreadgroup:tg];
-            } else {
-                [enc dispatchThreadgroups:MTLSizeMake(dim_x, dim_y, dim_z) threadsPerThreadgroup:tg];
-            }
-            S.pending = true;
-            return true;
-        };
         if (cs->info.uses_guest_memory) {
-            if (!GuestMemoryDispatch(cs, queue, encode)) return;
-        } else if (!encode()) {
+            if (!EnsureGuestMemoryState()) {
+                RLog("guestmem", "%s CS 0x%llx skipped: no guest memory state", queue, (unsigned long long)addr);
+                S.n_skipped++;
+                return;
+            }
+            if (r.gm_ticket) {
+                if (!GmDispatchFast(rp, pso, tg)) return;
+            } else if (!GmDispatchSync(r, pso, tg)) {
+                return;
+            }
+        } else if (!EncodeCs(r, pso, tg, nil, nil, 0)) {
             return;
         }
         S.n_dispatches++;
@@ -6681,9 +8619,10 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
 extern "C" int ps4_gnm_read_display_cpu(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height,
                                         uint32_t pitch, uint32_t tiling_mode, uint32_t pixel_format, uint8_t* out_bgra);
 
+// Fallback when the renderer cannot present (disabled or hung): detile on the CPU.
 void PresentFromGuestMemory(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
                             uint32_t tiling_mode, uint32_t pixel_format) {
-    thread_local std::vector<uint8_t> buf; // the encoder and the CPU present queue both come here
+    thread_local std::vector<uint8_t> buf;
     buf.resize((size_t)width * height * 4);
     if (ps4_gnm_read_display_cpu(ctx, addr, width, height, pitch, tiling_mode, pixel_format, buf.data()))
         ps4_metal_screen_present_frame(buf.data(), (size_t)width * 4, (int)width, (int)height);
@@ -6691,103 +8630,123 @@ void PresentFromGuestMemory(GuestContext* ctx, uint64_t addr, uint32_t width, ui
         ps4_metal_screen_present_frame(ctx->mem_base + addr, (size_t)pitch * 4, (int)width, (int)height);
 }
 
-// Display buffers that are not GPU targets are read from guest memory once the GPU work written
-// so far has finished. By default the encoder thread does that synchronously (Commit + WaitAll,
-// then detile and present). PS4_GNM_ASYNC_CPU_PRESENT=1 moves the read, the detile and the present
-// to this serial queue instead:
-// - the read waits for the frame's fence (AfterGpu), so it runs after every earlier fence action:
-//   the previous frames' flips and this frame's EOP / label writes;
-// - every flip completes on this queue, in order, while such a frame is pending (GPU-presented
-//   frames and the fallback path go through it too), so present_frame runs on one thread only;
-// - the encoder stays at most one frame ahead: before queueing the next guest-memory frame it
-//   waits for the previous one, so frame N's read is done before frame N+1's present is queued and
-//   N+2's work (which reuses buffer N with two buffers) is encoded after the read
-//   (sceGnmInsertWaitFlipDone is not a real wait yet); a GPU that does not finish turns into
-//   S.hung through WaitAll's watchdog. A GPU-presented frame after a guest-memory one waits for
-//   it too, so the images are shown in order. Writes the CP thread executes itself
-//   (DMA_DATA / WRITE_DATA) are not ordered against the read: one reason this stays opt-in.
-dispatch_queue_t CpuPresentQueue() {
-    static dispatch_queue_t q = dispatch_queue_create(
-        "gnm.cpu-present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
-    return q;
-}
-std::mutex g_cpu_present_mu;
-std::condition_variable g_cpu_present_cv;
-std::atomic<int> g_cpu_present_pending{0}; // queued or running jobs of CpuPresentQueue
+// ---- Flip order.
+// Every flip the renderer takes completes through CompleteFlip, in the order of the Present
+// calls. On the PS4, SubmitAndFlip only enqueues the flip and the flip completes when the
+// display takes the buffer; nothing here waits for the display (docs/present-pacing.md). A
+// frame that gets a present slot at once completes when the GPU has executed its conversion
+// (AfterGpu). A frame held for a slot (ps4_metal_screen_queue_held) completes when the Metal
+// screen has copied it into a slot, on the screen's own queue, independent of the renderer's
+// stream. So a later frame can complete first; its flip then waits here for the earlier ones.
+std::mutex g_flip_mu;
+uint64_t g_flip_next = 0;  // sequence number of the next flip (renderer context: encoder or CP lock)
+uint64_t g_flip_done = 0;  // flips completed, in order (g_flip_mu)
+std::map<uint64_t, std::function<void()>> g_flip_ready; // completed before an earlier one (g_flip_mu)
 
-bool AsyncCpuPresent() {
-    static const bool on = [] {
-        const char* v = getenv("PS4_GNM_ASYNC_CPU_PRESENT");
-        return v && v[0] == '1';
-    }();
-    return on;
-}
-
-// Encoder thread: waits until no guest-memory present is pending (the one-frame bound).
-void WaitCpuPresentIdle() {
-    auto idle = [] { return g_cpu_present_pending.load() == 0; };
-    const auto limit = std::chrono::milliseconds((int64_t)S.gpu_timeout_ms);
-    std::unique_lock<std::mutex> lk(g_cpu_present_mu);
-    if (g_cpu_present_cv.wait_for(lk, limit, idle)) return;
-    // the previous frame's GPU work has not finished: the watchdog decides (S.hung, fences run)
-    lk.unlock();
-    WaitAll();
-    lk.lock();
-    if (!g_cpu_present_cv.wait_for(lk, limit, idle))
-        fprintf(stderr, "[gnm-draw] CPU present: the previous frame is still being presented after the GPU watchdog\n");
-}
-
-// Encoder thread: queues fn behind everything already on CpuPresentQueue, after the GPU work
-// encoded so far (after_gpu) or right away.
-void QueueCpuPresentJob(std::function<void()> fn, bool after_gpu) {
-    WaitCpuPresentIdle();
-    g_cpu_present_pending.fetch_add(1);
-    auto job = std::make_shared<std::function<void()>>(std::move(fn));
-    auto dispatch = [job] {
-        dispatch_async(CpuPresentQueue(), ^{
-            (*job)();
-            {
-                std::lock_guard<std::mutex> lk(g_cpu_present_mu);
-                g_cpu_present_pending.fetch_sub(1);
-            }
-            g_cpu_present_cv.notify_all();
-        });
-    };
-    if (after_gpu) {
-        AfterGpu(std::move(dispatch)); // tagged with the open command buffer's sequence number
-        Commit();
-    } else {
-        dispatch();
+void CompleteFlip(uint64_t seq, std::function<void()> fn) {
+    std::lock_guard<std::mutex> lk(g_flip_mu);
+    g_flip_ready.emplace(seq, std::move(fn));
+    while (!g_flip_ready.empty() && g_flip_ready.begin()->first == g_flip_done) {
+        std::function<void()> f = std::move(g_flip_ready.begin()->second);
+        g_flip_ready.erase(g_flip_ready.begin());
+        ++g_flip_done;
+        // under the lock, so flips run one at a time and in order (the VideoOut flip completion
+        // takes only VideoOut's own locks)
+        if (f) f();
     }
 }
 
-void QueuePresentFromGuestMemory(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
-                                 uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done,
-                                 bool after_gpu) {
-    QueueCpuPresentJob(
-        [=, done = std::move(on_done)] {
-            PresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format);
-            if (done) done();
-        },
-        after_gpu);
+struct HeldFlip {
+    uint64_t seq;
+    std::function<void()> on_done;
+};
+
+void HeldFlipDone(void* arg, int shown) {
+    (void)shown; // a dropped frame's flip completes too, as on the PS4 when a newer flip replaces it
+    std::unique_ptr<HeldFlip> h(static_cast<HeldFlip*>(arg));
+    CompleteFlip(h->seq, std::move(h->on_done));
+}
+
+// A display buffer that is not a GPU render target (written by the CPU, or by compute shaders
+// through guest memory) is copied from guest memory into a texture on the GPU, behind the
+// frame's work in the current command buffer (compute detile for a tiled buffer), and then
+// presented like a render target. Nothing waits for the GPU. nil if the copy cannot be encoded.
+id<MTLTexture> GuestDisplayTexture(uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
+                                   uint32_t tiling_mode, uint32_t pixel_format) {
+    // the buffer's memory as an image resource (T#): format and component order of the VideoOut
+    // pixel format, linear or Display2DThin with the VideoOut pitch (as the CPU path reads it)
+    uint32_t dfmt = (uint32_t)DataFormat::Format8_8_8_8, nfmt = (uint32_t)NumberFormat::Unorm;
+    uint32_t sel_x = 6, sel_y = 5, sel_z = 4; // ARGB in memory: x = B, y = G, z = R
+    switch (pixel_format) {
+    case kVideoOutA8B8G8R8Srgb: sel_x = 4, sel_y = 5, sel_z = 6; break;
+    case kVideoOutA2R10G10B10:
+    case kVideoOutA2R10G10B10Srgb:
+    case kVideoOutA2R10G10B10Bt2020Pq: dfmt = (uint32_t)DataFormat::Format2_10_10_10; break;
+    case kVideoOutA16R16G16B16Float:
+        dfmt = (uint32_t)DataFormat::Format16_16_16_16;
+        nfmt = (uint32_t)NumberFormat::Float;
+        break;
+    default: break; // A8R8G8B8, also every format the CPU path reads as BGRA8
+    }
+    const bool tiled = tiling_mode == 0;
+    const uint32_t p = tiled ? ((std::max(pitch, width) + 127) & ~127u) : std::max(pitch, width);
+    const uint64_t base = addr >> 8;
+    uint32_t raw[8] = {};
+    raw[0] = (uint32_t)base;
+    raw[1] = (uint32_t)((base >> 32) & 0x3F) | (dfmt << 20) | (nfmt << 26);
+    raw[2] = (width - 1) | ((height - 1) << 14);
+    raw[3] = sel_x | (sel_y << 3) | (sel_z << 6) | (7u << 9) /* w = A */ |
+             ((uint32_t)(tiled ? TileMode::Display2DThin : TileMode::DisplayLinearAligned) << 20) |
+             ((uint32_t)ImageType::Color2D << 28);
+    raw[4] = (p - 1) << 13;
+    ImageDesc img;
+    if (!DecodeImage(raw, 8, &img) || !img.valid || !img.pixel.mtl_format) return nil;
+    TextureCache::GpuUpload up;
+    up.surf = img.ToSurfaceDesc();
+    if (!ComputeSurfaceLayout(up.surf, &up.layout)) return nil;
+    id<MTLTexture> t = S.guest_display_tex;
+    if (!t || t.width != width || t.height != height || t.pixelFormat != (MTLPixelFormat)img.pixel.mtl_format ||
+        S.guest_display_swizzle != img.view_swizzle) {
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)img.pixel.mtl_format
+                                                                                      width:width
+                                                                                     height:height
+                                                                                  mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        td.swizzle = ToMTLSwizzle(img.view_swizzle);
+        t = [S.dev newTextureWithDescriptor:td];
+        S.guest_display_tex = t;
+        S.guest_display_swizzle = img.view_swizzle;
+        if (!t) return nil;
+    }
+    // one texture for every such frame: the next frame's copy is ordered after this frame's
+    // conversion pass by Metal's hazard tracking (same queue)
+    up.tex = t;
+    up.width = width;
+    up.height = height;
+    up.tex_type = MTLTextureType2D;
+    up.bytes_per_block = img.pixel.bytes_per_block;
+    up.block_width = img.pixel.block_width ? img.pixel.block_width : 1;
+    up.block_height = img.pixel.block_height ? img.pixel.block_height : 1;
+    return EncodeGpuUpload(img, up, nil) ? t : nil;
 }
 
 bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
              uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done) {
-    if (encq::Inline()) return PresentImpl(ctx, addr, width, height, pitch, tiling_mode, pixel_format, std::move(on_done));
-    std::function<void()> done = on_done; // completes the flip if PresentImpl cannot
     static const bool dbg_cpu_present = getenv("PS4_GNM_DBG_CPU_PRESENT") != nullptr; // tests the fallback
-    encq::Defer([=, f = std::move(on_done)]() mutable {
-        if (!dbg_cpu_present && PresentImpl(ctx, addr, width, height, pitch, tiling_mode, pixel_format, std::move(f)))
-            return;
-        if (g_cpu_present_pending.load() > 0) {
-            // earlier guest-memory presents are still queued: stay behind them, on their thread
-            QueuePresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format, done, false);
-            return;
-        }
+    // PresentImpl returns false only when the renderer cannot present at all; the CPU then reads
+    // the buffer, and the flip still completes in order behind the renderer's flips
+    auto run = [=](std::function<void()> f) {
+        if (!dbg_cpu_present && PresentImpl(ctx, addr, width, height, pitch, tiling_mode, pixel_format, f)) return;
         PresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format);
-        if (done) done();
-    });
+        CompleteFlip(g_flip_next++, std::move(f));
+    };
+    if (encq::Inline()) {
+        if (!S.enabled) return false; // no renderer: the caller presents and completes the flip
+        run(std::move(on_done));
+        return true;
+    }
+    encq::Defer([run, f = std::move(on_done)]() mutable { run(std::move(f)); });
     return true;
 }
 
@@ -6795,10 +8754,9 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                  uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done) {
     g_present_gen++;
     (void)ctx;
-    (void)pitch;
-    (void)tiling_mode;
     if (!S.enabled || S.hung || !S.present_pso || !width || !height) return false;
     @autoreleasepool {
+        RefreshGuestNewer(addr, nil, false); // a display buffer last written by buffer stores
         id<MTLTexture> src = S.tex->FindColorTarget(addr, width, height);
         if (!src) src = S.tex->FindColorTarget(addr);
         if (src && (src.sampleCount > 1 ||
@@ -6813,50 +8771,67 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                  (unsigned long long)addr, (unsigned long)src.width, (unsigned long)src.height, width, height);
             src = nil;
         }
+        id<MTLTexture> view = nil;
         if (!src) {
             RLog("present-miss", "display buffer 0x%llx is not a GPU target (draws %llu dispatches %llu skipped %llu)",
                  (unsigned long long)addr, (unsigned long long)S.n_draws, (unsigned long long)S.n_dispatches,
                  (unsigned long long)S.n_skipped);
-            // the frame is read from guest memory on the CPU once all GPU work has landed: here
-            // (default), or on the CPU present queue with PS4_GNM_ASYNC_CPU_PRESENT=1
-            if (encq::t_worker && AsyncCpuPresent()) {
-                QueuePresentFromGuestMemory(ctx, addr, width, height, pitch, tiling_mode, pixel_format,
-                                            std::move(on_done), true);
-                return true;
+            view = GuestDisplayTexture(addr, width, height, pitch, tiling_mode, pixel_format);
+            if (!view) {
+                // last resort: the CPU reads the buffer once all GPU work has landed
+                RLog("present-guest", "display buffer 0x%llx (%ux%u fmt 0x%x) cannot be copied on the GPU; read on the CPU",
+                     (unsigned long long)addr, width, height, pixel_format);
+                Commit();
+                WaitAll();
+                return false;
             }
-            Commit();
-            WaitAll();
-            return false;
+        } else {
+            // read the raw (non-sRGB) values: the display buffer holds encoded pixels
+            MTLPixelFormat f = src.pixelFormat;
+            MTLPixelFormat lin = f == MTLPixelFormatBGRA8Unorm_sRGB ? MTLPixelFormatBGRA8Unorm
+                                 : f == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm
+                                                                      : f;
+            view = src;
+            // VideoOut A2R10G10B10 formats (0x88xxxxxx) keep R in the high bits, i.e. Metal's
+            // RGB10A2 blue channel: swap R/B when sampling (8-bit A8R8G8B8 targets are already
+            // stored as BGRA8, see GetColorTargetPixelFormat).
+            const bool rgb10 = f == MTLPixelFormatRGB10A2Unorm;
+            const bool swap_rb = rgb10 && (pixel_format & 0xFF000000u) == 0x88000000u;
+            if (swap_rb) {
+                const MTLTextureSwizzleChannels sw =
+                    MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen, MTLTextureSwizzleRed,
+                                                  MTLTextureSwizzleAlpha);
+                view = [src newTextureViewWithPixelFormat:lin textureType:MTLTextureType2D
+                                                   levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1) swizzle:sw];
+            } else if (lin != f || src.textureType != MTLTextureType2D)
+                view = [src newTextureViewWithPixelFormat:lin textureType:MTLTextureType2D
+                                                   levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
         }
-        // read the raw (non-sRGB) values: the display buffer holds encoded pixels
-        MTLPixelFormat f = src.pixelFormat;
-        MTLPixelFormat lin = f == MTLPixelFormatBGRA8Unorm_sRGB ? MTLPixelFormatBGRA8Unorm
-                             : f == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm
-                                                                  : f;
-        id<MTLTexture> view = src;
-        // VideoOut A2R10G10B10 formats (0x88xxxxxx) keep R in the high bits, i.e. Metal's
-        // RGB10A2 blue channel: swap R/B when sampling (8-bit A8R8G8B8 targets are already
-        // stored as BGRA8, see GetColorTargetPixelFormat).
-        const bool rgb10 = f == MTLPixelFormatRGB10A2Unorm;
-        const bool swap_rb = rgb10 && (pixel_format & 0xFF000000u) == 0x88000000u;
-        if (swap_rb) {
-            const MTLTextureSwizzleChannels sw =
-                MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen, MTLTextureSwizzleRed,
-                                              MTLTextureSwizzleAlpha);
-            view = [src newTextureViewWithPixelFormat:lin textureType:MTLTextureType2D
-                                               levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1) swizzle:sw];
-        } else if (lin != f || src.textureType != MTLTextureType2D)
-            view = [src newTextureViewWithPixelFormat:lin textureType:MTLTextureType2D
-                                               levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
-        // Convert into a present slot of the window's presenter (it waits here while every slot
-        // is queued or on screen: back-pressure from the display) and queue it behind the frame's
+        // Convert into a present slot of the window's presenter and queue it behind the frame's
         // work: the CPU does not wait for the GPU, so the next frame's command processing
-        // overlaps this frame's GPU execution and the presenter's wait for a drawable.
+        // overlaps this frame's GPU execution and the presenter's wait for a drawable. While
+        // every slot is queued or on screen (back-pressure from the display), or while frames
+        // before this one are held, the frame is converted into a held texture and handed over
+        // by the Metal screen when a slot frees: no thread waits for the display.
         const double tp0 = CFAbsoluteTimeGetCurrent();
-        // PS4_GNM_ASYNC_CPU_PRESENT only: a guest-memory frame before this one is shown first
-        if (g_cpu_present_pending.load() > 0) WaitCpuPresentIdle();
-        id<MTLTexture> dst = (__bridge id<MTLTexture>)ps4_metal_screen_acquire_frame((int)width, (int)height);
-        if (!dst) { // no slot: the presenter copies this texture if it can, or drops the frame
+        const uint64_t seq = g_flip_next++;
+        id<MTLTexture> dst = nil;
+        const bool behind_held = ps4_metal_screen_frames_held();
+        if (!behind_held)
+            dst = (__bridge id<MTLTexture>)ps4_metal_screen_try_acquire_frame((int)width, (int)height);
+        bool hold = false;
+        if (!dst) {
+            dst = (__bridge id<MTLTexture>)ps4_metal_screen_hold_texture((int)width, (int)height);
+            hold = dst != nil;
+        }
+        const bool drop = !dst && (behind_held || ps4_metal_screen_frames_held());
+        if (drop) {
+            // no texture to hold it in while earlier frames are held: shown directly it would
+            // overtake them, so it is dropped; its flip completes in order behind theirs
+            ps4_metal_screen_note_held_drop();
+            AfterGpu([seq, f = std::move(on_done)]() mutable { CompleteFlip(seq, std::move(f)); });
+        }
+        if (!dst && !drop) { // no texture to hold it in: the presenter copies this one if it can, or drops the frame
             if (!S.present_tex || S.present_tex.width != width || S.present_tex.height != height) {
                 MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                               width:width
@@ -6868,30 +8843,33 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
             }
             dst = S.present_tex;
         }
-        EndEncoders();
-        EnsureCmd();
-        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture = dst;
-        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> e = [S.cmd renderCommandEncoderWithDescriptor:rp];
-        [e setRenderPipelineState:S.present_pso];
-        [e setFragmentTexture:view atIndex:0];
-        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-        [e endEncoding];
-        LogWork("present");
-        if (ps4_metal_screen_encode_present((__bridge void*)S.cmd, (__bridge void*)dst) != 0)
-            RLog("present-screen", "the Metal screen could not take the frame");
-        S.screen_ms += (CFAbsoluteTimeGetCurrent() - tp0) * 1000.0; // includes waiting for a present slot
-        if (on_done) {
-            if (g_cpu_present_pending.load() > 0) {
-                // keep flips in order behind the guest-memory presents still queued
-                auto f = std::make_shared<std::function<void()>>(std::move(on_done));
-                AfterGpu([f] { dispatch_async(CpuPresentQueue(), ^{ (*f)(); }); });
-            } else {
-                AfterGpu(std::move(on_done));
+        if (!drop) {
+            EndEncoders();
+            EnsureCmd();
+            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = dst;
+            rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> e = [S.cmd renderCommandEncoderWithDescriptor:rp];
+            [e setRenderPipelineState:S.present_pso];
+            [e setFragmentTexture:view atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [e endEncoding];
+            LogWork("present");
+            HeldFlip* held = hold ? new HeldFlip{seq, std::move(on_done)} : nullptr;
+            if (held && ps4_metal_screen_queue_held((__bridge void*)S.cmd, (__bridge void*)dst, &HeldFlipDone, held) != 0) {
+                on_done = std::move(held->on_done); // not taken: shown like an unheld frame below
+                delete held;
+                held = nullptr;
+            }
+            if (!held) {
+                if (ps4_metal_screen_encode_present((__bridge void*)S.cmd, (__bridge void*)dst) != 0)
+                    RLog("present-screen", "the Metal screen could not take the frame");
+                ps4_metal_screen_note_backpressure(0.0);
+                AfterGpu([seq, f = std::move(on_done)]() mutable { CompleteFlip(seq, std::move(f)); });
             }
         }
+        S.screen_ms += (CFAbsoluteTimeGetCurrent() - tp0) * 1000.0;
         Commit();
         static const bool writeback_all = getenv("PS4_GNM_WRITEBACK_ALL") != nullptr;
         if (writeback_all) { // experiment: make every GPU surface CPU-visible
@@ -6965,6 +8943,33 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
             fprintf(stderr, "[gnm-draw] per frame: %.1f render passes (%.1f loading depth), %.1f compute encoders, %.1f dispatches, %.1f compute barriers\n",
                     S.n_passes / 300.0, S.n_depth_loads / 300.0, S.n_cencs / 300.0, S.n_cdisp / 300.0, S.n_cbarriers / 300.0);
             S.n_passes = S.n_depth_loads = S.n_cencs = S.n_cbarriers = S.n_cdisp = 0;
+            {
+                // GPU targets fully overwritten by buffer stores (TextureCache::NoteBufferWrite)
+                static TextureCache::GuestNewerStats last;
+                const TextureCache::GuestNewerStats g = S.tex->GetGuestNewerStats();
+                fprintf(stderr, "[gnm-draw] buffer writes over GPU targets in 300 presents: %llu marked, %llu refreshed, "
+                                "%llu partial (not refreshed), %llu refreshes not encoded; %zu marked now\n",
+                        (unsigned long long)(g.marked - last.marked), (unsigned long long)(g.refreshed - last.refreshed),
+                        (unsigned long long)(g.partial - last.partial), (unsigned long long)(g.failed - last.failed),
+                        S.tex->GuestNewerCount());
+                last = g;
+            }
+            {
+                static GuestMemoryStats last{};
+                const GuestMemoryStats now_gm = GetGuestMemoryStats();
+                const auto d = [](uint64_t a, uint64_t b) { return (a - b) / 300.0; };
+                if (now_gm.fast + now_gm.sync != last.fast + last.sync)
+                    fprintf(stderr, "[gnm-draw] guest memory per frame: %.1f dispatches (%.1f without a CPU wait, %.1f GPU waits for the CPU), "
+                                    "%.2f re-runs (longest wait for one %.2f ms, longest until a chain's re-runs ended %.2f ms), %.2f refused, %.2f mispredicted, %.2f CP waits (%.2f ms), "
+                                    "%.2f skipped (no buffer, binding)\n",
+                            d(now_gm.fast + now_gm.sync, last.fast + last.sync), d(now_gm.fast, last.fast), d(now_gm.chains, last.chains),
+                            d(now_gm.reruns, last.reruns), g_gm_stats.rerun_wait_max_us.exchange(0) / 1000.0,
+                            g_gm_stats.rerun_chain_max_us.exchange(0) / 1000.0,
+                            d(now_gm.refused, last.refused), d(now_gm.mispredicted, last.mispredicted),
+                            d(now_gm.cp_waits, last.cp_waits), d(now_gm.cp_wait_us, last.cp_wait_us) / 1000.0,
+                            d(now_gm.no_slot + now_gm.no_indirect + now_gm.pass_failed, last.no_slot + last.no_indirect + last.pass_failed));
+                last = now_gm;
+            }
             last_t = now;
             S.n_commits = S.n_waits = 0;
             ps4_gnm_print_sync_stats();
@@ -7007,6 +9012,17 @@ void ReplaySetMetaCleared(uint64_t cmask_address) {
 }
 
 uint64_t SkippedCount() { return S.n_skipped.load(); }
+
+ImageTableStats GetImageTableStats() {
+    ImageTableStats r;
+    r.bound = g_table_stats.bound.load(std::memory_order_relaxed);
+    r.empty = g_table_stats.empty.load(std::memory_order_relaxed);
+    r.rejected = g_table_stats.rejected.load(std::memory_order_relaxed);
+    r.unmapped = g_table_stats.unmapped.load(std::memory_order_relaxed);
+    r.hazard_drains = g_table_stats.hazard_drains.load(std::memory_order_relaxed);
+    r.hazard_skips = g_table_stats.hazard_skips.load(std::memory_order_relaxed);
+    return r;
+}
 
 void Shutdown() {
     if (!S.enabled) return;

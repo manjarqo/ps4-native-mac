@@ -693,6 +693,47 @@ Id EmitConditionRef(EmitContext& ctx, const IR::Value& value) {
     return id;
 }
 
+// PS4Recomp: a selection inside the block (like the bounds-checked stores) around the
+// instructions up to the matching PredicatedEnd*.
+void EmitPredicatedBegin(EmitContext& ctx, Id cond) {
+    const Id body_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.predicated_scopes.emplace_back(merge_label, ctx.last_label);
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(cond, body_label, merge_label);
+    ctx.AddLabel(body_label);
+}
+
+void EmitPredicatedEnd(EmitContext& ctx) {
+    ASSERT(!ctx.predicated_scopes.empty());
+    const Id merge_label = ctx.predicated_scopes.back().first;
+    ctx.predicated_scopes.pop_back();
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
+static Id EmitPredicatedEndValue(EmitContext& ctx, Id type, Id value) {
+    ASSERT(!ctx.predicated_scopes.empty());
+    const auto [merge_label, entry_label] = ctx.predicated_scopes.back();
+    ctx.predicated_scopes.pop_back();
+    const Id body_last = ctx.last_label;
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+    return ctx.OpPhi(type, value, body_last, ctx.ConstantNull(type), entry_label);
+}
+
+Id EmitPredicatedEndU32(EmitContext& ctx, Id value) {
+    return EmitPredicatedEndValue(ctx, ctx.U32[1], value);
+}
+
+Id EmitPredicatedEndU64(EmitContext& ctx, Id value) {
+    return EmitPredicatedEndValue(ctx, ctx.U64, value);
+}
+
+Id EmitPredicatedEndF32(EmitContext& ctx, Id value) {
+    return EmitPredicatedEndValue(ctx, ctx.F32[1], value);
+}
+
 Id EmitGetPcLo(EmitContext& ctx, const IR::Value& value) {
     const Id id{ctx.Def(value)};
     ASSERT_MSG(Sirit::ValidId(id), "Forward identity declaration");

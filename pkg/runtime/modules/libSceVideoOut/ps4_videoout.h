@@ -10,6 +10,21 @@
 extern "C" {
 #endif
 
+// sceVideoOut* error codes (SCE_VIDEO_OUT_ERROR_*).
+#define ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE 0x80290001u
+#define ORBIS_VIDEO_OUT_ERROR_INVALID_ADDRESS 0x80290002u
+#define ORBIS_VIDEO_OUT_ERROR_INVALID_PITCH 0x80290004u
+#define ORBIS_VIDEO_OUT_ERROR_INVALID_TILING_MODE 0x80290007u
+#define ORBIS_VIDEO_OUT_ERROR_INVALID_ASPECT_RATIO 0x80290008u
+#define ORBIS_VIDEO_OUT_ERROR_INVALID_INDEX 0x8029000Au
+#define ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE 0x8029000Bu
+#define ORBIS_VIDEO_OUT_ERROR_NO_EMPTY_SLOT 0x8029000Fu
+#define ORBIS_VIDEO_OUT_ERROR_SLOT_OCCUPIED 0x80290010u
+
+// Display buffer indices per handle, and buffer sets (sceVideoOutRegisterBuffers calls).
+#define PS4_VIDEO_OUT_MAX_BUFFERS 16
+#define PS4_VIDEO_OUT_MAX_BUFFER_SETS 4
+
 typedef struct OrbisVideoOutBufferAttribute {
     int32_t format;
     int32_t tmode;
@@ -60,6 +75,12 @@ typedef struct SceVideoOutDeviceCapabilityInfo {
 int32_t sceVideoOutOpen(int32_t userId, int32_t busType, int32_t index, const void *param);
 int32_t sceVideoOutClose(int32_t handle);
 void sceVideoOutSetBufferAttribute(OrbisVideoOutBufferAttribute *attr, uint32_t pixelFormat, uint32_t tilingMode, uint32_t aspectRatio, uint32_t width, uint32_t height, uint32_t pitch);
+// Registers bufferCount buffers at indices startIndex.. as one buffer set with attribute attr.
+// Returns the set index (0..3, for sceVideoOutUnregisterBuffers) or an ORBIS_VIDEO_OUT_ERROR_*
+// code: INVALID_ADDRESS (no array or attribute), INVALID_HANDLE, NO_EMPTY_SLOT (4 sets
+// registered), INVALID_VALUE (indices outside 0..15, reserved attribute fields set),
+// SLOT_OCCUPIED (an index already belongs to a set), INVALID_ASPECT_RATIO, INVALID_PITCH
+// (width above the pitch), INVALID_TILING_MODE.
 int32_t sceVideoOutRegisterBuffers(int32_t handle, int32_t startIndex, void * const *bufferArray, int32_t bufferCount, const OrbisVideoOutBufferAttribute *attr);
 int32_t sceVideoOutSetFlipRate(int32_t handle, int32_t fliprate);
 int32_t sceVideoOutAddFlipEvent(OrbisKernelEqueue eq, int32_t handle, void *flipArg);
@@ -67,6 +88,8 @@ int32_t sceVideoOutSubmitFlip(GuestContext *ctx, int32_t handle, int32_t bufferI
 int32_t sceVideoOutGetFlipStatus(int32_t handle, OrbisVideoOutFlipStatus *status);
 int32_t sceVideoOutGetResolutionStatus(int32_t handle, OrbisVideoOutResolutionStatus *status);
 int32_t sceVideoOutIsFlipPending(int32_t handle);
+// Unregisters every buffer of the set; flips of its indices fail from then on (INVALID_INDEX).
+// INVALID_HANDLE, or INVALID_VALUE for a set that is not registered.
 int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t setIndex);
 
 int32_t sceVideoOutAddVblankEvent(OrbisKernelEqueue eq, int32_t handle, void *udata);

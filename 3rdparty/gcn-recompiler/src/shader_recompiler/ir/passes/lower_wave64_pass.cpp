@@ -3,166 +3,18 @@
 
 #include <unordered_map>
 #include <unordered_set>
+#include "common/div_ceil.h"
 #include "common/logging/classes.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
+#include "shader_recompiler/ir/passes/wave_uniformity.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 
 namespace Shader::Optimization {
-
-// PS4Recomp: whether every lane of a wave holds the same value. Conservative: a value is uniform
-// only when nothing it is computed from can differ between lanes: lane and invocation ids,
-// per-lane attributes, phis, cross-lane operations (including per-lane tests of 64-bit masks,
-// i.e. EXEC), and memory other lanes may write (workgroup memory, guest memory, images, buffers
-// the shader writes, atomics). Constant memory, user data and read-only buffers are uniform when
-// their address is.
-class WaveUniformity {
-public:
-    explicit WaveUniformity(const Info& info_) : info{info_} {}
-
-    bool IsUniform(const IR::Value& value) {
-        if (value.IsImmediate()) {
-            return true;
-        }
-        IR::Inst* const root = value.Inst();
-        if (const auto it = known.find(root); it != known.end()) {
-            return it->second;
-        }
-        // Post-order walk: an instruction is decided once its arguments are, or by itself.
-        stack.clear();
-        stack.push_back({root, 0});
-        while (!stack.empty()) {
-            Frame& top = stack.back();
-            IR::Inst* const inst = top.inst;
-            if (top.next_arg == 0) {
-                if (const std::optional<bool> own = OwnUniformity(*inst)) {
-                    known[inst] = *own;
-                    stack.pop_back();
-                    continue;
-                }
-            }
-            std::optional<bool> decided;
-            while (top.next_arg < inst->NumArgs()) {
-                const IR::Value arg = inst->Arg(top.next_arg);
-                if (!arg.IsImmediate()) {
-                    const auto it = known.find(arg.Inst());
-                    if (it == known.end()) {
-                        break; // decide the argument first
-                    }
-                    if (!it->second) {
-                        decided = false;
-                        break;
-                    }
-                }
-                ++top.next_arg;
-            }
-            if (!decided && top.next_arg < inst->NumArgs()) {
-                IR::Inst* const arg_inst = inst->Arg(top.next_arg).Inst();
-                stack.push_back({arg_inst, 0}); // invalidates `top`
-                continue;
-            }
-            known[inst] = decided.value_or(true);
-            stack.pop_back();
-        }
-        return known.at(root);
-    }
-
-private:
-    struct Frame {
-        IR::Inst* inst;
-        size_t next_arg;
-    };
-
-    // Uniformity decided by the instruction itself, or nullopt when its arguments decide it.
-    std::optional<bool> OwnUniformity(const IR::Inst& inst) const {
-        if (inst.MayHaveSideEffects()) {
-            return false;
-        }
-        switch (inst.GetOpcode()) {
-        case IR::Opcode::LoadBufferU8:
-        case IR::Opcode::LoadBufferU16:
-        case IR::Opcode::LoadBufferU32:
-        case IR::Opcode::LoadBufferU32x2:
-        case IR::Opcode::LoadBufferU32x3:
-        case IR::Opcode::LoadBufferU32x4:
-        case IR::Opcode::LoadBufferU64:
-        case IR::Opcode::LoadBufferF32:
-        case IR::Opcode::LoadBufferF32x2:
-        case IR::Opcode::LoadBufferF32x3:
-        case IR::Opcode::LoadBufferF32x4:
-        case IR::Opcode::LoadBufferFormatF32: {
-            // a buffer this shader does not write: decided by the address
-            const IR::Value binding = inst.Arg(0);
-            if (binding.IsImmediate() && binding.U32() < info.buffers.size() &&
-                !info.buffers[binding.U32()].is_written) {
-                return std::nullopt;
-            }
-            return false;
-        }
-        case IR::Opcode::LoadGuestU32:
-        case IR::Opcode::ImageSampleRaw:
-        case IR::Opcode::ImageSampleImplicitLod:
-        case IR::Opcode::ImageSampleExplicitLod:
-        case IR::Opcode::ImageSampleDrefImplicitLod:
-        case IR::Opcode::ImageSampleDrefExplicitLod:
-        case IR::Opcode::ImageGather:
-        case IR::Opcode::ImageGatherDref:
-        case IR::Opcode::ImageQueryDimensions:
-        case IR::Opcode::ImageQueryLod:
-        case IR::Opcode::ImageGradient:
-        case IR::Opcode::ImageRead:
-        case IR::Opcode::GetAttributeU1:
-        case IR::Opcode::GetScc:
-        case IR::Opcode::GetExec:
-        case IR::Opcode::GetVcc:
-        case IR::Opcode::GetVccLo:
-        case IR::Opcode::GetVccHi:
-        case IR::Opcode::GetM0:
-        case IR::Opcode::GetScalarRegister:
-        case IR::Opcode::GetVectorRegister:
-        case IR::Opcode::GetVirtualRegister:
-        case IR::Opcode::GetGotoVariable:
-        case IR::Opcode::GetPatch:
-        case IR::Opcode::GetTessGenericAttribute:
-        case IR::Opcode::ReadTcsGenericOuputAttribute:
-        case IR::Opcode::Phi:
-        case IR::Opcode::LaneId:
-        case IR::Opcode::WarpId:
-        case IR::Opcode::QuadBroadcast:
-        case IR::Opcode::Shuffle:
-        case IR::Opcode::ShuffleXor:
-        case IR::Opcode::ReadFirstLane:
-        case IR::Opcode::ReadLane:
-        case IR::Opcode::WriteLane:
-        case IR::Opcode::Ballot:
-        case IR::Opcode::BallotFindLsb:
-        case IR::Opcode::InverseBallot:
-        case IR::Opcode::GroupAny:
-        case IR::Opcode::MaskedBitCount32:
-        case IR::Opcode::DataAppend:
-        case IR::Opcode::DataConsume:
-        case IR::Opcode::LoadSharedU16:
-        case IR::Opcode::LoadSharedU32:
-        case IR::Opcode::LoadSharedU64:
-            return false;
-        case IR::Opcode::GetAttribute:
-        case IR::Opcode::GetAttributeU32: {
-            const IR::Attribute attr = inst.Arg(0).Attribute();
-            return attr == IR::Attribute::WorkgroupId || attr == IR::Attribute::WorkgroupIndex;
-        }
-        default:
-            return std::nullopt;
-        }
-    }
-
-    const Info& info;
-    std::unordered_map<IR::Inst*, bool> known;
-    std::vector<Frame> stack;
-};
 
 // Blocks that every invocation of the workgroup runs: outside loops and outside ifs whose
 // condition can differ between lanes. PS4Recomp: an EXEC scope's condition is the lane's EXEC bit,
@@ -199,7 +51,9 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program,
                 ref && ref->GetOpcode() == IR::Opcode::ConditionRef) {
                 cond = ref->Arg(0);
             }
-            const bool divergent = !uniformity.IsUniform(cond);
+            // a predicated if runs in every invocation (predicate_wave64_pass.cpp)
+            const bool divergent = !program.predicated_merges.contains(node.data.if_node.merge) &&
+                                   !uniformity.IsUniform(cond);
             conditionals.push_back({node.data.if_node.merge, divergent});
             divergence_depth += static_cast<u32>(divergent);
             break;
@@ -210,9 +64,15 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program,
             conditionals.pop_back();
             break;
         case Type::Loop:
-            loops.push_back(node.data.loop.merge);
+            // a predicated loop iterates in every invocation until none runs it any more
+            if (!program.predicated_merges.contains(node.data.loop.merge)) {
+                loops.push_back(node.data.loop.merge);
+            }
             break;
         case Type::Repeat:
+            if (program.predicated_merges.contains(node.data.repeat.merge)) {
+                break;
+            }
             if (loops.empty() || loops.back() != node.data.repeat.merge) {
                 return {};
             }
@@ -333,6 +193,22 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
                        num_threads > 32;
 
     DropRedundantReadFirstLaneExec(program);
+    // v_writelane, in every stage: the lane named by the scalar operand (its low 6 bits) takes the
+    // new value, the others keep theirs, whatever EXEC is. A wave64 compute shader split into
+    // subgroups names the GCN lane (the local invocation index modulo 64).
+    for (IR::Block* block : program.blocks) {
+        for (auto it = block->begin(); it != block->end();) {
+            IR::Inst& inst = *it++;
+            if (inst.GetOpcode() != IR::Opcode::WriteLane) {
+                continue;
+            }
+            IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+            const IR::U32 lane = split ? ComputeWaveLane(ir) : ir.LaneId();
+            const IR::U1 is_lane =
+                ir.IEqual(lane, ir.BitwiseAnd(IR::U32{inst.Arg(2)}, ir.Imm32(63u)));
+            inst.ReplaceUsesWithAndRemove(ir.Select(is_lane, inst.Arg(1), inst.Arg(0)));
+        }
+    }
     if (split) {
         // A value that is the same in every lane needs no exchange: any lane reads it. Code that
         // only fed such reads (e.g. a ballot picking the lane) is dead afterwards.
@@ -369,6 +245,9 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
                             inst.GetOpcode());
                 if (inst.GetOpcode() == IR::Opcode::Ballot) {
                     subgroup_ballots.insert(&inst);
+                } else {
+                    // a known gap, counted (Info::per_subgroup_lane_ops)
+                    ++program.info.per_subgroup_lane_ops;
                 }
             }
         };
@@ -383,7 +262,10 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
                 push_worklist(inst);
             } else if (op == IR::Opcode::Ballot) {
                 const IR::Value bit = inst.Arg(0);
-                if (is_uniform && bit.IsImmediate() && bit.U1()) {
+                if (program.subgroup_ballots.contains(&inst)) {
+                    // predicated code whose mask is only tested per lane: no exchange needed
+                    subgroup_ballots.insert(&inst);
+                } else if (is_uniform && bit.IsImmediate() && bit.U1()) {
                     // every lane of the wave runs this: the mask of the lanes the wave has
                     IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
                     IR::U64 mask = ir.Imm64(~u64{0});
@@ -397,11 +279,18 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
                 } else {
                     push_worklist(inst);
                 }
+            } else if (op == IR::Opcode::WorkgroupAny || op == IR::Opcode::WaveAny) {
+                // predicate_wave64_pass.cpp only emits them where every invocation runs
+                ASSERT_MSG(is_uniform, "{} in non uniform control flow", op);
+                worklist.push_back(&inst);
             } else if (op == IR::Opcode::MaskedBitCount32) {
                 IR::Inst* const ballot = FindBallotForMaskedBitCount(inst);
                 if (ballot == nullptr ||
-                    std::ranges::contains(uniform_blocks, ballot->GetParent())) {
+                    (std::ranges::contains(uniform_blocks, ballot->GetParent()) &&
+                     !program.subgroup_ballots.contains(ballot))) {
                     worklist.push_back(&inst);
+                } else {
+                    ++program.info.per_subgroup_lane_ops;
                 }
             }
         }
@@ -445,13 +334,19 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
         return inst->GetOpcode() == IR::Opcode::ReadFirstLane;
     });
     const u32 num_subgroups = Common::AlignUp(num_threads, 64) / profile.subgroup_size;
+    // the subgroups the workgroup has (its last wave may have no upper half)
+    const u32 num_running_subgroups = Common::DivCeil(num_threads, profile.subgroup_size);
     const u32 scratch_base = Common::AlignUp(runtime_info.hw.cs.shared_memory_size, sizeof(u64));
     const u32 values_base = scratch_base + num_subgroups * u32(sizeof(u32));
     const u32 scratch_size = (needs_values ? 2 : 1) * num_subgroups * u32(sizeof(u32));
     program.info.shared_memory_scratch_size =
         scratch_base + scratch_size - runtime_info.hw.cs.shared_memory_size;
 
+    std::unordered_set<const IR::Inst*> merged_wave_any;
     for (IR::Inst* inst : worklist) {
+        if (merged_wave_any.contains(inst)) {
+            continue; // lowered with its WorkgroupAny
+        }
         LOG_INFO(Render_Recompiler, "Lowering {} instruction for wave64", inst->GetOpcode());
         IR::IREmitter ir{*inst->GetParent(), IR::Block::InstructionList::s_iterator_to(*inst)};
         const IR::U32 invocation_index = ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex);
@@ -473,11 +368,51 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
             return IR::U32{ir.Select(ir.ILessThan(hi_first, ir.Imm32(num_threads), false), hi,
                                      ir.Imm32(0u))};
         };
-        if (inst->GetOpcode() == IR::Opcode::Ballot) {
+        if (inst->GetOpcode() == IR::Opcode::WorkgroupAny ||
+            inst->GetOpcode() == IR::Opcode::WaveAny) {
+            // Each subgroup publishes whether any of its invocations has the bit, then every
+            // invocation reads all of them (WorkgroupAny) or its wave's two (WaveAny). A WaveAny
+            // of the same bit later in the block reads the same publication.
+            const IR::Value bit = inst->Arg(0);
+            const IR::U1 any = ir.GroupAny(IR::U1{bit});
+            ir.WriteShared(32, ir.Select(any, ir.Imm32(1u), ir.Imm32(0u)), offset);
+            ir.LdsBarrier();
+            IR::Inst* wave_any = inst->GetOpcode() == IR::Opcode::WaveAny ? inst : nullptr;
+            if (!wave_any) {
+                for (auto it = std::next(IR::Block::InstructionList::s_iterator_to(*inst));
+                     it != inst->GetParent()->end(); ++it) {
+                    if (it->GetOpcode() == IR::Opcode::WaveAny && it->Arg(0) == bit) {
+                        wave_any = &*it;
+                        merged_wave_any.insert(wave_any);
+                        break;
+                    }
+                }
+            }
+            IR::U1 wave_result{};
+            if (wave_any) {
+                wave_result = ir.INotEqual(ir.BitwiseOr(load_lo(scratch_base), load_hi(scratch_base)),
+                                           ir.Imm32(0u));
+            }
+            IR::U1 all_result{};
+            if (inst->GetOpcode() == IR::Opcode::WorkgroupAny) {
+                IR::U32 all = IR::U32{ir.LoadShared(32, false, ir.Imm32(scratch_base))};
+                for (u32 k = 1; k < num_running_subgroups; ++k) {
+                    all = ir.BitwiseOr(all, IR::U32{ir.LoadShared(32, false, ir.Imm32(scratch_base + 4 * k))});
+                }
+                all_result = ir.INotEqual(all, ir.Imm32(0u));
+            }
+            ir.LdsBarrier();
+            if (wave_any && wave_any != inst) {
+                wave_any->ReplaceUsesWithAndRemove(wave_result);
+            }
+            inst->ReplaceUsesWithAndRemove(inst->GetOpcode() == IR::Opcode::WorkgroupAny
+                                               ? all_result
+                                               : wave_result);
+        } else if (inst->GetOpcode() == IR::Opcode::Ballot) {
             const IR::U32 mask_low =
                 IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ir.Ballot(IR::U1{inst->Arg(0)})), 0)};
             ir.WriteShared(32, mask_low, offset);
-            ir.Barrier();
+            ir.LdsBarrier();
             // PS4Recomp: two 32-bit loads of the subgroup pair instead of one 64-bit load. A
             // u64 view of workgroup memory next to the u32 one needs explicit workgroup layouts
             // (aliased blocks), which the MSL backend drops: the variables went undeclared and
@@ -485,19 +420,22 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
             const IR::U32 lo = load_lo(scratch_base);
             const IR::U32 hi = load_hi(scratch_base);
             const IR::U64 mask = ir.PackUint2x32(ir.CompositeConstruct(lo, hi));
-            ir.Barrier();
+            ir.LdsBarrier();
             inst->ReplaceUsesWithAndRemove(mask);
         } else if (inst->GetOpcode() == IR::Opcode::ReadLane) {
             // v_readlane: the lane is the low 6 bits of a scalar operand (the same in every lane)
-            const IR::U32 lane = ir.BitwiseAnd(IR::U32{inst->Arg(1)}, ir.Imm32(63u));
+            // made the same in the subgroup: a slot is written by one value even where the
+            // lane operand differed between lanes (e.g. an SGPR written in divergent code)
+            const IR::U32 lane =
+                ir.BitwiseAnd(ir.ReadFirstLane(IR::U32{inst->Arg(1)}, ir.Imm1(true)), ir.Imm32(63u));
             const IR::U32 lane32 = ir.BitwiseAnd(lane, ir.Imm32(31u));
             const IR::U32 half = ir.ShiftRightLogical(lane, ir.Imm32(5u));
             ir.WriteShared(32, ir.ReadLane(IR::U32{inst->Arg(0)}, lane32), offset);
-            ir.Barrier();
+            ir.LdsBarrier();
             const IR::U32 value = IR::U32{ir.LoadShared(
                 32, false,
                 ir.IAdd(ir.IAdd(ir.Imm32(scratch_base), pair), ir.ShiftLeftLogical(half, ir.Imm32(2u))))};
-            ir.Barrier();
+            ir.LdsBarrier();
             inst->ReplaceUsesWithAndRemove(value);
         } else if (inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
             // v_readfirstlane: the first lane in EXEC across both halves, lane 0 when EXEC is 0.
@@ -517,7 +455,7 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
                     IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ir.Ballot(exec)), 0)};
                 ir.WriteShared(32, exec_half, offset);
             }
-            ir.Barrier();
+            ir.LdsBarrier();
             IR::U32 result = load_lo(values_base);
             if (!exec_is_executing) {
                 // no EXEC lane in the lower half: the upper half's first, if it has one
@@ -526,7 +464,7 @@ void LowerWaveOpsPass(IR::Program& program, const RuntimeInfo& runtime_info,
                                   ir.INotEqual(load_hi(scratch_base), ir.Imm32(0u)));
                 result = IR::U32{ir.Select(take_hi, load_hi(values_base), result)};
             }
-            ir.Barrier();
+            ir.LdsBarrier();
             inst->ReplaceUsesWithAndRemove(result);
         } else if (inst->GetOpcode() == IR::Opcode::MaskedBitCount32) {
             const IR::U32 subgroup_invocation_id = ir.BitwiseAnd(invocation_index, ir.Imm32(63));

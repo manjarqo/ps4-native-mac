@@ -34,6 +34,14 @@ uint64_t recomp_vm_alloc_fixed(GuestContext *ctx, uint64_t desired_addr, size_t 
 int recomp_vm_free(GuestContext *ctx, uint64_t addr, size_t size);
 bool recomp_vm_split_extent_at(GuestContext *proc, uint64_t at);
 GuestVMExtent *recomp_vm_find(GuestContext *ctx, uint64_t addr);
+// Provably unmapped guest ranges (free extents and untouched reservations), sorted and merged,
+// for readers that must not take vm_mutex per query: [out[i][0], out[i][1]). Writes at most max
+// ranges and returns how many there are; *gen gets the generation they belong to.
+size_t recomp_vm_unmapped_ranges(GuestContext *ctx, uint64_t (*out)[2], size_t max, uint64_t *gen);
+// Changes whenever an extent becomes free or mapped or is renamed (recomp_vm_note_change, called
+// with vm_mutex held by every such change).
+uint64_t recomp_vm_generation(void);
+void recomp_vm_note_change(void);
 
 // Unresolved Symbol Diagnostics & Core Stubs
 typedef struct RecompUnresolvedSym {

@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <limits>
+#include <map>
+#include <optional>
+#include <vector>
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -9,6 +13,7 @@
 #include "shader_recompiler/ir/operand_helper.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "shader_recompiler/ir/reinterpret.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/resource.h"
@@ -514,9 +519,17 @@ void PatchBufferSharp(const ResourceDiscovery& resource, Info& info, Descriptors
     inst.SetArg(0, ir.Imm32(buffer_binding));
 }
 
-void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors& descriptors,
-                     const Profile& profile) {
+// PS4Recomp: a read through a T# the shader loads at run time (Invalid fetch) is deferred
+// (returns false, nothing patched) when `defer_dynamic` is set: LowerDynamicImageTable gets it
+// once every buffer has its binding.
+bool PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors& descriptors,
+                     const Profile& profile, bool defer_dynamic = false) {
     IR::Inst& inst = *resource.user;
+    if (defer_dynamic && !IsImageAtomicInstruction(inst) && inst.GetOpcode() != IR::Opcode::ImageWrite &&
+        ConstructSharpFetch<AmdGpu::Image>(resource.sharps[0]).summary ==
+            SharpFetch<AmdGpu::Image>::Summary::Invalid) {
+        return false;
+    }
 
     // Read image sharp.
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
@@ -624,11 +637,11 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
             IR::F32 fmaskx = ir.BitCast<IR::F32>(ir.Imm32(0x76543210));
             IR::F32 fmasky = ir.BitCast<IR::F32>(ir.Imm32(0xfedcba98));
             inst.ReplaceUsesWith(ir.CompositeConstruct(fmaskx, fmasky));
-            return;
+            return true;
         }
         case IR::Opcode::ImageQueryLod:
             inst.ReplaceUsesWith(ir.Imm32(1));
-            return;
+            return true;
         case IR::Opcode::ImageQueryDimensions: {
             IR::Value dims = ir.CompositeConstruct(ir.Imm32(static_cast<u32>(image.width)),  // x
                                                    ir.Imm32(static_cast<u32>(image.height)), // y
@@ -639,7 +652,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
             descriptors.Add(FMaskResource{
                 .sharp_idx = SharpLocationFromSource(resource.sharps[0].dwords[0].Inst()),
             });
-            return;
+            return true;
         }
         default:
             UNREACHABLE_MSG("Can't patch fmask instruction {}", inst.GetOpcode());
@@ -663,6 +676,639 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     } else {
         inst.SetArg(0, ir.Imm32(image_binding));
     }
+    return true;
+}
+
+// PS4Recomp: value = mul * leaf + add (mod 2^32) for one value `leaf` only the shader knows
+// (leaf == nullptr: the constant add).
+struct AffineU32 {
+    const IR::Inst* leaf{};
+    u32 mul{};
+    u32 add{};
+};
+
+static std::optional<AffineU32> EvalAffine(const IR::Value& v, u32 depth = 0) {
+    if (v.IsImmediate()) {
+        if (v.Type() != IR::Type::U32) {
+            return std::nullopt;
+        }
+        return AffineU32{nullptr, 0, v.U32()};
+    }
+    const IR::Inst* inst = v.Inst();
+    const auto as_leaf = AffineU32{inst, 1, 0};
+    if (depth >= 16) {
+        return as_leaf;
+    }
+    const auto combine = [](AffineU32 a, AffineU32 b, bool sub) -> std::optional<AffineU32> {
+        if (a.leaf && b.leaf && a.leaf != b.leaf) {
+            return std::nullopt;
+        }
+        return AffineU32{a.leaf ? a.leaf : b.leaf, sub ? a.mul - b.mul : a.mul + b.mul,
+                         sub ? a.add - b.add : a.add + b.add};
+    };
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::IAdd32:
+    case IR::Opcode::ISub32: {
+        const auto a = EvalAffine(inst->Arg(0), depth + 1);
+        const auto b = EvalAffine(inst->Arg(1), depth + 1);
+        if (!a || !b) {
+            return as_leaf;
+        }
+        const auto r = combine(*a, *b, inst->GetOpcode() == IR::Opcode::ISub32);
+        return r ? r : std::optional<AffineU32>{as_leaf};
+    }
+    case IR::Opcode::IMul32: {
+        const auto a = EvalAffine(inst->Arg(0), depth + 1);
+        const auto b = EvalAffine(inst->Arg(1), depth + 1);
+        if (a && b && !b->leaf) {
+            return AffineU32{a->leaf, a->mul * b->add, a->add * b->add};
+        }
+        if (a && b && !a->leaf) {
+            return AffineU32{b->leaf, b->mul * a->add, b->add * a->add};
+        }
+        return as_leaf;
+    }
+    case IR::Opcode::ShiftLeftLogical32: {
+        const auto a = EvalAffine(inst->Arg(0), depth + 1);
+        if (a && inst->Arg(1).IsImmediate() && inst->Arg(1).U32() < 32) {
+            const u32 n = inst->Arg(1).U32();
+            return AffineU32{a->leaf, a->mul << n, a->add << n};
+        }
+        return as_leaf;
+    }
+    case IR::Opcode::ShiftRightLogical32: {
+        // (mul * leaf + add) >> n == (mul >> n) * leaf + (add >> n) only when mul and add are
+        // multiples of 2^n and the sum does not wrap: the T# offsets of a table are dword
+        // offsets of byte offsets (byte offset >> 2) far below 2^32. A multiplier of 2^31 or more
+        // is a negative one (first - s * index): the sum wraps for every index past 0
+        const auto a = EvalAffine(inst->Arg(0), depth + 1);
+        if (a && inst->Arg(1).IsImmediate() && inst->Arg(1).U32() < 32) {
+            const u32 n = inst->Arg(1).U32();
+            const u32 m = (1u << n) - 1;
+            if ((a->mul & m) == 0 && (a->add & m) == 0 && a->mul < 0x80000000u) {
+                return AffineU32{a->leaf, a->mul >> n, a->add >> n};
+            }
+        }
+        return as_leaf;
+    }
+    default:
+        return as_leaf;
+    }
+}
+
+// The flattened V# (or SRT pointer) an SRT program reads a guest buffer through, as
+// CopyBufferDwords takes it: V# at flat[vs] (SingleLoad), or the buffer of reads through an SRT
+// pointer at an offset only the shader knows (LowerDynamicReadConst: dwords 0-1 the pointer,
+// size_imm bytes).
+struct TableBufferSource {
+    SharpLocation vs{};
+    u32 size_imm{};
+};
+
+static std::optional<TableBufferSource> BufferSource(const Info& info, u32 buffer) {
+    if (buffer >= info.buffers.size()) {
+        return std::nullopt;
+    }
+    const BufferResource& b = info.buffers[buffer];
+    if (b.buffer_type != BufferType::Guest || b.post_op != SharpFetchPostOp::None) {
+        return std::nullopt;
+    }
+    const auto& f = b.sharp_fetch;
+    if (f.summary == SharpFetch<AmdGpu::Buffer>::Summary::SingleLoad) {
+        return TableBufferSource{f.offsets[0], 0};
+    }
+    if (f.summary == SharpFetch<AmdGpu::Buffer>::Summary::MultiLoad && f.load_mask == 0b0011 &&
+        f.offsets[1] == f.offsets[0] + 1 && f.immediates[2] != 0) {
+        return TableBufferSource{f.offsets[0], f.immediates[2]};
+    }
+    return std::nullopt;
+}
+
+// A T# whose dword i the shader reads at dword offset first + i + stride * L of buffer
+// `buffer` (s_buffer_load / s_load through a flattened V# or SRT pointer), L a value only the
+// shader knows.
+struct TableSite {
+    u32 buffer{};
+    u32 first{};
+    u32 stride{};
+    u32 num_dwords{};
+    const IR::Inst* leaf{};
+    IR::Value offset0; // the dword offset of T# dword 0 as the shader computes it
+};
+
+static std::optional<TableSite> MatchTableSite(const SharpReference& tsharp) {
+    if (tsharp.num_dwords != 4 && tsharp.num_dwords != 8) {
+        return std::nullopt;
+    }
+    TableSite site{};
+    site.num_dwords = tsharp.num_dwords;
+    for (u32 i = 0; i < tsharp.num_dwords; ++i) {
+        const IR::Inst* rd = tsharp.dwords[i].TryInst();
+        if (!rd || rd->GetOpcode() != IR::Opcode::ReadConstBuffer || !rd->Arg(0).IsImmediate()) {
+            return std::nullopt;
+        }
+        const auto a = EvalAffine(rd->Arg(1));
+        // a multiplier of 2^31 or more is a negative stride (first - s * index) mod 2^32: no
+        // table form (the bound and the entry offsets assume a growing index)
+        if (!a || !a->leaf || a->mul == 0 || a->mul >= 0x80000000u) {
+            return std::nullopt;
+        }
+        if (i == 0) {
+            site.buffer = rd->Arg(0).U32();
+            site.leaf = a->leaf;
+            site.stride = a->mul;
+            site.first = a->add;
+            site.offset0 = rd->Arg(1);
+        } else if (rd->Arg(0).U32() != site.buffer || a->leaf != site.leaf ||
+                   a->mul != site.stride || a->add != site.first + i) {
+            return std::nullopt;
+        }
+    }
+    return site;
+}
+
+// A flattened scalar: its flatbuf dword, or nullopt.
+static std::optional<SharpLocation> FlattenedDword(const IR::Value& v) {
+    const IR::Inst* inst = v.TryInst();
+    if (!inst) {
+        return std::nullopt;
+    }
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::GetUserData:
+        return static_cast<SharpLocation>(inst->Arg(0).ScalarReg());
+    case IR::Opcode::ReadConst:
+        if (const u16 off = inst->Flags<u16>(); off != 0) {
+            return off;
+        }
+        return std::nullopt;
+    case IR::Opcode::ReadConstBuffer: {
+        const auto f = inst->Flags<IR::BufferInstInfo>();
+        if (f.sharp_source != 0 && f.flatbuf_off_dw != 0) {
+            return static_cast<SharpLocation>(f.flatbuf_off_dw.Value());
+        }
+        return std::nullopt;
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
+static const IR::Inst* StripConditionRef(const IR::Value& v) {
+    const IR::Inst* inst = v.TryInst();
+    while (inst && inst->GetOpcode() == IR::Opcode::ConditionRef) {
+        inst = inst->Arg(0).TryInst();
+    }
+    return inst;
+}
+
+// The loop bound of a counter k = Phi(0, k + 1): the block feeding k + 1 back ends in a branch
+// on a compare of k + 1 with a flattened N that takes the back edge while k + 1 < N (signed or
+// unsigned) or k + 1 != N. Uncharted 4's T# tables indexed by a loop counter: a do-while over
+// N entries, N loaded from the SRT.
+static std::optional<ImageTableBound> MatchLoopCounter(const IR::Inst* phi) {
+    if (phi->GetOpcode() != IR::Opcode::Phi) {
+        return std::nullopt;
+    }
+    const IR::Inst* inc = nullptr;
+    const IR::Block* latch = nullptr;
+    bool init = false;
+    for (size_t i = 0; i < phi->NumArgs(); ++i) {
+        const IR::Value v = phi->Arg(i);
+        if (v.IsImmediate()) {
+            if (v.Type() != IR::Type::U32 || v.U32() != 0 || init) {
+                return std::nullopt;
+            }
+            init = true;
+            continue;
+        }
+        const IR::Inst* a = v.Inst();
+        const bool is_inc = a->GetOpcode() == IR::Opcode::IAdd32 &&
+                            ((a->Arg(0).TryInst() == phi && a->Arg(1).IsImmediate() &&
+                              a->Arg(1).U32() == 1) ||
+                             (a->Arg(1).TryInst() == phi && a->Arg(0).IsImmediate() &&
+                              a->Arg(0).U32() == 1));
+        if (!is_inc || (inc && inc != a) || (latch && latch != phi->PhiBlock(i))) {
+            return std::nullopt;
+        }
+        inc = a;
+        latch = phi->PhiBlock(i);
+    }
+    if (!init || !inc || !latch || latch->imm_successors.size() != 2) {
+        return std::nullopt;
+    }
+    const IR::Block* header = phi->GetParent();
+    const IR::Inst* cond = StripConditionRef(latch->branch_cond);
+    bool back_when_true = true;
+    while (cond && cond->GetOpcode() == IR::Opcode::LogicalNot) {
+        back_when_true = !back_when_true;
+        cond = StripConditionRef(cond->Arg(0));
+    }
+    if (!cond || cond->NumArgs() != 2) {
+        return std::nullopt;
+    }
+    // the compare as "continue while": (opcode, counter operand, whether it means continue)
+    const IR::Value lhs = cond->Arg(0), rhs = cond->Arg(1);
+    const bool lhs_inc = lhs.TryInst() == inc, rhs_inc = rhs.TryInst() == inc;
+    if (lhs_inc == rhs_inc) {
+        return std::nullopt;
+    }
+    const IR::Value n = lhs_inc ? rhs : lhs;
+    std::optional<LoopCompare> compare;
+    bool continue_when_true = true;
+    switch (cond->GetOpcode()) {
+    case IR::Opcode::ULessThan32: // inc < N, or N < inc (exit when true... not a count)
+        if (lhs_inc) compare = LoopCompare::ULess;
+        break;
+    case IR::Opcode::SLessThan32:
+        if (lhs_inc) compare = LoopCompare::SLess;
+        break;
+    case IR::Opcode::UGreaterThan32: // N > inc
+        if (rhs_inc) compare = LoopCompare::ULess;
+        break;
+    case IR::Opcode::SGreaterThan32:
+        if (rhs_inc) compare = LoopCompare::SLess;
+        break;
+    case IR::Opcode::UGreaterThanEqual32: // inc >= N: exit
+        if (lhs_inc) compare = LoopCompare::ULess, continue_when_true = false;
+        break;
+    case IR::Opcode::SGreaterThanEqual32:
+        if (lhs_inc) compare = LoopCompare::SLess, continue_when_true = false;
+        break;
+    case IR::Opcode::ULessThanEqual32: // N <= inc: exit
+        if (rhs_inc) compare = LoopCompare::ULess, continue_when_true = false;
+        break;
+    case IR::Opcode::SLessThanEqual32:
+        if (rhs_inc) compare = LoopCompare::SLess, continue_when_true = false;
+        break;
+    case IR::Opcode::INotEqual32:
+        compare = LoopCompare::NotEqual;
+        break;
+    case IR::Opcode::IEqual32:
+        compare = LoopCompare::NotEqual, continue_when_true = false;
+        break;
+    default:
+        break;
+    }
+    if (!compare) {
+        return std::nullopt;
+    }
+    // imm_successors[0] is the block taken when the condition holds
+    const bool back_on_true = continue_when_true == back_when_true;
+    if (latch->imm_successors[back_on_true ? 0 : 1] != header ||
+        latch->imm_successors[back_on_true ? 1 : 0] == header) {
+        return std::nullopt;
+    }
+    const auto n_dw = FlattenedDword(n);
+    if (!n_dw) {
+        return std::nullopt;
+    }
+    ImageTableBound bound{};
+    bound.kind = ImageTableKind::Loop;
+    bound.count_dw = *n_dw;
+    bound.compare = *compare;
+    return bound;
+}
+
+// Tables already lowered in this shader, by their form.
+struct TableKey {
+    u32 buffer, first, stride, num_dwords;
+    u32 index_buffer, index_first, index_stride; // Indexed (else ~0u)
+    u32 count_dw, compare;                       // Loop (else ~0u)
+    auto operator<=>(const TableKey&) const = default;
+};
+// One entry of a lowered table: its flatbuf dwords and the offset that selects it.
+struct TableEntry {
+    u32 dst{};      // flatbuf dword of T# dword 0
+    u32 cmp_imm{};  // the T# dword offset that selects the entry, or
+    u32 cmp_flat{}; // the flatbuf dword holding it (Indexed records; 0: cmp_imm)
+};
+struct LoweredTable {
+    u32 index{}; // into Info::image_tables
+    std::vector<TableEntry> entries;
+};
+struct DynamicImageTables {
+    std::map<TableKey, LoweredTable> tables;
+    // index buffer scans (buffer, first, stride) -> flatbuf dword of their CollectIndices result
+    std::map<std::array<u32, 3>, u32> index_scans;
+};
+
+// Appends ops to the SRT program (before its End) and refreshes the compile-time flatbuf.
+static void AppendSrtOps(Info& info, std::initializer_list<u32> ops, u32 new_flat_dwords) {
+    auto& program = info.srt_info.program;
+    if (!program.empty()) {
+        ASSERT(program.back() == static_cast<u32>(SrtOp::End));
+        program.pop_back();
+    }
+    program.insert(program.end(), ops);
+    program.push_back(static_cast<u32>(SrtOp::End));
+    info.srt_info.flattened_bufsize_dw += new_flat_dwords;
+}
+
+// PS4Recomp: an image read through a T# the shader loads from a table at run time: s_buffer_load
+// / s_load of T# dword i at dword offset c + i + s * L of a buffer whose V# (or SRT pointer) is
+// flattened, L a value only the shader knows (Uncharted 4: lights, records of 396 bytes indexed
+// by the tile's light list; reflection probes, indexed by a probe record's texture index; a loop
+// over N entries). The entries a draw can reach are copied into the flattened user data by the
+// SRT program (SrtOp::CopyBufferDwords / CopyIndexedDwords), each an ordinary image binding: the
+// renderer fetches, uploads, tracks and captures it like any other, and the shader is specialized
+// to it. Which entries a draw reaches comes from a bound (ImageTableBound): the table buffer's V#
+// (Records), the bounded buffer the index is read from (Indexed: one entry per distinct index its
+// records hold, scanned by the SRT program, and the entry of index 0 that an index read past that
+// buffer returns), or the count of the loop whose counter the index is (Loop). The bucket of every bound's entry count is part of the
+// specialization (StageSpecialization::image_tables), so a draw reaching more entries gets
+// another permutation. The shader runs the instruction once per entry and keeps the result of the
+// entry whose offset equals the one it loaded the T# from: an exact address compare, so any other
+// offset gives 0, the null image, as the all-zero T# an s_buffer_load past num_records returns.
+// Returns false if the T# does not have that form, or no bound gives at most
+// MaxImageTableEntries entries for this draw: the caller then binds the null image (logged and
+// counted, Info::null_image_reads).
+bool LowerDynamicImageTable(const ResourceDiscovery& resource, Info& info, Descriptors& descriptors,
+                            DynamicImageTables& lowering, std::vector<IR::Inst*>& clones) {
+    auto& tables = lowering.tables;
+    IR::Inst& inst = *resource.user;
+    const auto inst_info = inst.Flags<IR::TextureInstInfo>();
+    const u32 pc = u32(inst_info.pc.Value());
+    const IR::Opcode op = inst.GetOpcode();
+    const bool is_sample = op == IR::Opcode::ImageSampleRaw;
+    if (!is_sample && op != IR::Opcode::ImageRead) {
+        return false;
+    }
+    const SharpReference& tsharp = resource.sharps[0];
+    const auto site = MatchTableSite(tsharp);
+    if (!site) {
+        return false;
+    }
+    const auto table_src = BufferSource(info, site->buffer);
+    if (!table_src) {
+        return false;
+    }
+    // The S#: static (the same for every entry), or derived from T# dword 3 (aniso off for
+    // single-level images): then one S# per entry, reading that entry's dword 3.
+    const SharpReference& ssharp = resource.sharps[1];
+    const bool sampler_per_entry =
+        is_sample && ssharp.post_op == SharpFetchPostOp::DisableAnisoIfSingleLod;
+    SamplerResource sampler_res{};
+    if (is_sample) {
+        sampler_res = SamplerResource{
+            .sharp_fetch = ConstructSharpFetch<AmdGpu::Sampler>(ssharp),
+            .post_op = ssharp.post_op,
+            .post_op_tsharp_dw3_off = UNKNOWN_LOCATION,
+            .is_depth = bool(inst_info.is_depth),
+        };
+        if (sampler_res.sharp_fetch.summary == SharpFetch<AmdGpu::Sampler>::Summary::Invalid) {
+            return false;
+        }
+        if (sampler_per_entry && !(ssharp.post_op_data.lod_prod == tsharp.dwords[3])) {
+            return false;
+        }
+    }
+
+    // The bounds the table's form allows, in order of preference, until one fits this draw. The
+    // table keeps only the bound it was made for (its bucket must stay the same for the shader to
+    // be reused; the bounds before it do not matter once it fits), or every bound when none fits
+    // (so that a draw one of them fits re-specializes).
+    std::array<ImageTableBound, 3> bounds{};
+    u32 num_bounds = 0;
+    u32 chosen = ~0u, num_entries = 0, reached = 0;
+    const auto try_bound = [&](const ImageTableBound& b) {
+        bounds[num_bounds] = b;
+        const u64 n = b.Entries(info.flattened_ud_buf.data());
+        const u32 bucket_entries = ImageTableBucketEntries(ImageTableBucket(n));
+        if (bucket_entries <= MaxImageTableEntries) {
+            chosen = num_bounds;
+            num_entries = bucket_entries;
+            reached = static_cast<u32>(n);
+        }
+        ++num_bounds;
+        return chosen != ~0u;
+    };
+    bool fits = false;
+    if (table_src->size_imm == 0) {
+        ImageTableBound b{};
+        b.kind = ImageTableKind::Records;
+        b.vs = table_src->vs;
+        b.first_dw = site->first;
+        b.stride_dw = site->stride;
+        fits = try_bound(b);
+    }
+    std::optional<TableBufferSource> index_src;
+    u32 index_buffer = ~0u, index_first = 0, index_stride = 0;
+    if (const IR::Inst* rd = site->leaf; !fits && rd->GetOpcode() == IR::Opcode::ReadConstBuffer &&
+                                         rd->Arg(0).IsImmediate()) {
+        const auto a = EvalAffine(rd->Arg(1));
+        if (a && a->leaf && a->mul != 0 && a->mul < 0x80000000u) {
+            index_src = BufferSource(info, rd->Arg(0).U32());
+        }
+        if (index_src) {
+            index_buffer = rd->Arg(0).U32();
+            index_first = a->add;
+            index_stride = a->mul;
+            // the distinct indices the buffer's records hold, found by the SRT program
+            const std::array<u32, 3> scan{index_buffer, index_first, index_stride};
+            auto it = lowering.index_scans.find(scan);
+            if (it == lowering.index_scans.end()) {
+                const u32 dst = info.srt_info.flattened_bufsize_dw;
+                AppendSrtOps(info,
+                             {static_cast<u32>(SrtOp::CollectIndices), u32(index_src->vs),
+                              index_src->size_imm, index_first * 4, index_stride * 4,
+                              MaxImageTableIndexRecords, dst},
+                             1 + SrtMaxTableIndices);
+                info.RefreshFlatBuf();
+                it = lowering.index_scans.emplace(scan, dst).first;
+            }
+            ImageTableBound b{};
+            b.kind = ImageTableKind::Indexed;
+            b.count_dw = static_cast<SharpLocation>(it->second);
+            fits = try_bound(b);
+        }
+    }
+    if (!fits) {
+        if (const auto loop = MatchLoopCounter(site->leaf)) {
+            fits = try_bound(*loop);
+        }
+    }
+    if (num_bounds == 0) {
+        LOG_ERROR(Render_Recompiler,
+                  "{} at pc {:#x}: T# table in buffer {} (dword {} + {} * index): no bound for its "
+                  "index ({})",
+                  IR::NameOf(op), pc, site->buffer, site->first, site->stride,
+                  IR::NameOf(site->leaf->GetOpcode()));
+        return false;
+    }
+    if (fits) {
+        // only the bound the entries are made for
+        bounds[0] = bounds[chosen];
+        num_bounds = 1;
+        chosen = 0;
+    }
+    const ImageTableKind kind = fits ? bounds[chosen].kind : ImageTableKind::None;
+    TableKey key{site->buffer, site->first, site->stride, site->num_dwords, ~0u, ~0u, ~0u, ~0u, ~0u};
+    if (kind == ImageTableKind::Indexed) {
+        key.index_buffer = index_buffer;
+        key.index_first = index_first;
+        key.index_stride = index_stride;
+    } else if (kind == ImageTableKind::Loop) {
+        key.count_dw = bounds[chosen].count_dw;
+        key.compare = static_cast<u32>(bounds[chosen].compare);
+    }
+
+    // The table: found (another site reads it) or added, its entries copied by the SRT program.
+    const u32 nd = site->num_dwords;
+    auto it = tables.find(key);
+    if (it != tables.end() && kind == ImageTableKind::None) {
+        // a gap table: every bound of its sites, so that a draw one of them fits re-specializes
+        ImageTableResource& t = info.image_tables[it->second.index];
+        const auto same = [](const ImageTableBound& x, const ImageTableBound& y) {
+            return x.kind == y.kind && x.vs == y.vs && x.size_imm == y.size_imm &&
+                   x.first_dw == y.first_dw && x.stride_dw == y.stride_dw &&
+                   x.count_dw == y.count_dw && x.compare == y.compare;
+        };
+        for (u32 i = 0; i < num_bounds; ++i) {
+            bool have = false;
+            for (u32 j = 0; j < t.num_bounds; ++j) {
+                have |= same(t.bounds[j], bounds[i]);
+            }
+            if (!have && t.num_bounds < t.bounds.size()) {
+                t.bounds[t.num_bounds++] = bounds[i];
+            }
+        }
+    }
+    if (it == tables.end()) {
+        if (info.image_tables.size() == info.image_tables.capacity()) {
+            LOG_ERROR(Render_Recompiler, "{} at pc {:#x}: too many T# tables", IR::NameOf(op), pc);
+            return false;
+        }
+        ImageTableResource t{};
+        t.kind = kind;
+        t.table_buffer = site->buffer;
+        t.first_dw = site->first;
+        t.stride_dw = site->stride;
+        t.num_dwords = nd;
+        t.index_buffer = kind == ImageTableKind::Indexed ? index_buffer : ~0u;
+        t.reached = reached;
+        t.num_bounds = num_bounds;
+        t.bounds = bounds;
+        t.num_entries = num_entries;
+        if (kind != ImageTableKind::None && info.images.size() + t.num_entries > NUM_IMAGES) {
+            LOG_ERROR(Render_Recompiler, "{} at pc {:#x}: no image slots left for a T# table",
+                      IR::NameOf(op), pc);
+            t.kind = ImageTableKind::None;
+            t.num_entries = 0;
+        }
+        if (t.kind != ImageTableKind::None && t.kind != ImageTableKind::Indexed &&
+            (u64(site->first) + u64(site->stride) * (t.num_entries - 1) + nd) * 4 > 0xFFFFFFFFull) {
+            // the byte offset of a record the entries copy does not fit the 32 bits the SRT
+            // program (and s_buffer_load) offsets have
+            LOG_ERROR(Render_Recompiler,
+                      "{} at pc {:#x}: T# table in buffer {} (dword {} + {} * index): entry {} lies "
+                      "past 4 GiB",
+                      IR::NameOf(op), pc, site->buffer, site->first, site->stride, t.num_entries - 1);
+            t.kind = ImageTableKind::None;
+            t.num_entries = 0;
+        }
+        LoweredTable lowered{static_cast<u32>(info.image_tables.size()), {}};
+        if (t.kind != ImageTableKind::None) {
+            const u32 dst0 = info.srt_info.flattened_bufsize_dw;
+            u32 next_cmp = dst0 + t.num_entries * nd;
+            for (u32 k = 0; k < t.num_entries; ++k) {
+                const u32 dst = dst0 + k * nd;
+                if (kind == ImageTableKind::Indexed) {
+                    // distinct index k (index 0 first; past the count: index 0 again)
+                    const u32 idx = bounds[chosen].count_dw + 1 + k;
+                    AppendSrtOps(info,
+                                 {static_cast<u32>(SrtOp::CopyIndexedDwords), u32(table_src->vs),
+                                  table_src->size_imm, site->first, site->stride, idx, nd, dst,
+                                  next_cmp},
+                                 0);
+                    lowered.entries.push_back(TableEntry{dst, 0, next_cmp++});
+                    continue;
+                }
+                const u32 guard = kind == ImageTableKind::Loop
+                                      ? SrtTableGuard(bounds[chosen].count_dw, bounds[chosen].compare)
+                                      : 0;
+                AppendSrtOps(info,
+                             {static_cast<u32>(SrtOp::CopyBufferDwords), u32(table_src->vs),
+                              table_src->size_imm, (site->first + site->stride * k) * 4, nd, dst,
+                              guard, k},
+                             0);
+                lowered.entries.push_back(TableEntry{dst, site->first + site->stride * k, 0});
+            }
+            info.srt_info.flattened_bufsize_dw = next_cmp;
+            info.RefreshFlatBuf();
+        }
+        info.image_tables.push_back(t);
+        it = tables.emplace(key, std::move(lowered)).first;
+    }
+    const u32 table_index = it->second.index;
+    ImageTableResource& table = info.image_tables[table_index];
+    table.num_sites++;
+    if (table.kind == ImageTableKind::None) {
+        LOG_ERROR(Render_Recompiler,
+                  "{} at pc {:#x}: T# table in buffer {} (dword {} + {} * index): no bound gives at "
+                  "most {} entries for this draw ({} by its first bound), not bound",
+                  IR::NameOf(op), pc, site->buffer, site->first, site->stride, MaxImageTableEntries,
+                  bounds[0].Entries(info.flattened_ud_buf.data()));
+        return false;
+    }
+    const auto entry_image = [&](u32 k) {
+        const TableEntry& e = it->second.entries[k];
+        SharpFetch<AmdGpu::Image> fetch{};
+        fetch.summary = SharpFetch<AmdGpu::Image>::Summary::SingleLoad;
+        for (u32 i = 0; i < nd; ++i) {
+            fetch.offsets[i] = static_cast<SharpLocation>(e.dst + i);
+            fetch.load_mask |= u8(1u << i);
+        }
+        return ImageResource{
+            .sharp_fetch = fetch,
+            .is_depth = bool(inst_info.is_depth),
+            .is_array = bool(inst_info.is_array),
+            .is_r128 = bool(inst_info.is_r128),
+            .post_op = tsharp.post_op,
+            .table = static_cast<u8>(table_index),
+            .table_entry = static_cast<u8>(k),
+        };
+    };
+    const u32 n = static_cast<u32>(it->second.entries.size());
+
+    // One instruction per entry, then the result of the entry the shader's offset selects.
+    IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
+    const u32 shared_sampler = is_sample && !sampler_per_entry ? descriptors.Add(sampler_res) : 0;
+    const IR::F32 zero = ir.Imm32(0.0f);
+    std::array<IR::F32, 4> result{zero, zero, zero, zero};
+    for (u32 k = 0; k < n; ++k) {
+        const TableEntry& e = it->second.entries[k];
+        const u32 image_binding = descriptors.Add(entry_image(k));
+        u32 sampler_binding = shared_sampler;
+        if (sampler_per_entry) {
+            SamplerResource s = sampler_res;
+            s.post_op_tsharp_dw3_off = static_cast<SharpLocation>(e.dst + 3);
+            sampler_binding = descriptors.Add(s);
+        }
+        IR::Inst* clone = &*inst.GetParent()->PrependNewInst(
+            IR::Block::InstructionList::s_iterator_to(inst), inst);
+        clone->SetArg(0, ir.Imm32(is_sample ? (image_binding | sampler_binding << 16) : image_binding));
+        clones.push_back(clone);
+        IR::U32 cmp = ir.Imm32(e.cmp_imm);
+        if (e.cmp_flat != 0) {
+            IR::U32 flat = ir.ReadConst(ir.CompositeConstruct(ir.Imm32(0u), ir.Imm32(0u)), ir.Imm32(0u));
+            flat.Inst()->SetFlags<u16>(static_cast<u16>(e.cmp_flat));
+            cmp = flat;
+        }
+        const IR::U1 hit = ir.IEqual(IR::U32{site->offset0}, cmp);
+        for (u32 c = 0; c < 4; ++c) {
+            result[c] = IR::F32{ir.Select(hit, ir.CompositeExtract(IR::Value{clone}, c), result[c])};
+        }
+    }
+    LOG_INFO(Render_Recompiler,
+             "{} at pc {:#x}: T# table {} in buffer {} (dword {} + {} * index), {} entries bound ({}, "
+             "{} reached by this draw)",
+             IR::NameOf(op), pc, table_index, site->buffer, site->first, site->stride, n,
+             table.kind == ImageTableKind::Records   ? "records"
+             : table.kind == ImageTableKind::Indexed ? "indexed"
+                                                     : "loop",
+             table.reached);
+    inst.ReplaceUsesWith(ir.CompositeConstruct(result[0], result[1], result[2], result[3]));
+    return true;
 }
 
 static IR::Value IsMbcntWithExec(IR::Value value, bool is_hi, IR::U1 exec) {
@@ -1274,6 +1920,7 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
     Descriptors descriptors{info};
     // PS4Recomp: accesses through V#s loaded at run time become guest memory accesses
     boost::container::small_vector<bool, 32> lowered(resources.size(), false);
+    boost::container::small_vector<size_t, 8> deferred;
     for (size_t i = 0; i < resources.size(); ++i) {
         const auto& usage = resources[i];
         IR::Inst& inst = *usage.user;
@@ -1285,7 +1932,20 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
             }
             PatchBufferSharp(usage, info, descriptors, profile);
         } else if (IsImageInstruction(inst)) {
-            PatchImageSharp(usage, info, descriptors, profile);
+            if (!PatchImageSharp(usage, info, descriptors, profile, true)) {
+                deferred.push_back(i);
+            }
+        }
+    }
+    // PS4Recomp: reads through T#s the shader loads from a table at run time, once every buffer
+    // has its binding (the table's); the others read the null image (PatchImageSharp)
+    std::vector<IR::Inst*> table_clones;
+    DynamicImageTables tables;
+    for (const size_t i : deferred) {
+        if (LowerDynamicImageTable(resources[i], info, descriptors, tables, table_clones)) {
+            lowered[i] = true;
+        } else {
+            PatchImageSharp(resources[i], info, descriptors, profile);
         }
     }
 
@@ -1303,6 +1963,9 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
         } else if (IsDataRingInstruction(inst)) {
             PatchGlobalDataShareAccess(inst, info, descriptors, profile);
         }
+    }
+    for (IR::Inst* clone : table_clones) {
+        PatchImageArgs(*clone, info);
     }
 }
 

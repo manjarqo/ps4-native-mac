@@ -989,6 +989,7 @@ int sceKernelSetVirtualRangeName(GuestContext *ctx, const void *addr, size_t len
         }
         curr = curr->next;
     }
+    recomp_vm_note_change(); // a renamed reservation is no longer one (recomp_vm_unmapped_ranges)
     pthread_mutex_unlock(&proc->vm_mutex);
 
     printf("[ps4-mem] sceKernelSetVirtualRangeName: addr=%p len=%zu name='%s'\n", addr, len, name);

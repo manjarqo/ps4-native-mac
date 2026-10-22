@@ -101,17 +101,21 @@ static void fifo_test(void) {
     ps4_pq_init(&q, 3, false);
     int sup;
     // no drawable held by the presenter: the producer must wait
+    CHECK(!ps4_pq_can_acquire_locked(&q));
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == -1);
     ps4_pq_grant_locked(&q);
     ps4_pq_grant_locked(&q); // credits do not pile up
     CHECK(q.credits == 1);
+    CHECK(ps4_pq_can_acquire_locked(&q) && q.credits == 1); // the query consumes nothing
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == 0 && !sup);
+    CHECK(!ps4_pq_can_acquire_locked(&q));
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == -1); // one frame per drawable
     ps4_pq_grant_locked(&q);
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == 1);
     ps4_pq_grant_locked(&q);
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == 2);
     ps4_pq_grant_locked(&q);
+    CHECK(!ps4_pq_can_acquire_locked(&q));             // a credit but no free slot
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == -1); // full: FIFO waits, never replaces
     CHECK(q.credits == 1);                             // the credit waits for a free slot
     CHECK(ps4_pq_submit_locked(&q, 1, false));
@@ -159,6 +163,29 @@ static void cancel_credit_test(void) {
     CHECK(t >= 0 && ps4_pq_cancel(&m, t) && m.credits == 0);
 }
 
+// A held frame (outside the slots) may take the presenter's drawable only when no slot frame is
+// ahead of it: a slot being rendered or queued is an older frame. Taking the drawable uses up its
+// credit, so no slot frame can be acquired against the same drawable.
+static void claim_drawable_test(void) {
+    ps4_present_queue q;
+    ps4_pq_init(&q, 3, false);
+    int sup;
+    ps4_pq_grant_locked(&q);
+    const int s = ps4_pq_try_acquire_locked(&q, &sup);
+    CHECK(s >= 0);
+    CHECK(!ps4_pq_claim_drawable_locked(&q)); // rendering: the slot frame is older
+    CHECK(ps4_pq_submit_locked(&q, s, false));
+    CHECK(!ps4_pq_claim_drawable_locked(&q)); // queued: still older
+    CHECK(ps4_pq_try_take_locked(&q) == s);
+    ps4_pq_grant_locked(&q); // the next drawable
+    CHECK(ps4_pq_claim_drawable_locked(&q) && q.credits == 0); // presenting is not ahead
+    CHECK(ps4_pq_try_acquire_locked(&q, &sup) == -1);         // the drawable is used up
+    CHECK(ps4_pq_claim_drawable_locked(&q) && q.credits == 0); // no credit to take (already used)
+    ps4_present_queue m;
+    ps4_pq_init(&m, 3, true);
+    CHECK(ps4_pq_claim_drawable_locked(&m) && m.credits == 0);
+}
+
 static void mailbox_test(void) {
     ps4_present_queue q;
     ps4_pq_init(&q, 3, true);
@@ -170,6 +197,7 @@ static void mailbox_test(void) {
     CHECK(c == 2 && !sup);
     CHECK(ps4_pq_submit_locked(&q, c, false));
     // no free slot: the oldest queued frame (b) is replaced, the one being presented is not
+    CHECK(ps4_pq_can_acquire_locked(&q) && q.superseded == 0);
     int d = ps4_pq_try_acquire_locked(&q, &sup);
     CHECK(d == b && sup && q.superseded == 1);
     CHECK(ps4_pq_submit_locked(&q, d, false));
@@ -182,6 +210,7 @@ static void mailbox_test(void) {
     CHECK(ps4_pq_submit_locked(&q, b2, false));
     CHECK(ps4_pq_try_take_locked(&q) == c); // kept c was queued first
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == b && sup);
+    CHECK(!ps4_pq_can_acquire_locked(&q));
     CHECK(ps4_pq_try_acquire_locked(&q, &sup) == -1); // a and c presenting, b rendering
 }
 
@@ -289,6 +318,7 @@ int main(void) {
     min_duration_test();
     cadence_test();
     fifo_test();
+    claim_drawable_test();
     mailbox_test();
     cancel_credit_test();
     thread_test();

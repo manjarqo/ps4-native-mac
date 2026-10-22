@@ -302,6 +302,9 @@ public:
     SwStage sw_stage{};
 
     Id last_label{};
+    // PS4Recomp: open PredicatedBegin selections of the current block (merge label, label of
+    // the code before the selection)
+    std::vector<std::pair<Id, Id>> predicated_scopes;
 
     Id void_id{};
     Id U8{};

@@ -21,6 +21,7 @@
 #include <stdint.h>
 
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -104,6 +105,9 @@ struct ImageRec {
     uint32_t tsharp[8] = {};
     uint32_t dfmt = 0, nfmt = 0, width = 0, height = 0, depth = 1, levels = 1, layers = 1, type = 0, tile_mode = 0;
     bool storage = false, depth_image = false;
+    // entry `entry` of T# table `table` of the stage's shader (gcn_image_binding.table), -1 for
+    // other images
+    int32_t table = -1, entry = -1;
     std::vector<int> textures; // indices into PassRec::textures (GPU-owned entries at addr)
     uint64_t guest_bytes = 0;  // bytes snapshotted from guest memory (0 when GPU-owned)
 };
@@ -161,6 +165,10 @@ struct PassRec {
     std::vector<uint64_t> meta_cleared; // CMASK addresses whose fast clear was pending
     std::vector<BlobRef> inputs;  // guest memory before the pass (indices into nothing: full refs)
     std::vector<BlobRef> outputs; // written guest ranges after the pass
+    // inputs that were not the same after the pass ran ("input 0x..+0x..", "texture <role>"): a guest
+    // thread or other GPU work changed them between the snapshot and the end of the pass, so the pass
+    // may have run on other data than the snapshot holds (replay differences are not renderer bugs then)
+    std::vector<std::string> unstable;
     StateRec state;
 };
 
@@ -191,6 +199,11 @@ constexpr bool DepthTargetWritten(bool depth_write, bool stencil_test, bool clea
 }
 
 uint64_t Fnv64(const void* data, size_t n, uint64_t h = 0xcbf29ce484222325ull);
+// The stored `inputs` of a pass whose guest memory is not what the snapshot holds any more, as
+// "input 0x<addr>+0x<size>". Ranges overlapping `outputs` (the pass writes them) and ranges that were
+// recorded but not stored (no hash) are skipped.
+std::vector<std::string> ChangedInputs(const uint8_t* mem_base, const std::vector<BlobRef>& inputs,
+                                       const std::vector<BlobRef>& outputs);
 // Page-aligned cover of the ranges, sorted and merged (adjacent pages join). Ranges at address 0
 // (null pointers) are dropped; the cover is clamped to mem_size.
 std::vector<std::pair<uint64_t, uint64_t>> CoalescePages(std::vector<std::pair<uint64_t, uint64_t>> ranges,
@@ -200,6 +213,78 @@ std::vector<std::pair<uint64_t, uint64_t>> CoalescePages(std::vector<std::pair<u
 // never faults. Sorted input stays sorted.
 std::vector<std::pair<uint64_t, uint64_t>> ClampReadable(const uint8_t* mem_base,
                                                          const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+
+// Identity of a pass across frames: the code addresses of its first two shader stages in the
+// order the renderer notes them (vs, ps for a draw; cs, 0 for a dispatch) and how many earlier
+// passes of its frame had the same ones. Pass indices drift between frames and runs; this key
+// stays the same while the game renders the same scene the same way. pgm: the stages' program
+// hashes (OrbShdr footer), which, unlike code addresses of shaders the game loads into heaps,
+// are the same in every run; not part of the identity (within a run they follow the addresses).
+struct SelectKey {
+    uint64_t code[2] = {};
+    uint64_t pgm[2] = {};
+    uint32_t occurrence = 0;
+    bool operator<(const SelectKey& o) const {
+        return std::tie(code[0], code[1], occurrence) < std::tie(o.code[0], o.code[1], o.occurrence);
+    }
+    bool operator==(const SelectKey& o) const {
+        return code[0] == o.code[0] && code[1] == o.code[1] && occurrence == o.occurrence;
+    }
+};
+
+// Replayable passes chosen by shader address (PS4_GNM_CAPTURE_REPLAY_SHADER): every pass with a
+// stage at one of the addresses, and the passes of the same frame that may have written the bytes
+// those passes read (their producers; not transitive: a producer's own producers are not
+// selected). Producers are only known once their readers ran, so the frame before the captured
+// one is a learning frame: Learn records what each of its passes read and wrote, FinishLearning
+// finds the producers, and in the captured frame Selects matches passes by SelectKey. A producer
+// in an earlier frame is not selected (its output is the reader's "pre" contents). Not
+// thread-safe; the renderer calls it from the encoder thread only.
+class ShaderSelection {
+public:
+    using Range = std::pair<uint64_t, uint64_t>; // (addr, size)
+    // Comma-separated entries: a code address, hex (0x...) or decimal, or pgm:<hash>, a program
+    // hash (hex or decimal). Returns false (and the reason) for an empty list or an entry that is
+    // not a non-zero number.
+    bool Parse(const std::string& list, std::string* err);
+    bool Empty() const { return shaders_.empty() && pgms_.empty(); }
+    const std::vector<uint64_t>& Shaders() const { return shaders_; }
+    const std::vector<uint64_t>& Programs() const { return pgms_; }
+    // Start of a frame: occurrences count from 0 again.
+    void BeginFrame() { counts_.clear(); }
+    // The key of the next pass of the frame (call it once per pass, in pass order).
+    SelectKey Next(uint64_t code0, uint64_t code1, uint64_t pgm0 = 0, uint64_t pgm1 = 0);
+    // The pass has a stage at a selected address or with a selected program hash.
+    bool UsesShader(const SelectKey& k) const;
+    // Learning frame, in pass order: the guest ranges the pass read, the ranges it wrote exactly
+    // (every byte of them) and the ranges it may have written (a render target or a bound V# range,
+    // of which a pass writes the pixels it covers or the bytes it stores).
+    void Learn(const SelectKey& k, const std::vector<Range>& reads, const std::vector<Range>& exact_writes,
+               const std::vector<Range>& may_writes = {});
+    // End of the learning frame. Walking back from each pass using a selected shader, a pass is a
+    // producer when it may have written, or wrote, a byte the reader read and no pass between them
+    // wrote exactly; exact writes hide earlier writers, writes that may be partial do not (they
+    // over-select rather than miss a producer). The learned passes go; their keys stay (Known).
+    void FinishLearning();
+    bool Selects(const SelectKey& k) const { return UsesShader(k) || producers_.count(k) != 0; }
+    // The learning frame had a pass with this key (a selected pass of the captured frame that it
+    // had not means the two frames differ: occurrences shifted, producers may be wrong).
+    bool Known(const SelectKey& k) const { return known_.count(k) != 0; }
+    size_t NumProducers() const { return producers_.size(); }
+    size_t NumReaders() const { return readers_; }
+
+private:
+    struct Learned {
+        SelectKey key;
+        bool reader = false;
+        std::vector<Range> reads, exact, may; // [lo, hi), sorted and merged; reads only for readers
+    };
+    std::vector<uint64_t> shaders_, pgms_; // sorted
+    std::map<std::pair<uint64_t, uint64_t>, uint32_t> counts_;
+    std::vector<Learned> learned_;
+    std::set<SelectKey> producers_, known_;
+    size_t readers_ = 0;
+};
 
 // Writes one frame. Not thread-safe; the renderer calls it from the encoder thread only.
 class Writer {

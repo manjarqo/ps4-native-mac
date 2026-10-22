@@ -147,10 +147,11 @@ void PrintTable(const gcn_shader* sh, const uint32_t ud[16], FakeMem& mem) {
     gcn_shader_info info;
     gcn_shader_get_info(sh, &info);
     std::printf("  hash=%016llx flatbuf=%u dw buffers=%u images=%u samplers=%u fmasks=%u "
-                "attribs=%u mrt_mask=0x%x discard=%d failed=%d\n",
+                "attribs=%u mrt_mask=0x%x discard=%d failed=%d null_image_reads=%u tables=%u\n",
                 (unsigned long long)info.pgm_hash, info.flatbuf_size_dw, info.num_buffers,
                 info.num_images, info.num_samplers, info.num_fmasks, info.num_vertex_attribs,
-                info.mrt_mask, info.has_discard, info.translation_failed);
+                info.mrt_mask, info.has_discard, info.translation_failed, info.null_image_reads,
+                info.num_image_tables);
     std::printf("  msl: push_constant buffer(%d) first_free_buffer=%u textures=%u samplers=%u\n",
                 info.msl_push_constant_buffer, info.msl_first_free_buffer, info.msl_num_textures,
                 info.msl_num_samplers);
@@ -197,6 +198,9 @@ void PrintTable(const gcn_shader* sh, const uint32_t ud[16], FakeMem& mem) {
                     b.is_integer, b.view_type);
         PrintFetch(b.sharp);
         std::printf(" msl=texture(%d)", (int)b.msl_texture);
+        if (b.table != UINT32_MAX) {
+            std::printf(" table=%u entry=%u", b.table, b.table_entry);
+        }
         uint32_t t[8];
         if (gcn_shader_fetch_image_sharp(sh, i, flat.data(), t)) {
             gcn_image_desc d;
@@ -206,6 +210,17 @@ void PrintTable(const gcn_shader* sh, const uint32_t ud[16], FakeMem& mem) {
                         d.data_format, d.num_format, d.tiling_index);
         }
         std::printf("\n");
+    }
+    static const char* const kTableKinds[] = {"none", "records", "indexed", "loop"};
+    for (uint32_t i = 0; i < info.num_image_tables; i++) {
+        gcn_image_table t;
+        gcn_shader_get_image_table(sh, i, &t);
+        std::printf("  T# table[%u] kind=%s buffer=%u dword=%u+%u*index", i,
+                    t.kind < 4 ? kTableKinds[t.kind] : "?", t.table_buffer, t.first_dw, t.stride_dw);
+        if (t.index_buffer != UINT32_MAX) {
+            std::printf(" index_buffer=%u", t.index_buffer);
+        }
+        std::printf(" entries=%u reached=%u sites=%u\n", t.num_entries, t.reached, t.num_sites);
     }
     for (uint32_t i = 0; i < info.num_samplers; i++) {
         gcn_sampler_binding b;

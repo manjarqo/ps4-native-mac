@@ -12,12 +12,25 @@
 //  4. A compute shader dumped from Uncharted 4 (u4_cs_blur.*: a blur whose weights are read
 //     at s[0:1] + 72 + 4 * i) translates without SRT walker errors, and its weights come from a
 //     guest buffer based at the pointer it reads through.
+//  5. Uncharted 4's tiled lighting CS (u4_cs_lighting.*: code, registers and the guest memory
+//     its SRT walker reads, from a title-screen capture) loads the T# of light L with
+//     s_buffer_load_dwordx4 x2 at byte 0xb8 + 396 * L of its light records (a V# of 4 records),
+//     L taken from the tile's light list, and samples it at 3 sites. Its translation must have one
+//     T# table of 4 entries shared by the 3 sites, no null image reads, and entries whose dwords are
+//     the records' (two of them given valid T#s here; the game's title lights hold floats there).
 //
-// Case 4 needs a local fixture: game data, not distributed; each developer dumps it from their own
-// copy of the game (tests/host/README.md). Without it the case prints a SKIP line and does not
-// count as passed; a fixture that is present but unreadable fails.
+//  6. Uncharted 4's reflection-probe culling CS (u4_cs_probe.*, title capture frame 2341 pass
+//     947) samples the T# at SRT pointer + 0xc0 + 32 * t, t = CB[0x90 + 0xa0 * j] for probes j of
+//     its LDS list (j < N). As captured (N = 0, the CB's 1024 records past the probes hold other
+//     data) the index scan finds more than 8 indices: a counted, logged gap. With the CB holding
+//     only 3 probes (and the probe T# array three cubemap T#s) the table is indexed, 4 entries,
+//     each the cubemap T# its index selects.
 //
-// usage: gcn_scalar_reads_test <local fixture dir with u4_cs_blur.bin/.txt>
+// Cases 4-6 need local fixtures: game data, not distributed; each developer dumps them from their
+// own copy of the game (tests/host/README.md). A case whose fixture files are absent prints a SKIP
+// line and does not count as passed; a fixture that is present but unreadable fails.
+//
+// usage: gcn_scalar_reads_test <local fixture dir with u4_cs_blur.*, u4_cs_lighting.* and u4_cs_probe.*>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -26,8 +39,8 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
-#include <sys/stat.h>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 #include "gcn_recompiler.h"
@@ -292,16 +305,21 @@ bool LoadFile(const std::string& path, std::vector<uint8_t>& out) {
     return true;
 }
 
-// False (and a SKIP line) when one of the blur's fixture files is absent.
-bool HaveBlurFixture(const std::string& dir) {
-    for (const char* f : {"/u4_cs_blur.bin", "/u4_cs_blur.txt"}) {
+int g_run = 0, g_skipped = 0; // fixture cases
+
+// False (and a SKIP line) when one of a fixture case's files is absent.
+bool HaveFixture(const std::string& dir, const char* name, std::initializer_list<const char*> files) {
+    for (const char* f : files) {
+        const std::string path = dir + "/" + f;
         struct stat st;
-        if (stat((dir + f).c_str(), &st) != 0) {
-            std::printf("SKIP: gcn_scalar_reads_test/u4_cs_blur: needs local fixture %s%s (game data, not distributed)\n",
-                        dir.c_str(), f);
+        if (stat(path.c_str(), &st) != 0) {
+            std::printf("SKIP: gcn_scalar_reads_test/%s: needs local fixture %s (game data, not distributed)\n", name,
+                        path.c_str());
+            g_skipped++;
             return false;
         }
     }
+    g_run++;
     return true;
 }
 
@@ -380,6 +398,230 @@ void TestU4Blur(id<MTLDevice> dev, const std::string& dir) {
     gcn_shader_destroy(sh);
 }
 
+// Registers ("<reg> <value>"), the program address ("# ... at 0x<addr>") and guest memory
+// ("mem <addr> <file in dir>") of a fixture .txt.
+bool LoadFixture(const std::string& dir, const std::string& name, std::vector<uint32_t>& regs, uint64_t* code_addr,
+                 FakeGuest& mem) {
+    regs.assign(0x10000, 0);
+    std::ifstream txt(dir + "/" + name + ".txt");
+    if (!txt) return false;
+    std::string line;
+    while (std::getline(txt, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '#') {
+            const auto p = line.find("at 0x");
+            if (p != std::string::npos && !*code_addr) *code_addr = std::strtoull(line.c_str() + p + 3, nullptr, 16);
+            continue;
+        }
+        std::istringstream ss(line);
+        std::string a, b, c;
+        ss >> a >> b >> c;
+        if (a == "mem") {
+            std::vector<uint8_t> data;
+            if (!LoadFile(dir + "/" + c, data)) return false;
+            mem.Add(std::strtoull(b.c_str(), nullptr, 16), data.data(), data.size());
+            continue;
+        }
+        const uint32_t r = std::strtoul(a.c_str(), nullptr, 16);
+        if (r < regs.size()) regs[r] = std::strtoul(b.c_str(), nullptr, 16);
+    }
+    return *code_addr != 0;
+}
+
+void TestU4LightingTable(const std::string& dir) {
+    std::vector<uint8_t> code;
+    std::vector<uint32_t> regs;
+    uint64_t code_addr = 0;
+    FakeGuest mem;
+    CHECK(LoadFile(dir + "/u4_cs_lighting.bin", code) && code.size() >= 8 &&
+              LoadFixture(dir, "u4_cs_lighting", regs, &code_addr, mem) && mem.regions.size() == 2,
+          "cannot read %s/u4_cs_lighting.*", dir.c_str());
+    if (code.size() < 8 || mem.regions.size() != 2) return;
+    // the light records: V# 0x19010e0940, stride 396, 4 records; T# of light k at byte 0xb8
+    constexpr uint64_t kLights = 0x19010e0940, kCbBlob = 0x19010e0000;
+    auto& cb = mem.regions[1];
+    CHECK(cb.first == kCbBlob, "fixture memory order");
+    // lights 1 and 3 get valid T#s (a 64x64 RGBA8 2D texture and a 32x32 one); 0 and 2 keep the
+    // game's data (floats: no T#)
+    const uint32_t t1[8] = {0x13044400, 0x00a00000, 0x000fc03f, 0x90d00fac, 0x0007e000, 0, 0, 0};
+    const uint32_t t3[8] = {0x13044401, 0x00a00000, 0x0007c01f, 0x90d00fac, 0x0003e000, 0, 0, 0};
+    std::memcpy(cb.second.data() + (kLights - kCbBlob) + 396 * 1 + 0xb8, t1, 32);
+    std::memcpy(cb.second.data() + (kLights - kCbBlob) + 396 * 3 + 0xb8, t3, 32);
+    gcn_profile prof;
+    gcn_profile_default_metal(&prof);
+    gcn_runtime_info rt;
+    gcn_runtime_info_from_regs(regs.data(), regs.size(), GCN_HW_CS, GCN_SW_COMPUTE, &prof, &rt);
+    gcn_compile_desc d{};
+    d.hw_stage = GCN_HW_CS;
+    d.sw_stage = GCN_SW_COMPUTE;
+    uint64_t reg_addr = 0;
+    gcn_stage_from_regs(regs.data(), regs.size(), GCN_HW_CS, &reg_addr, d.user_data);
+    d.code_addr = code_addr;
+    d.code = reinterpret_cast<const uint32_t*>(code.data());
+    d.code_size = uint32_t(code.size() & ~3u);
+    d.runtime = &rt;
+    d.profile = &prof;
+    d.read_guest = FakeGuest::Read;
+    d.read_ctx = &mem;
+    d.flags = GCN_COMPILE_EMIT_MSL;
+    g_log.clear();
+    gcn_shader* sh = nullptr;
+    char err[512] = {};
+    const gcn_status st = gcn_compile(&d, &sh, err, sizeof(err));
+    CHECK(st == GCN_OK && sh, "U4 lighting CS does not compile: %s", err);
+    if (!sh) return;
+    gcn_shader_info info;
+    gcn_shader_get_info(sh, &info);
+    CHECK(info.null_image_reads == 0, "%u image reads of the null image; log:\n%s", info.null_image_reads, g_log.c_str());
+    CHECK(info.num_image_tables == 1, "%u T# tables", info.num_image_tables);
+    gcn_image_table t{};
+    CHECK(gcn_shader_get_image_table(sh, 0, &t) && t.kind == GCN_IMAGE_TABLE_RECORDS && t.num_entries == 4 &&
+              t.reached == 4 && t.num_sites == 3 && t.first_dw == 0xb8 / 4 && t.stride_dw == 396 / 4,
+          "table kind %u, %u entries, %u reached, %u sites, dword %u + %u * index", t.kind, t.num_entries, t.reached,
+          t.num_sites, t.first_dw, t.stride_dw);
+    std::vector<uint32_t> flat(info.flatbuf_size_dw);
+    gcn_shader_build_flatbuf(sh, d.user_data, FakeGuest::Read, &mem, flat.data(), flat.size());
+    uint32_t entries = 0;
+    for (uint32_t i = 0; i < info.num_images; i++) {
+        gcn_image_binding b;
+        gcn_shader_get_image(sh, i, &b);
+        if (b.table == UINT32_MAX) continue;
+        entries++;
+        const uint32_t k = b.table_entry;
+        // the entry's flattened dwords are light k's record dwords
+        const uint8_t* rec = cb.second.data() + (kLights - kCbBlob) + 396 * k + 0xb8;
+        bool same = true;
+        for (uint32_t w = 0; w < 8; ++w) {
+            uint32_t v;
+            std::memcpy(&v, rec + 4 * w, 4);
+            same &= b.sharp.offsets[w] < flat.size() && flat[b.sharp.offsets[w]] == v;
+        }
+        CHECK(same, "entry %u: flattened dwords are not light %u's T# dwords", k, k);
+        uint32_t ts[8] = {};
+        const bool fetched = gcn_shader_fetch_image_sharp(sh, i, flat.data(), ts);
+        if (k == 1 || k == 3) {
+            CHECK(fetched && std::memcmp(ts, k == 1 ? t1 : t3, 32) == 0, "entry %u: the light's T# was not fetched", k);
+        }
+    }
+    CHECK(entries == 4, "%u images are table entries", entries);
+    gcn_shader_destroy(sh);
+}
+
+// Compiles a fixture CS against its memory (gcn_compile as the renderer calls it).
+gcn_shader* CompileFixture(const std::vector<uint8_t>& code, const std::vector<uint32_t>& regs, uint64_t code_addr,
+                           FakeGuest& mem, gcn_compile_desc* d, gcn_runtime_info* rt) {
+    gcn_profile prof;
+    gcn_profile_default_metal(&prof);
+    gcn_runtime_info_from_regs(regs.data(), regs.size(), GCN_HW_CS, GCN_SW_COMPUTE, &prof, rt);
+    *d = gcn_compile_desc{};
+    d->hw_stage = GCN_HW_CS;
+    d->sw_stage = GCN_SW_COMPUTE;
+    uint64_t reg_addr = 0;
+    gcn_stage_from_regs(regs.data(), regs.size(), GCN_HW_CS, &reg_addr, d->user_data);
+    d->code_addr = code_addr;
+    d->code = reinterpret_cast<const uint32_t*>(code.data());
+    d->code_size = uint32_t(code.size() & ~3u);
+    d->runtime = rt;
+    d->profile = &prof;
+    d->read_guest = FakeGuest::Read;
+    d->read_ctx = &mem;
+    d->flags = GCN_COMPILE_EMIT_MSL;
+    gcn_shader* sh = nullptr;
+    char err[512] = {};
+    const gcn_status st = gcn_compile(d, &sh, err, sizeof(err));
+    CHECK(st == GCN_OK && sh, "fixture CS does not compile: %s", err);
+    return sh;
+}
+
+void TestU4ProbeTable(const std::string& dir) {
+    std::vector<uint8_t> code;
+    std::vector<uint32_t> regs;
+    uint64_t code_addr = 0;
+    FakeGuest mem;
+    CHECK(LoadFile(dir + "/u4_cs_probe.bin", code) && code.size() >= 8 &&
+              LoadFixture(dir, "u4_cs_probe", regs, &code_addr, mem) && mem.regions.size() == 3,
+          "cannot read %s/u4_cs_probe.*", dir.c_str());
+    if (code.size() < 8 || mem.regions.size() != 3) return;
+    constexpr uint64_t kSrtBlob = 0x1807630000, kCb = 0x1807600000, kTsharps = 0x1807628000;
+    constexpr uint64_t kCount = 0x18076300c0, kTable = kTsharps + 0xc0; // T# t at kTable + 32 * t (SRT pointer s[4:5])
+    auto& srt = mem.regions[0];
+    auto& cb = mem.regions[1];
+    auto& ts_mem = mem.regions[2];
+    CHECK(srt.first == kSrtBlob && cb.first == kCb && cb.second.size() == 1024 * 160 && ts_mem.first == kTsharps,
+          "fixture memory");
+
+    // 1. As captured: no probe (N = 0), and the CB's 1024 records hold data that is no probe past
+    //    them (282 distinct dwords at 0x90): the index scan finds more than 8 indices, the table is a
+    //    counted gap (3.7b: the shader's own bound, j < N through its LDS list, is not visible to
+    //    the translator) and the site reads the null image, logged.
+    {
+        gcn_compile_desc d;
+        gcn_runtime_info rt;
+        g_log.clear();
+        gcn_shader* sh = CompileFixture(code, regs, code_addr, mem, &d, &rt);
+        if (!sh) return;
+        gcn_shader_info info;
+        gcn_shader_get_info(sh, &info);
+        gcn_image_table t{};
+        CHECK(info.num_image_tables == 1 && gcn_shader_get_image_table(sh, 0, &t) && t.kind == GCN_IMAGE_TABLE_NONE &&
+                  t.first_dw == 0xc0 / 4 && t.stride_dw == 8 && t.num_sites == 1,
+              "captured probe CS: %u tables, kind %u, dword %u + %u * index", info.num_image_tables, t.kind, t.first_dw,
+              t.stride_dw);
+        CHECK(info.null_image_reads == 1 && g_log.find("no bound gives at most 8 entries") != std::string::npos,
+              "captured probe CS: %u null image reads, gap not logged; log:\n%s", info.null_image_reads, g_log.c_str());
+        gcn_shader_destroy(sh);
+    }
+
+    // 2. The CB in the shape the shader reads it: 3 probes with texture indices 2, 0, 1 and no data
+    //    past them, and the probe T# array (at frame 2341 it holds no T#: the game had no probe)
+    //    holding three 256x256 BC6H cubemap T#s (the format of the cubemaps the reflection-probe
+    //    resolve CS of the same frame samples; the base addresses are made up). The index scan finds {0, 1, 2}: an indexed table of 4 entries whose T#s
+    //    are the array's entries 0, 1, 2 (the padding entry repeats index 0).
+    std::fill(cb.second.begin(), cb.second.end(), 0);
+    const uint32_t tex_index[3] = {2, 0, 1};
+    for (uint32_t j = 0; j < 3; ++j) std::memcpy(cb.second.data() + 0xa0 * j + 0x90, &tex_index[j], 4);
+    const uint32_t n[2] = {3, 3};
+    std::memcpy(srt.second.data() + (kCount - kSrtBlob), n, 8);
+    const uint32_t cubes[3][8] = {{0x00a00000, 0x02800000, 0x703fc0ff, 0xb6d603ac, 0x001fe000, 0x0000a000, 0, 0},
+                                  {0x00a10000, 0x02800000, 0x703fc0ff, 0xb6d603ac, 0x001fe000, 0x0000a000, 0, 0},
+                                  {0x00a20000, 0x02800000, 0x703fc0ff, 0xb6d603ac, 0x001fe000, 0x0000a000, 0, 0}};
+    for (uint32_t tt = 0; tt < 3; ++tt) std::memcpy(ts_mem.second.data() + (kTable - kTsharps) + 32 * tt, cubes[tt], 32);
+    {
+        gcn_compile_desc d;
+        gcn_runtime_info rt;
+        g_log.clear();
+        gcn_shader* sh = CompileFixture(code, regs, code_addr, mem, &d, &rt);
+        if (!sh) return;
+        gcn_shader_info info;
+        gcn_shader_get_info(sh, &info);
+        CHECK(info.null_image_reads == 0, "probe CS: %u null image reads; log:\n%s", info.null_image_reads, g_log.c_str());
+        gcn_image_table t{};
+        CHECK(info.num_image_tables == 1 && gcn_shader_get_image_table(sh, 0, &t) && t.kind == GCN_IMAGE_TABLE_INDEXED &&
+                  t.num_entries == 4 && t.reached == 3 && t.index_buffer != UINT32_MAX,
+              "probe CS: kind %u, %u entries, %u reached", t.kind, t.num_entries, t.reached);
+        std::vector<uint32_t> flat(info.flatbuf_size_dw);
+        gcn_shader_build_flatbuf(sh, d.user_data, FakeGuest::Read, &mem, flat.data(), flat.size());
+        uint32_t entries = 0;
+        for (uint32_t i = 0; i < info.num_images; i++) {
+            gcn_image_binding b;
+            gcn_shader_get_image(sh, i, &b);
+            if (b.table == UINT32_MAX) continue;
+            entries++;
+            // distinct indices in scan order: 0 (always), then the records' 2 and 1; the padding
+            // entry repeats index 0
+            constexpr uint32_t kIndexOf[4] = {0, 2, 1, 0};
+            const uint32_t k = b.table_entry;
+            uint32_t ts[8] = {};
+            const bool fetched = gcn_shader_fetch_image_sharp(sh, i, flat.data(), ts);
+            const bool match = k < 4 && std::memcmp(ts, cubes[kIndexOf[k]], 32) == 0;
+            CHECK(fetched && match, "probe CS entry %u: not cubemap %u (fetched %d: %08x %08x %08x %08x)", k,
+                  k < 4 ? kIndexOf[k] : 99, fetched, ts[0], ts[1], ts[2], ts[3]);
+        }
+        CHECK(entries == 4, "%u images are table entries", entries);
+        gcn_shader_destroy(sh);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -393,11 +635,17 @@ int main(int argc, char** argv) {
         TestHandWritten(dev);
         TestLostPointerLogged();
         const std::string dir = argc > 1 ? argv[1] : ".";
-        const bool blur = HaveBlurFixture(dir);
-        if (blur) TestU4Blur(dev, dir);
+        if (HaveFixture(dir, "u4_cs_blur", {"u4_cs_blur.bin", "u4_cs_blur.txt"})) TestU4Blur(dev, dir);
+        if (HaveFixture(dir, "u4_cs_lighting",
+                        {"u4_cs_lighting.bin", "u4_cs_lighting.txt", "u4_cs_lighting_srt.bin", "u4_cs_lighting_cb.bin"}))
+            TestU4LightingTable(dir);
+        if (HaveFixture(dir, "u4_cs_probe",
+                        {"u4_cs_probe.bin", "u4_cs_probe.txt", "u4_cs_probe_srt.bin", "u4_cs_probe_cb.bin",
+                         "u4_cs_probe_tsharps.bin"}))
+            TestU4ProbeTable(dir);
         if (g_fail) return 1;
-        if (blur) std::printf("gcn_scalar_reads_test: PASS\n");
-        else std::printf("gcn_scalar_reads_test: PASS (3 cases run, 1 skipped)\n");
+        if (g_skipped) std::printf("gcn_scalar_reads_test: PASS (%d cases run, %d skipped)\n", 3 + g_run, g_skipped);
+        else std::printf("gcn_scalar_reads_test: PASS\n");
     }
     return 0;
 }
