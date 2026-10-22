@@ -20,7 +20,7 @@
 - Do not touch `~/ps4recomp-work/tlou_build`; the owner plays from it.
 - One game process at a time. Every build, generation, harness or game run goes through `~/ps4recomp-work/tools/heavy_lock.sh`. `ninja -j6`. Kill leftovers. Report peak memory.
 - Run `mount | grep ps4recomp-work` before builds and runs.
-- Generate U4: `./ps4-recomp "/Volumes/ssd/Uncharted 4 v1.32 by MorpheusGames/CUSA04529/eboot.bin" --app-dir "/Volumes/ssd/Uncharted 4 v1.32 by MorpheusGames/CUSA04529" -o ../u4_build_asm -c`
+- Generate U4: `./ps4-recomp "<your-U4-dump>/CUSA04529/eboot.bin" --app-dir "<your-U4-dump>/CUSA04529" -o ../u4_build_asm -c`
 - U4 runs:
   - env `PS4_RECOMP_HEADLESS=1 PS4_NO_DIALOGS=1 PS4_BACKGROUND_WINDOW=1 PS4_PAD_AUTOPRESS=4000`;
   - screenshots through `PS4_SCREENSHOT_DIR`/`PS4_SCREENSHOT_EVERY`;

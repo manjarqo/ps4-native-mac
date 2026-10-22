@@ -16,7 +16,7 @@
 - No fake tests, no stubs that return 0, no temporary solutions (AGENTS.md).
 - Automated game runs never use the owner's live saves: always `PS4RECOMP_DATA_DIR` pointing to a copy.
 - Install builds into `tlou_build/eboot.app` only via temp file + `mv` + `codesign`, after `pgrep -fl MacOS/eboot` (the owner may be playing).
-- Regenerate `/Volumes/ssd/The Last of Us Remastered Repack/ps4recomp-work/all-fixes.patch` under `bash -c` (zsh silently drops untracked files); check ~1.1 MB and ~88+ `diff --git` entries.
+- Regenerate `<your-TLOU-dump>/ps4recomp-work/all-fixes.patch` under `bash -c` (zsh silently drops untracked files); check ~1.1 MB and ~88+ `diff --git` entries.
 - Discard benchmark runs with outside load: loadavg after the run and `extload.txt` (other processes' CPU). The game alone keeps loadavg ~11–15.
 - Every new behaviour has an environment switch: `PS4_GNM_NO_PSO_ARCHIVE=1`, `PS4_GNM_GPU_UPLOAD_MIN_KB=-1`.
 - Thresholds: walking target 33 ms; pipeline archive budget 384 MB (`PS4_GNM_PSO_ARCHIVE_MB`); periodic archive save 300 s; GPU upload threshold 256 KB (`PS4_GNM_GPU_UPLOAD_MIN_KB`); profiler sampling period 1 ms, 8 frames deep, top 6 functions.
@@ -2416,7 +2416,7 @@ Then stop and present the addendum to the owner (in Russian). Implementation of 
 
 ### Task 13: Final verification and install
 
-**Files:** none in the repository besides the commits above; `/Volumes/ssd/The Last of Us Remastered Repack/ps4recomp-work/{all-fixes.patch,progress.md}`.
+**Files:** none in the repository besides the commits above; `<your-TLOU-dump>/ps4recomp-work/{all-fixes.patch,progress.md}`.
 
 - [ ] **Step 1: Walking benchmark, final build, two runs per route**
 
@@ -2441,12 +2441,12 @@ pgrep -fl "MacOS/eboot" && echo "RUNNING: ask the owner to quit first" || { cp p
 - [ ] **Step 5: Patch and notes**
 
 ```bash
-cd ~/ps4recomp-work/PS4Recomp; D="/Volumes/ssd/The Last of Us Remastered Repack/ps4recomp-work"
+cd ~/ps4recomp-work/PS4Recomp; D="<your-TLOU-dump>/ps4recomp-work"
 bash -c 'git diff 63510f6 -- . ":!3rdparty"; git ls-files --others --exclude-standard | grep -v -E "^3rdparty/|\.orig$|\.rej$|\.a$" | while read f; do git --no-pager diff --no-index /dev/null "$f"; done; true' > "$D/all-fixes.patch.new" && mv -f "$D/all-fixes.patch.new" "$D/all-fixes.patch"
 ls -la "$D/all-fixes.patch"; grep -c "^diff --git" "$D/all-fixes.patch"
 ```
 
-Expected: ≥ 1.1 MB, ≥ 88 entries (the new files add entries). The diff base is the upstream commit `63510f6`: since Task 0 the work is committed, so a plain `git diff` would be nearly empty. Update the memory note `~/.claude/projects/-Volumes-ssd-The-Last-of-Us-Remastered-Repack/memory/patch-export-under-bash.md` with this command (diff against `63510f6` plus untracked files). Append a Russian section to `$D/progress.md` with the before/after numbers of Steps 1–2.
+Expected: ≥ 1.1 MB, ≥ 88 entries (the new files add entries). The diff base is the upstream commit `63510f6`: since Task 0 the work is committed, so a plain `git diff` would be nearly empty. Update the memory note `the patch-export memory note` with this command (diff against `63510f6` plus untracked files). Append a Russian section to `$D/progress.md` with the before/after numbers of Steps 1–2.
 
 ---
 

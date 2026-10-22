@@ -62,7 +62,7 @@ Work is ordered by what gates progress.
   - never touch `tlou_build/eboot.app` except a planned TLOU install.
 - Memory budget: one game at a time; heavy jobs serialised with `tools/heavy_lock.sh`; memwatch running.
 - TLOU must not regress. Every runtime or lifter change re-runs a 120 s TLOU courtyard check: fatal 0, gameplay frames.
-- The U4 build lives in `~/ps4recomp-work/u4_build_asm`. The app dir is `/Volumes/ssd/Uncharted 4 v1.32 by MorpheusGames/CUSA04529`.
+- The U4 build lives in `~/ps4recomp-work/u4_build_asm`. The app dir is `<your-U4-dump>/CUSA04529`.
 
 ## Acceptance
 

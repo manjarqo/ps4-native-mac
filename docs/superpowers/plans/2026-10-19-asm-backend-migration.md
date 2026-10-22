@@ -44,7 +44,7 @@
 - [ ] Conventions for `common.md`:
   - Go tests: `cd ~/ps4recomp-work/PS4Recomp && go test ./pkg/...`
   - Build the recompiler: `go build -o ps4-recomp ./cmd/ps4-recomp`
-  - Generate TLOU: `./ps4-recomp "/Volumes/ssd/The Last of Us Remastered Repack/CUSA00557/eboot.bin" --app-dir "/Volumes/ssd/The Last of Us Remastered Repack/CUSA00557" -o ../tlou_build_asm -c`
+  - Generate TLOU: `./ps4-recomp "<your-TLOU-dump>/CUSA00557/eboot.bin" --app-dir "<your-TLOU-dump>/CUSA00557" -o ../tlou_build_asm -c`
   - Rebuild after a runtime-only change: `cd ~/ps4recomp-work/tlou_build_asm && ninja`
   - Host tests: `bash tests/host/run_host_tests.sh`
 
@@ -105,7 +105,7 @@ Why: the first asm run of TLOU hangs in early init because of a lifter bug. In `
 - [ ] **Step 3: Self-test.** The harness must catch a planted bug: temporarily break one lowering, for example swap the operands of one `sub`, and check that it reports a mismatch. Record the result; do not commit the planted bug.
 - [ ] **Step 4: Run on both eboots.**
   - TLOU: `guest_image.bin` from `tlou_build_asm`.
-  - Uncharted 4: `/Volumes/ssd/Uncharted 4 v1.32 by MorpheusGames/CUSA04529/eboot.bin`, generated with `ps4-recomp` into `~/ps4recomp-work/u4_build_asm`; generation only, no link needed.
+  - Uncharted 4: `<your-U4-dump>/CUSA04529/eboot.bin`, generated with `ps4-recomp` into `~/ps4recomp-work/u4_build_asm`; generation only, no link needed.
   - Produce the linear disassemblies the generator needs.
   - Report the mismatches grouped by opcode, with one example each.
 - [ ] **Step 5: Fix every mismatch** in the assembly lifter.

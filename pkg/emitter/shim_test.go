@@ -404,7 +404,11 @@ func TestNonLocalTransfersAreShimmed(t *testing.T) {
 			}
 		}
 	}
-	path := "/Volumes/ssd/The Last of Us Remastered Repack/CUSA00557/sce_module/libc.prx"
+	dir := os.Getenv("PS4_TLOU_APP_DIR")
+	if dir == "" {
+		t.Skip("PS4_TLOU_APP_DIR not set (your own TLOU dump, CUSA00557)")
+	}
+	path := dir + "/sce_module/libc.prx"
 	if _, err := os.Stat(path); err != nil {
 		t.Skip("TLOU libc.prx not present")
 	}
