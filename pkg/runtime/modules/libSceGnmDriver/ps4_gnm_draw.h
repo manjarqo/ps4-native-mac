@@ -93,6 +93,30 @@ bool HasPendingWork();
 void ComputeBarrier(int queue);
 // Commit the open command buffer; wait for all submitted work to finish when `wait`.
 void Flush(bool wait);
+// The end of a compute submission (CP thread): its work is committed now, or held in the open
+// command buffer while at least 2 seqs are in flight (the GPU is behind: committing later starts
+// it no later), so that back-to-back submissions share a command buffer and an encoder. Held work
+// is committed by the next Flush (a graphics submission, a CPU sync, a CP wait, a present), when
+// fewer than 2 seqs are in flight, or 0.5 ms after it was first held, whichever comes first
+// (docs/compute-batching.md). Its labels and interrupts come later by at most that, plus the
+// release thread's wake-up and the encoder jobs already queued before the release: the release
+// is an encoder job. Later submissions while it is held do not move the bound.
+// PS4_GNM_COMPUTE_BATCH=0 turns the hold off: every call commits at once (docs/compute-batching.md).
+void FlushCompute();
+// Test hook: compute commits held (FlushCompute) and released by the time bound and by the
+// backlog draining, since Init; whether work is held now.
+struct ComputeHoldStats {
+    uint64_t held = 0, by_time = 0, by_backlog = 0;
+    bool holding = false;
+};
+ComputeHoldStats GetComputeHoldStats();
+// Test hook: the bound on held compute work, in ns (0: the default, 0.5 ms).
+void DebugSetComputeHoldNs(uint64_t ns);
+// Test hook: committed seqs, compute encoders opened and compute barriers encoded, since Init.
+struct EncodeCounts {
+    uint64_t committed = 0, compute_encoders = 0, compute_barriers = 0;
+};
+EncodeCounts GetEncodeCounts();
 
 // CP DMA fill / CPU-side writes of guest memory (fast-clear metadata tracking, texture
 // invalidation).
@@ -118,6 +142,17 @@ bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, 
              uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done);
 // Test hook: the GPU work encoded from now on waits for an event that is never signalled (a hung GPU).
 void DebugStallGpu();
+// Test hook: the GPU work encoded from now on waits until `shared_event` (an id<MTLSharedEvent>
+// of the renderer's device) reaches `value`.
+void DebugGpuWait(void* shared_event, uint64_t value);
+// Test hook: a GPU fill of `value` into a fresh chunk of the upload arena (larger than a recycled
+// one, so made for this call), waited for; `out` gets the chunk's first `n` bytes as the CPU then
+// reads them. False without a renderer.
+bool DebugArenaGpuFill(uint8_t value, size_t n, std::vector<uint8_t>* out);
+// Test hook (tests/host/gnm_alias_dma_test.mm): one renderer job with two encoders, as a draw
+// whose bind encodes an upload first: it binds guest [src, src + n) and [dst, dst + n), fills an
+// arena buffer in one copy encoder, then copies src to dst in another (not waited for).
+bool DebugTwoEncoderCopy(uint64_t src, uint64_t dst, uint32_t n);
 
 // ---- Pass replay (tools/gnm_replay, docs/gnm-capture.md). Call after Init, like Draw. ----
 // A GPU-owned texture-cache entry with the captured identity (created if missing), filled with
@@ -129,6 +164,11 @@ bool ReplayReadTexture(const ps4gnm_capture::GpuTextureId& gid, std::vector<uint
 void ReplaySetMetaCleared(uint64_t cmask_address);
 // Draws and dispatches skipped so far (a replayed pass must not add one).
 uint64_t SkippedCount();
+// Draws skipped by PS4_GNM_MTL4_ONLY_CLEARS (debug) after their render pass began, so far.
+uint64_t OnlyClearsSkippedCount();
+// Sampled textures copied from guest memory on the GPU while a draw or dispatch was being bound
+// (into the texture-upload command buffer) so far.
+uint64_t BindUploadCount();
 
 // Guest memory dispatches (shaders with gcn_shader_info.uses_guest_memory) so far: on the sync
 // path (waited for) and on the fast path (no CPU wait), fast ones re-run after their probe met an

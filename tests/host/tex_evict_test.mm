@@ -5,14 +5,21 @@
 // buffer is done, that its memory is then freed, that an evicted texture comes back with the
 // current guest memory, how GPU-write invalidation behaves around eviction, that GPU-owned surfaces
 // are evicted only when exactly known writes covered all of their memory after their last use, and
-// that the GPU-owned range index notices entries added after an eviction.
+// that the GPU-owned range index notices entries added after an eviction; and the texture hooks
+// the Metal 4 residency rests on (every texture the cache creates is reported once, and reported
+// released when the cache lets it go). Each cache runs on the renderer backend PS4_GNM_METAL names
+// (test_backend.h): its command buffers go to the backend's SideQueue and its textures through the
+// backend's residency, as in the renderer; on Metal 4 no cache texture is left resident at the end.
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 
+#include <unordered_set>
+
 #include "ps4_gnm_membudget.h"
 #include "ps4_gnm_resources.h"
+#include "test_backend.h"
 
 // Runtime symbols ps4_gnm_resources.mm uses (the hitch counters and the Neo mode query).
 extern "C" uint64_t ps4_hitch_now_ns(void) { return 0; }
@@ -30,6 +37,15 @@ static void check(bool ok, const char* what) {
 }
 
 static const uint64_t MiB = 1ull << 20, GiB = 1ull << 30, MS = 1000000ull;
+
+// The renderer's residency hooks on a cache (TestTextureResidency).
+static void Attach(TextureCache& tc, TestTextureResidency& res) {
+    TextureCache::TextureHooks h;
+    h.ctx = &res;
+    h.created = TestTextureResidency::Created;
+    h.released = TestTextureResidency::Released;
+    tc.SetHooks(h);
+}
 
 // ---- policy ----
 
@@ -172,13 +188,14 @@ static DepthTarget Db(uint64_t addr, uint32_t slices) {
     return d;
 }
 
-static void test_cache(id<MTLDevice> dev) {
-    id<MTLCommandQueue> q = [dev newCommandQueue];
+static void test_cache(id<MTLDevice> dev, TestTextureResidency& res) {
+    id<MTLCommandQueue> q = res.be->SideQueue();
     Guest g;
     g.size = 16 * MiB;
     g.base = (uint8_t*)mmap(nullptr, g.size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     check(g.base != MAP_FAILED, "guest memory mapped");
     TextureCache tc(dev, q, g.base, g.size);
+    Attach(tc, res);
     const ps4_texcache_policy p = small_policy(1); // any sampled texture is over the budget
 
     const uint64_t A = 0x10000, B = 0x40000;
@@ -230,6 +247,7 @@ static void test_cache(id<MTLDevice> dev) {
     [cb waitUntilCompleted];
     check(cb.status == MTLCommandBufferStatusCompleted, "command buffer using the evicted texture completed");
     cb = nil;
+    res.Retire(); // the backend's residency let go of it too (Metal 4)
     for (int i = 0; i < 50 && weak_a; ++i) usleep(10000);
     check(weak_a == nil, "evicted texture freed once no command buffer holds it");
 
@@ -291,11 +309,12 @@ static void test_cache(id<MTLDevice> dev) {
 // Superseded GPU-owned surfaces: only when exactly known writes (clears, compute copies) of other
 // surfaces covered all of their memory after their last use. Draws and storage stores never count:
 // which bytes they write is unknown. Each case uses its own addresses; command buffer n is open at n s.
-static void test_superseded(id<MTLDevice> dev) {
-    id<MTLCommandQueue> q = [dev newCommandQueue];
+static void test_superseded(id<MTLDevice> dev, TestTextureResidency& res) {
+    id<MTLCommandQueue> q = res.be->SideQueue();
     const uint64_t size = 64 * MiB;
     uint8_t* base = (uint8_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     TextureCache tc(dev, q, base, size);
+    Attach(tc, res);
     auto at = [&](uint64_t seq) { tc.SetUse(seq, seq * 1000 * MS); };
     const uint32_t BGRA = MTLPixelFormatBGRA8Unorm;
     const uint64_t K16 = 64 * 64 * 4; // one 64x64 RGBA8 slice
@@ -330,6 +349,7 @@ static void test_superseded(id<MTLDevice> dev) {
         check(retired.size() == 1 && retired[0] == weak_a1, "case 1: evicted texture handed to the renderer");
         check(tc.OverlapsGpuTexture(X1, 16), "case 1: the newer surface stays in the range index");
         retired.clear();
+        res.Retire(); // and the backend's residency let go of it (Metal 4)
     }
     check(weak_a1 == nil, "case 1: freed once the renderer dropped it");
 
@@ -470,11 +490,12 @@ static void test_superseded(id<MTLDevice> dev) {
 // newer only when exactly known writes since its last GPU write cover all of it; a GPU write in
 // between starts the cover again; a mark is taken once; an evicted or cleared marked surface does
 // not leave the marked count behind (the renderer's fast path checks it before every lookup).
-static void test_guest_newer(id<MTLDevice> dev) {
-    id<MTLCommandQueue> q = [dev newCommandQueue];
+static void test_guest_newer(id<MTLDevice> dev, TestTextureResidency& res) {
+    id<MTLCommandQueue> q = res.be->SideQueue();
     const uint64_t size = 256 * MiB; // several 64 MiB hint granules
     uint8_t* base = (uint8_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     TextureCache tc(dev, q, base, size);
+    Attach(tc, res);
     auto at = [&](uint64_t seq) { tc.SetUse(seq, seq * 1000 * MS); };
     const uint64_t K16 = 64 * 64 * 4, H = K16 / 2;
     @autoreleasepool {
@@ -551,7 +572,149 @@ static void test_guest_newer(id<MTLDevice> dev) {
     munmap(base, size);
 }
 
+// The texture hooks the Metal 4 backend's residency rests on: every texture the cache creates is
+// reported once, and reported released when the cache drops it (eviction, replacement, the cache's
+// destruction), so created - released is always the number of live cache textures. Views are not
+// creations: a T# sampling a colour target with the target's size is a view of it (not reported),
+// one with another size is a copy (reported), which a later same-size lookup replaces by a view
+// (the copy reported released).
+struct HookCount {
+    TestTextureResidency* res = nullptr; // the counts are kept on the way to the backend's residency
+    std::unordered_set<const void*> live;
+    int created = 0, released = 0, released_unknown = 0, created_twice = 0;
+};
+static void test_texture_hooks(id<MTLDevice> dev, TestTextureResidency& res) {
+    id<MTLCommandQueue> q = res.be->SideQueue();
+    Guest g;
+    g.size = 16 * MiB;
+    g.base = (uint8_t*)mmap(nullptr, g.size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    check(g.base != MAP_FAILED, "hooks: guest memory mapped");
+    HookCount hc;
+    hc.res = &res;
+    @autoreleasepool {
+        TextureCache tc(dev, q, g.base, g.size);
+        TextureCache::TextureHooks h;
+        h.ctx = &hc;
+        h.created = [](void* c, id<MTLTexture> t) {
+            HookCount* x = static_cast<HookCount*>(c);
+            x->created++;
+            if (!x->live.insert((__bridge const void*)t).second) x->created_twice++;
+            TestTextureResidency::Created(x->res, t);
+        };
+        h.released = [](void* c, id<MTLTexture> t) {
+            HookCount* x = static_cast<HookCount*>(c);
+            x->released++;
+            if (!x->live.erase((__bridge const void*)t)) x->released_unknown++;
+            TestTextureResidency::Released(x->res, t);
+        };
+        tc.SetHooks(h);
+        tc.SetUse(1, 1000 * MS);
+        for (uint64_t i = 0; i < 8; ++i) {
+            Fill(g, 0x10000 * (i + 1), 64 * 64 * 4, (uint8_t)(0x10 + i));
+            check(tc.GetTexture(Tsharp(0x10000 * (i + 1), 64, 64)) != nil, "hooks: sampled texture");
+        }
+        check(tc.GetColorTarget(Rt(0x200000), false) != nil, "hooks: color target");
+        // sampling the colour target: another size is a copy, the target's size a view
+        check(tc.GetTexture(Tsharp(0x200000, 32, 32)) != nil, "hooks: colour target sampled at another size");
+        const int created_after_copy = hc.created;
+        check(tc.GetTexture(Tsharp(0x200000, 64, 64)) != nil, "hooks: colour target sampled at its size");
+        check(hc.created == created_after_copy, "hooks: a view of the colour target is not a creation");
+        id<MTLTexture> d1 = tc.GetDepthTarget(Db(0x300000, 1));
+        id<MTLTexture> grown_from = nil;
+        id<MTLTexture> d4 = tc.GetDepthTarget(Db(0x300000, 4), &grown_from);
+        check(d1 && d4 && d4 != d1, "hooks: the depth target grew into a new texture");
+        tc.SetUse(2, 60000 * MS);
+        TextureCache::EvictResult r = tc.EvictSampled(small_policy(1), false, 60000 * MS, 1);
+        check(r.count == 8, "hooks: the 8 idle sampled textures of a completed command buffer evicted");
+        // the other creation paths: a storage image, a GPU-side surface copy into a new address, and
+        // the capture-replay import of a GPU-owned identity (FindGpuTexture with create)
+        tc.SetUse(3, 61000 * MS);
+        check(tc.GetStorageTexture(Tsharp(0x500000, 64, 64)) != nil, "hooks: storage texture");
+        id<MTLTexture> csrc = nil, cdst = nil;
+        int ckind = 0;
+        check(tc.CloneGpuTexture(0x200000, 0x600000, 64 * 64 * 4, &csrc, &cdst, &ckind) && cdst && cdst != csrc,
+              "hooks: the colour target cloned into a new address");
+        ps4gnm_capture::GpuTextureId gid;
+        check(tc.DescribeGpuTexture(tc.FindColorTarget(0x200000), &gid), "hooks: the colour target's identity");
+        gid.address = 0x700000;
+        check(tc.FindGpuTexture(gid, true) != nil, "hooks: a GPU-owned texture imported at a new address");
+        // the superseded-surface eviction: an older colour target cleared over by a newer surface
+        id<MTLTexture> older = tc.GetColorTarget(Rt(0x800000), false);
+        tc.SetUse(4, 62000 * MS);
+        const ColorTarget newer_rt = Rt(0x800000, 64, MTLPixelFormatBGRA8Unorm);
+        id<MTLTexture> newer = tc.GetColorTarget(newer_rt, false);
+        check(older && newer && older != newer, "hooks: two surfaces at one address");
+        tc.SetUse(6, 63000 * MS);
+        check(tc.NoteExactWrite(newer_rt.address, newer, newer_rt.address, newer_rt.address + newer_rt.slice_bytes),
+              "hooks: the clear of the newer surface noted");
+        older = nil;
+        check(tc.EvictSuperseded(1000 * MS, 70000 * MS, 4).count == 1, "hooks: the older surface evicted as superseded");
+        std::vector<id<MTLTexture>> retired;
+        tc.TakeRetired(&retired);
+        // 8 sampled + 1 colour + the alias copy + 2 depth + storage + clone + import + 2 surfaces
+        if (hc.created != 17 || hc.released != 11)
+            printf("hooks: %d created, %d released\n", hc.created, hc.released);
+        // 8 sampled + 1 colour + the alias copy + 2 depth + storage + clone + import + 2 surfaces
+        check(hc.created == 17, "hooks: 17 creations reported (8 sampled, 1 color, 1 alias copy, 2 depth, storage, "
+                                "clone, import, 2 surfaces at one address)");
+        // 8 evicted + the alias copy (replaced by a view) + the replaced depth texture + the superseded surface
+        check(hc.released == 11, "hooks: 11 releases reported (8 evicted, the replaced alias copy, the replaced depth "
+                                 "texture, the superseded surface)");
+        check(hc.released_unknown == 0, "hooks: no release of a texture never reported created");
+        check(hc.created_twice == 0, "hooks: no texture reported created twice");
+        // the backend holds exactly the cache's live textures (on Metal 3 every texture is resident)
+        res.Retire();
+        size_t resident = 0;
+        for (const void* t : hc.live) resident += res.be->IsResident((__bridge id<MTLTexture>)t);
+        check(resident == hc.live.size(), "hooks: every live cache texture is resident on the backend");
+        check(res.Leaked() == (res.be->Kind() == GnmBackendKind::Metal4 ? hc.live.size() : 0),
+              "hooks: the backend's residency holds the live cache textures and nothing else");
+    }
+    check(hc.live.empty(), "hooks: the cache's destruction reports every texture it still held");
+    munmap(g.base, g.size);
+}
+
+// The texture cache's alias copy (a GPU target sampled with other dimensions) goes through the GPU
+// copy hook when one is set: once per new alias, with the target as the source and the alias's
+// parent as the destination, and none through the cache's own queue.
+static void test_gpu_copy_hook(id<MTLDevice> dev, TestTextureResidency& res) {
+    id<MTLCommandQueue> q = res.be->SideQueue();
+    Guest g;
+    g.size = 16 * MiB;
+    g.base = (uint8_t*)mmap(nullptr, g.size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    struct Hook {
+        int calls = 0;
+        __unsafe_unretained id<MTLTexture> src = nil, dst = nil;
+        MTLSize size{};
+    } hk;
+    @autoreleasepool {
+        TextureCache tc(dev, q, g.base, g.size);
+        Attach(tc, res);
+        TextureCache::GpuCopyHook h;
+        h.ctx = &hk;
+        h.copy = [](void* c, id<MTLTexture> s, id<MTLTexture> d, MTLSize n) {
+            Hook* x = static_cast<Hook*>(c);
+            x->calls++;
+            x->src = s;
+            x->dst = d;
+            x->size = n;
+        };
+        tc.SetGpuCopyHook(h);
+        tc.SetUse(1, 1000 * MS);
+        id<MTLTexture> rt = tc.GetColorTarget(Rt(0x100000), false); // 64x64 RGBA8
+        id<MTLTexture> a = tc.GetTexture(Tsharp(0x100000, 32, 32));  // the same memory sampled as 32x32
+        check(rt && a, "copy hook: target and its alias");
+        check(hk.calls == 1, "copy hook: the alias copy went through the hook, once");
+        check(hk.src == rt && hk.dst && hk.dst.width == 32 && hk.dst.height == 32 && hk.size.width == 32 &&
+                  hk.size.height == 32,
+              "copy hook: target -> 32x32 copy, 32x32 region");
+        check(tc.GetTexture(Tsharp(0x100000, 32, 32)) == a && hk.calls == 1, "copy hook: the alias is reused, no second copy");
+    }
+    munmap(g.base, g.size);
+}
+
 int main() {
+    const char* backend = "none";
     test_policy_init();
     test_select();
     @autoreleasepool {
@@ -560,10 +723,26 @@ int main() {
             printf("FAIL: no Metal device\n");
             return 1;
         }
-        test_cache(dev);
-        test_superseded(dev);
-        test_guest_newer(dev);
+        const char* env = getenv("PS4_GNM_METAL");
+        if (env && !strcmp(env, "4") && !RequireMetal4(dev, "tex_evict_test")) return 0;
+        std::string why;
+        std::unique_ptr<GnmBackend> be = MakeTestBackend(dev, &why);
+        if (!be) {
+            printf("FAIL: no backend: %s\n", why.c_str());
+            return 1;
+        }
+        backend = BackendName(be->Kind());
+        TestTextureResidency res;
+        res.be = be.get();
+        test_cache(dev, res);
+        test_superseded(dev, res);
+        test_guest_newer(dev, res);
+        test_texture_hooks(dev, res);
+        test_gpu_copy_hook(dev, res);
+        const size_t leaked = res.Leaked();
+        if (leaked) printf("%zu cache textures left resident\n", leaked);
+        check(leaked == 0, "no texture of a destroyed cache left in the backend's residency");
     }
-    printf("tex_evict_test: %s\n", g_fail ? "FAIL" : "PASS");
+    printf("tex_evict_test: %s [%s]\n", g_fail ? "FAIL" : "PASS", backend);
     return g_fail;
 }

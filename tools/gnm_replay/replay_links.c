@@ -18,6 +18,7 @@
 #include <stdbool.h>
 
 #include "recomp_runtime.h"
+#include "ps4_metal_screen.h" // the stubs below must keep its signatures
 
 static void NotInReplay(const char *what) {
     fprintf(stderr, "gnm_replay: %s was called; it is not on the draw / dispatch path a replay runs\n", what);
@@ -29,6 +30,18 @@ int32_t sceKernelIsNeoMode(void) { return g_replay_neo; }
 
 // ps4_metal_screen.m: no window in a replay
 void *ps4_metal_screen_get_device(void) { return NULL; }
+// Init sets the presenter's texture hooks only when the screen has a device (never here).
+void ps4_metal_screen_set_texture_hooks(void (*created)(void *, void *), void (*released)(void *, void *), void *ctx) {
+    (void)created;
+    (void)released;
+    (void)ctx;
+    NotInReplay("ps4_metal_screen_set_texture_hooks (Init with a screen device)");
+}
+// Init sets the overlay's backend label only when the screen has a device (never here).
+void ps4_metal_screen_set_backend_label(const char *label) {
+    (void)label;
+    NotInReplay("ps4_metal_screen_set_backend_label (Init with a screen device)");
+}
 void *ps4_metal_screen_try_acquire_frame(int width, int height) {
     (void)width; (void)height;
     NotInReplay("ps4_metal_screen_try_acquire_frame (Present)");
@@ -59,6 +72,25 @@ int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
     (void)command_buffer; (void)texture;
     NotInReplay("ps4_metal_screen_encode_present (Present)");
     return 0;
+}
+int ps4_metal_screen_present_begin(void *texture, ps4_metal_screen_present_op *op) {
+    (void)texture; (void)op;
+    NotInReplay("ps4_metal_screen_present_begin (Present)");
+    return -1;
+}
+void ps4_metal_screen_present_commit(const ps4_metal_screen_present_op *op) {
+    (void)op;
+    NotInReplay("ps4_metal_screen_present_commit (Present)");
+}
+void ps4_metal_screen_present_failed(const ps4_metal_screen_present_op *op) {
+    (void)op;
+    NotInReplay("ps4_metal_screen_present_failed (Present)");
+}
+int ps4_metal_screen_held_begin(void *texture, ps4_metal_screen_held_done_fn done, void *arg,
+                                ps4_metal_screen_present_op *op) {
+    (void)texture; (void)done; (void)arg; (void)op;
+    NotInReplay("ps4_metal_screen_held_begin (Present)");
+    return -1;
 }
 int ps4_metal_screen_present_frame(const void *pixels, size_t pitch, int width, int height) {
     (void)pixels; (void)pitch; (void)width; (void)height;

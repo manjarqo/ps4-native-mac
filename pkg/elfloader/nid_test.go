@@ -176,4 +176,3 @@ func TestResolveNID(t *testing.T) {
 		}
 	}
 }
-

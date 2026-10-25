@@ -29,7 +29,12 @@ void recomp_set_current_ctx(GuestContext *ctx) {
   g_current_ctx = ctx;
 }
 
+static _Atomic int g_crashing = 0;
+
+int ps4_host_crashing(void) { return g_crashing; }
+
 static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
+  g_crashing = 1; // before exit(1): the exit handlers it runs skip their waits
   ps4_log_drain_sync(1.0); // pending output first, so the FATAL report below is not lost
   if (g_current_ctx) {
     fprintf(stderr,
@@ -283,6 +288,16 @@ static size_t parse_mem_size_str(const char *str) {
   return (size_t)val;
 }
 
+void recomp_install_crash_handler(void) {
+  struct sigaction sa = {0};
+  sa.sa_flags = SA_SIGINFO;
+  sa.sa_sigaction = crash_handler;
+  sigaction(SIGSEGV, &sa, NULL);
+  sigaction(SIGBUS, &sa, NULL);
+  sigaction(SIGTRAP, &sa, NULL);
+  sigaction(SIGILL, &sa, NULL);
+}
+
 GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
                                   size_t image_size, const char *prog_name) {
   GuestContext *ctx = (GuestContext *)calloc(1, sizeof(GuestContext));
@@ -292,13 +307,7 @@ GuestContext *recomp_init_runtime(size_t guest_mem_sz, const uint8_t *elf_image,
   }
 
   g_current_ctx = ctx;
-  struct sigaction sa = {0};
-  sa.sa_flags = SA_SIGINFO;
-  sa.sa_sigaction = crash_handler;
-  sigaction(SIGSEGV, &sa, NULL);
-  sigaction(SIGBUS, &sa, NULL);
-  sigaction(SIGTRAP, &sa, NULL);
-  sigaction(SIGILL, &sa, NULL);
+  recomp_install_crash_handler();
 
   // Dynamic memory size calculation without hardcoded limits
   if (guest_mem_sz == 0) {

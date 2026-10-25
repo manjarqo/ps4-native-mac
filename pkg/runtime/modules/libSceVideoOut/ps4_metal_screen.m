@@ -12,6 +12,7 @@
 #include "ps4_metal_screen.h"
 #include "ps4_present_queue.h"
 #include "ps4_present_stats.h"
+#include "ps4_screenshot_cadence.h"
 #include "recomp_runtime.h"
 
 @interface PS4ScreenDelegate : NSObject <NSWindowDelegate, NSApplicationDelegate>
@@ -258,20 +259,66 @@ volatile int g_ps4_screenshot_request;
 
 // Called once per flip, in flip order, from the renderer (for presented, held and dropped
 // frames) and from the CPU present paths: the counter and the debug request are atomic.
+// PS4_SCREENSHOT_EVERY_SEC=<s> (time mode, s a whole number of seconds): the first flip at or after
+// each multiple of s seconds of wall time since the first flip is saved as sec_<seconds>.png,
+// named by the last multiple it has passed (ps4_screenshot_cadence.h), and a debug request as
+// sec_<seconds>_req.png; the index is then the milliseconds since the first flip, so the saved
+// line shows how late a shot is. Otherwise every PS4_SCREENSHOT_EVERY-th flip (default 600) and a
+// debug request are saved as frame_<flip>.png.
+#define PS4_SHOT_REQ_BIT (1L << 40) // in a time-mode index: a debug request, not a cadence shot
+static _Atomic bool g_shot_time_mode;
+static _Atomic long g_shot_flip;   // flips counted by the frame cadence
+static long g_shot_every_sec;      // the time cadence's period (set once, before any time-mode index)
+static double g_shot_process_start; // CLOCK_MONOTONIC at load, for the first flip's offset
+
+static double shot_clock(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+__attribute__((constructor)) static void shot_note_start(void) { g_shot_process_start = shot_clock(); }
+
 static long screenshot_due(void) {
     static dispatch_once_t once;
     static const char *dir;
     static long every = 600;
-    static _Atomic long frame;
+    static ps4_shot_cadence cadence;
+    static pthread_mutex_t cadence_mu = PTHREAD_MUTEX_INITIALIZER;
     dispatch_once(&once, ^{
         dir = getenv("PS4_SCREENSHOT_DIR");
         const char *e = getenv("PS4_SCREENSHOT_EVERY");
         if (e && atol(e) > 0) every = atol(e);
+        const char *es = getenv("PS4_SCREENSHOT_EVERY_SEC");
+        if (es && atol(es) > 0) {
+            cadence.every = g_shot_every_sec = atol(es);
+            atomic_store(&g_shot_time_mode, true);
+        }
     });
-    const long n = atomic_fetch_add(&frame, 1);
-    if (dir && __atomic_exchange_n(&g_ps4_screenshot_request, 0, __ATOMIC_ACQ_REL)) return n;
-    if (!dir || n % every != 0) return -1;
+    const long n = atomic_fetch_add(&g_shot_flip, 1);
+    if (!dir) return -1;
+    if (atomic_load_explicit(&g_shot_time_mode, memory_order_relaxed)) {
+        const double now = shot_clock();
+        pthread_mutex_lock(&cadence_mu); // flips come in order, but from more than one thread
+        const bool first = !cadence.started;
+        long ms = ps4_shot_cadence_due(&cadence, now);
+        if (ms < 0 && __atomic_exchange_n(&g_ps4_screenshot_request, 0, __ATOMIC_ACQ_REL))
+            ms = (long)floor((now - cadence.t0) * 1000.0) | PS4_SHOT_REQ_BIT;
+        pthread_mutex_unlock(&cadence_mu);
+        if (first) // compare between runs: an offset here shifts every pair by the same time
+            fprintf(stderr, "[metal-screen] time cadence: every %ld s, first flip at %.3f s after start\n",
+                    g_shot_every_sec, now - g_shot_process_start);
+        return ms;
+    }
+    if (__atomic_exchange_n(&g_ps4_screenshot_request, 0, __ATOMIC_ACQ_REL)) return n;
+    if (n % every != 0) return -1;
     return n;
+}
+
+// A flip that is not shown (no slot, dropped): the frame cadence still counts it, so its
+// numbering stays per flip; the time cadence keeps its due shot for the next flip that is shown.
+static void screenshot_skip(void) {
+    if (!atomic_load_explicit(&g_shot_time_mode, memory_order_relaxed)) atomic_fetch_add(&g_shot_flip, 1);
 }
 
 // Screenshots are encoded and written on a background queue: the PNG encode and the file write
@@ -294,7 +341,8 @@ static dispatch_queue_t shot_queue(void) {
     return q;
 }
 
-// Encodes buf (BGRA8, w x h, `row` bytes per row) as <dir>/frame_<n>.png and frees it.
+// Encodes buf (BGRA8, w x h, `row` bytes per row) as <dir>/frame_<n>.png (time mode:
+// sec_<seconds>.png, n in milliseconds) and frees it.
 static void write_screenshot_png(uint8_t *buf, size_t w, size_t h, size_t row, long n) {
     const char *dir = getenv("PS4_SCREENSHOT_DIR");
     @autoreleasepool {
@@ -303,14 +351,23 @@ static void write_screenshot_png(uint8_t *buf, size_t w, size_t h, size_t row, l
             kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
         CGImageRef img = bc ? CGBitmapContextCreateImage(bc) : NULL;
         if (img && dir) {
-            NSString *path = [NSString stringWithFormat:@"%s/frame_%06ld.png", dir, n];
+            const bool timed = atomic_load_explicit(&g_shot_time_mode, memory_order_relaxed);
+            const long ms = n & ~PS4_SHOT_REQ_BIT; // time mode: milliseconds since the first flip
+            NSString *path =
+                !timed                   ? [NSString stringWithFormat:@"%s/frame_%06ld.png", dir, n]
+                : (n & PS4_SHOT_REQ_BIT) ? [NSString stringWithFormat:@"%s/sec_%06ld_req.png", dir, ms / 1000]
+                                         : [NSString stringWithFormat:@"%s/sec_%06ld.png", dir,
+                                                                      ps4_shot_cadence_name(g_shot_every_sec, ms)];
             CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
                 (__bridge CFURLRef)[NSURL fileURLWithPath:path], CFSTR("public.png"), 1, NULL);
             if (dst) {
                 CGImageDestinationAddImage(dst, img, NULL);
                 CGImageDestinationFinalize(dst);
                 CFRelease(dst);
-                fprintf(stderr, "[metal-screen] saved %s\n", path.UTF8String);
+                if (timed)
+                    fprintf(stderr, "[metal-screen] saved %s (%.3f s after the first flip)\n", path.UTF8String, ms / 1000.0);
+                else
+                    fprintf(stderr, "[metal-screen] saved %s\n", path.UTF8String);
             }
         }
         if (img) CGImageRelease(img);
@@ -699,6 +756,17 @@ static struct {
     NSUInteger slot, tex_w, tex_h, font_px;
 } g_hud;
 
+// Set by the renderer's thread once, read by the presenter thread (a static string, never freed).
+static _Atomic(const char *) g_backend_label;
+
+void ps4_metal_screen_set_backend_label(const char *label) {
+    atomic_store_explicit(&g_backend_label, label, memory_order_release);
+}
+
+const char *ps4_metal_screen_backend_label(void) {
+    return atomic_load_explicit(&g_backend_label, memory_order_acquire);
+}
+
 static bool hud_enabled(void) {
     if (g_hud.state == 0) {
         const char *e = getenv("MTL_HUD_ENABLED");
@@ -722,13 +790,16 @@ static void hud_tick(NSUInteger src_w, NSUInteger src_h, NSUInteger out_w, NSUIn
     if (span < 0.5 || g_hud.frames == 0) return;
     const double fps = g_hud.frames / span;
     const char *mode = ps4_host_setting_pro_mode() ? "PS4 Pro" : "PS4";
+    const char *backend = ps4_metal_screen_backend_label();
+    const char *sep = backend ? "  " : "";
+    if (!backend) backend = "";
     if (out_w != src_w || out_h != src_h) {
-        snprintf(g_hud.text, sizeof(g_hud.text), "%.0f FPS  %.1f ms  (max %.0f)\n%s %lux%lu -> %lux%lu MetalFX", fps,
-                 1000.0 / fps, g_hud.max_ms, mode, (unsigned long)src_w, (unsigned long)src_h, (unsigned long)out_w,
-                 (unsigned long)out_h);
+        snprintf(g_hud.text, sizeof(g_hud.text), "%.0f FPS  %.1f ms  (max %.0f)%s%s\n%s %lux%lu -> %lux%lu MetalFX",
+                 fps, 1000.0 / fps, g_hud.max_ms, sep, backend, mode, (unsigned long)src_w, (unsigned long)src_h,
+                 (unsigned long)out_w, (unsigned long)out_h);
     } else {
-        snprintf(g_hud.text, sizeof(g_hud.text), "%.0f FPS  %.1f ms  (max %.0f)\n%s %lux%lu", fps, 1000.0 / fps,
-                 g_hud.max_ms, mode, (unsigned long)src_w, (unsigned long)src_h);
+        snprintf(g_hud.text, sizeof(g_hud.text), "%.0f FPS  %.1f ms  (max %.0f)%s%s\n%s %lux%lu", fps, 1000.0 / fps,
+                 g_hud.max_ms, sep, backend, mode, (unsigned long)src_w, (unsigned long)src_h);
     }
     g_hud.window_start = now;
     g_hud.frames = 0;
@@ -743,7 +814,7 @@ static id<MTLTexture> hud_texture(NSUInteger target_h) {
     const NSUInteger font_px = MAX((NSUInteger)14, target_h / 48);
     if (font_px != g_hud.font_px) {
         g_hud.font_px = font_px;
-        g_hud.tex_w = font_px * 22;
+        g_hud.tex_w = font_px * 26; // the first line ends with the backend ("Metal 4")
         g_hud.tex_h = font_px * 3;
         for (int i = 0; i < HUD_SLOTS; i++) g_hud.tex[i] = nil;
         g_hud.dirty = true;
@@ -960,6 +1031,26 @@ static uint64_t query_display_hz_main(void) {
     return fps > 0 ? (uint64_t)fps : 0;
 }
 
+static struct {
+    void (*created)(void *, void *);
+    void (*released)(void *, void *);
+    void *ctx;
+} g_tex_hooks;
+
+void ps4_metal_screen_set_texture_hooks(void (*created)(void *, void *), void (*released)(void *, void *), void *ctx) {
+    g_tex_hooks.created = created;
+    g_tex_hooks.released = released;
+    g_tex_hooks.ctx = ctx;
+}
+
+// A new slot or held texture in place of old (nil the first time), reported to the hooks.
+static id<MTLTexture> hooked_texture(MTLTextureDescriptor *td, id<MTLTexture> old) {
+    id<MTLTexture> t = [g_device newTextureWithDescriptor:td];
+    if (old && g_tex_hooks.released) g_tex_hooks.released(g_tex_hooks.ctx, (__bridge void *)old);
+    if (t && g_tex_hooks.created) g_tex_hooks.created(g_tex_hooks.ctx, (__bridge void *)t);
+    return t;
+}
+
 static bool slot_texture(PresentSlot *ps, NSUInteger w, NSUInteger h) {
     if (ps->tex && ps->tex.width == w && ps->tex.height == h) return true;
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -968,7 +1059,7 @@ static bool slot_texture(PresentSlot *ps, NSUInteger w, NSUInteger h) {
                                                                               mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModePrivate;
-    ps->tex = [g_device newTextureWithDescriptor:td];
+    ps->tex = hooked_texture(td, ps->tex);
     return ps->tex != nil;
 }
 
@@ -1106,59 +1197,6 @@ uint64_t ps4_metal_screen_presented_count(void) {
     return atomic_load(&g_pr.presented);
 }
 
-int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
-    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)command_buffer;
-    id<MTLTexture> src = (__bridge id<MTLTexture>)texture;
-    if (!cb || !src) return -1;
-    if (!g_inited) {
-        if (ps4_metal_screen_init((int)src.width, (int)src.height, "PS4Recomp - Native Metal Display") != 0) return -1;
-    }
-    presenter_start();
-    int s = -1;
-    pthread_mutex_lock(&g_pr.q.mu);
-    for (int i = 0; i < PRESENT_SLOTS; i++)
-        if (g_pr.q.state[i] == PS4_PQ_RENDERING && g_pr.slot[i].tex == src) s = i;
-    pthread_mutex_unlock(&g_pr.q.mu);
-    @autoreleasepool {
-        if (s < 0) {
-            // not an acquired slot: copy it into a free one behind the caller's work, without waiting
-            int superseded = 0;
-            double waited = 0;
-            s = ps4_pq_acquire(&g_pr.q, 0, &superseded, &waited);
-            if (superseded) ps4_present_stats_on_superseded(pstats());
-            if (s >= 0 && (src.pixelFormat != MTLPixelFormatBGRA8Unorm || !slot_texture(&g_pr.slot[s], src.width, src.height))) {
-                ps4_pq_cancel(&g_pr.q, s);
-                s = -1;
-            }
-            if (s < 0) {
-                ps4_present_stats_on_superseded(pstats()); // this frame is not shown
-                (void)screenshot_due();                    // but keeps the per-flip numbering
-                ps4_metal_screen_pump_events();
-                return 0;
-            }
-            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-            [blit copyFromTexture:src toTexture:g_pr.slot[s].tex];
-            [blit endEncoding];
-        }
-        const uint64_t v = atomic_fetch_add(&g_pr.ready_value, 1) + 1;
-        [cb encodeSignalEvent:g_pr.ready value:v];
-        id<MTLSharedEvent> ev = g_pr.ready;
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            // A failed command buffer may not have reached its signal; the presenter must not
-            // wait for it forever. Only while v is the newest value handed out: a later command
-            // buffer's GPU signal could otherwise be lowered again by this CPU write.
-            if (done.status == MTLCommandBufferStatusError && atomic_load(&g_pr.ready_value) == v &&
-                ev.signaledValue < v)
-                ev.signaledValue = v;
-        }];
-        g_pr.slot[s].ready = v;
-        g_pr.slot[s].shot_idx = screenshot_due();
-        ps4_pq_submit(&g_pr.q, s, g_pr.slot[s].shot_idx >= 0);
-    }
-    ps4_metal_screen_pump_events();
-    return 0;
-}
-
 // ---------------------------------------------------------------------------
 // Held frames (docs/present-pacing.md, "No waiting on the display"). A frame that finds every
 // present slot taken is converted by the renderer into one of these textures; the renderer's
@@ -1198,6 +1236,82 @@ static struct {
     dispatch_queue_t q; // drop listeners and the timeout timer; set once in held_init
     _Atomic bool timer_armed;
 } g_held = {.mu = PTHREAD_MUTEX_INITIALIZER};
+
+int ps4_metal_screen_present_begin(void *texture, ps4_metal_screen_present_op *op) {
+    id<MTLTexture> src = (__bridge id<MTLTexture>)texture;
+    if (!src || !op) return -1;
+    if (!g_inited) {
+        if (ps4_metal_screen_init((int)src.width, (int)src.height, "PS4Recomp - Native Metal Display") != 0) return -1;
+    }
+    presenter_start();
+    int s = -1;
+    pthread_mutex_lock(&g_pr.q.mu);
+    for (int i = 0; i < PRESENT_SLOTS; i++)
+        if (g_pr.q.state[i] == PS4_PQ_RENDERING && g_pr.slot[i].tex == src) s = i;
+    pthread_mutex_unlock(&g_pr.q.mu);
+    op->copy_dst = NULL;
+    if (s < 0) {
+        // not an acquired slot: copied into a free one behind the caller's work, without waiting
+        int superseded = 0;
+        double waited = 0;
+        s = ps4_pq_acquire(&g_pr.q, 0, &superseded, &waited);
+        if (superseded) ps4_present_stats_on_superseded(pstats());
+        if (s >= 0 && (src.pixelFormat != MTLPixelFormatBGRA8Unorm || !slot_texture(&g_pr.slot[s], src.width, src.height))) {
+            ps4_pq_cancel(&g_pr.q, s);
+            s = -1;
+        }
+        if (s < 0) {
+            ps4_present_stats_on_superseded(pstats()); // this frame is not shown
+            screenshot_skip();                         // but keeps the per-flip numbering
+            ps4_metal_screen_pump_events();
+            return 1;
+        }
+        op->copy_dst = (__bridge void *)g_pr.slot[s].tex;
+    }
+    op->event = (__bridge void *)g_pr.ready;
+    op->value = atomic_fetch_add(&g_pr.ready_value, 1) + 1;
+    op->slot = s;
+    return 0;
+}
+
+void ps4_metal_screen_present_commit(const ps4_metal_screen_present_op *op) {
+    g_pr.slot[op->slot].ready = op->value;
+    g_pr.slot[op->slot].shot_idx = screenshot_due();
+    ps4_pq_submit(&g_pr.q, op->slot, g_pr.slot[op->slot].shot_idx >= 0);
+    ps4_metal_screen_pump_events();
+}
+
+// A failed command buffer may not have reached its signal; the presenter must not wait for it
+// forever. Only while value is the newest one handed out: a later command buffer's GPU signal
+// could otherwise be lowered again by this CPU write.
+void ps4_metal_screen_present_failed(const ps4_metal_screen_present_op *op) {
+    id<MTLSharedEvent> ev = (__bridge id<MTLSharedEvent>)op->event;
+    _Atomic uint64_t *newest = ev == g_held.ev ? &g_held.ev_value : &g_pr.ready_value;
+    if (atomic_load(newest) == op->value && ev.signaledValue < op->value) ev.signaledValue = op->value;
+}
+
+int ps4_metal_screen_encode_present(void *command_buffer, void *texture) {
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)command_buffer;
+    if (!cb) return -1;
+    ps4_metal_screen_present_op op;
+    const int r = ps4_metal_screen_present_begin(texture, &op);
+    if (r != 0) return r < 0 ? -1 : 0;
+    @autoreleasepool {
+        if (op.copy_dst) {
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit copyFromTexture:(__bridge id<MTLTexture>)texture toTexture:(__bridge id<MTLTexture>)op.copy_dst];
+            [blit endEncoding];
+        }
+        [cb encodeSignalEvent:(__bridge id<MTLSharedEvent>)op.event value:op.value];
+        const ps4_metal_screen_present_op o = op;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if (done.status == MTLCommandBufferStatusError) ps4_metal_screen_present_failed(&o);
+        }];
+        ps4_metal_screen_present_commit(&op);
+    }
+    return 0;
+}
+
 
 static double held_now(void) {
     return CACurrentMediaTime();
@@ -1375,7 +1489,7 @@ void *ps4_metal_screen_hold_texture(int width, int height) {
                                                                                       mipmapped:NO];
             td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             td.storageMode = MTLStorageModePrivate;
-            h->tex = [g_device newTextureWithDescriptor:td];
+            h->tex = hooked_texture(td, h->tex);
         }
         if (h->tex) {
             h->state = HELD_RENDERING;
@@ -1387,10 +1501,10 @@ void *ps4_metal_screen_hold_texture(int width, int height) {
     return tex;
 }
 
-int ps4_metal_screen_queue_held(void *command_buffer, void *texture, ps4_metal_screen_held_done_fn done, void *arg) {
-    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)command_buffer;
+int ps4_metal_screen_held_begin(void *texture, ps4_metal_screen_held_done_fn done, void *arg,
+                                ps4_metal_screen_present_op *op) {
     id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
-    if (!cb || !tex || !g_held.ev) return -1;
+    if (!tex || !op || !g_held.ev) return -1;
     pthread_mutex_lock(&g_held.mu);
     int i = -1;
     for (int k = 0; k < kHeldTextures; k++)
@@ -1400,14 +1514,10 @@ int ps4_metal_screen_queue_held(void *command_buffer, void *texture, ps4_metal_s
         return -1;
     }
     const uint64_t v = atomic_fetch_add(&g_held.ev_value, 1) + 1;
-    [cb encodeSignalEvent:g_held.ev value:v];
-    id<MTLSharedEvent> ev = g_held.ev;
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
-        // a failed command buffer may not have reached its signal: nothing may wait for it forever
-        // (only while v is the newest value: a later GPU signal must not be lowered)
-        if (c.status == MTLCommandBufferStatusError && atomic_load(&g_held.ev_value) == v && ev.signaledValue < v)
-            ev.signaledValue = v;
-    }];
+    op->event = (__bridge void *)g_held.ev;
+    op->value = v;
+    op->copy_dst = NULL;
+    op->slot = i;
     HeldFrame *h = &g_held.f[i];
     h->state = HELD_QUEUED;
     h->ready = v;
@@ -1428,9 +1538,22 @@ int ps4_metal_screen_queue_held(void *command_buffer, void *texture, ps4_metal_s
     return 0;
 }
 
+int ps4_metal_screen_queue_held(void *command_buffer, void *texture, ps4_metal_screen_held_done_fn done, void *arg) {
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)command_buffer;
+    if (!cb) return -1;
+    ps4_metal_screen_present_op op;
+    if (ps4_metal_screen_held_begin(texture, done, arg, &op) != 0) return -1;
+    [cb encodeSignalEvent:(__bridge id<MTLSharedEvent>)op.event value:op.value];
+    const ps4_metal_screen_present_op o = op;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        if (c.status == MTLCommandBufferStatusError) ps4_metal_screen_present_failed(&o);
+    }];
+    return 0;
+}
+
 void ps4_metal_screen_note_held_drop(void) {
     ps4_present_stats_on_held_dropped(pstats());
-    (void)screenshot_due(); // keeps the per-flip numbering
+    screenshot_skip(); // keeps the per-flip numbering
 }
 
 void ps4_metal_screen_release_held(void) {

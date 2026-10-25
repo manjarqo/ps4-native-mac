@@ -176,7 +176,7 @@ func TestShortByteDispatchTableStopsAtData(t *testing.T) {
 		putRel(img, i, bdCase(i))
 	}
 	binary.LittleEndian.PutUint32(img[bdTable+12:], 0x7fff0000) // outside the image
-	putRel(img, 4, bdCase0+1)                                    // another table after it
+	putRel(img, 4, bdCase0+1)                                   // another table after it
 	putRel(img, 5, bdCase(3))
 
 	d, err := NewDisassembler(switchTestELF(img))

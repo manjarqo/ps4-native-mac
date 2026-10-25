@@ -21,26 +21,24 @@
 #include <vector>
 
 #include "gcn_recompiler.h"
+#include "backend_harness.h" // CHECK, g_fail, MakeTestBackend (PS4_GNM_METAL=3|4)
 #include "msl_barrier_check.h"
 
 namespace {
 
-int g_fail = 0;
-#define CHECK(c, ...)                                                                         \
-    do {                                                                                      \
-        if (!(c)) {                                                                           \
-            std::fprintf(stderr, "gcn_wave_exec_test: FAIL %s:%d: ", __FILE__, __LINE__); \
-            std::fprintf(stderr, __VA_ARGS__);                                                \
-            std::fprintf(stderr, "\n");                                                       \
-            g_fail++;                                                                         \
-        }                                                                                     \
-    } while (0)
+// The kernels run through the renderer's backend (PS4_GNM_METAL), created once in main.
+std::unique_ptr<ps4gnm::GnmBackend> g_be;
+uint64_t g_seq = 0;
 
 constexpr uint64_t kGuestBase = 0x10000000;
 constexpr uint64_t kGuestSize = 1u << 20;
 
 struct Guest {
     id<MTLBuffer> buf;
+    // resident from Setup on; leaves its set once the last seq that used it completed
+    ~Guest() {
+        if (buf && g_be) g_be->Evict(buf, g_seq);
+    }
     uint8_t* p(uint64_t a) { return static_cast<uint8_t*>(buf.contents) + (a - kGuestBase); }
     static bool Read(void* ctx, uint64_t addr, void* dst, uint64_t size) {
         auto* g = static_cast<Guest*>(ctx);
@@ -279,46 +277,61 @@ bool Run(id<MTLDevice> dev, Guest& g, const gcn_shader* sh, const uint32_t ud[16
     gcn_shader_build_flatbuf(sh, ud, Guest::Read, &g, flat.data(), flat.size());
     alignas(16) uint8_t push[(sizeof(gcn_push_data) + 15) & ~size_t(15)] = {};
     auto* pd = reinterpret_cast<gcn_push_data*>(push);
-    id<MTLCommandQueue> q = [dev newCommandQueue];
-    id<MTLCommandBuffer> cb = [q commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    [enc setComputePipelineState:pso];
+    ps4gnm::GnmBackend& be = *g_be;
+    be.BeginCmd(ps4gnm::GnmCmdTarget::Main, nil, false);
+    be.BeginCompute(false);
+    be.SetComputePipeline(pso);
     for (uint32_t i = 0; i < info.num_buffers; i++) {
         gcn_buffer_binding b;
         gcn_shader_get_buffer(sh, i, &b);
         for (uint32_t k = 0; k < b.num_msl_buffers; k++) {
             if (b.type == GCN_BUFFER_FLATBUF) {
-                [enc setBytes:flat.data() length:flat.size() * 4 atIndex:b.msl_buffers[k]];
+                be.BindBytes(ps4gnm::GnmStage::Compute, b.msl_buffers[k], flat.data(), flat.size() * 4);
                 continue;
             }
-            if (b.type != GCN_BUFFER_GUEST) return false;
+            if (b.type != GCN_BUFFER_GUEST) {
+                be.EndEncoder();
+                be.Commit(++g_seq, [](void*, const ps4gnm::GnmCompletion&) {}, nullptr);
+                return false;
+            }
             uint32_t v[4];
             gcn_buffer_desc d{};
-            if (!gcn_shader_fetch_buffer_sharp(sh, i, flat.data(), info.code_addr, v)) return false;
+            if (!gcn_shader_fetch_buffer_sharp(sh, i, flat.data(), info.code_addr, v)) {
+                be.EndEncoder();
+                be.Commit(++g_seq, [](void*, const ps4gnm::GnmCompletion&) {}, nullptr);
+                return false;
+            }
             gcn_decode_buffer(v, &d);
             const uint64_t base = d.base_address & ~3ull;
-            [enc setBuffer:g.buf offset:base - kGuestBase atIndex:b.msl_buffers[k]];
+            be.BindBuffer(ps4gnm::GnmStage::Compute, b.msl_buffers[k], g.buf, base - kGuestBase);
             if (b.buffer_slot < GCN_MAX_BUFFERS)
                 pd->buf_sizes[b.buffer_slot] =
                     base == d.base_address ? d.size_bytes : (d.size_bytes + uint32_t(d.base_address - base) + 3) & ~3u;
         }
     }
-    if (info.msl_push_constant_buffer >= 0) [enc setBytes:push length:sizeof(push) atIndex:(NSUInteger)info.msl_push_constant_buffer];
-    if (info.shared_memory_size)
-        [enc setThreadgroupMemoryLength:(info.shared_memory_size + 15) & ~15u atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-    [enc endEncoding];
-    dispatch_semaphore_t done = dispatch_semaphore_create(0);
-    [cb addCompletedHandler:^(id<MTLCommandBuffer>) { dispatch_semaphore_signal(done); }];
-    [cb commit];
-    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, int64_t(kKernelTimeoutSec) * NSEC_PER_SEC)) != 0) {
+    if (info.msl_push_constant_buffer >= 0)
+        be.BindBytes(ps4gnm::GnmStage::Compute, (uint32_t)info.msl_push_constant_buffer, push, sizeof(push));
+    // LDS: the translated kernels declare it statically (threadgroup arrays in main0), as the
+    // renderer relies on; no threadgroup memory is set at dispatch
+    be.Dispatch(MTLSizeMake(1, 1, 1), MTLSizeMake(threads, 1, 1));
+    be.EndEncoder();
+    struct W {
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        bool failed = false;
+    } w;
+    be.Commit(++g_seq, [](void* p, const ps4gnm::GnmCompletion& c) {
+        auto* x = static_cast<W*>(p);
+        x->failed = c.failed;
+        dispatch_semaphore_signal(x->done);
+    }, &w);
+    if (dispatch_semaphore_wait(w.done, dispatch_time(DISPATCH_TIME_NOW, int64_t(kKernelTimeoutSec) * NSEC_PER_SEC)) != 0) {
         // The process ends: the GPU work of a hung kernel cannot be cancelled, and process exit
         // tears down its command queue.
         std::fprintf(stderr, "gcn_wave_exec_test: FAIL: kernel %016llx did not end in %d s (a GPU hang)\n",
                      (unsigned long long)g_case_hash, kKernelTimeoutSec);
         std::_Exit(124);
     }
-    return cb.status == MTLCommandBufferStatusCompleted;
+    return !w.failed;
 }
 
 constexpr uint32_t kEnd = 0xBF810000;
@@ -327,7 +340,9 @@ uint32_t* Out(Guest& g) { return reinterpret_cast<uint32_t*>(g.p(kGuestBase + 0x
 
 bool Setup(id<MTLDevice> dev, Guest& g, const std::vector<uint32_t>& body, uint64_t hash, uint32_t ud[16],
            uint32_t out_bytes = 256) {
+    if (g.buf) g_be->Evict(g.buf, g_seq);
     g.buf = [dev newBufferWithLength:kGuestSize options:MTLResourceStorageModeShared];
+    g_be->MakeResident(g.buf, ps4gnm::GnmResidencyClass::Guest);
     std::memset(g.buf.contents, 0, kGuestSize);
     const auto prog = WithFooter(body, hash);
     g_case_hash = hash;
@@ -1491,6 +1506,13 @@ int main() {
             std::fprintf(stderr, "gcn_wave_exec_test: no Metal device\n");
             return 1;
         }
+        std::string why;
+        g_be = MakeTestBackend(dev, &why);
+        if (!g_be) {
+            std::fprintf(stderr, "gcn_wave_exec_test: FAIL: no backend: %s\n", why.c_str());
+            return 1;
+        }
+        std::printf("gcn_wave_exec_test: backend %s\n", ps4gnm::BackendName(g_be->Kind()));
         TestHangGuard();
         TestExecHalf(dev);
         TestSpilledSharp(dev);

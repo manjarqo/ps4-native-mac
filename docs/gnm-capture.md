@@ -170,6 +170,41 @@ One- and two-channel formats show R (and G). Multisampled textures have no view.
   notes on stderr list the store instructions in its shaders' GCN code). `--out <dir>` writes the replayed outputs (`.raw`, `.png`,
   `.bin`). The replay runs the renderer with `PS4_GNM_SYNC_ENCODE`, `PS4_GNM_SYNC_COMPILE` and no
   shader cache, PSO archive or library store, so it reads and writes nothing outside its process.
+  `<out>/gnm_replay <frame_dir> <a>-<b>|all --sha` replays a range in one process and prints one
+  `P` line per pass and one `O` line (SHA-256) per output (gnm_replay.h, FormatPassResult).
+- `--settle` (single pass or range) is a **diagnostic, not a gate**. It replays each pass twice in
+  a row, restoring its inputs (guest memory, seeded textures, fast clears) before each replay, and
+  judges the second replay: MATCH / DIFF, hashes, `--out` files and the exit status are the second
+  replay's.
+  - An output whose two replays differ is reported as `UNSTABLE-FIRST` with both hashes:
+    - single pass: an `UNSTABLE-FIRST <what>: first <sha> settled <sha>` line, then
+      `pass <n>: UNSTABLE-FIRST` before the verdict;
+    - range: a `U <pass> UNSTABLE-FIRST <what> <first sha|ABSENT> <settled sha|ABSENT>` line after
+      the pass's `O` lines.
+  - A pass that writes a texture it creates (no contents before the pass in the capture) is
+    replayed once, with `pass <n>: NOT SETTLED: <reason>` (range: `S <pass> NOT-SETTLED <reason>`).
+    The replay does not restore renderer textures it did not seed, so a second replay would start
+    from the first one's output.
+  - Use it to classify a difference a **plain** replay or sweep found:
+    - a DIFF that is UNSTABLE-FIRST with a settled hash that is stable over repeats is a candidate
+      first-execution effect (U4 water/frame_6200 pass 690 and frame_6200_w3 pass 736, "A
+      first-execution effect" below);
+    - anything else is a real difference.
+  - **It must not be the gate for ordering or barrier changes.** The second replay runs on the
+    renderer state the first one left: cache entries, uploads already done, resources already
+    resident and holding the bytes a racing read would need. This hides missing barriers. With
+    `PS4_GNM_MTL4_NO_BARRIERS=1` (every Metal 4 barrier removed), the review of 58eabbc measured:
+
+    | capture | plain sweeps (DIFF outputs per run) | `--settle` sweeps (DIFF outputs per run) |
+    |---|---|---|
+    | TLOU courtyard | 8, 5, 7 | 1, 0, 0 |
+    | TLOU spores | 2, 6, 6 | 0, 0, 0 (no U line either) |
+
+    The gate is the plain sweep, run twice per build. Its non-deterministic list is built from
+    the outputs that differ between two plain sweeps of the same build.
+  - `tools/metal4_replay_cmp.py --fail-new-unstable` fails on a U line of the new list that the
+    base lists do not have.
+  - A sweep takes twice as long with `--settle`. `--allocs` does not combine with it.
 - `tools/gnm_capture_extract.py <frame_dir> <pass> <out> [--max-bytes N] [--drop-input 0xADDR]
   [--dim X,Y,Z] [--keep-outputs]`: one replayable pass, renumbered 0, as a minimal frame for a
   host test. A pass extracted from a game's capture holds that game's shaders and data: it is a
@@ -186,3 +221,39 @@ One- and two-channel formats show R (and G). Multisampled textures have no view.
   shrunk dispatch writes less.
 - `tools/refcompare.py <frame.png> <reference.png>`: 4x4-region mean colour and luminance and a
   luminance histogram against a reference frame.
+
+## A first-execution effect: U4 water/frame_6200 pass 690
+
+**The pass and its symptom.**
+- Pass 690 is one indexed draw: 1536 indices × 233 instances. Its fragment shader:
+  - samples 10 images (BC1/BC4/BC5/BC7 tiled textures, and a 7-level RGBA16F chain the renderer
+    assembles from render targets);
+  - runs at sample rate with early fragment tests;
+  - uses implicit-derivative sampling, with texture coordinates scaled per pixel.
+- About one replay in four to seven gives a different t0/t1 (several modes, on Metal 3 and
+  Metal 4 alike). The differing pixels all lie in the band of distant water (rows 330–405), with
+  small value differences (about 1e-3 typically).
+
+**What is known.**
+- Only the first execution of this draw in a process varies.
+- Replaying it again in the same process, with guest memory and the targets reloaded, was exact
+  in more than 250 iterations.
+- Running the 90 passes before it does not remove the variation.
+
+**Ruled out:**
+- GPU upload and detile ordering (all-CPU uploads), the upload command buffer racing the main one,
+  and work before the pass not being finished (commit and wait before the pass);
+- the readback racing the draw;
+- different sampled texture contents (every level hashed), different bindings or state (every
+  binder operation logged), and different MSL;
+- first-use renderer objects (a recompiled pipeline, a cleared texture cache).
+
+**Not confirmed.**
+- The most likely causes are inside the driver: a first use or lazy specialisation of the
+  pipeline, or quad and helper-lane scheduling that changes the derivatives at distance.
+- Until one of them is confirmed, nothing in the renderer is changed for it.
+
+**Consequences for validation.**
+- The pass's outputs (and w3 pass 736's) are in the non-deterministic lists of the replay gate.
+- `--settle` was added to tell such first-execution effects from real differences. It is a
+  diagnostic only, as described above.

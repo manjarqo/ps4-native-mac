@@ -76,6 +76,12 @@ void ps4_host_run_main_loop(void);
 // Ends the process from an exit path (window close, Cmd+Q) without running static
 // destructors: game threads and Metal completion handlers still use global state.
 void ps4_host_quit(int code) __attribute__((noreturn));
+// Nonzero once the crash handler runs (it ends the process with exit(1) so the logs flush): exit
+// handlers and destructors that would wait for other threads or the GPU skip that work then.
+int ps4_host_crashing(void);
+// The crash handler (SIGSEGV, SIGBUS, SIGTRAP, SIGILL): installed by recomp_init_runtime; host
+// tests install it on their own.
+void recomp_install_crash_handler(void);
 // Startup settings (libSceSystemService/ps4_settings.m): resolved once before the guest starts.
 void ps4_host_settings_init(void);
 void ps4_stall_watchdog_note_present(void); // frame stall diagnostics (PS4_STALL_WATCHDOG)

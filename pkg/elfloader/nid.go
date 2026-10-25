@@ -68,7 +68,6 @@ func ResolveNID(nidOrSym string) (string, bool) {
 	return name, ok
 }
 
-
 // nidSuffixKey is the OpenOrbis / Sony suffix mixed into symbol-name SHA-1 hashes.
 const nidSuffixKey = "518D64A635DED8C1E6B039B1C3E55230"
 

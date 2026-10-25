@@ -19,7 +19,7 @@ Branch u4-render (worktree `~/ps4recomp-work/PS4Recomp-render`) is ahead of u4-b
 - renderer fixes reviewed in two rounds (render1-review.md, render2-review.md);
 - eef5783, which has not been reviewed yet: render targets written by buffer stores are refreshed before they are sampled.
 
-The findings so far are in `.superpowers/sdd/2026-10-20-uncharted4-bringup/render-report.md`.
+The findings so far are in the render report of the local SDD workspace (git-ignored, not in the repository).
 
 - **Drake.** He is present in the depth prepass and in the g-buffer: MRT2 at 0x130b520000 holds material IDs and MRT0 at 0x13100b0000 holds albedo. He is lost in tiled deferred lighting, which is 33 indirect compute dispatches writing 0x1323370000. The output is flat sky-grey, which looks like zero lighting plus fog. One of the lighting inputs, 0x1309858000 (11_11_10 float), is never written by any GPU work in three traced gameplay frames.
 - **Other open issues:**

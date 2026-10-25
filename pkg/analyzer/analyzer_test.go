@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 )
+
 func TestAnalyzeBinary(t *testing.T) {
 	elfPath := os.Getenv("PS4_TEST_ELF")
 	if elfPath == "" {

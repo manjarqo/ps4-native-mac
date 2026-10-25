@@ -7,11 +7,10 @@ arm64 `.app`. The game code is lifted once, at build time, into ARM64 assembly. 
 against a high-level emulation (HLE) runtime of the Orbis OS libraries and a GNM command processor
 that renders with Metal. There is no JIT, no interpreter, no Rosetta and no MoltenVK.
 
-**The Last of Us Remastered** is playable on Mac from boot to gameplay, at 78–114 fps in 1080p in
-the measured scenes on an M1 Pro. **Uncharted 4: A Thief's End** is in progress: it boots and
-reaches gameplay in chapter 1 at about 20 fps, with visible rendering differences from a PS4 still
-open. See
-[Supported games](#supported-games-on-mac) for the exact status.
+**The Last of Us Remastered** is playable on Mac from boot to gameplay, at about 99 fps in 1080p
+on a scripted chapter 1 route on an M1 Pro. **Uncharted 4: A Thief's End** is in progress: it boots
+and reaches gameplay in chapter 1 at about 20 fps, with visible rendering differences from a PS4
+still open. See [Supported games](#supported-games-on-mac) for the exact status.
 
 **Based on:** forked from [PS4Recomp](https://github.com/wie-project/PS4Recomp) by its authors, and
 developed independently under the new name since 2026-10. License: GPL-2.0.
@@ -34,6 +33,8 @@ developed independently under the new name since 2026-10. License: GPL-2.0.
   AudioToolbox, VideoToolbox and GameController.
 - **A Metal renderer.** The game's GPU commands are processed by a GNM command processor that
   draws with Metal; its GCN shaders are translated to Metal Shading Language and cached on disk.
+  Every build contains two renderer backends, Metal 3 (the default) and Metal 4
+  (`PS4_GNM_METAL=4`).
 
 Why this approach: native code with pinned registers, x86 memory ordering mapped onto ARM
 acquire/release instructions and zero-copy guest memory on unified memory keep the run-time
@@ -49,17 +50,24 @@ not measured yet.
 
 | Game | Stage | fps | Resolution | Notes |
 | --- | --- | --- | --- | --- |
-| The Last of Us Remastered (CUSA00557) | Playable: boot, menus, movies, gameplay, saves | Walking (330 s scripted routes): chapter 1 courtyard 89.7 fps, spore corridor 99.6 fps, 0 frames > 100 ms. Standing: courtyard 78.5–78.9 fps, Sarah's house 113.7–114.5 fps. | 1920x1080 (base PS4 mode, `PS4_PRO=0`), MetalFX off. Pro mode: TBD | 30-minute courtyard soak: no fatal errors, no hangs, memory footprint flat at ~3.5 GB. Exit: 3/3 by closing the window, 3/3 by terminate, no crash reports. |
+| The Last of Us Remastered (CUSA00557) | Playable: boot, menus, movies, gameplay, saves | Chapter 1 courtyard route (300 s, median of 5 runs): **98.9 fps** on Metal 3 (the default), 85.5 fps on Metal 4. Earlier walking and standing numbers: see below. | 1920x1080 (base PS4 mode, `PS4_PRO=0`), MetalFX off. Pro mode: TBD | 30-minute courtyard soak (commit 8145002): no fatal errors, no hangs, memory footprint flat at ~3.5 GB. Exit: 3/3 by closing the window, 3/3 by terminate, no crash reports. 300 s route on Metal 3 and on Metal 4: no fatal errors, GPU errors or watchdog reports. |
 | Uncharted 4: A Thief's End (CUSA04529) | In progress: boots, menus, New Game, chapter 1 (boat cutscene and boat gameplay), saves, audio | Title screen about 21–22 fps, boat gameplay about 20–21 fps (`PS4_PRO=0`, 1080p, measured while other work ran on the machine). Pro mode: not re-measured (TBD) | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Title screen: the scene is lit, but fog and light shafts are missing. Boat cutscene: Drake and Sully are lit and the motion-blur smear is fixed. Gameplay: water colour and foam differ from a PS4 and the sky is too dark. Base mode is recommended. |
 
 How the TLOU numbers were taken:
 
-- Walking: a scripted pad route played from copies of saves, with `PS4_PRO=0` and a separate data
-  directory, at commit 8145002. Earlier runs of the same backend gave 93.0–93.5 fps (courtyard) and
-  103.2–103.6 fps (spores). The machine's background load moves these numbers by a few fps between
-  runs.
-- Standing: an A/B against the previous C backend, 2 alternating rounds per build.
+- Route: `tools/metal4_route.sh` plays a scripted pad route from a copy of a chapter 1 save, with
+  `PS4_PRO=0`, separate data and cache directories and no screenshots. `tools/metal4_perf_ab.sh`
+  alternated 5 runs of 300 s per backend on one build (commit 8bdffe7) and kept only pairs taken
+  under the same machine load. Noise between runs was ±1.3 fps. The full numbers are in
+  [docs/metal4-baseline.md](docs/metal4-baseline.md).
+- Batched compute commits (9 command buffers per frame instead of 49) raised this route from
+  about 82 to 92 fps on Metal 3 in their own A/B
+  ([docs/compute-batching.md](docs/compute-batching.md)).
+- Earlier measurements, at commit 8145002, with a different route script, so not directly
+  comparable: walking (330 s) chapter 1 courtyard 89.7 fps and spore corridor 99.6 fps, no frame
+  over 100 ms; standing courtyard 78.5–78.9 fps and Sarah's house 113.7–114.5 fps.
 - The frame rate is uncapped. The bench window is in the background, so vsync does not limit it.
+  The machine's background load moves these numbers by a few fps between runs.
 
 **Upstream milestones (not verified in this fork):**
 
@@ -86,6 +94,13 @@ How the TLOU numbers were taken:
   - The faster guest-memory dispatch path (`PS4_GNM_GUEST_MEMORY_FAST=1`, about 3 fps more in boat gameplay) is
     opt-in: in long runs it showed rare anomalies (a stalled dispatch, a GPU memory blow-up, one
     crash) that the default path did not show, not yet explained.
+- **Metal 4 is slower than Metal 3.** On the TLOU route it runs at 85.5 fps against 98.9. Each
+  Metal 4 encoder starts with a barrier after all earlier work, so its command buffers never
+  overlap on the GPU (11.4 against 9.3 ms of GPU time per frame). Metal 3 stays the default until
+  Metal 4 at least matches it ([docs/metal4-backend.md](docs/metal4-backend.md),
+  [docs/gnm-ordering.md](docs/gnm-ordering.md)).
+- **Quit after a GPU hang.** If the command buffer watchdog gave up on the GPU, a normal quit waits
+  10 s for the GPU and then stops with a FATAL message.
 - **x87.** 80-bit values are kept as doubles, which loses 11 mantissa bits.
 - **Misaligned atomics.** A LOCK operation on an operand that crosses a 16-byte boundary raises
   SIGBUS. TLOU has none.
@@ -108,7 +123,7 @@ How the TLOU numbers were taken:
 | Requirement | Notes |
 | --- | --- |
 | Apple Silicon Mac | Developed and measured on M1 Pro, 16 GB. Code is built with `-mcpu=apple-m1`. |
-| macOS | Tested on macOS 27.0.1. The bundle declares 12.0 as its minimum, but older versions are untested (TBD). MetalFX upscaling needs macOS 13 or later. |
+| macOS | Tested on macOS 27.0.1. Building a game needs the macOS 26 SDK or later (Xcode or Command Line Tools 26+), because the Metal 4 backend is compiled into every build; the game is linked for the SDK of the Mac it is built on. The bundle declares 12.0 as its minimum, but older versions are untested (TBD). MetalFX upscaling needs macOS 13 or later. The Metal 4 backend also needs a GPU with `MTLGPUFamilyMetal4`. |
 | Xcode Command Line Tools | `xcode-select --install`. gcn-recompiler needs Apple clang 17+ (C++23); tested with Apple clang 21. |
 | Go | `go.mod` requires Go 1.27.1. An older `go` with `GOTOOLCHAIN=auto` (the default) downloads it. |
 | CMake ≥ 3.20 and Ninja | `brew install cmake ninja`. Ninja also drives the parallel game build. |
@@ -237,7 +252,7 @@ A settings window opens before the game starts:
 | **Language** | The console system language reported to the game. The list shows only the languages whose speech packs are in your game data, and English if none are found. The first entry selected is the one matching your macOS language. | macOS language |
 | **PS4 Pro mode** | The game is told it runs on a PS4 Pro (`sceKernelIsNeoMode`), so it takes its Pro rendering path. The Last of Us Remastered then renders at 3200x1800, the PS4 Pro's "4K" mode, instead of 1920x1080 on a base PS4. This costs more GPU time. | On |
 | **MetalFX upscaling** | Scales the presented frame up to the window size with MetalFX spatial upscaling, for example to 3840x2160 in a full-screen window on a 4K display. It needs macOS 13 or later. Combined with PS4 Pro mode it gives 1800p → 4K; with Pro mode off it can bring 1080p up to a large window for less GPU cost. | Off |
-| **FPS counter (Metal HUD)** | An on-screen overlay. It shows fps, frame time and the longest frame, the mode (PS4 / PS4 Pro), the game's render resolution and, with MetalFX, the output resolution, for example `PS4 Pro 3200x1800 -> 3840x2160 MetalFX`. | On |
+| **FPS counter (Metal HUD)** | An on-screen overlay. It shows fps, frame time and the longest frame, the renderer backend (`Metal 3` or `Metal 4`), the mode (PS4 / PS4 Pro), the game's render resolution and, with MetalFX, the output resolution, for example `PS4 Pro 3200x1800 -> 3840x2160 MetalFX`. | On |
 | **Remember** | Saves the choices for this game, so the window does not open on later launches unless Option is held. Untick it to use the choices for this launch only. | On |
 
 How the settings are stored and overridden:
@@ -321,7 +336,10 @@ your own from your own game copy.
 | `PS4_UPSCALE_FACTOR=<1..4>` | Upscale by a fixed factor instead of to the window size |
 | `PS4_LANG=<code>` | System language (`en`, `ru`, `ja`, ... or an Orbis number); skips the dialog |
 | `PS4_NO_DIALOGS=1` | Never show the settings dialog |
-| `MTL_HUD_ENABLED=0\|1` | Metal performance HUD |
+| `MTL_HUD_ENABLED=0\|1` | Metal performance HUD (its first line ends with the backend in use, `Metal 3` or `Metal 4`) |
+| `PS4_GNM_METAL=3\|4` | Renderer backend (default 3). `4` needs a GPU with Metal 4 support; if it cannot start, the game stops with the reason instead of falling back (see [docs/metal4-backend.md](docs/metal4-backend.md)) |
+| `PS4_GNM_COMPUTE_BATCH=0` | Commit every compute submission at its end instead of batching them (see [docs/compute-batching.md](docs/compute-batching.md)) |
+| `PS4_GNM_RESIDENCY_CHECK=1` | Metal 4 only: check that every resource a command uses is resident and log each one that is not (costs encoder time) |
 | `PS4_GNM_NO_SHADER_CACHE=1` | Disable the on-disk shader caches (MSL and GCN) |
 | `PS4_GNM_NO_GCN_CACHE=1` | Disable only the GCN -> MSL translation cache |
 | `PS4_GNM_SHADER_CACHE_MB=<n>` | Shader cache size budget |
@@ -334,6 +352,7 @@ your own from your own game copy.
 | `PS4_GNM_STATS=1`, `PS4_AUDIO_LOG=1`, `PS4_NP_LOG_ALL=1` | Command processor, audio and NP logging |
 | `PS4_GNM_GPU_TIMEOUT=<ms>` | Command buffer watchdog (default 4000) |
 | `PS4_SCREENSHOT_DIR=<dir>`, `PS4_SCREENSHOT_EVERY=<frames>` | Save presented frames as PNG |
+| `PS4_SCREENSHOT_EVERY_SEC=<s>` | Save the first frame after every `s` seconds of wall time instead, as `sec_<seconds>.png` (to compare runs at the same moments) |
 | `PS4_RECOMP_HEADLESS=1`, `PS4_BACKGROUND_WINDOW=1`, `PS4_PAD_SCRIPT=...` | Automated test runs |
 | `PS4_PRESENT_MODE=uncapped\|vsync\|mailbox` | Frame pacing (default `uncapped`; see [docs/present-pacing.md](docs/present-pacing.md)) |
 | `PS4_GNM_CAPTURE_FRAME=<n>`, `PS4_GNM_CAPTURE_DIR=<dir>` | Capture frame `n` (see [Debugging the renderer](#debugging-the-renderer)) |
@@ -346,8 +365,9 @@ Host unit tests: `tests/host/run_host_tests.sh`. Some cases need shaders dumped 
 game (local fixtures in `tests/host/data/game/` or `PS4_HOST_GAME_FIXTURES`, never committed);
 without them they are reported as SKIP and the run ends with the number of skipped cases (see
 [tests/host/README.md](tests/host/README.md)).
-The benchmark scripts behind the supported-games table (walking routes, A/B runs) are not in the
-repository yet.
+The benchmark scripts behind the TLOU numbers are `tools/metal4_route.sh` (one route run) and
+`tools/metal4_perf_ab.sh` (alternating A/B runs). They are written for the developer's workspace
+(`~/ps4recomp-work`) and need your own save and pad script, which are not in the repository.
 
 ### Debugging the renderer
 
@@ -453,6 +473,18 @@ The table also covers what Uncharted 4 needs: AAC decoding (`libSceAudiodec`, Au
   buffers: the graphics ring, compute queues and indirect buffers.
 - It tracks Liverpool register state and records Metal command buffers on a separate encoder
   thread.
+- Two backends sit behind one interface (`ps4_gnm_backend.h`); `PS4_GNM_METAL` picks one at
+  start and the log says which (`[gnm-draw] backend metal3 (...)`).
+  - **Metal 3** (default): `MTLCommandQueue` with Metal's own hazard tracking between encoders.
+  - **Metal 4**: `MTL4CommandQueue`, command allocators reused once their work completed, argument
+    tables, residency sets for every resource, and a barrier at each encoder start.
+  - The command processor, caches, shader translation, capture and replay are shared, and replays
+    of captured TLOU frames give byte-identical outputs on both. See
+    [docs/metal4-backend.md](docs/metal4-backend.md) and
+    [docs/gnm-ordering.md](docs/gnm-ordering.md) for the ordering rules of each backend.
+- Compute submissions are batched: while at least two command buffers are in flight, the end of a
+  compute submission is held for at most 0.5 ms, so back-to-back submissions share a command
+  buffer ([docs/compute-batching.md](docs/compute-batching.md)).
 - Guest memory is mapped zero-copy into Metal buffers on unified memory.
 - Textures are detiled and cached. GPU writes invalidate the cached copies.
 - The frame is presented through `CAMetalLayer`, with optional MetalFX spatial upscaling.
@@ -540,7 +572,7 @@ Boost subset (BSL-1.0). Its README lists every change made to the shadPS4 source
 │       └── modules/         # libSce* HLE modules (GnmDriver, VideoOut, AudioOut, Ajm, ...)
 ├── tests/                   # host unit tests and runtime test programs
 ├── tools/                   # capture viewer, pass replay, fixture extraction, reference comparison
-├── docs/                    # renderer notes (capture, GPU memory budget, present pacing), plans
+├── docs/                    # renderer notes (backends, ordering, compute batching, capture, GPU memory budget, present pacing), plans
 └── 3rdparty/                # see "Third-party components"
 ```
 

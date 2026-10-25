@@ -2965,7 +2965,7 @@ TextureCache::EvictResult TextureCache::EvictSuperseded(uint64_t idle_ns, uint64
             r.bytes += e->alloc_bytes;
             TrackLocked(e, -1); // also marks the GPU range index stale
             UnmarkLocked(e);
-            delete e;
+            DropEntryLocked(e);
             entries_.erase(it);
             break;
         }
@@ -2975,6 +2975,27 @@ TextureCache::EvictResult TextureCache::EvictSuperseded(uint64_t idle_ns, uint64
         evicted_gpu_bytes_.fetch_add(r.bytes, std::memory_order_relaxed);
     }
     return r;
+}
+
+id<MTLTexture> TextureCache::NewTextureLocked(MTLTextureDescriptor* td) {
+    id<MTLTexture> t = [device_ newTextureWithDescriptor:td];
+    if (t && hooks_.created) hooks_.created(hooks_.ctx, t);
+    return t;
+}
+
+void TextureCache::ReleaseTextureLocked(id<MTLTexture> t) {
+    if (t && hooks_.released) hooks_.released(hooks_.ctx, t);
+}
+
+// An alias that is a view of a copy (GetTextureImpl: different dimensions) holds that copy as its parent.
+id<MTLTexture> TextureCache::AliasCopy(const Entry* e) {
+    return e->alias && e->alias.parentTexture && e->alias.parentTexture != e->tex ? e->alias.parentTexture : nil;
+}
+
+void TextureCache::DropEntryLocked(Entry* e) {
+    ReleaseTextureLocked(e->tex);
+    ReleaseTextureLocked(AliasCopy(e));
+    delete e;
 }
 
 TextureCache::TextureCache(id<MTLDevice> device, id<MTLCommandQueue> queue, uint8_t* mem_base,
@@ -2989,7 +3010,7 @@ void TextureCache::Clear() {
     TimedLock lk(mutex_);
     for (auto& kv : entries_) {
         TrackLocked(kv.second, -1);
-        delete kv.second;
+        DropEntryLocked(kv.second);
     }
     entries_.clear();
     guest_newer_n_.store(0, std::memory_order_relaxed);
@@ -3050,7 +3071,9 @@ TextureCache::EvictResult TextureCache::EvictSampled(const ps4_texcache_policy& 
     for (uint64_t i = 0; i < n; ++i) {
         auto it = evict_its_[evict_items_[i].id];
         TrackLocked(it->second, -1);
-        delete it->second; // releases the texture; a command buffer still holding it keeps it alive
+        // work still using the texture keeps it alive: on Metal 3 its command buffer; on Metal 4 the
+        // residency set until the removal's seq completed, and the part of each encoder that used it
+        DropEntryLocked(it->second);
         entries_.erase(it);  // other iterators of the multimap stay valid
     }
     r.count = n;
@@ -3071,7 +3094,7 @@ TextureCache::MemStats TextureCache::GetMemStats() const {
     return m;
 }
 
-void TextureCache::WaitIdleLocked() {
+void TextureCache::DrainQueueLocked() {
     if (!queue_) return;
     id<MTLCommandBuffer> cb = [queue_ commandBuffer];
     [cb commit];
@@ -3254,6 +3277,7 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
                                  ((uint32_t)img.view_swizzle.g << 20) ^ ((uint32_t)img.view_swizzle.b << 24) ^
                                  ((uint32_t)img.view_swizzle.a << 28);
             if (!e->alias || e->alias_key != key) {
+                ReleaseTextureLocked(AliasCopy(e)); // a copy this view replaces
                 e->alias = [e->tex newTextureViewWithPixelFormat:(MTLPixelFormat)img.pixel.mtl_format
                                                      textureType:MTLTextureType2D
                                                           levels:NSMakeRange(0, 1)
@@ -3272,20 +3296,26 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
                                                                                       mipmapped:NO];
             td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
             td.storageMode = MTLStorageModePrivate;
-            id<MTLTexture> copy = [device_ newTextureWithDescriptor:td];
-            id<MTLCommandBuffer> cb = [queue_ commandBuffer];
-            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-            [bl copyFromTexture:e->tex
-                    sourceSlice:0
-                    sourceLevel:0
-                   sourceOrigin:MTLOriginMake(0, 0, 0)
-                     sourceSize:MTLSizeMake(std::min(width, e->width), std::min(height, e->height), 1)
-                      toTexture:copy
-               destinationSlice:0
-               destinationLevel:0
-              destinationOrigin:MTLOriginMake(0, 0, 0)];
-            [bl endEncoding];
-            [cb commit];
+            id<MTLTexture> copy = NewTextureLocked(td);
+            const MTLSize sz = MTLSizeMake(std::min(width, e->width), std::min(height, e->height), 1);
+            if (copy_hook_.copy) {
+                copy_hook_.copy(copy_hook_.ctx, e->tex, copy, sz);
+            } else {
+                id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+                id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+                [bl copyFromTexture:e->tex
+                        sourceSlice:0
+                        sourceLevel:0
+                       sourceOrigin:MTLOriginMake(0, 0, 0)
+                         sourceSize:sz
+                          toTexture:copy
+                   destinationSlice:0
+                   destinationLevel:0
+                  destinationOrigin:MTLOriginMake(0, 0, 0)];
+                [bl endEncoding];
+                [cb commit];
+            }
+            ReleaseTextureLocked(AliasCopy(e)); // the copy this one replaces
             e->alias = [copy newTextureViewWithPixelFormat:(MTLPixelFormat)img.pixel.mtl_format
                                                textureType:MTLTextureType2D
                                                     levels:NSMakeRange(0, 1)
@@ -3363,7 +3393,7 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
     e->dfmt = img.dfmt;
     e->nfmt = img.nfmt;
     if (!ComputeSurfaceLayout(sd, &e->layout)) {
-        delete e;
+        DropEntryLocked(e); // nothing created yet: reports nothing
         return nil;
     }
     e->size = e->layout.total_size;
@@ -3382,9 +3412,9 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
     td.usage = MTLTextureUsageShaderRead;
     td.storageMode = msaa ? MTLStorageModePrivate : SharedOrManaged(device_);
     td.swizzle = ToMTLSwizzle(img.view_swizzle);
-    e->tex = [device_ newTextureWithDescriptor:td];
+    e->tex = NewTextureLocked(td);
     if (!e->tex) {
-        delete e;
+        DropEntryLocked(e); // nothing created yet: reports nothing
         return nil;
     }
     if (!msaa) {
@@ -3445,9 +3475,9 @@ id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_fro
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
                MTLTextureUsagePixelFormatView;
     td.storageMode = cb.num_samples > 1 ? MTLStorageModePrivate : SharedOrManaged(device_);
-    e->tex = [device_ newTextureWithDescriptor:td];
+    e->tex = NewTextureLocked(td);
     if (!e->tex) {
-        delete e;
+        DropEntryLocked(e); // nothing created yet: reports nothing
         return nil;
     }
     if (load_from_guest && cb.num_samples == 1) {
@@ -3487,9 +3517,10 @@ id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture
                 td.arrayLength = layers;
                 td.usage = e->tex.usage;
                 td.storageMode = MTLStorageModePrivate;
-                id<MTLTexture> t = [device_ newTextureWithDescriptor:td];
+                id<MTLTexture> t = NewTextureLocked(td);
                 if (!t) return e->tex;
                 if (grown_from) *grown_from = e->tex;
+                ReleaseTextureLocked(e->tex);
                 RetireLocked(e->tex); // the renderer forgets state keyed by the old texture
                 TrackLocked(e, -1);
                 e->tex = t;
@@ -3522,9 +3553,9 @@ id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture
     td.sampleCount = db.num_samples;
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     td.storageMode = MTLStorageModePrivate; // depth contents are not loaded from guest memory
-    e->tex = [device_ newTextureWithDescriptor:td];
+    e->tex = NewTextureLocked(td);
     if (!e->tex) {
-        delete e;
+        DropEntryLocked(e); // nothing created yet: reports nothing
         return nil;
     }
     e->dirty = false;
@@ -3672,9 +3703,9 @@ bool TextureCache::CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, uint64_
         td.mipmapLevelCount = s->tex.mipmapLevelCount;
         td.usage = s->tex.usage;
         td.storageMode = s->tex.storageMode;
-        d->tex = [device_ newTextureWithDescriptor:td];
+        d->tex = NewTextureLocked(td);
         if (!d->tex) {
-            delete d;
+            DropEntryLocked(d);
             return false;
         }
         d->generation = 1;
@@ -3830,7 +3861,7 @@ id<MTLTexture> TextureCache::FindGpuTexture(const ps4gnm_capture::GpuTextureId& 
         e->cb_swizzle[k] = (CompSwizzle)gid.cb_swizzle[k];
     }
     if (!UnpackSurface(gid.surface, &e->surf, &e->layout)) {
-        delete e;
+        DropEntryLocked(e); // nothing created yet: reports nothing
         return nil;
     }
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
@@ -3844,9 +3875,9 @@ id<MTLTexture> TextureCache::FindGpuTexture(const ps4gnm_capture::GpuTextureId& 
     td.sampleCount = gid.mtl_samples;
     td.usage = (MTLTextureUsage)gid.usage;
     td.storageMode = (MTLStorageMode)gid.storage_mode;
-    e->tex = [device_ newTextureWithDescriptor:td];
+    e->tex = NewTextureLocked(td);
     if (!e->tex) {
-        delete e;
+        DropEntryLocked(e); // nothing created yet: reports nothing
         return nil;
     }
     e->dirty = false;
@@ -4105,7 +4136,7 @@ id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img) {
     e->nfmt = img.nfmt;
     e->cb_swizzle = CompMapping{};
     if (!ComputeSurfaceLayout(e->surf, &e->layout)) {
-        delete e;
+        DropEntryLocked(e); // nothing created yet: reports nothing
         return nil;
     }
     e->size = e->layout.total_size;
@@ -4119,9 +4150,9 @@ id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img) {
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
                MTLTextureUsagePixelFormatView;
     td.storageMode = SharedOrManaged(device_);
-    e->tex = [device_ newTextureWithDescriptor:td];
+    e->tex = NewTextureLocked(td);
     if (!e->tex) {
-        delete e;
+        DropEntryLocked(e); // nothing created yet: reports nothing
         return nil;
     }
     UploadLocked(e);
@@ -4174,7 +4205,7 @@ bool TextureCache::ReadTextureBGRA8(id<MTLTexture> tex, DataFormat, NumberFormat
                                     std::vector<uint8_t>* out) {
     if (!tex || !out) return false;
     TimedLock lk(mutex_);
-    WaitIdleLocked();
+    DrainQueueLocked();
     std::vector<uint8_t> raw;
     uint32_t row;
     if (!ReadTextureBytes(device_, queue_, tex, 0, &raw, &row)) return false;
@@ -4192,7 +4223,7 @@ bool TextureCache::WriteBackColorTarget(uint64_t address) {
     for (auto it = range.first; it != range.second; ++it)
         if (it->second->kind == Entry::Color) e = it->second;
     if (!e || !mem_base_ || e->address >= mem_size_) return false;
-    WaitIdleLocked();
+    DrainQueueLocked();
     const uint32_t bpe = e->surf.bpp / 8;
     std::vector<uint8_t> lin((size_t)e->layout.total_size, 0);
     for (uint32_t s = 0; s < e->layers; ++s) {

@@ -203,4 +203,3 @@ func TestMergeImagesCanary(t *testing.T) {
 		t.Fatalf("expected merged GOT entry to point to process canary 0x%x, got 0x%x", dstCanaryAddr, gotPtr)
 	}
 }
-

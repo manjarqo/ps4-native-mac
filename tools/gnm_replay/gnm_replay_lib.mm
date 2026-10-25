@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <CommonCrypto/CommonDigest.h>
 
 #include <algorithm>
 
@@ -30,6 +31,7 @@ uint64_t g_mem_size = 0;
 bool g_neo = false;
 GuestContext g_ctx;
 std::vector<std::pair<uint64_t, uint64_t>> g_loaded; // ranges the last call wrote
+bool g_settle_first = false; // ReplaySettled's first replay is running (Options::test_settle_first)
 
 // The guest's VM extents as the replay knows them: the pass's guest memory snapshots and the
 // images the captured draw bound are mapped, the rest of guest memory is free. The renderer treats
@@ -140,6 +142,13 @@ bool LoadBlob(const std::string& dir, const BlobRef& b, Result* r) {
 // The replayed bytes of an output, compared with the capture's when it holds them.
 void AddOutput(const Options& opt, OutputResult o, const uint8_t* got, size_t got_n, const std::vector<uint8_t>* want,
                Result* r) {
+    std::vector<uint8_t> perturbed; // test-only: the first replay's bytes as the hook left them
+    if (g_settle_first && opt.test_settle_first) {
+        perturbed.assign(got, got + got_n);
+        opt.test_settle_first(opt.test_settle_ctx, &o.what, &perturbed);
+        got = perturbed.data();
+        got_n = perturbed.size();
+    }
     if (want) {
         o.compared = true;
         o.size = want->size();
@@ -155,6 +164,14 @@ void AddOutput(const Options& opt, OutputResult o, const uint8_t* got, size_t go
         }
         o.match = o.diff_bytes == 0;
     }
+    o.replayed_size = got_n;
+    if (opt.sha256) {
+        unsigned char md[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256(got, (CC_LONG)got_n, md);
+        char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+        for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) snprintf(hex + 2 * i, 3, "%02x", md[i]);
+        o.sha256 = hex;
+    }
     if (!opt.out_dir.empty()) {
         mkdir(opt.out_dir.c_str(), 0755);
         std::string name = o.is_texture ? o.what : "buf_" + o.what.substr(7); // "buffer 0x.." -> "buf_0x.."
@@ -168,13 +185,9 @@ void AddOutput(const Options& opt, OutputResult o, const uint8_t* got, size_t go
     r->outputs.push_back(std::move(o));
 }
 
-} // namespace
-
-Result ReplayPass(const Options& o) {
+Result ReplayLoaded(const Options& o, const FrameRec& f) {
     Result r;
-    FrameRec f;
     std::string err;
-    if (!LoadFrame(o.frame_dir, &f, &err)) return r.error = err, r;
     if (o.pass >= f.passes.size() || f.passes[o.pass].index != o.pass) {
         r.error = "no pass " + std::to_string(o.pass) + " in " + o.frame_dir;
         return r;
@@ -217,6 +230,7 @@ Result ReplayPass(const Options& o) {
 
     const uint64_t skipped0 = ps4draw::SkippedCount();
     ps4draw::SetExtentHints(p.cb_extent, p.db_extent);
+    if (o.around_render) o.around_render(o.around_ctx, true);
     if (p.type == "draw") {
         ps4draw::DrawArgs a;
         a.indexed = p.indexed;
@@ -230,16 +244,20 @@ Result ReplayPass(const Options& o) {
         a.indirect_addr = p.indirect_addr;
         a.base_vertex_ud = p.base_vertex_ud;
         a.start_instance_ud = p.start_instance_ud;
-        if (!ps4draw::Draw(&g_ctx, regs.data(), a))
+        if (!ps4draw::Draw(&g_ctx, regs.data(), a)) {
+            if (o.around_render) o.around_render(o.around_ctx, false);
             return r.error = "Draw refused the indirect draw (the CPU fallback is a different pass)", r;
+        }
     } else if (p.type == "dispatch") {
         // the queue as the command processor named it ("gfx", "asc", "asc-indirect")
         const int queue = p.queue.compare(0, 3, "asc") == 0 ? ps4draw::kQueueCompute : ps4draw::kQueueGfx;
         ps4draw::Dispatch(&g_ctx, regs.data(), p.dim[0], p.dim[1], p.dim[2], p.indirect_addr, p.queue.c_str(), queue);
     } else {
+        if (o.around_render) o.around_render(o.around_ctx, false);
         return r.error = "unknown pass type " + p.type, r;
     }
     ps4draw::Flush(true);
+    if (o.around_render) o.around_render(o.around_ctx, false);
     if (ps4draw::SkippedCount() != skipped0) return r.error = "the renderer skipped the pass (see the [gnm-draw] log)", r;
     r.ran = true;
 
@@ -255,6 +273,7 @@ Result ReplayPass(const Options& o) {
             out.what += " (the renderer made no texture with the captured identity)";
             out.compared = have;
             out.size = out.diff_bytes = want.size();
+            if (o.sha256) out.sha256 = "MISSING";
             r.outputs.push_back(std::move(out));
             continue;
         }
@@ -306,6 +325,153 @@ Result ReplayPass(const Options& o) {
         }
     }
     return r;
+}
+
+// Options::settle: the pass twice, inputs restored by each ReplayLoaded; the second is returned,
+// each output compared by name and hash with the first (MarkUnstableFirst). The first replay writes
+// no --out files, keeps no bytes and runs without around_render: only the judged replay is observed.
+// A pass that writes a texture it creates itself (no pre_file: made from guest memory by the pass)
+// is not settled: the replay does not restore renderer textures it did not seed, so the second
+// replay would start from the first one's output. It is replayed once and says why (not_settled).
+Result ReplaySettled(const Options& o, const FrameRec& f) {
+    if (o.pass < f.passes.size() && f.passes[o.pass].index == o.pass) {
+        for (const TextureRec& t : f.passes[o.pass].textures)
+            if (t.written && t.pre_file.empty()) {
+                Result r = ReplayLoaded(o, f);
+                r.not_settled = "writes " + t.role + ", a texture the pass creates (not restored between replays)";
+                return r;
+            }
+    }
+    Options first = o;
+    first.sha256 = true;
+    first.keep_outputs = false;
+    first.out_dir.clear();
+    first.around_render = nullptr;
+    g_settle_first = true;
+    const Result r1 = ReplayLoaded(first, f);
+    g_settle_first = false;
+    if (!r1.ran) return r1; // not replayable: the second replay would refuse it alike
+    Options second = o;
+    second.sha256 = true;
+    Result r2 = ReplayLoaded(second, f);
+    if (!r2.ran) {
+        r2.notes.push_back("settle: the first replay ran, the second did not");
+        return r2;
+    }
+    MarkUnstableFirst(r1, &r2);
+    return r2;
+}
+
+Result ReplayOne(const Options& o, const FrameRec& f) { return o.settle ? ReplaySettled(o, f) : ReplayLoaded(o, f); }
+
+} // namespace
+
+void MarkUnstableFirst(const Result& first, Result* settled) {
+    settled->settled = true;
+    settled->unstable_first = false;
+    settled->first_only.clear();
+    std::vector<bool> seen(first.outputs.size(), false);
+    for (OutputResult& out : settled->outputs) {
+        out.first_sha256 = "ABSENT";
+        for (size_t i = 0; i < first.outputs.size(); ++i)
+            if (!seen[i] && first.outputs[i].what == out.what) {
+                seen[i] = true;
+                out.first_sha256 = first.outputs[i].sha256;
+                break;
+            }
+        out.unstable_first = out.first_sha256 != out.sha256;
+        settled->unstable_first |= out.unstable_first;
+    }
+    for (size_t i = 0; i < first.outputs.size(); ++i)
+        if (!seen[i]) settled->first_only.push_back({first.outputs[i].what, first.outputs[i].sha256});
+    settled->unstable_first |= !settled->first_only.empty();
+}
+
+Result ReplayPass(const Options& o) {
+    Result r;
+    FrameRec f;
+    std::string err;
+    if (!LoadFrame(o.frame_dir, &f, &err)) return r.error = err, r;
+    return ReplayOne(o, f);
+}
+
+std::vector<PassResult> ReplayPasses(const Options& base, uint32_t first, uint32_t last) {
+    std::vector<PassResult> out;
+    FrameRec f;
+    std::string err;
+    if (!LoadFrame(base.frame_dir, &f, &err)) {
+        PassResult p;
+        p.pass = first;
+        p.r.error = err;
+        out.push_back(std::move(p));
+        return out;
+    }
+    if (last == UINT32_MAX) last = f.passes.empty() ? 0 : (uint32_t)f.passes.size() - 1;
+    if (!base.out_dir.empty()) mkdir(base.out_dir.c_str(), 0755);
+    for (uint32_t i = first; i <= last; ++i) {
+        Options o = base;
+        o.pass = i;
+        if (!o.out_dir.empty()) o.out_dir += "/pass_" + std::to_string(i);
+        PassResult p;
+        p.pass = i;
+        if (i < f.passes.size()) p.type = f.passes[i].type;
+        p.r = ReplayOne(o, f);
+        out.push_back(std::move(p));
+        if (i >= f.passes.size() || i == UINT32_MAX) break; // the frame ends here: one report, not one per number
+    }
+    return out;
+}
+
+bool ParsePassSpec(const std::string& s, uint32_t* first, uint32_t* last, bool* range) {
+    if (s == "all") return *first = 0, *last = UINT32_MAX, *range = true, true;
+    const size_t dash = s.find('-');
+    auto num = [](const std::string& t, uint32_t* v) {
+        if (t.empty() || t.size() > 10 || t.find_first_not_of("0123456789") != std::string::npos) return false;
+        const unsigned long long x = strtoull(t.c_str(), nullptr, 10);
+        if (x >= UINT32_MAX) return false; // UINT32_MAX itself means "to the end"
+        *v = (uint32_t)x;
+        return true;
+    };
+    if (dash == std::string::npos) return *range = false, num(s, first) && (*last = *first, true);
+    if (!num(s.substr(0, dash), first) || !num(s.substr(dash + 1), last) || *first > *last) return false;
+    return *range = true, true;
+}
+
+std::string FormatPassResult(const PassResult& p) {
+    std::string s;
+    char buf[512];
+    const char* type = p.type.empty() ? "-" : p.type.c_str();
+    if (!p.r.ran) {
+        snprintf(buf, sizeof(buf), "P %u %s NOT ", p.pass, type);
+        return s + buf + p.r.error + "\n";
+    }
+    snprintf(buf, sizeof(buf), "P %u %s RAN %d %zu\n", p.pass, type, p.r.AllMatch() ? 1 : 0, p.r.outputs.size());
+    s += buf;
+    for (const OutputResult& out : p.r.outputs) {
+        std::string w = out.what;
+        for (char& c : w)
+            if (c == ' ') c = '_';
+        snprintf(buf, sizeof(buf), "O %u ", p.pass);
+        s += buf + w;
+        snprintf(buf, sizeof(buf), " %llu %s\n", (unsigned long long)out.replayed_size,
+                 out.sha256.empty() ? "-" : out.sha256.c_str());
+        s += buf;
+    }
+    auto unstable = [&](const std::string& what, const std::string& h1, const std::string& h2) {
+        std::string w = what;
+        for (char& c : w)
+            if (c == ' ') c = '_';
+        snprintf(buf, sizeof(buf), "U %u UNSTABLE-FIRST ", p.pass);
+        s += buf + w + " " + (h1.empty() ? "-" : h1) + " " + (h2.empty() ? "-" : h2) + "\n";
+    };
+    for (const OutputResult& out : p.r.outputs)
+        if (out.unstable_first) unstable(out.what, out.first_sha256, out.sha256);
+    for (const auto& [what, h] : p.r.first_only) unstable(what, h, "ABSENT");
+    if (!p.r.not_settled.empty()) {
+        snprintf(buf, sizeof(buf), "S %u NOT-SETTLED ", p.pass);
+        s += buf + p.r.not_settled + "\n";
+    }
+    return s;
 }
 
 } // namespace ps4replay

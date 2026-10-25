@@ -917,6 +917,28 @@ public:
     // renderer calls SetUse at each commit with the number of the command buffer that work
     // encoded from now on belongs to.
     void SetUse(uint64_t seq, uint64_t now_ns);
+    // Every texture the cache creates (created) and every one it lets go (released: entry deleted,
+    // texture replaced, alias copy replaced, the cache destroyed), for the Metal 4 backend's
+    // residency sets. Views are not reported (a view counts as its parent texture). Set once,
+    // before the first lookup. Called with the cache's lock held, on the thread that creates or lets
+    // go of the texture: in the renderer always the holder of the encoder's state (the encoder
+    // thread, or the thread running encoder work inline; ps4_gnm_draw.mm checks it, FATAL).
+    struct TextureHooks {
+        void* ctx = nullptr;
+        void (*created)(void* ctx, id<MTLTexture> t) = nullptr;
+        void (*released)(void* ctx, id<MTLTexture> t) = nullptr;
+    };
+    void SetHooks(const TextureHooks& h) { hooks_ = h; }
+    // The GPU copy of a target into the sampled copy an alias views (different dimensions). Set: the
+    // renderer encodes it on its own timeline (its upload command buffer). Unset: a command buffer of
+    // the cache's queue, committed at once (tests that use the cache alone). Called with the cache's
+    // lock held, by the holder of the encoder's state (the renderer encodes the copy into its own
+    // command buffers there).
+    struct GpuCopyHook {
+        void* ctx = nullptr;
+        void (*copy)(void* ctx, id<MTLTexture> src, id<MTLTexture> dst, MTLSize size) = nullptr;
+    };
+    void SetGpuCopyHook(const GpuCopyHook& h) { copy_hook_ = h; }
     // Evicts sampled textures chosen by ps4_texcache_select: only entries whose last command
     // buffer has completed (completed_seq), least recently used first. GPU-owned surfaces are
     // never evicted here (see EvictSuperseded). An evicted texture still referenced by a command buffer lives until that
@@ -953,7 +975,12 @@ private:
     bool UploadLockedImpl(Entry* e);
     id<MTLTexture> GetTextureImpl(const ImageDesc& img, const uint64_t* gpu_epochs, GpuUpload* up,
                                   uint64_t refresh_min_bytes = 0);
-    void WaitIdleLocked();
+    // Waits for the work committed so far on the cache's queue (queue_: the backend's SideQueue).
+    // On Metal 3 that is the renderer's own queue, so the renderer's committed work is drained too.
+    // On Metal 4 it is a separate side queue: the renderer's timeline is NOT drained, and a reader
+    // of GPU-written textures must drain the renderer first (Flush(true), as DumpTargets and the
+    // writeback paths do).
+    void DrainQueueLocked();
     // Adds (sign +1) or removes (sign -1) an entry's texture in the MemStats counters.
     void TrackLocked(const Entry* e, int sign);
     // Stamps the entry's last use with the SetUse values (ExactWriteLocked: and an exactly known
@@ -971,6 +998,15 @@ private:
     void GpuEntriesOverlappingLocked(uint64_t addr, uint64_t size, std::vector<Entry*>* out) const;
     void RebuildGpuIndexLocked() const;
     void RetireLocked(id<MTLTexture> t);
+    TextureHooks hooks_;
+    GpuCopyHook copy_hook_;
+    id<MTLTexture> NewTextureLocked(MTLTextureDescriptor* td); // [device_ newTextureWithDescriptor:], reported
+    void ReleaseTextureLocked(id<MTLTexture> t);               // reported released (nil: nothing)
+    // The texture an alias holds of its own: the copy an alias view was made from (a view of the
+    // entry's texture holds nothing of its own).
+    static id<MTLTexture> AliasCopy(const Entry* e);
+    // deletes e after reporting its texture and its alias copy released
+    void DropEntryLocked(Entry* e);
     std::vector<id<MTLTexture>> retired_;
     std::atomic<bool> retired_pending_{false};
 

@@ -1362,8 +1362,14 @@ int32_t ps4_gnm_metal_process_compute_packets(GuestContext *ctx, const uint32_t 
         sub.frames.push_back({words, size_dw, 0});
         q.pending.push_back(std::move(sub));
         if (!q.Suspended()) RunComputeQueue(slot, false);
-        // compute work without a trailing fence still has to reach the GPU
-        if (ps4draw::HasPendingWork()) ps4draw::Flush(false);
+        // compute work without a trailing fence still has to reach the GPU: committed now, or held
+        // for the next submissions while the GPU is behind (ps4draw::FlushCompute: 0.5 ms at most,
+        // plus the encoder jobs queued before the release);
+        // a queue that now waits for another one commits now (what it waits for may be in it)
+        if (ps4draw::HasPendingWork()) {
+            if (q.Suspended()) ps4draw::Flush(false);
+            else ps4draw::FlushCompute();
+        }
         PumpQueues();
         ps4draw::WaitKernelCompiles();
     }

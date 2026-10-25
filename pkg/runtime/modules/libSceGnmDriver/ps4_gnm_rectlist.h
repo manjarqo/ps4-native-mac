@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <string>
 
+#include "ps4_gnm_backend.h"
+
 namespace ps4gnm_rect {
 
 // Capture index of every vertex of a RectList draw of `count` vertices (3 per rectangle):
@@ -43,6 +45,7 @@ struct Geometry {
     int32_t base_vertex = 0;    // indexed draws
     id<MTLBuffer> index_buffer = nil; // nil: non-indexed
     NSUInteger index_offset = 0;
+    uint64_t index_length = 0; // bytes readable at index_offset (Metal 4 needs it)
     MTLIndexType index_type = MTLIndexTypeUInt16;
 };
 
@@ -57,31 +60,44 @@ struct Buffers {
     uint32_t capture_slot, params_slot; // gcn_rectlist_msl capture_buffer / params_buffer
 };
 
-// Encodes both draws on `enc`. Before the call the caller has bound everything the guest vertex
-// shader reads on the vertex stage (resources and vertex buffers) and the fragment shader's
-// resources, and set the draw's fixed-function state. Afterwards the encoder's pipeline is
-// `expand` and vertex buffer slots 0, 1, 2, capture_slot and params_slot hold `b`.
-inline void Encode(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> capture,
-                   id<MTLRenderPipelineState> expand, const Geometry& g, const Buffers& b) {
-    [enc setRenderPipelineState:capture];
-    [enc setVertexBuffer:b.vertices offset:b.vertices_off atIndex:b.capture_slot];
-    [enc setVertexBuffer:b.params offset:b.params_off atIndex:b.params_slot];
-    if (g.index_buffer)
-        [enc drawIndexedPrimitives:MTLPrimitiveTypePoint indexCount:g.count indexType:g.index_type
-                       indexBuffer:g.index_buffer indexBufferOffset:g.index_offset instanceCount:g.instances
-                        baseVertex:g.base_vertex baseInstance:g.base_instance];
-    else
-        [enc drawPrimitives:MTLPrimitiveTypePoint vertexStart:g.vertex_start vertexCount:g.count
-              instanceCount:g.instances baseInstance:g.base_instance];
+// Encodes both draws on the backend's open render encoder. Before the call the caller has bound
+// everything the guest vertex shader reads on the vertex stage (resources and vertex buffers) and
+// the fragment shader's resources, and set the draw's fixed-function state. Afterwards the
+// encoder's pipeline is `expand` and vertex buffer slots 0, 1, 2, capture_slot and params_slot
+// hold `b`.
+inline void Encode(ps4gnm::GnmBackend& be, id<MTLRenderPipelineState> capture, id<MTLRenderPipelineState> expand,
+                   const Geometry& g, const Buffers& b) {
+    using namespace ps4gnm;
+    be.SetRenderPipeline(capture);
+    be.BindBuffer(GnmStage::Vertex, b.capture_slot, b.vertices, b.vertices_off);
+    be.BindBuffer(GnmStage::Vertex, b.params_slot, b.params, b.params_off);
+    GnmDraw d;
+    d.prim = MTLPrimitiveTypePoint;
+    d.count = g.count;
+    d.instances = g.instances;
+    d.base_instance = g.base_instance;
+    if (g.index_buffer) {
+        d.kind = GnmDrawKind::Indexed;
+        d.index_type = g.index_type;
+        d.index_buffer = g.index_buffer;
+        d.index_offset = g.index_offset;
+        d.index_length = g.index_length;
+        d.base_vertex = g.base_vertex;
+    } else {
+        d.vertex_start = g.vertex_start;
+    }
+    be.Draw(d);
     // The expansion's vertex shader reads what the capture's vertex shader wrote.
-    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers afterStages:MTLRenderStageVertex
-                   beforeStages:MTLRenderStageVertex];
-    [enc setRenderPipelineState:expand];
-    [enc setVertexBuffer:b.vertices offset:b.vertices_off atIndex:0];
-    [enc setVertexBuffer:b.slots offset:b.slots_off atIndex:1];
-    [enc setVertexBuffer:b.params offset:b.params_off atIndex:2];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:g.count / 3 * 6
-          instanceCount:g.instances baseInstance:g.base_instance];
+    be.Barrier(kGnmStageVertex, kGnmStageVertex, kGnmScopeBuffers);
+    be.SetRenderPipeline(expand);
+    be.BindBuffer(GnmStage::Vertex, 0, b.vertices, b.vertices_off);
+    be.BindBuffer(GnmStage::Vertex, 1, b.slots, b.slots_off);
+    be.BindBuffer(GnmStage::Vertex, 2, b.params, b.params_off);
+    GnmDraw e;
+    e.count = g.count / 3 * 6;
+    e.instances = g.instances;
+    e.base_instance = g.base_instance;
+    be.Draw(e);
 }
 
 // The Metal libraries of a RectList draw's two vertex shaders (capture and expansion), compiled in

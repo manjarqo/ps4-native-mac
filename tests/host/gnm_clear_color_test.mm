@@ -3,19 +3,18 @@
 // A fast-cleared colour target is cleared by the renderer with the colour decoded from the
 // CB_COLOR*_CLEAR_WORD registers. Integer and snorm formats were not decoded ("fast clear:
 // unsupported format 13" = R8Uint in Uncharted 4's chapter 1): the clear was skipped and the
-// target kept stale contents. Each case clears a 4x4 target with a render pass load action and
-// reads the texel back; the bits must be those of the clear words.
-#import <Foundation/Foundation.h>
-#import <Metal/Metal.h>
-
+// target kept stale contents. Each case clears a 4x4 target with a render pass load action of
+// the backend PS4_GNM_METAL selects (GnmLoad::Clear: Metal 3's or Metal 4's render pass
+// descriptor) and reads the texel back; the bits must be those of the clear words.
 #include <cstdio>
 #include <cstring>
 
+#include "backend_harness.h"
 #include "ps4_gnm_clear_color.h"
 
-namespace {
+using namespace ps4gnm;
 
-int g_fail = 0;
+namespace {
 
 struct Case {
     const char* name;
@@ -25,7 +24,7 @@ struct Case {
     uint8_t want[16];  // expected texel bytes
 };
 
-void Run(id<MTLDevice> dev, id<MTLCommandQueue> q, const Case& c) {
+void Run(id<MTLDevice> dev, GnmBackend& be, uint64_t seq, const Case& c) {
     MTLClearColor cc;
     if (!ps4gnm_clear::ClearColorFor(c.fmt, c.w0, c.w1, &cc)) {
         std::fprintf(stderr, "gnm_clear_color_test: FAIL %s: format %lu not decoded\n", c.name, (unsigned long)c.fmt);
@@ -36,15 +35,23 @@ void Run(id<MTLDevice> dev, id<MTLCommandQueue> q, const Case& c) {
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [dev newTextureWithDescriptor:td];
-    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    rp.colorAttachments[0].texture = t;
-    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-    rp.colorAttachments[0].clearColor = cc;
-    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLCommandBuffer> cb = [q commandBuffer];
-    [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
+    be.MakeResident(t, GnmResidencyClass::Texture);
+    GnmPassDesc pd;
+    pd.color[0].tex = t;
+    pd.color[0].load = GnmLoad::Clear;
+    pd.clear_color[0] = cc;
+    be.BeginCmd(GnmCmdTarget::Main, @"clear", false);
+    if (!be.BeginRender(pd)) {
+        std::fprintf(stderr, "gnm_clear_color_test: FAIL %s: no render pass\n", c.name);
+        g_fail++;
+        return;
+    }
+    be.EndEncoder();
+    if (!CommitAndWait(be, seq)) {
+        std::fprintf(stderr, "gnm_clear_color_test: FAIL %s: the clear did not complete\n", c.name);
+        g_fail++;
+        return;
+    }
     uint8_t px[16] = {};
     [t getBytes:px bytesPerRow:4 * c.bytes fromRegion:MTLRegionMake2D(1, 2, 1, 1) mipmapLevel:0];
     if (memcmp(px, c.want, c.bytes) != 0) {
@@ -66,7 +73,15 @@ int main() {
             std::fprintf(stderr, "gnm_clear_color_test: no Metal device\n");
             return 1;
         }
-        id<MTLCommandQueue> q = [dev newCommandQueue];
+        const char* env = getenv("PS4_GNM_METAL");
+        if (env && !strcmp(env, "4") && !RequireMetal4(dev, "gnm_clear_color_test")) return 0;
+        std::string why;
+        std::unique_ptr<GnmBackend> be = MakeTestBackend(dev, &why);
+        if (!be) {
+            std::fprintf(stderr, "gnm_clear_color_test: FAIL %s\n", why.c_str());
+            return 1;
+        }
+        std::printf("gnm_clear_color_test: backend %s\n", BackendName(be->Kind()));
         const Case cases[] = {
             {"R8Uint", MTLPixelFormatR8Uint, 0x000000C5, 0, 1, {0xC5}},
             {"R8Sint", MTLPixelFormatR8Sint, 0x000000F6, 0, 1, {0xF6}},
@@ -84,7 +99,8 @@ int main() {
             {"RGBA8Unorm", MTLPixelFormatRGBA8Unorm, 0x80FF4000, 0, 4, {0x00, 0x40, 0xFF, 0x80}},
             {"R32Uint", MTLPixelFormatR32Uint, 0x89ABCDEF, 0, 4, {0xEF, 0xCD, 0xAB, 0x89}},
         };
-        for (const Case& c : cases) Run(dev, q, c);
+        uint64_t seq = 0;
+        for (const Case& c : cases) Run(dev, *be, ++seq, c);
         if (g_fail) {
             std::fprintf(stderr, "gnm_clear_color_test: %d failure(s)\n", g_fail);
             return 1;

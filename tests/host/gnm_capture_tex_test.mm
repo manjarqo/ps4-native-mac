@@ -3,6 +3,8 @@
 // an entry re-created from its identity in another cache (what pass replay does), and the raw
 // layout of ReadRaw / WriteRaw (ps4gnm_capture::RawSize: levels, then slices, depth and stencil
 // planes of Depth32Float_Stencil8), checked against per-level / per-slice reads of the texture.
+// The caches run on the renderer backend PS4_GNM_METAL names (test_backend.h): command buffers on
+// its SideQueue, textures through its residency; on Metal 4 none is left resident at the end.
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,6 +13,7 @@
 #include <vector>
 
 #include "ps4_gnm_resources.h"
+#include "test_backend.h"
 
 // Runtime symbols ps4_gnm_resources.mm uses (the hitch counters and the Neo mode query).
 extern "C" uint64_t ps4_hitch_now_ns(void) { return 0; }
@@ -26,6 +29,15 @@ static int g_fail;
 static void check(bool ok, const char* what) {
     printf("%s: %s\n", ok ? "ok" : "FAIL", what);
     if (!ok) g_fail = 1;
+}
+
+// The renderer's residency hooks on a cache (TestTextureResidency).
+static void Attach(TextureCache& tc, TestTextureResidency& res) {
+    TextureCache::TextureHooks h;
+    h.ctx = &res;
+    h.created = TestTextureResidency::Created;
+    h.released = TestTextureResidency::Released;
+    tc.SetHooks(h);
 }
 
 static ColorTarget Rt(uint64_t addr) {
@@ -80,8 +92,10 @@ static bool SameId(const cap::GpuTextureId& a, const cap::GpuTextureId& b) {
            a.storage_mode == b.storage_mode && a.surface == b.surface;
 }
 
-static void test_identity(id<MTLDevice> dev, id<MTLCommandQueue> q, uint8_t* base, uint64_t size) {
+static void test_identity(id<MTLDevice> dev, TestTextureResidency& res, uint8_t* base, uint64_t size) {
+    id<MTLCommandQueue> q = res.be->SideQueue();
     TextureCache tc(dev, q, base, size);
+    Attach(tc, res);
     const uint64_t C = 0x100000, D = 0x200000;
     id<MTLTexture> ct = tc.GetColorTarget(Rt(C), false);
     id<MTLTexture> dt = tc.GetDepthTarget(Db(D));
@@ -121,6 +135,7 @@ static void test_identity(id<MTLDevice> dev, id<MTLCommandQueue> q, uint8_t* bas
     std::vector<uint8_t> back;
     check(tc.ReadRaw(ct, &back) && back == px, "ReadRaw returns what WriteRaw wrote");
     TextureCache tc2(dev, q, base, size);
+    Attach(tc2, res);
     check(tc2.FindGpuTexture(g, false) == nil, "a fresh cache has no entry");
     id<MTLTexture> made = tc2.FindGpuTexture(g, true);
     cap::GpuTextureId gm;
@@ -132,8 +147,10 @@ static void test_identity(id<MTLDevice> dev, id<MTLCommandQueue> q, uint8_t* bas
 }
 
 // Raw layout: level-major, then slices; checked against getBytes of each level and slice.
-static void test_layout(id<MTLDevice> dev, id<MTLCommandQueue> q, uint8_t* base, uint64_t size) {
+static void test_layout(id<MTLDevice> dev, TestTextureResidency& res, uint8_t* base, uint64_t size) {
+    id<MTLCommandQueue> q = res.be->SideQueue();
     TextureCache tc(dev, q, base, size);
+    Attach(tc, res);
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
     td.textureType = MTLTextureType2DArray;
     td.pixelFormat = MTLPixelFormatRGBA16Float;
@@ -212,18 +229,32 @@ static void test_layout(id<MTLDevice> dev, id<MTLCommandQueue> q, uint8_t* base,
 }
 
 int main() {
+    const char* backend = "none";
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         if (!dev) {
             printf("FAIL: no Metal device\n");
             return 1;
         }
-        id<MTLCommandQueue> q = [dev newCommandQueue];
+        const char* env = getenv("PS4_GNM_METAL");
+        if (env && !strcmp(env, "4") && !RequireMetal4(dev, "gnm_capture_tex_test")) return 0;
+        std::string why;
+        std::unique_ptr<GnmBackend> be = MakeTestBackend(dev, &why);
+        if (!be) {
+            printf("FAIL: no backend: %s\n", why.c_str());
+            return 1;
+        }
+        backend = BackendName(be->Kind());
+        TestTextureResidency res;
+        res.be = be.get();
         const uint64_t size = 16ull << 20;
         uint8_t* base = (uint8_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-        test_identity(dev, q, base, size);
-        test_layout(dev, q, base, size);
+        test_identity(dev, res, base, size);
+        test_layout(dev, res, base, size);
+        const size_t leaked = res.Leaked();
+        if (leaked) printf("%zu cache textures left resident\n", leaked);
+        check(leaked == 0, "no texture of a destroyed cache left in the backend's residency");
     }
-    printf("gnm_capture_tex_test: %s\n", g_fail ? "FAIL" : "PASS");
+    printf("gnm_capture_tex_test: %s [%s]\n", g_fail ? "FAIL" : "PASS", backend);
     return g_fail;
 }

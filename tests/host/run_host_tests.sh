@@ -28,10 +28,50 @@ gpu() {
   fi
   return $rc
 }
+# A renderer-level test on backend $1 (3 or 4); the rest is its command line. Metal 4 runs with
+# the bind-time residency check (PS4_GNM_RESIDENCY_CHECK=1): a resource reported not resident fails
+# the run, as does a run without the renderer's "backend metal$1" line (it did not start, or
+# started on the other backend). Shows the test's PASS / SKIP / FAIL lines tagged with the
+# backend; on a failure, its output without the translator's lines.
+rtest() {
+  local m=$1 rc=0
+  shift
+  local out="$T/rtest_$(basename "$1").txt"
+  ( export PS4_GNM_METAL=$m; [ "$m" = 4 ] && export PS4_GNM_RESIDENCY_CHECK=1; gpu "$@" ) > "$out" 2>&1 || rc=$?
+  if [ $rc -ne 0 ]; then
+    grep -v "^\[gcn " "$out" | tail -60; echo "$(basename "$1") $* on Metal $m: FAIL (rc=$rc)"; exit 1
+  fi
+  if grep "gnm-residency\] ASSERT" "$out"; then echo "$(basename "$1") on Metal $m: resources not resident"; exit 1; fi
+  if ! grep -q "^\[gnm-draw\] backend metal$m" "$out"; then
+    grep "^\[gnm-draw\] backend" "$out"; echo "$(basename "$1") on Metal $m: the renderer did not start on Metal $m"; exit 1
+  fi
+  grep -E ": (PASS|SKIP|FAIL)|^(PASS|SKIP|FAIL)" "$out" | sed "s/\$/ [metal$m]/" || true
+}
+# A test that drives a backend directly, on backend $1 (3 or 4), with Metal API validation when $2
+# is 1; the rest is its command line. Metal 4 runs with PS4_GNM_RESIDENCY_CHECK=1 (the backend reads
+# it in Init) and fails on a resource reported not resident.
+btest() {
+  local m=$1 dbg=$2 rc=0
+  shift 2
+  local out="$T/btest_$(basename "$1").txt"
+  ( export PS4_GNM_METAL=$m; [ "$m" = 4 ] && export PS4_GNM_RESIDENCY_CHECK=1; [ "$dbg" = 1 ] && export MTL_DEBUG_LAYER=1
+    gpu "$@" ) > "$out" 2>&1 || rc=$?
+  grep -v "Metal API Validation Enabled\|^\[gcn [WID]\]" "$out" || true
+  [ $rc -eq 0 ] || { echo "$(basename "$1") on Metal $m: FAIL (rc=$rc)"; exit 1; }
+  if grep -q "gnm-residency\] ASSERT" "$out"; then echo "$(basename "$1") on Metal $m: resources not resident"; exit 1; fi
+}
 "$R/tests/host/runtime_link_check.sh"
 clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/kernel/threading" "$R/tests/host/stall_profile_test.c" \
   "$R/pkg/runtime/kernel/threading/ps4_stall_profile.c" -o "$T/stall_profile_test"
 "$T/stall_profile_test"
+# The renderer's index of pending GPU writes (ps4_gnm_pending_writes.h) against the scan it replaces.
+clang++ -std=c++17 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/runtime/modules/libSceGnmDriver" \
+  "$R/tests/host/gnm_pending_writes_test.cc" -o "$T/gnm_pending_writes_test"
+"$T/gnm_pending_writes_test"
+# The PS4_SCREENSHOT_EVERY_SEC cadence: one shot at the first flip after each multiple of the period.
+clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/modules/libSceVideoOut" "$R/tests/host/screenshot_cadence_test.c" \
+  -o "$T/screenshot_cadence_test"
+"$T/screenshot_cadence_test"
 # libSceAudio3d on the real libSceAudioOut (headless device): panner, attribute validation, queue
 # levels and device-clock pacing, bed plus object mixed to a known output.
 A3="$R/pkg/runtime/modules/libSceAudio3d"
@@ -133,10 +173,15 @@ clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$VO" "$R/
 # the display takes the frame; the 1 s and 3-frame drops; a CPU-written display buffer.
 "$R/tests/host/build_runtime_test.sh" "$T/rt_test" "$R/tests/host/gnm_submit_flip_nonblocking_test.mm" \
   > "$T/rt_test_build.txt" 2>&1 || { cat "$T/rt_test_build.txt"; exit 1; }
-for mode in sync async nohooks; do
-  "$T/rt_test/gnm_submit_flip_nonblocking_test" $mode > "$T/flip_nonblocking.txt" 2>&1 || { cat "$T/flip_nonblocking.txt"; exit 1; }
-  grep "^gnm_submit_flip_nonblocking_test" "$T/flip_nonblocking.txt"
+for m in 3 4; do
+  for mode in sync async nohooks; do rtest $m "$T/rt_test/gnm_submit_flip_nonblocking_test" $mode; done
 done
+# The present producer's failure rule (ps4_metal_screen_present_failed): a failed command buffer's
+# present event is raised to its value only while that value is the newest of its event.
+"$R/tests/host/build_runtime_test.sh" "$T/rt_test" "$R/tests/host/present_fail_test.mm" \
+  > "$T/rt_test_build2.txt" 2>&1 || { cat "$T/rt_test_build2.txt"; exit 1; }
+"$T/rt_test/present_fail_test" > "$T/present_fail.txt" 2>&1 || { cat "$T/present_fail.txt"; exit 1; }
+grep "^present_fail_test" "$T/present_fail.txt"
 G="$R/pkg/runtime/modules/libSceGnmDriver"
 # Frame capture store (ps4_gnm_capture.cpp): snapshot dedup, register file and manifest round trip,
 # raw texture layout sizes, the documented per-format view mapping, thumbnails. No Metal.
@@ -152,10 +197,12 @@ clang++ -std=c++17 -Wall -Werror -g -fsanitize=address,undefined -I "$G" "$R/tes
 "$T/gnm_compute_wait_test" > "$T/gnm_compute_wait.txt" || { cat "$T/gnm_compute_wait.txt"; exit 1; }
 echo "gnm_compute_wait_test: PASS"
 "$T/gnm_ib_chain_test"
-# GPU windows over guest memory work with the guest NULL page guard on.
-clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/guest_window_test.mm" -framework Metal \
-  -framework Foundation -o "$T/guest_window_test"
-gpu "$T/guest_window_test"
+# GPU windows over guest memory work with the guest NULL page guard on; the GPU reads guest bytes
+# through them on each backend (Metal 4 with the windows resident, and the residency check).
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" -I "$R/tests/host" "$R/tests/host/guest_window_test.mm" \
+  "$G/ps4_gnm_backend.mm" "$G/ps4_gnm_backend_metal3.mm" "$G/ps4_gnm_backend_metal4.mm" "$G/ps4_gnm_residency.mm" \
+  "$G/ps4_gnm_util_passes.mm" -framework Metal -framework Foundation -o "$T/guest_window_test"
+for m in 3 4; do btest $m 0 "$T/guest_window_test"; done
 # Shader translator (3rdparty/gcn-recompiler) scalar reads on Metal: SRT reads at offsets only the
 # shader knows, s_buffer_load past num_records, and compute shaders dumped from Uncharted 4 (local
 # fixtures: a blur, the tiled lighting and the reflection-probe culling T# tables).
@@ -171,31 +218,130 @@ clang++ -std=c++17 -fobjc-arc -Wall -Werror -g -O1 -fsanitize=address,undefined 
   "$T/membudget.o" -framework Metal -framework Foundation -o "$T/gpu_membudget_test"
 gpu "$T/gpu_membudget_test" > "$T/gpu_membudget.txt" || { cat "$T/gpu_membudget.txt"; exit 1; }
 tail -1 "$T/gpu_membudget.txt"
+# Backend sources for tests that drive a backend directly (tests/host/test_backend.h).
+BE=("$G/ps4_gnm_backend.mm" "$G/ps4_gnm_backend_metal3.mm" "$G/ps4_gnm_backend_metal4.mm" "$G/ps4_gnm_residency.mm"
+    "$G/ps4_gnm_util_passes.mm")
 # Texture cache eviction: the policy and the real TextureCache on Metal (lifetime of textures used
-# by command buffers in flight, re-upload after eviction, GPU-write invalidation, GPU-owned surfaces).
+# by command buffers in flight, re-upload after eviction, GPU-write invalidation, GPU-owned surfaces),
+# on each backend: the backend's side queue and residency (no cache texture left resident on Metal 4).
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 -fsanitize=address,undefined \
-  -I "$G" -I "$R/pkg/runtime/core" "$R/tests/host/tex_evict_test.mm" "$G/ps4_gnm_resources.mm" "$G/ps4_gnm_capture.cpp" "$T/membudget.o" \
-  -framework Metal -framework Foundation -lz -o "$T/tex_evict_test"
-gpu "$T/tex_evict_test" > "$T/tex_evict.txt" 2>&1 || { cat "$T/tex_evict.txt"; exit 1; }
-tail -1 "$T/tex_evict.txt"
+  -I "$G" -I "$R/pkg/runtime/core" -I "$R/tests/host" "$R/tests/host/tex_evict_test.mm" "$G/ps4_gnm_resources.mm" \
+  "$G/ps4_gnm_capture.cpp" "$T/membudget.o" "${BE[@]}" -framework Metal -framework Foundation -lz -o "$T/tex_evict_test"
+for m in 3 4; do
+  ( export PS4_GNM_METAL=$m; gpu "$T/tex_evict_test" ) > "$T/tex_evict.txt" 2>&1 || { cat "$T/tex_evict.txt"; exit 1; }
+  tail -1 "$T/tex_evict.txt"
+done
+# Every texture the cache makes goes through TextureCache::NewTextureLocked, which reports it to the
+# residency hooks (Metal 4): no other texture creation (newTexture..., except views, which count as
+# their parent) in ps4_gnm_resources.mm.
+bad=$(awk '/^[A-Za-z].*[{] *$/ { fn = $0 } /^}/ { fn = "" } /newTexture/ && !/newTextureView/ && fn !~ /TextureCache::NewTextureLocked\(/ { print FILENAME ":" FNR ": " $0 }' "$G/ps4_gnm_resources.mm")
+[ -z "$bad" ] || { echo "texture creation outside TextureCache::NewTextureLocked (not reported to the residency hooks):"; echo "$bad"; exit 1; }
 # Frame capture on the TextureCache: entry identities, an entry re-created from its identity,
 # and the raw layout of ReadRaw / WriteRaw (levels, slices, depth and stencil planes).
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 -fsanitize=address,undefined \
-  -I "$G" -I "$R/pkg/runtime/core" "$R/tests/host/gnm_capture_tex_test.mm" "$G/ps4_gnm_resources.mm" "$G/ps4_gnm_capture.cpp" \
-  "$T/membudget.o" -framework Metal -framework Foundation -lz -o "$T/gnm_capture_tex_test"
-gpu "$T/gnm_capture_tex_test" > "$T/gnm_capture_tex.txt" 2>&1 || { cat "$T/gnm_capture_tex.txt"; exit 1; }
-tail -1 "$T/gnm_capture_tex.txt"
+  -I "$G" -I "$R/pkg/runtime/core" -I "$R/tests/host" "$R/tests/host/gnm_capture_tex_test.mm" "$G/ps4_gnm_resources.mm" \
+  "$G/ps4_gnm_capture.cpp" "$T/membudget.o" "${BE[@]}" -framework Metal -framework Foundation -lz -o "$T/gnm_capture_tex_test"
+for m in 3 4; do
+  ( export PS4_GNM_METAL=$m; gpu "$T/gnm_capture_tex_test" ) > "$T/gnm_capture_tex.txt" 2>&1 ||
+    { cat "$T/gnm_capture_tex.txt"; exit 1; }
+  tail -1 "$T/gnm_capture_tex.txt"
+done
 # Pass replay through the real renderer (tools/gnm_replay): a synthetic captured dispatch is
 # translated, bound and encoded by ps4draw::Dispatch and matches its capture byte for byte; an
 # altered capture is reported at the altered byte; seeded GPU-owned textures keep their contents.
 "$R/tools/gnm_replay/build.sh" "$T/replay" "$R/tests/host/gnm_replay_test.mm" "$R/tests/host/gnm_guest_memory_test.mm" \
   "$R/tests/host/gnm_buffer_over_target_test.mm" "$R/tests/host/gnm_tsharp_table_test.mm" \
+  "$R/tests/host/gnm_upload_bind_test.mm" "$R/tests/host/gnm_before_init_test.mm" "$R/tools/gnm_replay/gnm_replay.mm" \
+  "$R/tests/host/gnm_exit_test.mm" "$R/tests/host/gnm_crash_exit_test.mm" "$R/tests/host/gnm_alias_dma_test.mm" \
+  "$R/tests/host/gnm_compute_batch_test.mm" "$R/tests/host/gnm_detile_order_test.mm" \
   > "$T/replay_build.txt" 2>&1 || { cat "$T/replay_build.txt"; exit 1; }
-gpu "$T/replay/gnm_replay_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
+# Each case on both backends, Metal 4 with the residency check.
+for m in 3 4; do rtest $m "$T/replay/gnm_replay_test"; done
+# Guest windows that alias, through the renderer: GPU DMAs through a two-window and a one-window
+# buffer over the same memory; on Metal 3 a copy of bytes written through the other window waits
+# for that write once (not for other bytes, not after its seq completed) and reads what it wrote;
+# a fill after a copy of its bytes through the other window waits for the copy (write after
+# read); a job with two encoders orders its uses in each.
+for m in 3 4; do rtest $m "$T/replay/gnm_alias_dma_test"; done
+# Batched compute commits (ps4draw::FlushCompute): while 2 seqs are in flight the end of a
+# compute submission is held; two submissions share one compute encoder, a guest wait between them
+# is a barrier in it; a Flush commits held work at once, the release thread within the bound
+# (0.5 ms) or when the backlog drains, and the fence actions after it run. Encoder thread and
+# PS4_GNM_SYNC_ENCODE, both backends; "off": PS4_GNM_COMPUTE_BATCH=0 commits every submission at once.
+for m in 3 4; do
+  for mode in sync async off; do rtest $m "$T/replay/gnm_compute_batch_test" $mode; done
+done
+# PS4_GNM_MTL4_ONLY_CLEARS=1 (debug): a draw is skipped once its render pass began, the pass's
+# clear happens, and the draw is counted as skipped by the mode.
+( export PS4_GNM_MTL4_ONLY_CLEARS=1; rtest 4 "$T/replay/gnm_replay_test" only-clears )
+# PS4_GNM_METAL=4 through the whole renderer starts without the debug mode now that the Metal 4
+# backend has every capability; with PS4_GNM_MTL4_ONLY_CLEARS=1 (draws skipped) it still replays the
+# dispatch byte for byte.
+"$T/replay/gnm_replay_test" write-capture "$T/m4cap" > "$T/m4cap.txt" 2>&1 || { cat "$T/m4cap.txt"; exit 1; }
+for oc in 0 1; do
+  rc=0; ( export PS4_GNM_METAL=4; [ $oc = 1 ] && export PS4_GNM_MTL4_ONLY_CLEARS=1
+          "$T/replay/gnm_replay" "$T/m4cap/frame_1" 0 ) > "$T/m4_$oc.txt" 2>&1 || rc=$?
+  grep -q "backend metal4" "$T/m4_$oc.txt" && grep -q "^MATCH buffer" "$T/m4_$oc.txt" && [ $rc -eq 0 ] ||
+    { echo "Metal 4 (only clears $oc) did not replay the dispatch (rc=$rc)"; cat "$T/m4_$oc.txt"; exit 1; }
+done
+# gnm_replay --settle on the stable dispatch: judged on the second replay, never UNSTABLE-FIRST,
+# single pass (exit status and verdict) and range (no U line, the settled hash on the O line).
+for m in 3 4; do
+  rc=0; ( export PS4_GNM_METAL=$m; gpu "$T/replay/gnm_replay" "$T/m4cap/frame_1" 0 --settle ) > "$T/settle_$m.txt" 2>&1 || rc=$?
+  ( export PS4_GNM_METAL=$m; gpu "$T/replay/gnm_replay" "$T/m4cap/frame_1" all --sha --settle ) > "$T/settle_r$m.txt" 2>&1 || rc=$?
+  [ $rc -eq 0 ] && grep -q "^pass 0: BYTE-EXACT" "$T/settle_$m.txt" && ! grep -q "UNSTABLE-FIRST" "$T/settle_$m.txt" &&
+    grep -q "^O 0 buffer_0x" "$T/settle_r$m.txt" && ! grep -q "^U " "$T/settle_r$m.txt" ||
+    { echo "gnm_replay --settle (Metal $m, rc=$rc)"; cat "$T/settle_$m.txt" "$T/settle_r$m.txt"; exit 1; }
+done
+# The renderer's exit order: a program returning from main with GPU work in flight completes it
+# and destroys the backend before the renderer's static objects (gnm_exit_test.mm).
+for m in 3 4; do
+  for sync in 0 1; do
+    rc=0; ( export PS4_GNM_METAL=$m; [ $m = 4 ] && export PS4_GNM_RESIDENCY_CHECK=1
+            [ $sync = 1 ] && export PS4_GNM_SYNC_ENCODE=1
+            gpu "$T/replay/gnm_exit_test" ) > "$T/exit_$m.txt" 2>&1 || rc=$?
+    grep -q "^gnm_exit_test: PASS" "$T/exit_$m.txt" && grep -q "backend metal$m" "$T/exit_$m.txt" && [ $rc -eq 0 ] &&
+      ! grep -q "gnm-residency\] ASSERT" "$T/exit_$m.txt" ||
+      { echo "gnm_exit_test on Metal $m (sync encode $sync): FAIL (rc=$rc)"; cat "$T/exit_$m.txt"; exit 1; }
+    echo "$(grep "^gnm_exit_test" "$T/exit_$m.txt") [metal$m, sync encode $sync]"
+  done
+done
+# A crash with the GPU stalled ends at once (gnm_crash_exit_test.mm): the renderer's exit handler
+# does nothing after the crash handler's exit(1).
+for m in 3 4; do
+  rc=0; ( export PS4_GNM_METAL=$m; [ $m = 4 ] && export PS4_GNM_RESIDENCY_CHECK=1
+          gpu "$T/replay/gnm_crash_exit_test" ) > "$T/crash_$m.txt" 2>&1 || rc=$?
+  end=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
+  at=$(sed -n 's/^gnm_crash_exit_test: crashing at //p' "$T/crash_$m.txt")
+  took=$(awk -v a="$at" -v b="$end" 'BEGIN { if (a == "") print "none"; else printf "%.2f", b - a }')
+  grep -q "FATAL: Signal 11" "$T/crash_$m.txt" && [ $rc -eq 1 ] && [ "$took" != none ] && awk -v t="$took" 'BEGIN { exit !(t < 2) }' &&
+    ! grep -q "gnm-residency\] ASSERT" "$T/crash_$m.txt" ||
+    { echo "gnm_crash_exit_test on Metal $m: FAIL (rc=$rc, exit took ${took} s after the crash)"; cat "$T/crash_$m.txt"; exit 1; }
+  echo "gnm_crash_exit_test: PASS [metal$m: exit ${took} s after the crash]"
+done
+# The allocation counter of gnm_replay --allocs: counts this thread's calls only, and the
+# program refuses to report without the interposer (exit 3).
+clang -std=gnu11 -Wall -Werror "$R/tests/host/alloc_count_test.c" -o "$T/alloc_count_test"
+DYLD_INSERT_LIBRARIES="$T/replay/alloc_count.dylib" "$T/alloc_count_test"
+rc=0; "$T/alloc_count_test" > /dev/null || rc=$?
+[ $rc -eq 3 ] || { echo "alloc_count_test: without the interposer it did not refuse (rc=$rc)"; exit 1; }
 # Buffer stores over a GPU-owned surface, replayed pass by pass: a store covering the whole surface
 # makes the GPU copy guest memory into its texture before it is next sampled; a partial store
 # keeps the GPU-only contents; a storage write after the store survives (the copy runs first).
-gpu "$T/replay/gnm_buffer_over_target_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
+for m in 3 4; do rtest $m "$T/replay/gnm_buffer_over_target_test"; done
+# A texture uploaded on the GPU while a draw is being bound (upload command buffer): the draw's
+# encoder serial is unchanged (it is per target), so it is drawn, not skipped.
+for m in 3 4; do rtest $m "$T/replay/gnm_upload_bind_test"; done
+# The guest detile dispatch of a texture copied on the GPU behind pending writes (GpuUploadTexture),
+# in one seq: after the dispatch that wrote the tiled source (its barrier in that encoder), and two
+# detiles reusing the staging buffer of one size class, each after the earlier copy from it read it;
+# 2048x2048 surfaces, a slow producer writing the detile's first bytes last, 6 iterations with a new
+# pattern each, byte-exact. It fails with the detile's barrier removed or misplaced (both backends),
+# with untracked staging (Metal 3) and with PS4_GNM_MTL4_NO_BARRIERS=1 (Metal 4).
+for m in 3 4; do rtest $m "$T/replay/gnm_detile_order_test"; done
+# The entry points the command processor reaches before the renderer starts (compute barriers,
+# flushes, fence actions) do nothing and do not reach for the backend.
+gpu "$T/replay/gnm_before_init_test"
 # Buffer loads and stores through V#s a compute shader loads at run time (Uncharted 4's GPU copy
 # shader, capture r13c pass 21; local fixture; hand-assembled shaders cover the same paths
 # without it) through the renderer: probe, guest page table, dispatch; each
@@ -204,16 +350,17 @@ gpu "$T/replay/gnm_buffer_over_target_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|
 # meets a new page re-runs the dispatch without a second effect; after a barrier the CP waits for
 # such dispatches before it reads guest memory (also where a pass wrote outside its prediction:
 # a resource table, a cached texture), per queue; a miss is re-run without further work.
-gpu "$T/replay/gnm_guest_memory_test" "$FIX" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; } \
-  | tee -a "$T/fixture_cases.txt"
-# A result that never becomes final: the CP's wait and the command buffer throttle give up on the
-# GPU after the GPU timeout (separate runs: the renderer is hung afterwards).
-# The default mode (fast path not requested): every guest memory dispatch is waited for.
-gpu "$T/replay/gnm_guest_memory_test" "$FIX" default 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; } \
-  | tee -a "$T/fixture_cases.txt"
-for mode in hang-cp hang-throttle hang-fast-throttle; do
-  gpu "$T/replay/gnm_guest_memory_test" "$FIX" "$mode" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; } \
-    | tee -a "$T/fixture_cases.txt"
+# A result that never becomes final (hang-*): the CP's wait and the command buffer throttle give up
+# on the GPU after the GPU timeout (separate runs: the renderer is hung afterwards). default: the
+# fast path not requested, every guest memory dispatch is waited for. remap: windows dropped by
+# remaps (also while a seq that used them waits behind a gate) and released by the idle sweep, and
+# re-created under dispatches; on Metal 4 every bound resource must be resident (the bind-time
+# check, rtest) and dropped windows leave the guest residency set once their seqs completed. Every
+# mode on both backends.
+for m in 3 4; do
+  for mode in "" default hang-cp hang-throttle hang-fast-throttle remap; do
+    rtest $m "$T/replay/gnm_guest_memory_test" "$FIX" $mode | tee -a "$T/fixture_cases.txt"
+  done
 done
 # T# tables a compute shader indexes at run time (light records behind a V#, a table behind an
 # SRT pointer indexed through a buffer, a loop over N records), sampled and image_load_mip'd
@@ -223,16 +370,18 @@ done
 # at the CP's copy of the tables, not at encoding: a draw's VS and PS both read again after one
 # drain; a CP DMA pending at the copy in a captured frame (whose passes start encoding with the
 # GPU drained); with the encoder thread, a second reader encoded after the first one's drain.
-gpu "$T/replay/gnm_tsharp_table_test" 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
-for mode in capture async; do
-  gpu "$T/replay/gnm_tsharp_table_test" $mode 2>&1 | { grep -v "^\[gnm-\|^\[gcn \|^\[gpumem\]" || true; }
+for m in 3 4; do
+  for mode in "" capture async; do rtest $m "$T/replay/gnm_tsharp_table_test" $mode; done
 done
 # RectList draws: a translated vertex shader drawn as rectangles (capture, barrier, expansion);
-# the colours at all 4 corners of each rectangle, with Metal API validation on.
-clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_rectlist_test.mm" \
+# the colours at all 4 corners of each rectangle, with Metal API validation on, on each backend.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" -I "$R/tests/host" "$R/tests/host/gnm_rectlist_test.mm" \
+  "$G/ps4_gnm_backend.mm" "$G/ps4_gnm_backend_metal3.mm" "$G/ps4_gnm_backend_metal4.mm" "$G/ps4_gnm_residency.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gnm_rectlist_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-MTL_DEBUG_LAYER=1 gpu "$T/gnm_rectlist_test" 2>&1 | { grep -v "Metal API Validation Enabled" || true; }
+for m in 3 4; do
+  btest $m 1 "$T/gnm_rectlist_test"
+done
 # Shader permutations with another SRT program are found (not re-translated per draw up to the
 # cap), and the push constants bound cover the translated shaders' MSL struct.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" "$R/tests/host/gnm_shader_perm_test.mm" \
@@ -258,12 +407,6 @@ clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_runtime_sharp_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
 gpu "$T/gcn_runtime_sharp_test" 2>&1 | { grep -v "^\[gcn [WIDEC]\]\|^ImageRead at\|^ImageSampleRaw at" || true; }
-# Wave-level instructions executed on Metal: EXEC half writes in a wave64, V# dwords spilled to
-# VGPR lanes, a wave64 compare read from both halves.
-clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_wave_exec_test.mm" \
-  "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
-  -o "$T/gcn_wave_exec_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
-gpu "$T/gcn_wave_exec_test" 2>&1 | { grep -v "^\[gcn [WID]\]" || true; }
 # Mapping a compute queue drops its waiting submissions before the new mapping is published.
 RT_INC=$(find "$R/pkg/runtime" -type d | sed 's/^/-I/' | tr '\n' ' ')
 # shellcheck disable=SC2086
@@ -271,10 +414,78 @@ clang -std=gnu11 -Wall -Werror -g -fsanitize=address,undefined $RT_INC "$R/tests
   "$G/ps4_gnmdriver.c" -o "$T/gnm_compute_map_test"
 "$T/gnm_compute_map_test" > "$T/gnm_compute_map.txt" 2>&1 || { cat "$T/gnm_compute_map.txt"; exit 1; }
 echo "gnm_compute_map_test: PASS"
-# Fast-clear colours of integer/snorm targets.
-clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/gnm_clear_color_test.mm" -framework Metal \
-  -framework Foundation -o "$T/gnm_clear_color_test"
-gpu "$T/gnm_clear_color_test"
+# Fast-clear colours of integer/snorm targets, cleared by each backend's render pass.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" -I "$R/tests/host" "$R/tests/host/gnm_clear_color_test.mm" "${BE[@]}" \
+  -framework Metal -framework Foundation -o "$T/gnm_clear_color_test"
+for m in 3 4; do btest $m 0 "$T/gnm_clear_color_test"; done
+# Backend selection (ps4_gnm_backend.h): default, explicit choices, every refusal of "4" says why.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/gnm_backend_select_test.mm" "$G/ps4_gnm_backend.mm" \
+  "$G/ps4_gnm_backend_metal4.mm" "$G/ps4_gnm_residency.mm" -framework Metal -framework Foundation \
+  -o "$T/gnm_backend_select_test"
+"$T/gnm_backend_select_test"
+# Wave-level instructions executed on Metal through the backend, on both backends: EXEC half writes
+# in a wave64, V# dwords spilled to VGPR lanes, a wave64 compare read from both halves.
+clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" -I "$R/tests/host" "$R/tests/host/gcn_wave_exec_test.mm" \
+  "${BE[@]}" "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
+  -o "$T/gcn_wave_exec_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
+for m in 3 4; do
+  btest $m 0 "$T/gcn_wave_exec_test"
+done
+# Residency sets of the Metal 4 backend (ps4_gnm_residency.h): deferred removal in seq order,
+# cancellation, strong references, views, aborting misuse, and three threads at once (built with
+# ThreadSanitizer, which fails the run on a data race); Metal 4 GPU writes into a no-copy window
+# with and without a set (the negative control). The set-logic cases ignore PS4_GNM_METAL.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -g -fsanitize=thread -I "$G" -I "$R/tests/host" \
+  "$R/tests/host/gnm_residency_test.mm" "${BE[@]}" -framework Metal -framework Foundation -o "$T/gnm_residency_test"
+PS4_GNM_METAL=4 gpu "$T/gnm_residency_test"
+# Command buffers and the seq timeline on each backend: per-target encoder state, event order,
+# the seq split at events between render passes, compute dispatches, barriers and bindings,
+# destruction with work in flight; Metal 4 allocator reuse after completion, bounded allocator
+# memory, WaitForRoom on a stalled GPU.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" -I "$R/tests/host" "$R/tests/host/gnm_backend_cmd_test.mm" "${BE[@]}" \
+  -framework Metal -framework Foundation -o "$T/gnm_backend_cmd_test"
+for m in 3 4; do btest $m 0 "$T/gnm_backend_cmd_test"; done
+# Any other PS4_GNM_METAL value must not run (and report PASS for) a backend it did not name.
+if PS4_GNM_METAL=metal4 "$T/gnm_backend_cmd_test" > "$T/gnm_backend_cmd_bad_env.txt" 2>&1; then
+  echo "gnm_backend_cmd_test: FAIL: PS4_GNM_METAL=metal4 ran a backend"; exit 1
+fi
+grep -q "FATAL: PS4_GNM_METAL=metal4" "$T/gnm_backend_cmd_bad_env.txt" || { cat "$T/gnm_backend_cmd_bad_env.txt"; exit 1; }
+# A clear presented and read back (clear, present conversion, slot copy, ready signal) and the
+# render bindings of a draw (bytes past one Metal 4 arena chunk, buffer, buffer offset), equal on
+# both backends.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" -I "$R/tests/host" "$R/tests/host/gnm_backend_present_test.mm" "${BE[@]}" \
+  -framework Metal -framework Foundation -o "$T/gnm_backend_present_test"
+for m in 3 4; do btest $m 0 "$T/gnm_backend_present_test"; done
+# Every copy and fill on each backend (Metal 4 output compared with Metal 3's), dependent copies
+# in one copy group, the upload command buffer ordered before the main one.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" -I "$R/tests/host" "$R/tests/host/gnm_backend_copy_test.mm" "${BE[@]}" \
+  -framework Metal -framework Foundation -o "$T/gnm_backend_copy_test"
+for m in 3 4; do btest $m 0 "$T/gnm_backend_copy_test"; done
+# Every draw kind, SetFixed, depth/stencil, MSAA resolve with sample positions, array slices and an
+# indirect dispatch on each backend (Metal 4 output compared with Metal 3's).
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" -I "$R/tests/host" "$R/tests/host/gnm_backend_draw_test.mm" "${BE[@]}" \
+  -framework Metal -framework Foundation -o "$T/gnm_backend_draw_test"
+for m in 3 4; do btest $m 1 "$T/gnm_backend_draw_test"; done
+# Barrier coverage: a render pass sampling a texture a compute pass just wrote sees every texel,
+# on each backend; on Metal 4 without encoder barriers the test sees the race (its teeth).
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" -I "$R/tests/host" "$R/tests/host/gnm_backend_barrier_test.mm" "${BE[@]}" \
+  -framework Metal -framework Foundation -o "$T/gnm_backend_barrier_test"
+for m in 3 4; do btest $m 0 "$T/gnm_backend_barrier_test"; done
+# Guest windows that alias: accesses of the same bytes through a two-window and a one-window
+# buffer (same seq, next seq behind a gate), with Metal API validation: compute, blit and vertex
+# reads after a slow compute write, compute reads after a slow fragment write and after a large
+# blit fill, and a blit fill after a slow compute read (write after read). Ordered by the access
+# fences they all are right; unordered on Metal 3 each case goes wrong (the teeth). On Metal 4 the
+# encoder-start barriers order them (with PS4_GNM_MTL4_NO_BARRIERS=1 the tries fail).
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" -I "$R/tests/host" "$R/tests/host/gnm_backend_alias_test.mm" "${BE[@]}" \
+  -framework Metal -framework Foundation -o "$T/gnm_backend_alias_test"
+for m in 3 4; do btest $m 1 "$T/gnm_backend_alias_test"; done
+# Metal3Backend (ps4_gnm_backend_metal3.h): seq timeline and completion, upload before main,
+# queue event waits, per-target encoder serial.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/gnm_backend_metal3_test.mm" \
+  "$G/ps4_gnm_backend_metal3.mm" "$G/ps4_gnm_backend.mm" -framework Metal -framework Foundation \
+  -o "$T/gnm_backend_metal3_test"
+gpu "$T/gnm_backend_metal3_test"
 clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" "$R/tests/host/pso_archive_test.mm" "$G/ps4_gnm_pipeline_archive.mm" \
   "$G/ps4_gnm_library_store.mm" -framework Metal -framework Foundation -o "$T/pso_archive_test"
 A="$T/archive"; mkdir -p "$A"

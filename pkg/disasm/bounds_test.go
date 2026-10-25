@@ -174,4 +174,3 @@ func TestBlockSplitsOnMaxBytes(t *testing.T) {
 		t.Fatalf("block splitting should not record a cap hit, got %d cap hits", d.CapHits)
 	}
 }
-

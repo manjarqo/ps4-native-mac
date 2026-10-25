@@ -674,6 +674,18 @@ void* TestThread(void* argp) {
             }
         }
 
+        // The performance overlay names the backend the renderer started (PS4_GNM_METAL, default 3).
+        {
+            const char* want_env = getenv("PS4_GNM_METAL");
+            const char* want = want_env && !strcmp(want_env, "4") ? "Metal 4" : "Metal 3";
+            using Label = const char* (*)(void);
+            auto get = (Label)dlsym(RTLD_DEFAULT, "ps4_metal_screen_backend_label");
+            CHECK(get != nullptr, "ps4_metal_screen_backend_label is not exported");
+            const char* label = get ? get() : nullptr;
+            CHECK(label && !strcmp(label, want), "overlay backend label \"%s\", want \"%s\"", label ? label : "(none)",
+                  want);
+        }
+
         if (g_fail) {
             fprintf(stderr, "gnm_submit_flip_nonblocking_test %s: %d failure(s)\n", async ? "async" : "sync", g_fail);
             exit(1);

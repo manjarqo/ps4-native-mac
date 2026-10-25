@@ -75,7 +75,14 @@
 #include <vector>
 
 #include "gcn_recompiler.h"
+#include "ps4_gnm_backend_metal4.h"
 #include "ps4_gnm_draw.h"
+
+extern "C" void ps4_gnm_guest_remapped(uint64_t addr, uint64_t size);
+extern "C" void* ps4_gnm_debug_backend(void);
+extern "C" uint32_t ps4_gnm_debug_window_count(void);
+extern "C" uint32_t ps4_gnm_debug_arena_chunks(void);
+extern "C" uint64_t ps4_gnm_debug_sweep_released(void);
 
 namespace {
 
@@ -171,7 +178,7 @@ bool Load(const std::string& dir) {
 
 // Writes the code, the table and (fill) the buffers: sources hold 0xA5000000 | (entry << 16) |
 // dword, destinations kSentinel.
-void PrepareCopy(const std::vector<Entry>& entries, bool remove_dst_compare, bool fill = true) {
+void PrepareCopy(const std::vector<Entry>& entries, bool remove_dst_compare, bool fill = true, uint64_t table = kTable) {
     std::vector<uint8_t> code = g_code;
     if (remove_dst_compare) {
         // v_cmpx_gt_u32 s[2:3], s14, v0 (dst num_records > thread) at byte 0x74 -> two s_nop
@@ -186,21 +193,22 @@ void PrepareCopy(const std::vector<Entry>& entries, bool remove_dst_compare, boo
         code[216 + 16] ^= 0x5A;
     }
     memcpy(g_mem + kCode, code.data(), code.size());
-    memset(g_mem + kTable, 0, 512);
-    At(kTable)[72] = uint32_t(entries.size());
+    memset(g_mem + table, 0, 512);
+    At(table)[72] = uint32_t(entries.size());
     for (size_t i = 0; i < entries.size(); ++i) {
         const Entry& e = entries[i];
-        PutVsharp(At(kTable + 16 * i), e.src, 4, e.src_records, 0x20024004u);
-        if (e.null_dst) memset(At(kTable + 128 + 16 * i), 0, 16);
-        else PutVsharp(At(kTable + 128 + 16 * i), e.dst, 4, e.dst_records, e.dst_dword3);
-        At(kTable + 256)[i] = e.count;
+        PutVsharp(At(table + 16 * i), e.src, 4, e.src_records, 0x20024004u);
+        if (e.null_dst) memset(At(table + 128 + 16 * i), 0, 16);
+        else PutVsharp(At(table + 128 + 16 * i), e.dst, 4, e.dst_records, e.dst_dword3);
+        At(table + 256)[i] = e.count;
         for (uint32_t k = 0; fill && k < 64; ++k) {
             At(e.src)[k] = 0xA5000000u | uint32_t(i << 16) | k;
             if (!e.null_dst) At(e.dst)[k] = kSentinel;
         }
     }
     // the CPU wrote guest memory the renderer may have cached
-    ps4draw::NotifyGuestWrite(kTable, 4096, false, 0);
+    g_regs[0x2E40] = uint32_t(table); // COMPUTE_USER_DATA_0: the copy table
+    ps4draw::NotifyGuestWrite(table, 4096, false, 0);
 }
 
 // PrepareCopy, then one dispatch of 64 threads, waited for. after_dispatch: the renderer's
@@ -1163,6 +1171,100 @@ void TestDefaultIsSync() {
           (unsigned long long)(s1.sync - s0.sync), (unsigned long long)(s1.fast - s0.fast));
 }
 
+// On Metal 4: the guest residency set holds no more than the live windows and arena chunks once
+// the GPU is idle and a seq after the last drop completed (dropped windows left their set). A drop
+// waits for the open seq: the copy run here commits it (and re-creates its windows).
+void CheckGuestResidency(const Entry& e, const char* what) {
+    Run({e}, false);
+    CheckCopy(e, 0, what);
+    auto* be = static_cast<ps4gnm::GnmBackend*>(ps4_gnm_debug_backend());
+    CHECK(be != nullptr, "no backend");
+    if (!be || be->Kind() != ps4gnm::GnmBackendKind::Metal4) return;
+    auto& m4 = static_cast<ps4gnm::Metal4Backend&>(*be);
+    m4.Residency().Retire(m4.CompletedSeq());
+    const uint32_t windows = ps4_gnm_debug_window_count(), chunks = ps4_gnm_debug_arena_chunks();
+    const size_t guest = m4.Residency().Count(ps4gnm::GnmResidencyClass::Guest);
+    CHECK(guest <= windows + chunks, "%s: guest residency %zu > live windows %u + arena chunks %u: dropped windows stayed resident",
+          what, guest, windows, chunks);
+}
+
+// Windows dropped and re-created many times while dispatches use them, on each backend:
+// - remaps of their guest memory (the source's and the destination's 64 MiB windows, after every
+//   copy but the one before a pause);
+// - the idle sweep (PS4_GNM_GPU_WINDOW_IDLE_S=1): every 40 copies the windows sit idle for 1.2 s,
+//   then a command buffer that binds no window (a GPU fill of an arena chunk) commits and its sweep
+//   releases them (counted). A guest memory dispatch would not do: it reaches every window through
+//   the guest page table, which counts as a use of each;
+// - drops while a seq that used the window is in flight (TestInflightDrops).
+// Every copy is right (a re-created window is a new no-copy buffer: on Metal 4 it must be in a
+// residency set before its dispatch, and a dropped one must stay in it until the seqs that may use
+// it completed, or their copies are lost), and every 40 copies the guest residency set is checked
+// (CheckGuestResidency), whatever the copies gave.
+void TestRemapSweepStress() {
+    const Entry e{kSrc, kDst, 24, 24, 24};
+    uint64_t swept = 0;
+    for (int i = 0; i < 200; ++i) {
+        Run({e}, false);
+        CheckCopy(e, 0, "remap stress");
+        if (i % 40 != 39) {
+            ps4_gnm_guest_remapped(kSrc & ~((64ull << 20) - 1), 64ull << 20);
+            ps4_gnm_guest_remapped(kDst & ~((64ull << 20) - 1), 64ull << 20);
+            continue;
+        }
+        // the windows go idle; the sweep at the next commit (over a second later, binding none of
+        // them) releases them
+        usleep(1200 * 1000);
+        const uint32_t live = ps4_gnm_debug_window_count();
+        const uint64_t r0 = ps4_gnm_debug_sweep_released();
+        std::vector<uint8_t> fill;
+        CHECK(ps4draw::DebugArenaGpuFill(0x5A, 16, &fill) && fill.size() == 16 && fill[0] == 0x5A, "the GPU fill");
+        const uint64_t r = ps4_gnm_debug_sweep_released() - r0;
+        CHECK(live >= 3 && r == live, "iteration %d: the idle sweep released %llu of %u idle windows", i,
+              (unsigned long long)r, live);
+        swept += r;
+        CheckGuestResidency(e, "remap stress, residency after a sweep");
+    }
+    printf("gnm_guest_memory_test remap: the idle sweep released %llu windows; %u windows live at the end\n",
+           (unsigned long long)swept, ps4_gnm_debug_window_count());
+}
+
+// Windows dropped by a remap while a seq that used them has not run yet; the GPU is held by a
+// gate (DebugGpuWait) until the drops are done, so "in flight" does not depend on timing.
+// - committed: copy 1 is committed (Flush(false)) behind the gate, the windows are remapped, copy 2
+//   (same windows: new buffers) drops the old ones while copy 1 waits;
+// - open: copy 1 is encoded into the open command buffer, the windows are remapped, copy 2 drops
+//   them within the same command buffer.
+// Each copy has its own table and destination, so a lost copy shows. Then on Metal 4 the residency
+// check as above.
+void TestInflightDrops() {
+    auto* be = static_cast<ps4gnm::GnmBackend*>(ps4_gnm_debug_backend());
+    CHECK(be != nullptr, "no backend");
+    if (!be) return;
+    constexpr uint64_t kTable2 = kTable + 0x1000;
+    for (int round = 0; round < 20; ++round) {
+        const bool committed = round % 2 == 0;
+        const Entry e1{kSrc + 0x300000, kDst + 0x300000, 24, 24, 24};
+        const Entry e2{kSrc + 0x400000, kDst + 0x400000, 20, 20, 20};
+        id<MTLSharedEvent> gate = [be->Device() newSharedEvent];
+        ps4draw::DebugGpuWait((__bridge void*)gate, 1); // the GPU work encoded from now on waits
+        PrepareCopy({e1}, false);
+        ps4draw::Dispatch(&g_ctx, g_regs.data(), 1, 1, 1, 0, "gfx", ps4draw::kQueueGfx);
+        if (committed) ps4draw::Flush(false);
+        ps4_gnm_guest_remapped(kSrc & ~((64ull << 20) - 1), 64ull << 20);
+        ps4_gnm_guest_remapped(kDst & ~((64ull << 20) - 1), 64ull << 20);
+        PrepareCopy({e2}, false, true, kTable2); // its GuestBuffer drops the old windows
+        ps4draw::Dispatch(&g_ctx, g_regs.data(), 1, 1, 1, 0, "gfx", ps4draw::kQueueGfx);
+        ps4draw::Flush(false);
+        gate.signaledValue = 1;
+        ps4draw::Flush(true);
+        g_regs[0x2E40] = uint32_t(kTable);
+        const char* what = committed ? "drop under a committed seq" : "drop under the open seq";
+        CheckCopy(e1, 0, what);
+        CheckCopy(e2, 0, what);
+    }
+    CheckGuestResidency(Entry{kSrc, kDst, 24, 24, 24}, "residency after in-flight drops");
+}
+
 void OnAlarm(int) {
     static const char msg[] = "gnm_guest_memory_test: FAIL a wait did not end (60 s)\n";
     (void)!write(2, msg, sizeof(msg) - 1);
@@ -1194,15 +1296,14 @@ int main(int argc, char** argv) {
         if (mode != "default") setenv("PS4_GNM_GUEST_MEMORY_FAST", "1", 1);
         else unsetenv("PS4_GNM_GUEST_MEMORY_FAST");
         if (mode == "default") {
+        } else if (mode == "remap") {
+            setenv("PS4_GNM_GPU_WINDOW_IDLE_S", "1", 1); // the sweep releases windows idle for a second
+            signal(SIGALRM, OnAlarm);
+            alarm(60);
         } else if (!mode.empty()) {
             if (mode != "hang-cp" && mode != "hang-throttle" && mode != "hang-fast-throttle") {
                 fprintf(stderr, "gnm_guest_memory_test: unknown mode %s\n", mode.c_str());
                 return 2;
-            }
-            if (!copy_shader) { // every hang-* run dispatches the copy shader
-                PrintSkip(mode.c_str(), missing);
-                printf("gnm_guest_memory_test %s: SKIP (needs a local fixture)\n", mode.c_str());
-                return 0;
             }
             setenv("PS4_GNM_GPU_TIMEOUT", "300", 1);
             signal(SIGALRM, OnAlarm);
@@ -1221,9 +1322,11 @@ int main(int argc, char** argv) {
             fprintf(stderr, "gnm_guest_memory_test: FAIL the renderer did not start\n");
             return 1;
         }
-        if (mode == "default" && !copy_shader) {
-            PrintSkip("default", missing);
-            printf("gnm_guest_memory_test default: SKIP (needs a local fixture)\n");
+        // default, remap and every hang-* run dispatch the copy shader; they skip after Init, so
+        // the renderer's backend line is in their output
+        if (!mode.empty() && !copy_shader) {
+            PrintSkip(mode.c_str(), missing);
+            printf("gnm_guest_memory_test %s: SKIP (needs a local fixture)\n", mode.c_str());
             return 0;
         }
         if (mode == "default") {
@@ -1234,6 +1337,15 @@ int main(int argc, char** argv) {
             }
             printf("gnm_guest_memory_test default: PASS\n");
             return 0;
+        }
+        if (mode == "remap") {
+            TestRemapSweepStress();
+            TestInflightDrops();
+            if (g_fail) fprintf(stderr, "gnm_guest_memory_test remap: %d failure(s)\n", g_fail);
+            else printf("gnm_guest_memory_test remap: PASS\n");
+            fflush(stdout);
+            fflush(stderr);
+            _exit(g_fail ? 1 : 0);
         }
         if (!mode.empty()) {
             // the GPU stays held behind the withheld result: leave without tearing Metal down

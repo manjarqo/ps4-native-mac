@@ -7,8 +7,12 @@
 // target and checks the colour at all 4 corners of every rectangle (the 4th corner's colour is
 // the sum of its neighbours' minus the corner's), the centre, and that nothing is drawn outside.
 // Rectangles have their corner at vertex 0, 1 and 2, in both windings; draws are non-indexed
-// from vertex 0, non-indexed from a later vertex, indexed (16-bit indices, base vertex),
-// instanced, and with back faces culled (a rectangle is drawn whole or not at all).
+// from vertex 0, non-indexed from a later vertex, indexed (16-bit indices, base vertex; 32-bit
+// indices), instanced, from base instance 2 (with a second vertex shader that moves its rectangles
+// right by 16 pixels per instance index, so the base instance shows in the image), and with back
+// faces culled (a rectangle is drawn whole or not at all).
+// It runs on the backend PS4_GNM_METAL selects (backend_harness.h), with every buffer and texture
+// the draws use made resident (Metal 4).
 // It also runs the renderer's background compile of the two RectList shaders
 // (ps4gnm_rect::CompileLibrary) from a stack frame that is gone before Metal completes, and
 // their compile on the calling thread (ps4gnm_rect::CompileLibraryNow, PS4_GNM_SYNC_COMPILE=1).
@@ -19,26 +23,17 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
+#include "backend_harness.h"
 #include "gcn_recompiler.h"
 #include "ps4_gnm_rectlist.h"
 
 namespace {
-
-int g_fail = 0;
-#define CHECK(c, ...)                                                                    \
-    do {                                                                                 \
-        if (!(c)) {                                                                      \
-            std::fprintf(stderr, "gnm_rectlist_test: FAIL %s:%d: ", __FILE__, __LINE__); \
-            std::fprintf(stderr, __VA_ARGS__);                                           \
-            std::fprintf(stderr, "\n");                                                  \
-            g_fail++;                                                                    \
-        }                                                                                \
-    } while (0)
 
 constexpr uint64_t kGuestBase = 0x10000000;
 constexpr uint64_t kGuestSize = 1u << 20;
@@ -106,19 +101,26 @@ fragment float4 main0(In in [[stage_in]]) { return in.color; }
 
 struct Fixture {
     id<MTLDevice> dev;
-    id<MTLCommandQueue> q;
+    std::unique_ptr<ps4gnm::GnmBackend> be; // encodes the draws, as in the renderer
+    uint64_t n_commits = 0;
     Guest g;
     gcn_shader* vs = nullptr;
     gcn_shader_info info{};
     gcn_rectlist_msl rect{};
     id<MTLRenderPipelineState> capture, expand;
     uint32_t ud[16] = {};
+    bool by_instance = false; // the vertex shader adds 16 * instance index (v3) to x
     uint64_t code_addr = kGuestBase, vtx_addr = kGuestBase + 0x1000;
 };
 
 bool Setup(Fixture& f) {
-    f.q = [f.dev newCommandQueue];
+    std::string why;
+    f.be = MakeTestBackend(f.dev, &why);
+    CHECK(f.be != nullptr, "backend: %s", why.c_str());
+    if (!f.be) return false;
+    std::printf("gnm_rectlist_test: backend %s\n", ps4gnm::BackendName(f.be->Kind()));
     f.g.buf = [f.dev newBufferWithLength:kGuestSize options:MTLResourceStorageModeShared];
+    f.be->MakeResident(f.g.buf, ps4gnm::GnmResidencyClass::Guest);
     std::memset(f.g.buf.contents, 0, kGuestSize);
     // user data s[4:7]: V# of the vertices; v0: vertex index
     //   buffer_load_dwordx4 v[1:4], v0, s[4:7], 0 idxen            ; position
@@ -127,9 +129,14 @@ bool Setup(Fixture& f) {
     //   exp pos0 v1, v2, v3, v4 done
     //   exp param0 v5, v6, v7, v8
     //   s_endpgm
-    const auto prog = WithFooter({0xE0382000, 0x80010100, 0xE0382010, 0x80010500, 0xBF8C0F70, 0xF80008CF,
-                                  0x04030201, 0xF800020F, 0x08070605, 0xBF810000},
-                                 0x5EC71157D0000001ULL);
+    // by_instance (v3: instance index, VGPR_COMP_CNT 3), before the loads overwrite v3:
+    //   v_lshlrev_b32 v9, 4, v3; and after s_waitcnt: v_cvt_f32_u32 v9, v9; v_add_f32 v1, v9, v1
+    std::vector<uint32_t> body;
+    if (f.by_instance) body.push_back(0x34120684);
+    body.insert(body.end(), {0xE0382000, 0x80010100, 0xE0382010, 0x80010500, 0xBF8C0F70});
+    if (f.by_instance) body.insert(body.end(), {0x7E120D09, 0x06020309});
+    body.insert(body.end(), {0xF80008CF, 0x04030201, 0xF800020F, 0x08070605, 0xBF810000});
+    const auto prog = WithFooter(body, f.by_instance ? 0x5EC71157D0000002ULL : 0x5EC71157D0000001ULL);
     std::memcpy(f.g.p(f.code_addr), prog.data(), prog.size() * 4);
     VertexSharp(&f.ud[4], f.vtx_addr, 64);
 
@@ -139,6 +146,7 @@ bool Setup(Fixture& f) {
     rt.hw_stage = GCN_HW_VS;
     rt.sw_stage = GCN_SW_VERTEX;
     rt.num_allocated_vgprs = 12;
+    rt.num_input_vgprs = f.by_instance ? 3 : 0;
     rt.num_user_data = 8;
     rt.vs.clip_disable = true; // RectList: screen-space positions
     gcn_compile_desc d{};
@@ -190,6 +198,8 @@ struct DrawCase {
     int32_t base_vertex = 0;
     uint32_t instances = 1;
     bool cull_back = false;      // cull back faces, clockwise (in screen space, y down) is front
+    bool idx32 = false;          // indexed: 32-bit indices
+    uint32_t base_instance = 0;
 };
 
 std::vector<float> Render(Fixture& f, const DrawCase& c) {
@@ -197,6 +207,7 @@ std::vector<float> Render(Fixture& f, const DrawCase& c) {
     const uint32_t nv = uint32_t(c.rects.size() * 3);
     std::vector<Vertex> verts(64);
     std::vector<uint16_t> idx;
+    std::vector<uint32_t> idx32;
     for (uint32_t r = 0; r < c.rects.size(); r++) {
         for (uint32_t k = 0; k < 3; k++) {
             const uint32_t i = r * 3 + k;
@@ -205,6 +216,7 @@ std::vector<float> Render(Fixture& f, const DrawCase& c) {
             v = {{c.rects[r].x[k], c.rects[r].y[k], 0.5f, 1.f},
                  {c.rects[r].c[k][0], c.rects[r].c[k][1], c.rects[r].c[k][2], c.rects[r].c[k][3]}};
             if (c.indexed) idx.push_back(uint16_t(nv - 1 - i));
+            if (c.indexed) idx32.push_back(nv - 1 - i);
         }
     }
     std::memcpy(f.g.p(f.vtx_addr), verts.data(), verts.size() * sizeof(Vertex));
@@ -214,21 +226,25 @@ std::vector<float> Render(Fixture& f, const DrawCase& c) {
     td.usage = MTLTextureUsageRenderTarget;
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> rt = [f.dev newTextureWithDescriptor:td];
-    MTLRenderPassDescriptor* pd = [MTLRenderPassDescriptor renderPassDescriptor];
-    pd.colorAttachments[0].texture = rt;
-    pd.colorAttachments[0].loadAction = MTLLoadActionClear;
-    pd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
-    pd.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLCommandBuffer> cb = [f.q commandBuffer];
-    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pd];
+    ps4gnm::GnmBackend& be = *f.be;
+    be.MakeResident(rt, ps4gnm::GnmResidencyClass::Texture);
+    be.BeginCmd(ps4gnm::GnmCmdTarget::Main, @"rectlist test", false);
+    ps4gnm::GnmPassDesc pd;
+    pd.color[0].tex = rt;
+    pd.color[0].load = ps4gnm::GnmLoad::Clear;
+    pd.clear_color[0] = MTLClearColorMake(0, 0, 0, 0);
+    CHECK(be.BeginRender(pd), "%s: no render encoder", c.name);
     // Clip disabled: the shader maps screen space [0, 16384) to NDC with y down (Vulkan's
     // convention); the renderer's viewport for such draws (DecodeRenderState) maps it back with a
-    // negative height. Winding stays that of screen space.
-    [enc setViewport:MTLViewport{0, 16384, 16384, -16384, 0, 1}];
-    if (c.cull_back) {
-        [enc setCullMode:MTLCullModeBack];
-        [enc setFrontFacingWinding:MTLWindingClockwise];
-    }
+    // negative height. Winding stays that of screen space. The scissor is Metal's default for the
+    // kSize target.
+    ps4gnm::GnmFixedState fx{};
+    fx.vp = MTLViewport{0, 16384, 16384, -16384, 0, 1};
+    fx.sc = MTLScissorRect{0, 0, kSize, kSize};
+    fx.cull = c.cull_back ? (uint32_t)MTLCullModeBack : (uint32_t)MTLCullModeNone;
+    fx.winding = (uint32_t)MTLWindingClockwise;
+    be.SetFixed(fx, ps4gnm::kGnmFixedViewport | ps4gnm::kGnmFixedScissor | ps4gnm::kGnmFixedCull |
+                        ps4gnm::kGnmFixedWinding);
 
     // the vertex shader's resources, as the renderer binds them
     std::vector<uint32_t> flat(f.info.flatbuf_size_dw);
@@ -240,17 +256,17 @@ std::vector<float> Render(Fixture& f, const DrawCase& c) {
         gcn_shader_get_buffer(f.vs, i, &b);
         for (uint32_t k = 0; k < b.num_msl_buffers; k++) {
             if (b.type == GCN_BUFFER_FLATBUF) {
-                [enc setVertexBytes:flat.data() length:flat.size() * 4 atIndex:b.msl_buffers[k]];
+                be.BindBytes(ps4gnm::GnmStage::Vertex, b.msl_buffers[k], flat.data(), flat.size() * 4);
             } else if (b.type == GCN_BUFFER_GUEST) {
                 uint32_t v[4];
                 gcn_buffer_desc bd{};
                 gcn_shader_fetch_buffer_sharp(f.vs, i, flat.data(), f.code_addr, v);
                 gcn_decode_buffer(v, &bd);
-                [enc setVertexBuffer:f.g.buf offset:bd.base_address - kGuestBase atIndex:b.msl_buffers[k]];
+                be.BindBuffer(ps4gnm::GnmStage::Vertex, b.msl_buffers[k], f.g.buf, bd.base_address - kGuestBase);
                 if (b.buffer_slot < GCN_MAX_BUFFERS) push.buf_sizes[b.buffer_slot] = bd.size_bytes;
             } else {
                 // clip planes etc.: unused by this shader, any buffer
-                [enc setVertexBuffer:f.g.buf offset:0 atIndex:b.msl_buffers[k]];
+                be.BindBuffer(ps4gnm::GnmStage::Vertex, b.msl_buffers[k], f.g.buf, 0);
             }
         }
     }
@@ -259,15 +275,16 @@ std::vector<float> Render(Fixture& f, const DrawCase& c) {
         // the MSL struct is padded to 16 bytes
         uint8_t pb[(sizeof(push) + 15) / 16 * 16] = {};
         std::memcpy(pb, &push, sizeof(push));
-        [enc setVertexBytes:pb length:sizeof(pb) atIndex:(NSUInteger)f.info.msl_push_constant_buffer];
+        be.BindBytes(ps4gnm::GnmStage::Vertex, (uint32_t)f.info.msl_push_constant_buffer, pb, sizeof(pb));
     }
 
     // the renderer's encoding
     std::vector<uint32_t> slots(nv);
-    const uint32_t per_instance = ps4gnm_rect::BuildSlots(c.indexed ? idx.data() : nullptr, false, nv, slots.data());
+    const void* indices = !c.indexed ? nullptr : c.idx32 ? (const void*)idx32.data() : (const void*)idx.data();
+    const uint32_t per_instance = ps4gnm_rect::BuildSlots(indices, c.idx32, nv, slots.data());
     CHECK(per_instance > 0, "%s: BuildSlots rejected %u vertices", c.name, nv);
-    id<MTLBuffer> ib = c.indexed ? [f.dev newBufferWithBytes:idx.data() length:idx.size() * 2
-                                                     options:MTLResourceStorageModeShared]
+    const size_t ib_bytes = !c.indexed ? 0 : c.idx32 ? idx32.size() * 4 : idx.size() * 2;
+    id<MTLBuffer> ib = c.indexed ? [f.dev newBufferWithBytes:indices length:ib_bytes options:MTLResourceStorageModeShared]
                                  : nil;
     id<MTLBuffer> sb = [f.dev newBufferWithBytes:slots.data() length:slots.size() * 4 options:MTLResourceStorageModeShared];
     id<MTLBuffer> pb = [f.dev newBufferWithBytes:&per_instance length:4 options:MTLResourceStorageModeShared];
@@ -275,20 +292,41 @@ std::vector<float> Render(Fixture& f, const DrawCase& c) {
     const size_t cap_bytes = size_t(per_instance + c.first) * c.instances * f.rect.vertex_stride;
     id<MTLBuffer> vb = [f.dev newBufferWithLength:cap_bytes options:MTLResourceStorageModeShared];
     std::memset(vb.contents, 0x7F, cap_bytes);
+    for (id<MTLBuffer> b : {ib, sb, pb, vb})
+        if (b) be.MakeResident(b, ps4gnm::GnmResidencyClass::Guest);
     ps4gnm_rect::Geometry geo;
     geo.count = nv;
     geo.instances = c.instances;
+    geo.base_instance = c.base_instance;
     geo.vertex_start = c.first;
     geo.base_vertex = c.base_vertex;
     geo.index_buffer = ib;
-    geo.index_type = MTLIndexTypeUInt16;
+    geo.index_type = c.idx32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
+    geo.index_length = ib_bytes;
     ps4gnm_rect::Buffers bufs{vb, 0, sb, 0, pb, 0, f.rect.capture_buffer, f.rect.params_buffer};
-    ps4gnm_rect::Encode(enc, f.capture, f.expand, geo, bufs);
-    [enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
-    CHECK(cb.status == MTLCommandBufferStatusCompleted, "%s: command buffer failed: %s", c.name,
-          cb.error.localizedDescription.UTF8String);
+    ps4gnm_rect::Encode(be, f.capture, f.expand, geo, bufs);
+    be.EndEncoder();
+    struct Done {
+        dispatch_semaphore_t sem;
+        bool failed;
+        std::string error;
+    };
+    // on the heap: if the command buffer hangs past the wait, its completion still has a Done to
+    // write to (leaked on that failure path only)
+    Done* done = new Done{dispatch_semaphore_create(0), false, {}};
+    be.Commit(
+        1 + f.n_commits++,
+        [](void* p, const ps4gnm::GnmCompletion& r) {
+            Done* d = static_cast<Done*>(p);
+            d->failed = r.failed;
+            if (r.error) d->error = r.error.localizedDescription.UTF8String;
+            dispatch_semaphore_signal(d->sem);
+        },
+        done);
+    const bool completed = dispatch_semaphore_wait(done->sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) == 0;
+    CHECK(completed && !done->failed, "%s: command buffer %s %s", c.name, completed ? "failed:" : "hung",
+          completed ? done->error.c_str() : "");
+    if (completed) delete done;
     std::vector<float> px(kSize * kSize * 4);
     [rt getBytes:px.data() bytesPerRow:kSize * 16 fromRegion:MTLRegionMake2D(0, 0, kSize, kSize) mipmapLevel:0];
     return px;
@@ -451,8 +489,27 @@ int main() {
             {"indexed with base vertex", {b, d, a}, 0, true, 5, 1},
             {"instanced", {cr, a}, 0, false, 0, 3},
             {"back faces culled", {a, b, cr, d}, 0, false, 0, 1, true},
+            {"indexed, 32-bit indices", {b, d, a}, 0, true, 5, 1, false, true},
         };
         for (const DrawCase& c : cases) CheckRects(c, Render(f, c));
+        // the vertex shader that reads the instance index: one instance from base instance 2 draws
+        // its rectangles 32 pixels to the right
+        Fixture fi;
+        fi.dev = f.dev;
+        fi.by_instance = true;
+        if (!Setup(fi)) return 1;
+        const DrawCase from_base[] = {
+            {"base instance 2", {a, d}, 0, false, 0, 1, false, false, 2},
+            {"indexed, 32-bit indices, base instance 2", {a, d}, 0, true, 5, 1, false, true, 2},
+        };
+        for (const DrawCase& c : from_base) {
+            DrawCase want = c;
+            for (TestRect& r : want.rects)
+                for (float& x : r.x) x += 16.0f * c.base_instance;
+            CheckRects(want, Render(fi, c));
+        }
+        gcn_rectlist_msl_free(&fi.rect);
+        gcn_shader_destroy(fi.vs);
         CheckBackgroundCompile(f);
         CheckSyncCompile(f);
         gcn_rectlist_msl_free(&f.rect);

@@ -4,14 +4,19 @@
 // altered is reported as a mismatch at the altered byte; a pass that is not replayable is
 // refused with its reason; GPU-owned textures created from captured identities hold the
 // captured contents (mip levels, depth and stencil planes); replay_props decodes and measures
-// replayed outputs.
+// replayed outputs; each draw kind (32-bit indexed with a start index and base vertex, instanced
+// with a start instance, indexed indirect up to max_index, indirect) draws exactly its columns,
+// and an indirect dispatch takes its dimensions from the argument record; a settled replay (--settle)
+// reports a first replay that differs as UNSTABLE-FIRST and never a stable one.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <CommonCrypto/CommonDigest.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include <string>
 #include <vector>
@@ -62,17 +67,47 @@ std::vector<uint32_t> WithFooter(const std::vector<uint32_t>& body, uint64_t has
 // Writes <root>/frame_1 with one replayable dispatch: v2 = v0 << 2; v1 = v0;
 // buffer_store_dword v1, v2, s[4:7] offen (64 threads, out[i] = i). corrupt_at >= 0: the
 // captured output has byte corrupt_at changed.
-std::string WriteCapture(const std::string& root, int corrupt_at) {
+// ghost_texture: the pass also lists a written color target that no one creates (no pre file, not
+// touched by the shader), so the replay cannot read it back.
+// lds_spill: the value goes through LDS (ds_write_b32 / ds_read_b32 at v2) in a workgroup that
+// declares 48 KiB of LDS, more than Metal's threadgroup memory: the translator moves the LDS into a
+// storage buffer the renderer allocates in its upload arena. Same output.
+// accumulate: out[i] += i (buffer_load_dword, v_add_i32, buffer_store_dword) on an output whose
+// first half is captured as an input (1000 each) and whose second half is not in the capture (0 in
+// the replay's guest memory): what the pass leaves is 1000 + i, then i. Replaying it twice gives the
+// same result only if the replay zeroes what the previous call wrote (the second half is no input).
+std::string WriteCapture(const std::string& root, int corrupt_at, bool ghost_texture = false, bool lds_spill = false,
+                         bool accumulate = false) {
     uint8_t* mem = (uint8_t*)mmap(nullptr, kMemSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    const auto prog = WithFooter({0x34040082, 0x7E020300, 0xE0701000, 0x80010102, kEnd}, 0x5CA1AB1E000000A1ull);
+    const auto prog = accumulate
+        ? WithFooter({0x34040082,             // v2 = v0 << 2
+                      0xE0301000, 0x80010302, // buffer_load_dword v3, v2, s[4:7] offen
+                      0xBF8C0000,             // s_waitcnt 0
+                      0x4A060700,             // v_add_i32 v3, vcc, v0, v3
+                      0xE0701000, 0x80010302, // buffer_store_dword v3, v2, s[4:7] offen
+                      kEnd},
+                     0x5CA1AB1E000000A3ull)
+        : lds_spill
+        ? WithFooter({0x34040082, 0x7E020300,             // v2 = v0 << 2; v1 = v0
+                      0xD8340000, 0x00000102, 0xBF8C0000, // ds_write_b32 v2, v1; s_waitcnt 0
+                      0xD8D80000, 0x05000002, 0xBF8C0000, // ds_read_b32 v5, v2; s_waitcnt 0
+                      0xE0701000, 0x80010502, kEnd},      // buffer_store_dword v5, v2, s[4:7] offen
+                     0x5CA1AB1E000000A2ull)
+        : WithFooter({0x34040082, 0x7E020300, 0xE0701000, 0x80010102, kEnd}, 0x5CA1AB1E000000A1ull);
     memcpy(mem + kCode, prog.data(), prog.size() * 4);
-    memset(mem + kOut, 0xAB, kPage); // the output's memory before the pass
+    memset(mem + kOut, accumulate ? 0 : 0xAB, kPage); // the output's memory before the pass
+    if (accumulate)
+        for (uint32_t i = 0; i < 32; ++i) {
+            const uint32_t v = 1000;
+            memcpy(mem + kOut + 4 * i, &v, 4);
+        }
     std::vector<uint32_t> regs(kNumRegs, 0);
     regs[0x2E07] = 64; // COMPUTE_NUM_THREAD_X
     regs[0x2E08] = regs[0x2E09] = 1;
     regs[0x2E0C] = uint32_t(kCode >> 8); // COMPUTE_PGM_LO
     regs[0x2E12] = 1;                    // RSRC1: 8 VGPRs
     regs[0x2E13] = 8 << 1;               // RSRC2: 8 user SGPRs
+    if (lds_spill) regs[0x2E13] |= 96u << 15; // LDS_SIZE: 96 x 128 dwords = 48 KiB
     uint32_t* ud = &regs[0x2E40];        // COMPUTE_USER_DATA_0..
     ud[4] = uint32_t(kOut);              // V#: base, stride 0, 256 bytes, 32-bit uint
     ud[5] = 0;
@@ -96,9 +131,27 @@ std::string WriteCapture(const std::string& root, int corrupt_at) {
     b.written = true;
     memcpy(b.vsharp, &ud[4], 16);
     p.buffers.push_back(b);
+    if (ghost_texture) {
+        TextureRec t;
+        t.role = "color0";
+        t.written = true;
+        t.id.kind = 1;
+        t.id.address = 0x30000000;
+        t.id.mtl_format = t.id.entry_format = (uint32_t)MTLPixelFormatRGBA8Unorm;
+        t.id.tex_type = t.id.mtl_type = (uint32_t)MTLTextureType2D;
+        t.id.width = t.id.mtl_width = 8;
+        t.id.height = t.id.mtl_height = 8;
+        t.id.usage = (uint32_t)(MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
+        t.id.storage_mode = (uint32_t)MTLStorageModeShared;
+        t.id.surface.assign(ps4gnm::kPackedSurfaceWords, 0);
+        p.textures.push_back(t);
+    }
     p.inputs.push_back(w.Snapshot(mem, kCode, kPage));
-    p.inputs.push_back(w.Snapshot(mem, kOut, kPage));
-    for (uint32_t i = 0; i < 64; ++i) memcpy(mem + kOut + 4 * i, &i, 4); // what the pass must leave
+    p.inputs.push_back(w.Snapshot(mem, kOut, accumulate ? 128 : kPage));
+    for (uint32_t i = 0; i < 64; ++i) { // what the pass must leave
+        const uint32_t v = (accumulate && i < 32 ? 1000 : 0) + i;
+        memcpy(mem + kOut + 4 * i, &v, 4);
+    }
     if (corrupt_at >= 0) mem[kOut + corrupt_at] ^= 0x40;
     p.outputs.push_back(w.Snapshot(mem, kOut, 256));
     w.AddPass(std::move(p));
@@ -141,6 +194,32 @@ void TestDispatchReplay(const std::string& root) {
 // The extractor's output is a frame the replay accepts: tools/gnm_capture_extract.py cuts the
 // dispatch of WriteCapture out of its frame (pass 0 of 2), and the extracted frame replays like
 // the original, byte for byte with --keep-outputs and with nothing compared without.
+// A dispatch whose LDS lives in a buffer of the renderer's upload arena (WriteCapture lds_spill:
+// 48 KiB is over the Metal profile's 32 KiB, so SharedMemoryToStoragePass moves it to a storage
+// buffer). It checks the spill's binding and translation, not the arena's residency: each thread
+// reads back only the dword it has just written, which the GPU can return from its cache, and an
+// arena chunk left out of the residency sets keeps this test green. TestArenaGpuWrite covers that.
+void TestLdsSpill(const std::string& root) {
+    ps4replay::Options o;
+    o.frame_dir = WriteCapture(root + "/lds", -1, false, true);
+    o.keep_outputs = true;
+    ps4replay::Result r = ps4replay::ReplayPass(o);
+    CHECK(r.ran, "LDS spill: not replayed: %s", r.error.c_str());
+    CHECK(r.outputs.size() == 1 && r.AllMatch(), "LDS spill: replay differs from the capture (%zu outputs, %llu bytes differ)",
+          r.outputs.size(), r.outputs.empty() ? 0ull : (unsigned long long)r.outputs[0].diff_bytes);
+}
+
+// The GPU writes a fresh chunk of the renderer's upload arena (DebugArenaGpuFill): on Metal 4 the
+// chunk is resident from its creation (UploadArena::on_new), or the fill is lost and the CPU reads
+// the zeros it wrote before.
+void TestArenaGpuWrite() {
+    std::vector<uint8_t> got;
+    CHECK(ps4draw::DebugArenaGpuFill(0x5A, 1 << 20, &got), "arena fill: no renderer");
+    size_t right = 0;
+    for (uint8_t b : got) right += b == 0x5A;
+    CHECK(right == got.size() && !got.empty(), "arena fill: %zu of %zu bytes written by the GPU", right, got.size());
+}
+
 void TestExtractedFixture(const std::string& root) {
     const std::string tool = std::string(PS4_REPO_ROOT) + "/tools/gnm_capture_extract.py"; // set by build.sh
     const std::string src = WriteCapture(root + "/ex_src", -1);
@@ -435,6 +514,270 @@ void TestDrawReplay(const std::string& root) {
           "a target whose contents could not be read back replayed: %s", r2.error.c_str());
 }
 
+// ---- The draw kinds and an indirect dispatch, replayed through ps4draw::Draw / Dispatch ----
+// The 8x8 RGBA16Float target of DrawRegs, cut into 8 one-column rectangles: vertices 6r..6r+5 of
+// the vertex buffer cover column r. The VS calls a fetch shader (s_swappc_b64) that loads the
+// position per vertex (v0 + s4, the base vertex) and an x offset per instance (v3 + s5, the start
+// instance) from the V# table at s[2:3], and adds the offset (whole columns) to x; the PS exports
+// (1, 0.5, 0, 1). Each case draws its columns with every argument mattering: the columns of a
+// renderer that ignored one of them are named in the case. The translator turns the fetch shader
+// into vertex attributes (the offset steps per instance), so base vertex and base instance reach
+// Metal as the draw's baseVertex / baseInstance, and for the indirect kinds come from the GPU.
+constexpr uint64_t kVs2 = 0x190000, kPs2 = 0x1A0000, kFetch = 0x1B0000, kVsharps = 0x1C0000;
+constexpr uint64_t kOffs = 0x1D0000, kIb = 0x1E0000, kArgs = 0x1F0000;
+constexpr float kColOffset[8] = {0, 6, 1, 3, 5, 2, 4, 0}; // instance i moves its rectangle this many columns
+
+struct DrawCase {
+    const char* name;
+    const char* pm4; // the PassRec name
+    bool indexed;
+    uint32_t index_type; // 0: 16 bit, 1: 32 bit
+    bool indirect;
+    uint32_t count, index_offset, max_index, instances;
+    uint32_t s4, s5; // user data: base vertex, start instance (direct draws)
+    std::vector<uint32_t> indices;
+    std::vector<uint32_t> args; // the indirect record (MTLDraw[Indexed]PrimitivesIndirectArguments)
+    uint8_t columns;            // the columns drawn, bit c = column c
+};
+
+std::vector<uint32_t> KindRegs(const DrawCase& c) {
+    std::vector<uint32_t> regs = DrawRegs();
+    regs[0x2C48] = uint32_t(kVs2 >> 8);
+    regs[0x2C4A] = 2 | (2 << 6) | (3u << 24); // 12 VGPRs, 24 SGPRs, VGPR_COMP_CNT 3: v3 = instance id
+    regs[0x2C4B] = 6 << 1;                    // 6 user SGPRs
+    uint32_t* vud = &regs[0x2C4C];
+    vud[0] = uint32_t(kFetch);
+    vud[1] = uint32_t(kFetch >> 32);
+    vud[2] = uint32_t(kVsharps);
+    vud[3] = uint32_t(kVsharps >> 32);
+    vud[4] = c.indirect ? 0 : c.s4; // an indirect draw's come from its record (the CP's writes)
+    vud[5] = c.indirect ? 0 : c.s5;
+    regs[0x2C08] = uint32_t(kPs2 >> 8);
+    regs[0x2C0B] = 0; // no user SGPRs
+    return regs;
+}
+
+std::string WriteKindCapture(const std::string& root, const DrawCase& c, std::vector<uint8_t>* want) {
+    uint8_t* mem = (uint8_t*)mmap(nullptr, kMemSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    // fetch shader: s_load_dwordx4 s[8:11], s[2:3], 0; s_load_dwordx4 s[12:15], s[2:3], 4;
+    // v_add_i32 v0, s4, v0; v_add_i32 v3, s5, v3; s_waitcnt lgkmcnt(0);
+    // buffer_load_format_xyzw v[4:7], v0, s[8:11] idxen; buffer_load_format_x v8, v3, s[12:15] idxen;
+    // s_waitcnt vmcnt(0); s_setpc_b64 s[16:17]
+    const uint32_t fetch[] = {0xC0840300, 0xC0860304, 0x4A000004, 0x4A060605, 0xBF8C007F, 0xE00C2000,
+                              0x80020400, 0xE0002000, 0x80030803, 0xBF8C0F70, 0xBE802010};
+    // VS: s_swappc_b64 s[16:17], s[0:1]; v_add_f32 v4, v8, v4; exp param0 v[4:7]; exp pos0 v[4:7] done
+    const auto vs = WithFooter({0xBE902100, 0x06080908, 0xF800020F, 0x07060504, 0xF80008CF, 0x07060504, kEnd},
+                               0x5CA1AB1E000000B3ull);
+    // PS: v0 = 1.0; v1 = 0.5; v2 = 0; v3 = 1.0; exp mrt0 v[0:3] done vm
+    const auto ps = WithFooter({0x7E0002F2, 0x7E0202F0, 0x7E040280, 0x7E0602F2, 0xF800180F, 0x03020100, kEnd},
+                               0x5CA1AB1E000000B4ull);
+    memcpy(mem + kFetch, fetch, sizeof(fetch));
+    memcpy(mem + kVs2, vs.data(), vs.size() * 4);
+    memcpy(mem + kPs2, ps.data(), ps.size() * 4);
+    for (uint32_t r = 0; r < 8; ++r) { // column r: x in [r / 4 - 1, (r + 1) / 4 - 1], two triangles
+        const float x0 = r * 0.25f - 1, x1 = x0 + 0.25f;
+        const float v[6][4] = {{x0, -1, 0.5f, 1}, {x1, -1, 0.5f, 1}, {x0, 1, 0.5f, 1},
+                               {x1, -1, 0.5f, 1}, {x1, 1, 0.5f, 1},  {x0, 1, 0.5f, 1}};
+        memcpy(mem + kVb + r * sizeof(v), v, sizeof(v));
+    }
+    for (uint32_t i = 0; i < 8; ++i) {
+        const float x = kColOffset[i] * 0.25f;
+        memcpy(mem + kOffs + 4 * i, &x, 4);
+    }
+    uint32_t vsharp[8] = {uint32_t(kVb), 16u << 16, 48, 4 | (5 << 3) | (6 << 6) | (7 << 9) | (7 << 12) | (14 << 15),
+                          uint32_t(kOffs), 4u << 16, 8, 4 | (5 << 3) | (6 << 6) | (7 << 9) | (7 << 12) | (4 << 15)};
+    memcpy(mem + kVsharps, vsharp, sizeof(vsharp));
+    for (size_t i = 0; i < c.indices.size(); ++i) {
+        if (c.index_type) memcpy(mem + kIb + 4 * i, &c.indices[i], 4);
+        else {
+            const uint16_t h = (uint16_t)c.indices[i];
+            memcpy(mem + kIb + 2 * i, &h, 2);
+        }
+    }
+    if (!c.args.empty()) memcpy(mem + kArgs, c.args.data(), c.args.size() * 4);
+    const std::vector<uint32_t> regs = KindRegs(c);
+    const GpuTextureId tid = TargetId(regs);
+    std::vector<uint8_t> tpre(RawSize(tid));
+    for (size_t i = 0; i < tpre.size(); ++i) tpre[i] = (uint8_t)(i * 13 + 5);
+    *want = tpre;
+    const uint16_t color[4] = {0x3C00, 0x3800, 0x0000, 0x3C00};
+    for (uint32_t y = 0; y < 8; ++y)
+        for (uint32_t x = 0; x < 8; ++x)
+            if (c.columns >> x & 1) memcpy(want->data() + (y * 8 + x) * 8, color, 8);
+    const std::string dir = root + "/frame_1";
+    Writer w(dir, 1, kMemSize, false, gcn_shader_cache_id());
+    std::string err;
+    CHECK(w.Begin(&err), "%s", err.c_str());
+    PassRec p;
+    p.index = 0;
+    p.replayable = true;
+    p.type = "draw";
+    p.queue = "gfx";
+    p.name = c.pm4;
+    p.indexed = c.indexed;
+    p.index_base = c.indexed ? kIb : 0;
+    p.index_type = c.index_type;
+    p.index_offset = c.index_offset;
+    p.count = c.count;
+    p.max_index = c.max_index;
+    p.num_instances = c.instances;
+    if (c.indirect) {
+        p.indirect_addr = kArgs;
+        p.base_vertex_ud = 4;
+        p.start_instance_ud = 5;
+    }
+    p.cb_extent[0] = 8 | 8 << 16;
+    p.regs_file = w.SaveRegs(regs.data(), &p.regs_hash);
+    TextureRec t;
+    t.role = "t0_color0";
+    t.written = true;
+    t.id = tid;
+    t.pre_file = w.SaveTexture(0, t.role, "pre", tpre, &t.pre_hash);
+    t.post_file = w.SaveTexture(0, t.role, "post", *want, &t.post_hash);
+    p.textures.push_back(t);
+    for (uint64_t a : {kVs2, kPs2, kFetch, kVsharps, kVb, kOffs, kIb, kArgs}) p.inputs.push_back(w.Snapshot(mem, a, kPage));
+    w.AddPass(std::move(p));
+    CHECK(w.Finish(&err), "%s", err.c_str());
+    munmap(mem, kMemSize);
+    return dir;
+}
+
+std::vector<uint32_t> Rect(uint32_t r) { return {6 * r, 6 * r + 1, 6 * r + 2, 6 * r + 3, 6 * r + 4, 6 * r + 5}; }
+std::vector<uint32_t> Cat(std::initializer_list<std::vector<uint32_t>> parts) {
+    std::vector<uint32_t> v;
+    for (const auto& x : parts) v.insert(v.end(), x.begin(), x.end());
+    return v;
+}
+
+void TestDrawKinds(const std::string& root) {
+    const DrawCase cases[] = {
+        // 32-bit indices from index 6 (the first 6 are a decoy, rectangle 7), base vertex 6: the
+        // indices name rectangles 1 and 4, drawn as 2 and 5. Without the base vertex: 1, 4; read
+        // as 16-bit indices or from index 0: other vertices.
+        {"indexed, 32-bit indices, start index and base vertex", "DRAW_INDEX_2", true, 1, false, 12, 6, 18, 1, 6, 0,
+         Cat({Rect(7), Rect(1), Rect(4)}), {}, (1 << 2) | (1 << 5)},
+        // rectangle 0, 3 instances from instance 2: offsets 1, 3, 5. From instance 0: 0, 6, 1.
+        {"instanced with a start instance", "DRAW_INDEX_AUTO", false, 0, false, 6, 0, 0, 3, 0, 2, {}, {},
+         (1 << 1) | (1 << 3) | (1 << 5)},
+        // 16-bit indices, the record's start index 12 is the last 6 of max_index 18 (the first 12
+        // are a decoy, rectangle 7), base vertex 6 (rectangle 0 drawn as 1), 2 instances from
+        // instance 4 (offsets 5, 2): columns 6, 3. From instance 0: 1, 7; no base vertex: 5, 2.
+        {"indexed indirect", "DRAW_INDEX_INDIRECT", true, 0, true, 0, 0, 18, 1, 0, 0,
+         Cat({Rect(7), Rect(7), Rect(0)}), {6, 2, 12, 6, 4}, (1 << 3) | (1 << 6)},
+        // 6 vertices from vertex 12 (rectangle 2), 1 instance from instance 3 (offset 3): column 5.
+        // From vertex 0: 3; from instance 0: 2.
+        {"indirect", "DRAW_INDIRECT", false, 0, true, 0, 0, 0, 1, 0, 0, {}, {6, 1, 12, 3}, 1 << 5},
+    };
+    int k = 0;
+    for (const DrawCase& c : cases) {
+        ps4replay::Options o;
+        std::vector<uint8_t> want;
+        o.frame_dir = WriteKindCapture(root + "/kind" + std::to_string(k++), c, &want);
+        o.keep_outputs = true;
+        const ps4replay::Result r = ps4replay::ReplayPass(o);
+        CHECK(r.ran, "%s: not replayed: %s", c.name, r.error.c_str());
+        const ps4replay::OutputResult* out = replay_props::Find(r, "_color0");
+        CHECK(out && out->compared && out->match, "%s: %llu bytes differ", c.name,
+              out ? (unsigned long long)out->diff_bytes : 0ull);
+        if (out && out->bytes.size() == want.size() && !out->match) {
+            char drawn[9] = "........";
+            for (uint32_t x = 0; x < 8; ++x) {
+                uint16_t h[4];
+                memcpy(h, out->bytes.data() + (4 * 8 + x) * 8, 8);
+                if (h[0] == 0x3C00 && h[1] == 0x3800 && h[2] == 0 && h[3] == 0x3C00) drawn[x] = 'x';
+            }
+            fprintf(stderr, "  %s: columns drawn in row 4: %s, want %02x\n", c.name, drawn, c.columns);
+        }
+    }
+}
+
+// An indirect dispatch: 2 workgroups from the argument record while the PM4 dimensions (the pass's
+// dim) say 1, each thread storing its global index (s8 = workgroup id x: s9 = s8 << 6; v1 = s9 + v0;
+// buffer_store_dword v1 at 4 * v1). Read from the dimensions instead, the second half keeps 0xAB.
+std::string WriteIndirectDispatchCapture(const std::string& root) {
+    uint8_t* mem = (uint8_t*)mmap(nullptr, kMemSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    const auto prog = WithFooter({0x8F098608, 0x4A020009, 0x34040282, 0xE0701000, 0x80010102, kEnd}, 0x5CA1AB1E000000A3ull);
+    memcpy(mem + kCode, prog.data(), prog.size() * 4);
+    memset(mem + kOut, 0xAB, kPage);
+    const uint32_t dims[3] = {2, 1, 1};
+    memcpy(mem + kArgs, dims, sizeof(dims));
+    std::vector<uint32_t> regs(kNumRegs, 0);
+    regs[0x2E07] = 64;
+    regs[0x2E08] = regs[0x2E09] = 1;
+    regs[0x2E0C] = uint32_t(kCode >> 8);
+    regs[0x2E12] = 1 | (1 << 6);        // RSRC1: 8 VGPRs, 16 SGPRs
+    regs[0x2E13] = (8 << 1) | (1 << 7); // RSRC2: 8 user SGPRs, TGID_X_EN (s8)
+    uint32_t* ud = &regs[0x2E40];
+    ud[4] = uint32_t(kOut); // V#: 512 bytes, 32-bit uint
+    ud[5] = 0;
+    ud[6] = 512;
+    ud[7] = 4 | (5 << 3) | (6 << 6) | (7 << 9) | (4 << 12) | (4 << 15);
+    const std::string dir = root + "/frame_1";
+    Writer w(dir, 1, kMemSize, false, gcn_shader_cache_id());
+    std::string err;
+    CHECK(w.Begin(&err), "%s", err.c_str());
+    PassRec p;
+    p.index = 0;
+    p.replayable = true;
+    p.type = "dispatch";
+    p.queue = p.name = "gfx";
+    p.regs_file = w.SaveRegs(regs.data(), &p.regs_hash);
+    p.dim[0] = p.dim[1] = p.dim[2] = 1;
+    p.indirect_addr = kArgs;
+    BufferRec b;
+    b.stage = "cs";
+    b.addr = kOut;
+    b.size = 512;
+    b.written = true;
+    memcpy(b.vsharp, &ud[4], 16);
+    p.buffers.push_back(b);
+    p.inputs.push_back(w.Snapshot(mem, kCode, kPage));
+    p.inputs.push_back(w.Snapshot(mem, kOut, kPage));
+    p.inputs.push_back(w.Snapshot(mem, kArgs, kPage));
+    for (uint32_t i = 0; i < 128; ++i) memcpy(mem + kOut + 4 * i, &i, 4);
+    p.outputs.push_back(w.Snapshot(mem, kOut, 512));
+    w.AddPass(std::move(p));
+    CHECK(w.Finish(&err), "%s", err.c_str());
+    munmap(mem, kMemSize);
+    return dir;
+}
+
+void TestIndirectDispatch(const std::string& root) {
+    ps4replay::Options o;
+    o.frame_dir = WriteIndirectDispatchCapture(root + "/indirect_dispatch");
+    o.keep_outputs = true;
+    const ps4replay::Result r = ps4replay::ReplayPass(o);
+    CHECK(r.ran, "indirect dispatch: not replayed: %s", r.error.c_str());
+    CHECK(r.outputs.size() == 1 && r.AllMatch(), "indirect dispatch: %llu bytes differ, first at %llu",
+          r.outputs.empty() ? 0ull : (unsigned long long)r.outputs[0].diff_bytes,
+          r.outputs.empty() ? 0ull : (unsigned long long)r.outputs[0].first_diff);
+}
+
+// PS4_GNM_MTL4_ONLY_CLEARS=1 (debug, Metal 4; run_host_tests.sh runs the "only-clears" mode with
+// it): the draw of WriteDrawCapture with its fast clear pending is skipped once its render pass
+// began, so the pass's clear happens and the draw does not: every texel holds the clear colour
+// (the draw would have put the sampled texel in columns 0-3), the draw is counted as skipped by
+// the mode and not as a skipped pass.
+void TestOnlyClearsDraw(const std::string& root) {
+    const char* oc = getenv("PS4_GNM_MTL4_ONLY_CLEARS");
+    CHECK(oc && !strcmp(oc, "1"), "only-clears: run with PS4_GNM_MTL4_ONLY_CLEARS=1");
+    std::vector<uint8_t> want;
+    ps4replay::Options o;
+    o.frame_dir = WriteDrawCapture(root + "/only_clears", true, &want);
+    o.keep_outputs = true;
+    const uint64_t before = ps4draw::OnlyClearsSkippedCount();
+    const ps4replay::Result r = ps4replay::ReplayPass(o);
+    CHECK(r.ran, "only-clears: not replayed: %s", r.error.c_str());
+    const uint64_t skipped = ps4draw::OnlyClearsSkippedCount() - before;
+    CHECK(skipped == 1, "only-clears: %llu draws skipped by the mode, want 1", (unsigned long long)skipped);
+    const ps4replay::OutputResult* c = replay_props::Find(r, "_color0");
+    CHECK(c && c->bytes.size() == want.size(), "only-clears: no target read back");
+    if (!c || c->bytes.size() != want.size()) return;
+    size_t cleared = 0;
+    for (size_t i = 0; i < 64; ++i) cleared += !memcmp(c->bytes.data() + i * 8, kClear, 8);
+    CHECK(cleared == 64, "only-clears: %zu of 64 texels hold the clear colour", cleared);
+}
+
 // ScanGcnStores (the replay's note on passes with no recorded output) on the programs above:
 // the dispatch's buffer_store_dword is found; the pixel shader (image_sample_lz, export) and the
 // vertex shader (buffer_load_format) write no memory; an image_store is found as one. The scan is
@@ -521,16 +864,312 @@ void TestProps() {
     CHECK(one.texels == 1 && one.non_finite == 1, "region of the NaN texel");
 }
 
+// ReplayPasses: every pass of the frame in one call, with one SHA-256 per output; the hash is
+// that of the replayed bytes (out[i] = i), a pass the renderer skipped is reported with its reason, and
+// a range past the frame's end reports the pass.
+void TestRange(const std::string& root) {
+    const std::string frame = WriteCapture(root + "/range", -1);
+    ps4replay::Options o;
+    o.frame_dir = frame;
+    o.sha256 = true;
+    const std::vector<ps4replay::PassResult> all = ps4replay::ReplayPasses(o, 0, UINT32_MAX);
+    // WriteCapture's frame holds the dispatch (pass 0) and a pass the renderer encoded nothing for
+    CHECK(all.size() == 2, "range: %zu passes, want 2", all.size());
+    if (all.size() != 2) return;
+    CHECK(all[1].pass == 1 && !all[1].r.ran && all[1].r.error.find("meta clear") != std::string::npos,
+          "range: pass 1 not reported as skipped: %s", all[1].r.error.c_str());
+    CHECK(all[0].pass == 0 && all[0].type == "dispatch", "range: pass %u type %s", all[0].pass, all[0].type.c_str());
+    CHECK(all[0].r.ran && all[0].r.outputs.size() == 1, "range: not replayed: %s", all[0].r.error.c_str());
+    if (!all[0].r.ran || all[0].r.outputs.size() != 1) return;
+    uint32_t want[64];
+    for (uint32_t i = 0; i < 64; ++i) want[i] = i;
+    unsigned char md[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(want, sizeof(want), md);
+    char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) snprintf(hex + 2 * i, 3, "%02x", md[i]);
+    CHECK(all[0].r.outputs[0].sha256 == hex, "range: sha %s, want %s", all[0].r.outputs[0].sha256.c_str(), hex);
+    const std::vector<ps4replay::PassResult> past = ps4replay::ReplayPasses(o, 1, 2);
+    CHECK(past.size() == 2 && !past[1].r.ran && past[1].type.empty() &&
+              past[1].r.error.find("no pass 2") != std::string::npos,
+          "range: pass 2 of a 2-pass frame not reported");
+
+    // a huge last pass number ends at the first pass the frame does not have
+    const std::vector<ps4replay::PassResult> huge = ps4replay::ReplayPasses(o, 0, 4000000000u);
+    CHECK(huge.size() == 3 && huge[2].pass == 2 && !huge[2].r.ran, "range: %zu results for 0-4000000000, want 3",
+          huge.size());
+
+    // the hook brackets the renderer calls of the replayed pass only: one pair, begin first
+    struct Hook {
+        int begins = 0, ends = 0;
+        bool order_ok = true;
+    } hook;
+    ps4replay::Options oh = o;
+    oh.around_ctx = &hook;
+    oh.around_render = [](void* c, bool begin) {
+        Hook* h = static_cast<Hook*>(c);
+        if (begin) {
+            h->order_ok &= h->begins == h->ends;
+            h->begins++;
+        } else {
+            h->order_ok &= h->begins == h->ends + 1;
+            h->ends++;
+        }
+    };
+    ps4replay::ReplayPasses(oh, 0, UINT32_MAX); // pass 0 renders, pass 1 is skipped before the renderer
+    CHECK(hook.begins == 1 && hook.ends == 1 && hook.order_ok, "range: hook begin %d end %d order %d", hook.begins,
+          hook.ends, (int)hook.order_ok);
+
+    // the output lines, in the grammar of the comparison tool: P <pass> <type> RAN|NOT ..., then
+    // exactly five words per O line
+    const std::string lines = ps4replay::FormatPassResult(all[0]) + ps4replay::FormatPassResult(all[1]);
+    const std::string want_p = "P 0 dispatch RAN 1 1\nO 0 buffer_0x";
+    CHECK(lines.compare(0, want_p.size(), want_p) == 0, "range: lines\n%s", lines.c_str());
+    CHECK(lines.find(std::string(" 256 ") + hex + "\nP 1 dispatch NOT ") != std::string::npos,
+          "range: O line lacks size and hash\n%s", lines.c_str());
+
+    // outputs of a range go to one directory per pass
+    ps4replay::Options oo = o;
+    oo.out_dir = root + "/range_out";
+    ps4replay::ReplayPasses(oo, 0, 0);
+    struct stat st;
+    CHECK(stat((oo.out_dir + "/pass_0").c_str(), &st) == 0 && S_ISDIR(st.st_mode), "range: no pass_0 directory");
+
+    // a texture the renderer has no identity for: the hash says so, in every run alike
+    ps4replay::Options og;
+    og.frame_dir = WriteCapture(root + "/range_ghost", -1, true);
+    og.sha256 = true;
+    const std::vector<ps4replay::PassResult> ghost = ps4replay::ReplayPasses(og, 0, 0);
+    CHECK(ghost.size() == 1 && ghost[0].r.ran, "range: ghost capture not replayed: %s",
+          ghost.empty() ? "" : ghost[0].r.error.c_str());
+    if (ghost.size() == 1 && ghost[0].r.ran) {
+        const std::string gl = ps4replay::FormatPassResult(ghost[0]);
+        CHECK(gl.find("_(the_renderer_made_no_texture_with_the_captured_identity) 0 MISSING\n") != std::string::npos,
+              "range: missing texture line\n%s", gl.c_str());
+    }
+}
+
+// SHA-256 of out[i] = i (the dispatch of WriteCapture), lowercase hex; flip_byte >= 0: with that
+// byte's bit 0x10 flipped.
+std::string IotaSha(int flip_byte) {
+    uint8_t want[256];
+    for (uint32_t i = 0; i < 64; ++i) memcpy(want + 4 * i, &i, 4);
+    if (flip_byte >= 0) want[flip_byte] ^= 0x10;
+    unsigned char md[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(want, sizeof(want), md);
+    char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) snprintf(hex + 2 * i, 3, "%02x", md[i]);
+    return hex;
+}
+
+// --settle (Options::settle). A stable pass is replayed twice, both hashes equal, never reported
+// unstable, in a single replay and in a range. A first replay made to differ (the test-only hook
+// flips one byte of its output) is reported UNSTABLE-FIRST with both hashes, while the verdict is
+// the second, correct replay's. Without settle the hook is never called.
+void TestSettle(const std::string& root) {
+    const std::string frame = WriteCapture(root + "/settle", -1);
+    const std::string good = IotaSha(-1), flipped = IotaSha(9);
+    ps4replay::Options o;
+    o.frame_dir = frame;
+    o.settle = true;
+    for (int k = 0; k < 3; ++k) {
+        const ps4replay::Result r = ps4replay::ReplayPass(o);
+        CHECK(r.ran && r.settled && !r.unstable_first && r.first_only.empty() && r.AllMatch(),
+              "settle (stable) %d: ran %d settled %d unstable %d match %d: %s", k, (int)r.ran, (int)r.settled,
+              (int)r.unstable_first, (int)r.AllMatch(), r.error.c_str());
+        if (r.outputs.size() == 1)
+            CHECK(r.outputs[0].sha256 == good && r.outputs[0].first_sha256 == good && !r.outputs[0].unstable_first,
+                  "settle (stable): hashes %s / %s", r.outputs[0].first_sha256.c_str(), r.outputs[0].sha256.c_str());
+        else
+            CHECK(false, "settle (stable): %zu outputs", r.outputs.size());
+    }
+    const std::vector<ps4replay::PassResult> range = ps4replay::ReplayPasses(o, 0, UINT32_MAX);
+    std::string lines;
+    for (const ps4replay::PassResult& p : range) lines += ps4replay::FormatPassResult(p);
+    CHECK(range.size() == 2 && lines.find("\nU ") == std::string::npos &&
+              lines.find(std::string(" 256 ") + good + "\n") != std::string::npos,
+          "settle (stable range): lines\n%s", lines.c_str());
+
+    struct Flip {
+        int calls = 0;
+        std::string what;
+    } flip;
+    ps4replay::Options of = o;
+    of.test_settle_ctx = &flip;
+    of.test_settle_first = [](void* c, std::string* what, std::vector<uint8_t>* bytes) {
+        Flip* f = static_cast<Flip*>(c);
+        f->calls++;
+        f->what = *what;
+        if (bytes->size() > 9) (*bytes)[9] ^= 0x10;
+    };
+    const ps4replay::Result u = ps4replay::ReplayPass(of);
+    CHECK(flip.calls == 1 && flip.what == "buffer 0x200000", "settle hook: %d calls, output '%s'", flip.calls,
+          flip.what.c_str());
+    CHECK(u.ran && u.settled && u.unstable_first && u.AllMatch(),
+          "settle (perturbed first): ran %d settled %d unstable %d match %d", (int)u.ran, (int)u.settled,
+          (int)u.unstable_first, (int)u.AllMatch());
+    if (u.outputs.size() == 1) {
+        CHECK(u.outputs[0].unstable_first && u.outputs[0].first_sha256 == flipped && u.outputs[0].sha256 == good,
+              "settle (perturbed first): hashes %s / %s", u.outputs[0].first_sha256.c_str(),
+              u.outputs[0].sha256.c_str());
+        ps4replay::PassResult pr;
+        pr.pass = 0;
+        pr.type = "dispatch";
+        pr.r = u;
+        const std::string ul = ps4replay::FormatPassResult(pr);
+        const std::string want = "U 0 UNSTABLE-FIRST buffer_0x200000 " + flipped + " " + good + "\n";
+        CHECK(ul.find("\nO 0 buffer_0x200000 256 " + good + "\n" + want) != std::string::npos,
+              "settle (perturbed first): lines\n%s", ul.c_str());
+    } else {
+        CHECK(false, "settle (perturbed first): %zu outputs", u.outputs.size());
+    }
+
+    // the default replay is one replay: the hook is not called, nothing is settled
+    ps4replay::Options od = of;
+    od.settle = false;
+    flip.calls = 0;
+    const ps4replay::Result d = ps4replay::ReplayPass(od);
+    CHECK(flip.calls == 0 && d.ran && !d.settled && !d.unstable_first && d.AllMatch() && d.outputs.size() == 1 &&
+              d.outputs[0].first_sha256.empty(),
+          "default replay: hook calls %d settled %d unstable %d", flip.calls, (int)d.settled, (int)d.unstable_first);
+}
+
+// --settle restores between its two replays: a pass that accumulates into memory outside its
+// captured inputs settles stable and byte-exact (and so do two plain replays in a row). A pass that
+// writes a texture it creates is not settled: replayed once, the reason given, the hook not called.
+// An output only the first replay wrote is unstable (first_only, S/U lines), alone too.
+void TestSettleRestore(const std::string& root) {
+    ps4replay::Options o;
+    o.frame_dir = WriteCapture(root + "/settle_acc", -1, false, false, true);
+    for (int k = 0; k < 2; ++k) {
+        const ps4replay::Result r = ps4replay::ReplayPass(o);
+        CHECK(r.ran && r.AllMatch(), "accumulate (plain %d): ran %d match %d %s", k, (int)r.ran, (int)r.AllMatch(),
+              r.error.c_str());
+    }
+    o.settle = true;
+    const ps4replay::Result r = ps4replay::ReplayPass(o);
+    CHECK(r.ran && r.settled && !r.unstable_first && r.AllMatch(),
+          "accumulate (settle): ran %d settled %d unstable %d match %d", (int)r.ran, (int)r.settled,
+          (int)r.unstable_first, (int)r.AllMatch());
+
+    // a written texture without contents before the pass: not settled
+    int calls = 0;
+    ps4replay::Options og;
+    og.frame_dir = WriteCapture(root + "/settle_ghost", -1, true);
+    og.settle = true;
+    og.sha256 = true;
+    og.test_settle_ctx = &calls;
+    og.test_settle_first = [](void* c, std::string*, std::vector<uint8_t>*) { ++*static_cast<int*>(c); };
+    const ps4replay::Result g = ps4replay::ReplayPass(og);
+    CHECK(g.ran && !g.settled && !g.unstable_first && calls == 0 &&
+              g.not_settled.find("color0, a texture the pass creates") != std::string::npos,
+          "not settled: ran %d settled %d hook %d reason '%s'", (int)g.ran, (int)g.settled, calls,
+          g.not_settled.c_str());
+    ps4replay::PassResult gp;
+    gp.pass = 0;
+    gp.type = "dispatch";
+    gp.r = g;
+    const std::string gl = ps4replay::FormatPassResult(gp);
+    CHECK(gl.find("\nS 0 NOT-SETTLED writes color0, a texture") != std::string::npos, "not settled: lines\n%s",
+          gl.c_str());
+
+    // the first replay's output under another name: the real one is ABSENT in the first replay, the
+    // renamed one only in the first
+    ps4replay::Options orn;
+    orn.frame_dir = WriteCapture(root + "/settle_rename", -1);
+    orn.settle = true;
+    orn.test_settle_first = [](void*, std::string* what, std::vector<uint8_t>*) { *what += " renamed"; };
+    const ps4replay::Result rn = ps4replay::ReplayPass(orn);
+    const std::string good = IotaSha(-1);
+    CHECK(rn.ran && rn.unstable_first && rn.AllMatch() && rn.outputs.size() == 1 && rn.outputs[0].first_sha256 == "ABSENT" &&
+              rn.first_only.size() == 1 && rn.first_only[0].first == "buffer 0x200000 renamed" &&
+              rn.first_only[0].second == good,
+          "renamed first output: unstable %d first_only %zu", (int)rn.unstable_first, rn.first_only.size());
+    ps4replay::PassResult rp;
+    rp.pass = 0;
+    rp.type = "dispatch";
+    rp.r = rn;
+    const std::string rl = ps4replay::FormatPassResult(rp);
+    CHECK(rl.find("U 0 UNSTABLE-FIRST buffer_0x200000 ABSENT " + good + "\n") != std::string::npos &&
+              rl.find("U 0 UNSTABLE-FIRST buffer_0x200000_renamed " + good + " ABSENT\n") != std::string::npos,
+          "renamed first output: lines\n%s", rl.c_str());
+
+    // an extra output of the first replay alone (every other output equal) still makes the pass unstable
+    ps4replay::Result first, second;
+    ps4replay::OutputResult a;
+    a.what = "buffer 0x1000";
+    a.sha256 = "aa";
+    first.outputs.push_back(a);
+    second.outputs.push_back(a);
+    a.what = "buffer 0x2000";
+    a.sha256 = "bb";
+    first.outputs.push_back(a);
+    ps4replay::MarkUnstableFirst(first, &second);
+    CHECK(second.settled && second.unstable_first && !second.outputs[0].unstable_first &&
+              second.outputs[0].first_sha256 == "aa" && second.first_only.size() == 1 &&
+              second.first_only[0].first == "buffer 0x2000" && second.first_only[0].second == "bb",
+          "first-only output: unstable %d first_only %zu", (int)second.unstable_first, second.first_only.size());
+    ps4replay::Result same;
+    same.outputs = second.outputs;
+    first.outputs.pop_back();
+    ps4replay::MarkUnstableFirst(first, &same);
+    CHECK(same.settled && !same.unstable_first && same.first_only.empty(), "equal outputs reported unstable");
+}
+
+void TestPassSpec() {
+    struct Case {
+        const char* s;
+        bool ok, range;
+        uint32_t first, last;
+    } cases[] = {{"7", true, false, 7, 7},          {"2-4", true, true, 2, 4},   {"3-3", true, true, 3, 3},
+                 {"all", true, true, 0, UINT32_MAX}, {"5-", false, 0, 0, 0},     {"5-3", false, 0, 0, 0},
+                 {"-3", false, 0, 0, 0},            {"foo-bar", false, 0, 0, 0}, {"", false, 0, 0, 0},
+                 {"1-2-3", false, 0, 0, 0},         {"x", false, 0, 0, 0},       {"4294967295", false, 0, 0, 0}};
+    for (const Case& c : cases) {
+        uint32_t a = 99, b = 99;
+        bool range = false;
+        const bool ok = ps4replay::ParsePassSpec(c.s, &a, &b, &range);
+        CHECK(ok == c.ok && (!ok || (range == c.range && a == c.first && b == c.last)),
+              "pass spec '%s': ok %d range %d %u-%u", c.s, (int)ok, (int)range, a, b);
+    }
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     @autoreleasepool {
+        // write-capture <dir>: only writes the synthetic dispatch capture (<dir>/frame_1), for
+        // run_host_tests.sh to replay through tools/gnm_replay under other settings.
+        if (argc == 3 && !strcmp(argv[1], "write-capture")) {
+            WriteCapture(argv[2], -1);
+            return g_fail ? 1 : 0;
+        }
+        // only-clears: the draw under PS4_GNM_MTL4_ONLY_CLEARS=1 alone (run_host_tests.sh sets it)
+        const bool only_clears = argc == 2 && !strcmp(argv[1], "only-clears");
+        if (argc > 1 && !only_clears) {
+            fprintf(stderr, "usage: gnm_replay_test [only-clears | write-capture <dir>]\n");
+            return 2;
+        }
         char tmpl[] = "/tmp/gnm_replay_test.XXXXXX";
         const char* root = mkdtemp(tmpl);
         if (!root) return 1;
+        if (only_clears) {
+            TestOnlyClearsDraw(root);
+            const std::string rm = std::string("rm -rf '") + root + "'";
+            if (system(rm.c_str()) != 0) g_fail++;
+            printf("gnm_replay_test only-clears: %s\n", g_fail ? "FAIL" : "PASS");
+            return g_fail ? 1 : 0;
+        }
         TestDispatchReplay(root);
+        TestLdsSpill(root);
+        TestArenaGpuWrite(); // after the first replay: the renderer is running
         TestExtractedFixture(root);
+        TestIndirectDispatch(root);
         TestDrawReplay(root);
+        TestDrawKinds(root);
+        TestRange(root);
+        TestSettle(root);
+        TestSettleRestore(root);
+        TestPassSpec();
         TestTextureSeeding();
         TestProps();
         TestStoreScan();

@@ -38,6 +38,29 @@ typedef void (*ps4_metal_screen_held_done_fn)(void *arg, int shown);
 bool ps4_metal_screen_frames_held(void);
 void *ps4_metal_screen_hold_texture(int width, int height);
 int ps4_metal_screen_queue_held(void *command_buffer, void *texture, ps4_metal_screen_held_done_fn done, void *arg);
+// The producer side of a present, split from the command buffer so any renderer backend encodes
+// it (docs/present-pacing.md): ps4_metal_screen_present_begin takes a slot for `texture` (the
+// texture itself when it is an acquired slot) and fills `op`; the renderer then encodes, behind
+// the frame's work, the copy of `texture` into op->copy_dst when that is not NULL and a signal of
+// op->event with op->value; ps4_metal_screen_present_commit queues the slot for the presenter.
+// If the command buffer fails, ps4_metal_screen_present_failed raises the event so the presenter
+// never waits for it forever. Returns 0 with op filled, 1 when the frame is not shown (no free
+// slot: nothing to encode, no commit call), -1 on error.
+// ps4_metal_screen_encode_present and ps4_metal_screen_queue_held are these on a Metal 3 command
+// buffer.
+typedef struct ps4_metal_screen_present_op {
+    void *event;    // id<MTLSharedEvent>
+    uint64_t value;
+    void *copy_dst; // id<MTLTexture> or NULL
+    int slot;
+} ps4_metal_screen_present_op;
+int ps4_metal_screen_present_begin(void *texture, ps4_metal_screen_present_op *op);
+void ps4_metal_screen_present_commit(const ps4_metal_screen_present_op *op);
+void ps4_metal_screen_present_failed(const ps4_metal_screen_present_op *op);
+// The same for a held frame: fills op (copy_dst is always NULL: the frame was rendered into the
+// held texture) and queues it with done/arg; -1 if `texture` is not a held texture being rendered.
+int ps4_metal_screen_held_begin(void *texture, ps4_metal_screen_held_done_fn done, void *arg,
+                                ps4_metal_screen_present_op *op);
 void ps4_metal_screen_release_held(void);
 // Hold depth from the buffer count of the flipped buffer's set (one sceVideoOutRegisterBuffers
 // call; set by sceVideoOutSubmitFlip): min(3, buffers - 1), at least 1, so the guest cannot run
@@ -65,7 +88,15 @@ void ps4_metal_screen_set_guest_flip_mode(int flip_mode);
 void ps4_metal_screen_pump_events(void);
 // Output gamma from sceVideoOutAdjustColor (1.0 = plain sRGB).
 void ps4_metal_screen_set_gamma(float gamma);
+// The renderer backend shown in the performance overlay ("Metal 3" / "Metal 4"). `label` must be a
+// string with static storage; the renderer sets it once its backend has started. NULL = not shown.
+void ps4_metal_screen_set_backend_label(const char *label);
+const char *ps4_metal_screen_backend_label(void);
 void *ps4_metal_screen_get_device(void);
+// The presenter's slot and held textures, for the renderer's Metal 4 residency sets: created for
+// each one made, released for each one replaced. Set once, before the first present.
+void ps4_metal_screen_set_texture_hooks(void (*created)(void *ctx, void *tex), void (*released)(void *ctx, void *tex),
+                                        void *ctx);
 void *ps4_metal_screen_get_command_queue(void);
 void *ps4_metal_screen_get_layer(void);
 void *ps4_metal_screen_get_texture(void);

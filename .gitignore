@@ -4,6 +4,11 @@ tools/
 !/tools/gnm_capture_view.py
 !/tools/gnm_capture_extract.py
 !/tools/refcompare.py
+!/tools/metal4_replay_cmp.py
+!/tools/metal4_route_report.py
+!/tools/metal4_route.sh
+!/tools/metal4_perf_ab.sh
+!/tools/metal4_shot_diff.py
 !/tools/tests/
 !/tools/gnm_replay/
 !/3rdparty/gcn-recompiler/tools/
