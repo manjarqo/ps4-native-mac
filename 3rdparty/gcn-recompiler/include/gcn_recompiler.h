@@ -391,12 +391,17 @@ typedef enum gcn_buffer_type { /* Shader::BufferType */
 } gcn_buffer_type;
 
 /* Guest memory (gcn_shader_info.uses_guest_memory). A buffer access through a V# the shader
- * loads at run time cannot be bound before the dispatch: the shader reads and writes guest
- * memory through a page table instead (compute shaders only; others fail to translate).
+ * loads at run time, or a MUBUF/MTBUF access with ADDR64 (address = V#.base + a 64-bit VGPR
+ * pointer + soffset + inst_offset), cannot be bound before the work runs: the shader reads and
+ * writes guest memory through a page table instead. Compute shaders load and store; draw stages
+ * (VS, PS) only load (a guest memory store outside compute fails to translate), and the renderer
+ * binds them one fault buffer that stays in mode 0 (no probe; an unmapped page reads 0 and is
+ * reported in GCN_GUEST_UNMAPPED, to be mapped for later draws).
  * - GCN_BUFFER_BDA_PAGETABLE: GCN_GUEST_PAGES uint64 entries, one per 64 MiB page of the 40-bit
  *   guest address space: the GPU address (MTLBuffer.gpuAddress + offset) of host memory holding
  *   guest [p << GCN_GUEST_PAGE_SHIFT, (p + 1) << GCN_GUEST_PAGE_SHIFT), or 0 if not mapped. Make
- *   every buffer it points into resident (useResource:usage:, read and write).
+ *   every buffer it points into resident (useResource:usage:): read and write for compute, read
+ *   only for draw stages (they only load).
  * - GCN_BUFFER_FAULT_BUFFER: GCN_GUEST_FAULT_DWORDS uint32, zero before a dispatch except the
  *   mode dword. With mode 1 (a probe) the shader writes nothing (no guest, buffer or image
  *   store, no atomic) but records the pages it would access: run it, map the pages of the

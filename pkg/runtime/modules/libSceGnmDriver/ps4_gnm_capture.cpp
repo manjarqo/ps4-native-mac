@@ -660,6 +660,13 @@ void WritePass(Out& o, const PassRec& p) {
         o.Str(Hex(a));
     }
     o.Close(']');
+    o.Key("meta_cleared_slices");
+    o.Open('[');
+    for (uint32_t sl : p.meta_cleared_slices) {
+        o.Elem();
+        o.Str(Hex(sl));
+    }
+    o.Close(']');
     o.Key("unstable");
     o.Open('[');
     for (const std::string& u : p.unstable) {
@@ -993,6 +1000,7 @@ PassRec Pass(const J& j) {
             p.textures.push_back(t);
         }
     Vec(j, "meta_cleared", &p.meta_cleared);
+    Vec(j, "meta_cleared_slices", &p.meta_cleared_slices);
     if (const J* a = j.Get("unstable"))
         for (const J& e : a->a)
             if (e.t == J::Str) p.unstable.push_back(e.s);

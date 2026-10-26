@@ -163,6 +163,8 @@ struct PassRec {
     std::vector<SamplerRec> samplers;
     std::vector<TextureRec> textures;
     std::vector<uint64_t> meta_cleared; // CMASK addresses whose fast clear was pending
+    // the slice that took each (parallel to meta_cleared; empty in captures made before it existed)
+    std::vector<uint32_t> meta_cleared_slices;
     std::vector<BlobRef> inputs;  // guest memory before the pass (indices into nothing: full refs)
     std::vector<BlobRef> outputs; // written guest ranges after the pass
     // inputs that were not the same after the pass ran ("input 0x..+0x..", "texture <role>"): a guest

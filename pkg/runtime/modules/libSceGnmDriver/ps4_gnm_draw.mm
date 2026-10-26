@@ -551,7 +551,23 @@ struct PassKey {
 struct MetaState {
     bool cleared = false;
     uint64_t cleared_seq = 0; // command buffer the clear (CMASK/HTILE fill) belongs to
+    // Bytes the clear wrote from the metadata's base (kAllMeta: not known, all of it), and the
+    // slices whose draws already took the clear. A metadata surface holds every slice of an
+    // array: one clear of an HTILE of 3 slices clears all 3, each taken by its first draw.
+    uint64_t cleared_bytes = 0;
+    uint64_t taken_slices = 0;
 };
+constexpr uint64_t kAllMeta = ~0ull;
+
+// A clear arms the metadata at its base for every slice it covers. A second clear at the same
+// base before all covered slices were drawn resets the pending slices: the later clear wins, as
+// it rewrites the same HTILE/CMASK bytes on the GPU.
+void ArmMetaClear(MetaState& m, uint64_t bytes, uint64_t seq) {
+    m.cleared = true;
+    m.cleared_seq = seq;
+    m.cleared_bytes = bytes;
+    m.taken_slices = 0;
+}
 
 // Compact record of the work encoded into a command buffer, printed when it fails or hangs
 // (formatting text for every draw would cost more than encoding the draw).
@@ -946,6 +962,9 @@ struct GmStats {
     // missed one re-run too, one after the other): the longest (reset by the perf line)
     std::atomic<uint64_t> rerun_chain_max_us{0};
     std::atomic<uint64_t> no_slot{0};         // dispatches without a fault buffer (skipped)
+    std::atomic<uint64_t> draw_mapped{0};     // 64 MiB pages mapped after draws met them unmapped
+    std::atomic<uint64_t> draw_harvests{0};   // harvests of the draws' fault slot (GmDrawSlot)
+    std::atomic<uint64_t> draw_unmappable{0}; // tries to map a page for draws that failed (GmMapPages)
     std::atomic<uint64_t> no_indirect{0};     // passes whose indirect arguments had no buffer (skipped)
     std::atomic<uint64_t> pass_failed{0};     // passes whose binding failed after their probe ran
 } g_gm_stats;
@@ -1187,6 +1206,9 @@ struct GpuMem {
     // Window spans refused at creation (key -> ps4_gpumem_admit), so later binds neither walk the
     // VM regions again nor retry; cleared on remaps and every policy.idle_ns.
     std::unordered_map<uint64_t, uint8_t> refused;
+    // 64 MiB pages draws met unmapped that could not be mapped (GmMapPages): not tried again by
+    // every harvest; cleared with `refused`.
+    std::unordered_set<uint32_t> draw_unmappable;
     // Read-only copies made in the open command buffer (they live in its upload chunks), keyed by
     // the exact guest range: one copy per range and command buffer.
     struct Copy {
@@ -1348,7 +1370,10 @@ void DropRemappedWindows() {
         if (hit) it = ReleaseWindow(it);
         else ++it;
     }
-    if (!ranges.empty()) g_mem.refused.clear(); // the new mapping may have no holes
+    if (!ranges.empty()) { // the new mapping may have no holes
+        g_mem.refused.clear();
+        g_mem.draw_unmappable.clear();
+    }
     for (auto& m : g_guest_buf_mru) m = GuestBufMru{};
     ps4_hitch_add_ns(PS4_HITCH_MTLBUF, ps4_hitch_now_ns() - mb_t0);
 }
@@ -1379,6 +1404,7 @@ void SweepGuestWindows() {
     swept_over = over;
     if (g_mem.policy.idle_ns && now - g_mem.last_refused_clear >= g_mem.policy.idle_ns) {
         g_mem.refused.clear();
+        g_mem.draw_unmappable.clear();
         g_mem.last_refused_clear = now;
     }
     uint64_t n_rel = 0, bytes = 0;
@@ -1519,10 +1545,12 @@ bool GuestCopy(uint64_t addr, uint64_t size, __strong id<MTLBuffer>* out, uint64
 
 // A guest range whose window span got no no-copy buffer (adm: why). Reads of ranges with holes
 // get a copy; GPU-written ranges and spans over policy.nocopy_max are not bound (false), as
-// before the budget existed.
+// before the budget existed. allow_copy false (GuestPageWindow: only the window itself will do):
+// nothing is copied and nothing logged here (the caller reports it).
 bool RefusedGuestBuffer(uint64_t addr, uint64_t size, uint64_t base, uint64_t end, enum ps4_gpumem_admit adm,
-                        GuestAccess access, __strong id<MTLBuffer>* out, uint64_t* offset) {
+                        GuestAccess access, __strong id<MTLBuffer>* out, uint64_t* offset, bool allow_copy) {
     const bool holes = adm == PS4_GPUMEM_REFUSE_HOLES;
+    if (!allow_copy) return false;
     const bool copied =
         ps4_gpumem_refused_copy(adm, access == GuestAccess::Write, size) && GuestCopy(addr, size, out, offset);
     if (holes && access == GuestAccess::Write) g_mem.refused_written.fetch_add(1, std::memory_order_relaxed);
@@ -1728,8 +1756,10 @@ struct AliasJob {
 
 // `out` is a strong pointer: an (implicitly autoreleasing) plain one would retain and autorelease
 // the buffer on every call. `access`: whether the GPU writes the range (a written range is only
-// ever bound in place).
-bool GuestBuffer(uint64_t addr, uint64_t size, GuestAccess access, __strong id<MTLBuffer>* out, uint64_t* offset) {
+// ever bound in place). allow_copy false: a span refused a no-copy buffer gets no read-only copy
+// either (false).
+bool GuestBuffer(uint64_t addr, uint64_t size, GuestAccess access, __strong id<MTLBuffer>* out, uint64_t* offset,
+                 bool allow_copy = true) {
     GuestContext* ctx = S.ctx;
     if (g_remap_pending.load(std::memory_order_acquire)) DropRemappedWindows();
     if (!ctx) return false;
@@ -1748,7 +1778,8 @@ bool GuestBuffer(uint64_t addr, uint64_t size, GuestAccess access, __strong id<M
     if (it == S.guest_bufs.end()) {
         auto rit = g_mem.refused.find(key);
         if (rit != g_mem.refused.end())
-            return RefusedGuestBuffer(addr, size, base, end, (enum ps4_gpumem_admit)rit->second, access, out, offset);
+            return RefusedGuestBuffer(addr, size, base, end, (enum ps4_gpumem_admit)rit->second, access, out, offset,
+                                      allow_copy);
         const uint64_t mb_t0 = ps4_hitch_now_ns();
         // size first: a too large span is refused without walking its VM regions
         enum ps4_gpumem_admit adm = ps4_gpumem_admit_nocopy(&g_mem.policy, end - base, 0);
@@ -1760,7 +1791,7 @@ bool GuestBuffer(uint64_t addr, uint64_t size, GuestAccess access, __strong id<M
             (adm == PS4_GPUMEM_REFUSE_TOO_LARGE ? g_mem.refused_large : g_mem.refused_holes)
                 .fetch_add(1, std::memory_order_relaxed);
             g_mem.refused[key] = (uint8_t)adm;
-            return RefusedGuestBuffer(addr, size, base, end, adm, access, out, offset);
+            return RefusedGuestBuffer(addr, size, base, end, adm, access, out, offset, allow_copy);
         }
         if (adm == PS4_GPUMEM_ADMIT_LARGE) {
             g_mem.large.fetch_add(1, std::memory_order_relaxed);
@@ -4310,6 +4341,9 @@ struct GuestMemoryState {
     std::vector<std::shared_ptr<GmTicket>> chain;  // the open chain (g_gms.chain_open)
     id<MTLBuffer> chain_prev = nil;                // the slot of its last dispatch
     bool servicing = false;
+    // Draw stages (GmDrawSlot): one fault slot for every draw, always in pass mode
+    GmSlot draw_slot;
+    uint64_t draw_harvested = ~0ull; // present index of the last harvest of draw_slot
 } g_gmem;
 
 
@@ -4533,34 +4567,62 @@ void GmInvalidateOutside(const GmResult& res, const GmPages* pred) {
 
 // The no-copy window holding guest page p and the table entry for it: the GPU address of guest
 // address p << GCN_GUEST_PAGE_SHIFT. Page 0's window starts at PS4_GNM_WINDOW0_BASE
-// (= GCN_GUEST_FIRST_MAPPED, below which the shader never accesses).
+// (= GCN_GUEST_FIRST_MAPPED, below which the shader never accesses). `access`: Write for compute
+// (guest memory stores), Read for draw stages, which only load through guest memory (the
+// translator refuses their stores): a window noted written orders every later encoder that uses
+// it after this one (alias waits on Metal 3).
 static_assert(PS4_GNM_WINDOW0_BASE == GCN_GUEST_FIRST_MAPPED, "page 0's first mapped address");
-bool GuestPageWindow(uint32_t p, __strong id<MTLBuffer>* mb, uint64_t* entry) {
+bool GuestPageWindow(uint32_t p, __strong id<MTLBuffer>* mb, uint64_t* entry, GuestAccess access) {
     const uint64_t start = (uint64_t)p << GCN_GUEST_PAGE_SHIFT;
     const uint64_t first = p == 0 ? PS4_GNM_WINDOW0_BASE : start;
     const uint64_t end = start + (1ull << GCN_GUEST_PAGE_SHIFT);
     if (first >= S.ctx->mem_size) return false;
     uint64_t off = 0;
-    if (!GuestBuffer(first, std::min<uint64_t>(end, S.ctx->mem_size) - first, GuestAccess::Write, mb, &off) || off != 0)
+    // only the no-copy window itself: no read-only copy of a page with holes (it would be made,
+    // 64 MiB of it, only to be dropped)
+    if (!GuestBuffer(first, std::min<uint64_t>(end, S.ctx->mem_size) - first, access, mb, &off, false) || off != 0)
         return false;
+    if ((const uint8_t*)(*mb).contents != (const uint8_t*)S.ctx->mem_base + first) return false;
     *entry = (*mb).gpuAddress - (first - start);
     return true;
 }
 
 // Adds the 64 MiB pages to the mapped set (their table entries are written by the next bind).
-bool GmMapPages(const GmPages& pages, const char* queue, uint64_t code_addr) {
+// queue nullptr: for draws (GmDrawSlot), which are not re-run: they read 0 from such a page. A page
+// draws could not map is remembered (g_mem.draw_unmappable, cleared with g_mem.refused) and not
+// tried again by every later harvest; it is logged once. For draws the other pages are still mapped
+// and *mapped (if not null) counts the pages mapped; for dispatches the first failure ends it (false).
+bool GmMapPages(const GmPages& pages, const char* queue, uint64_t code_addr, size_t* mapped = nullptr) {
+    static std::unordered_set<uint32_t> draw_logged; // encoder thread
+    bool ok = true;
+    // a remap clears draw_unmappable (DropRemappedWindows): apply it before that is consulted
+    if (!queue && g_remap_pending.load(std::memory_order_acquire)) DropRemappedWindows();
     for (uint32_t p : pages) {
+        if (!queue && g_mem.draw_unmappable.count(p)) {
+            ok = false;
+            continue;
+        }
         id<MTLBuffer> mb = nil;
         uint64_t entry = 0;
-        if (!GuestPageWindow(p, &mb, &entry)) {
+        if (!GuestPageWindow(p, &mb, &entry, queue ? GuestAccess::Write : GuestAccess::Read)) {
+            const unsigned long long a = (unsigned long long)((uint64_t)p << GCN_GUEST_PAGE_SHIFT);
+            if (!queue) {
+                g_mem.draw_unmappable.insert(p);
+                g_gm_stats.draw_unmappable.fetch_add(1, std::memory_order_relaxed);
+                if (draw_logged.insert(p).second)
+                    RLog("guestmem-draw", "guest page 0x%llx (64 MiB) cannot be mapped: draws read 0 there", a);
+                ok = false;
+                continue;
+            }
             RLog("guestmem", "%s CS 0x%llx skipped: guest page 0x%llx (64 MiB) cannot be mapped", queue,
-                 (unsigned long long)code_addr, (unsigned long long)((uint64_t)p << GCN_GUEST_PAGE_SHIFT));
+                 (unsigned long long)code_addr, a);
             return false;
         }
         if (!g_gmem.last_used[p]) g_gmem.pages.push_back(p);
         g_gmem.last_used[p] = std::max<uint64_t>(S.present_idx, 1);
+        if (mapped) ++*mapped;
     }
-    return true;
+    return ok;
 }
 
 // The page table with an entry for every mapped page; each window is (re)created through
@@ -4569,6 +4631,8 @@ bool GmMapPages(const GmPages& pages, const char* queue, uint64_t code_addr) {
 // copied first (passes encoded earlier keep theirs).
 bool BindGuestPageTable(Binder& b, __strong id<MTLBuffer>* out) {
     if (!EnsureGuestMemoryState()) return false;
+    // draw stages only load through guest memory: their windows are used read-only
+    const bool written = b.stage == Stage::Compute;
     {
         const uint64_t done = CompletedSeq();
         size_t k = 0;
@@ -4593,7 +4657,8 @@ bool BindGuestPageTable(Binder& b, __strong id<MTLBuffer>* out) {
         g_gmem.pages[n++] = p;
         id<MTLBuffer> mb = nil;
         uint64_t entry = 0;
-        if (!GuestPageWindow(p, &mb, &entry)) entry = 0; // the next probe reports it again
+        if (!GuestPageWindow(p, &mb, &entry, written ? GuestAccess::Write : GuestAccess::Read))
+            entry = 0; // the next probe reports it again
         else windows.push_back(mb);
         want.push_back({p, entry});
         change |= cur[p] != entry;
@@ -4614,7 +4679,7 @@ bool BindGuestPageTable(Binder& b, __strong id<MTLBuffer>* out) {
         uint64_t* table = (uint64_t*)g_gmem.table.contents;
         for (auto [p, e] : want) table[p] = e;
     }
-    for (id<MTLBuffer> mb : windows) b.Use(mb, true);
+    for (id<MTLBuffer> mb : windows) b.Use(mb, written);
     windows.clear();
     g_gmem.table_bound = true;
     *out = g_gmem.table;
@@ -4688,6 +4753,9 @@ GuestMemoryStats GetGuestMemoryStats() {
     st.rerun_wait_us = g_gm_stats.rerun_wait_us.load();
     st.rerun_wait_max_us = g_gm_stats.rerun_wait_max_us.load();
     st.no_slot = g_gm_stats.no_slot.load();
+    st.draw_mapped = g_gm_stats.draw_mapped.load();
+    st.draw_harvests = g_gm_stats.draw_harvests.load();
+    st.draw_unmappable = g_gm_stats.draw_unmappable.load();
     st.no_indirect = g_gm_stats.no_indirect.load();
     st.pass_failed = g_gm_stats.pass_failed.load();
     st.waits = S.n_waits_total.load();
@@ -4862,6 +4930,64 @@ bool ResolveTableHazards(const TableStage* st, uint32_t n, uint64_t snap) {
     return true;
 }
 
+// Draw stages that load through guest memory (gcn_shader_info.uses_guest_memory in a VS or PS:
+// ADDR64 loads, loads through V#s loaded at run time; the translator refuses guest memory stores
+// outside compute). They bind the page table like a dispatch, and as their fault buffer one slot
+// shared by every such draw that stays in pass mode (GCN_GUEST_MODE 0): a draw is not probed and
+// not run again, so a load from a 64 MiB page that is not mapped yet reads 0 and sets the page's
+// bit and GCN_GUEST_STATUS_UNMAPPED. Each such draw first reads the status dword the GPU wrote
+// so far (before its page table is bound): with a status bit, the pages met unmapped are mapped
+// for this draw and the later ones. The GPU sets the bits and only this clears them; a
+// bit set while it is cleared is set again by the next draw that meets the page. Once per present
+// the 64 MiB pages whose 1 MiB pages the draws read keep their last use (kGuestPageIdlePresents).
+// Draws of shaders without guest memory never come here.
+id<MTLBuffer> GmDrawSlot() {
+    if (!EnsureGuestMemoryState()) return nil;
+    GmSlot& slot = g_gmem.draw_slot;
+    if (!slot.buf) {
+        // Not hazard tracked: the draws only set bits in it (atomic ORs, in any order) and the CPU
+        // reads and clears them; tracked, every render pass with such a draw would wait for the
+        // previous one (Metal 3), as the slot is the one buffer these draws write.
+        slot.buf = [S.dev newBufferWithLength:kGmSlotDwords * sizeof(uint32_t)
+                                      options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+        if (!slot.buf) return nil;
+        S.be->MakeResident(slot.buf, GnmResidencyClass::Builtin); // kept for the process lifetime
+        slot.f = (uint32_t*)slot.buf.contents;
+        memset(slot.f, 0, kGmSlotDwords * sizeof(uint32_t));
+        slot.f[GCN_GUEST_MODE] = 0;
+    }
+    uint32_t* f = slot.f;
+    if (__atomic_load_n(&f[GCN_GUEST_STATUS], __ATOMIC_RELAXED)) {
+        const uint32_t status = __atomic_exchange_n(&f[GCN_GUEST_STATUS], 0u, __ATOMIC_RELAXED);
+        if (status & ~GCN_GUEST_STATUS_UNMAPPED)
+            RLog("guestmem-draw", "a draw's guest memory access was not made (status 0x%x: format, swizzle, "
+                                  "range or alignment; GCN_GUEST_STATUS_*)", status & ~GCN_GUEST_STATUS_UNMAPPED);
+        GmPages unmapped;
+        for (uint32_t i = 0; i < GCN_GUEST_PAGES / 32; ++i) {
+            if (!__atomic_load_n(&f[GCN_GUEST_UNMAPPED + i], __ATOMIC_RELAXED)) continue;
+            for (uint32_t w = __atomic_exchange_n(&f[GCN_GUEST_UNMAPPED + i], 0u, __ATOMIC_RELAXED); w; w &= w - 1)
+                unmapped.push_back(i * 32 + (uint32_t)__builtin_ctz(w));
+        }
+        g_gm_stats.draw_harvests.fetch_add(1, std::memory_order_relaxed);
+        size_t mapped = 0;
+        if (!unmapped.empty()) GmMapPages(unmapped, nullptr, 0, &mapped);
+        if (mapped) g_gm_stats.draw_mapped.fetch_add(mapped, std::memory_order_relaxed);
+    }
+    if (g_gmem.draw_harvested != S.present_idx) {
+        g_gmem.draw_harvested = S.present_idx;
+        const uint64_t now = std::max<uint64_t>(S.present_idx, 1);
+        constexpr uint32_t kTrackPerPage = 1u << (GCN_GUEST_PAGE_SHIFT - GCN_GUEST_TRACK_SHIFT); // 64
+        for (uint32_t i = 0; i < GCN_GUEST_TRACK_PAGES / 32; ++i) {
+            if (!__atomic_load_n(&f[GCN_GUEST_READ + i], __ATOMIC_RELAXED)) continue;
+            // exchange, as the UNMAPPED loop: a bit the GPU sets between a load and a store is kept
+            if (!__atomic_exchange_n(&f[GCN_GUEST_READ + i], 0u, __ATOMIC_RELAXED)) continue;
+            const uint32_t p = i * 32 / kTrackPerPage;
+            if (g_gmem.last_used[p]) g_gmem.last_used[p] = now;
+        }
+    }
+    return slot.buf;
+}
+
 bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_t>& flat, Binder& b,
                const BindCtx& bc, const gcn_push_data& push, std::string* why) {
     (void)ud;
@@ -4972,10 +5098,8 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                 NoteGpuWrite(base, bd.size_bytes);
                 if (!unbounded) NoteBufferStore(bd.base_address, bd.size_bytes);
                 auto mit = S.meta.find(base);
-                if (mit != S.meta.end() && b.stage == Stage::Compute) {
-                    mit->second.cleared = true;
-                    mit->second.cleared_seq = S.committed_seq + 1;
-                }
+                if (mit != S.meta.end() && b.stage == Stage::Compute)
+                    ArmMetaClear(mit->second, bd.size_bytes, S.committed_seq + 1);
             }
             break;
         }
@@ -4987,13 +5111,18 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             mb = S.gds_buf;
             break;
         case GCN_BUFFER_BDA_PAGETABLE:
+            // a draw stage: map the pages earlier draws met unmapped before the table is bound
+            if (b.stage != Stage::Compute && !GmDrawSlot()) {
+                if (why) *why = "no guest memory fault buffer for draws";
+                return false;
+            }
             if (!BindGuestPageTable(b, &mb)) {
                 if (why) *why = "no guest memory page table";
                 return false;
             }
             break;
         case GCN_BUFFER_FAULT_BUFFER:
-            if (!(mb = g_gmem.cur_slot)) {
+            if (!(mb = b.stage == Stage::Compute ? g_gmem.cur_slot : GmDrawSlot())) {
                 if (why) *why = "no guest memory fault buffer";
                 return false;
             }
@@ -6188,14 +6317,72 @@ void RegisterMeta(uint64_t addr) {
     if (addr) S.meta.emplace(addr, MetaState{});
 }
 
-// seq (optional): the command buffer the clear belongs to.
-bool TakeMetaCleared(uint64_t addr, uint64_t* seq = nullptr) {
+// seq (optional): the command buffer the clear belongs to. slice / slice_bytes: the draw's
+// slice of an array whose metadata holds slice_bytes per slice (0: not known, one slice).
+// The clear covers cleared_bytes / slice_bytes slices from the base. That count does not depend on
+// the Metal texture's current array length (which grows only as later slices are drawn) nor on
+// the draw's DB_DEPTH_VIEW (a slice-0 view says nothing about slices 1..n): the slice-0 draw of a
+// frame whose array has not grown yet must leave the clear pending for slices 1..n. Each covered
+// slice takes the clear once; it stays pending until all of them have (as the HTILE of a slice
+// no draw touched stays cleared on the GPU).
+bool TakeMetaCleared(uint64_t addr, uint64_t* seq = nullptr, uint32_t slice = 0, uint64_t slice_bytes = 0) {
     auto it = S.meta.find(addr);
     if (it == S.meta.end() || !it->second.cleared) return false;
-    it->second.cleared = false;
-    if (cap::g_pass) cap::g_pass->meta_cleared.push_back(addr); // replay re-arms the fast clear
+    MetaState& m = it->second;
+    uint64_t covered = 1;
+    if (slice_bytes)
+        covered = std::max<uint64_t>(1, std::min<uint64_t>(64, m.cleared_bytes == kAllMeta ? 64 : m.cleared_bytes / slice_bytes));
+    if (slice >= covered || (m.taken_slices >> slice & 1)) return false;
+    m.taken_slices |= 1ull << slice;
+    if ((uint64_t)__builtin_popcountll(m.taken_slices) >= covered) m.cleared = false;
+    if (cap::g_pass) { // replay re-arms the fast clear for this slice
+        cap::g_pass->meta_cleared.push_back(addr);
+        cap::g_pass->meta_cleared_slices.push_back(slice);
+    }
     if (seq) *seq = it->second.cleared_seq;
     return true;
+}
+
+// The fast clears a draw took (TakeMetaCleared) before its render pass began: a draw skipped
+// before BeginPass encoded them (a pipeline that failed, an empty scissor, a table hazard, ...)
+// gives them back, so the slice's next draw still clears. Once the pass began they are in its
+// load actions (a later BindStage failure skips only the draw, not the clear): Keep().
+struct MetaTakeUndo {
+    struct Taken {
+        uint64_t addr, seq;
+        uint32_t slice;
+    };
+    Taken taken[9];
+    int n = 0;
+    void Add(uint64_t addr, uint32_t slice, uint64_t seq) {
+        if (n < 9) taken[n++] = {addr, seq, slice};
+    }
+    void Keep() { n = 0; }
+    ~MetaTakeUndo() {
+        for (int i = 0; i < n; ++i) {
+            auto it = S.meta.find(taken[i].addr);
+            // not when another clear re-armed it since (ArmMetaClear: a new seq)
+            if (it == S.meta.end() || it->second.cleared_seq != taken[i].seq) continue;
+            it->second.taken_slices &= ~(1ull << taken[i].slice);
+            it->second.cleared = true;
+        }
+    }
+    MetaTakeUndo() = default;
+    MetaTakeUndo(const MetaTakeUndo&) = delete;
+    MetaTakeUndo& operator=(const MetaTakeUndo&) = delete;
+};
+
+// HTILE bytes per slice of a depth target (0: not known exactly, a clear then covers one slice, as
+// before; logged once)
+uint64_t HtileSliceBytesOf(const DepthTarget& db) {
+    static const bool neo = sceKernelIsNeoMode() != 0;
+    const uint64_t b = DepthHtileSliceBytes(db, neo);
+    static std::atomic<bool> logged{false};
+    if (!b && !logged.exchange(true))
+        RLog(neo ? "htile-neo" : "htile-pipes",
+             "HTILE slice size not known (%s, tile mode %u): a metadata clear of a depth array covers its first "
+             "slice only", neo ? "Neo depth tiling" : "pipe config", (uint32_t)db.tile_mode);
+    return b;
 }
 
 // =====================================================================================
@@ -7283,10 +7470,7 @@ void NotifyGuestWriteImpl(uint64_t addr, uint64_t size, bool is_fill, uint32_t f
     (void)fill_value;
     if (is_fill) {
         auto it = S.meta.find(addr);
-        if (it != S.meta.end()) {
-            it->second.cleared = true;
-            it->second.cleared_seq = S.committed_seq + 1;
-        }
+        if (it != S.meta.end()) ArmMetaClear(it->second, size, S.committed_seq + 1);
     }
     if (S.tex) S.tex->InvalidateRange(addr, size, false);
 }
@@ -7608,6 +7792,7 @@ void DrawEncode(DrawRec& r) {
         id<MTLTexture> hold[9] = {};
         uint32_t color_fmt[8] = {}, write_mask[8] = {};
         ClearReq clr;
+        MetaTakeUndo meta_undo; // the fast clears taken below, given back if the pass does not begin
         uint32_t rt_w = 16384, rt_h = 16384, samples = 0;
         bool any_rt = false;
         const uint32_t mrt_mask = ps ? ps->info.mrt_mask : 0;
@@ -7635,6 +7820,7 @@ void DrawEncode(DrawRec& r) {
             any_rt = true;
             uint64_t clear_seq = 0;
             if (c.fast_clear && TakeMetaCleared(c.cmask_address, &clear_seq)) {
+                meta_undo.Add(c.cmask_address, 0, clear_seq);
                 if (ClearColorFor(t.pixelFormat, c.clear_word0, c.clear_word1, &clr.color_value[i])) {
                     clr.color[i] = true;
                     NoteClearedColor(c, t, clear_seq);
@@ -7694,7 +7880,10 @@ void DrawEncode(DrawRec& r) {
                 if (depth_write || rs.ds.stencil_test || db.depth_clear_enable || db.stencil_clear_enable)
                     BumpDepthVersion(t);
                 uint64_t htile_seq = 0;
-                const bool htile_clear = db.htile_enable && TakeMetaCleared(db.htile_address, &htile_seq);
+                const uint32_t htile_slice = std::min<uint32_t>(db.base_slice, 63);
+                const bool htile_clear =
+                    db.htile_enable && TakeMetaCleared(db.htile_address, &htile_seq, htile_slice, HtileSliceBytesOf(db));
+                if (htile_clear) meta_undo.Add(db.htile_address, htile_slice, htile_seq);
                 if ((db.depth_clear_enable && depth_enable && depth_write) || htile_clear) {
                     clr.depth = true;
                     clr.depth_value = db.depth_clear;
@@ -7977,6 +8166,7 @@ void DrawEncode(DrawRec& r) {
             if (ps) PrepareDepthCompanions(ps, ps_flat);
         }
         if (!BeginPass(key, clr, hold)) return;
+        meta_undo.Keep(); // the pass's load actions hold the clears now
         if (g_only_clears) { // debug (Metal 4 without draws): the pass's clears happen, the draw does not
             S.n_clear_only++;
             return;
@@ -9068,7 +9258,7 @@ void DispatchEncode(DispatchRec*& rp) {
         std::vector<uint32_t>& flat = r.flat;
         {
             bool reads_meta = false;
-            uint64_t meta_written = 0;
+            uint64_t meta_written = 0, meta_bytes = 0;
             for (uint32_t i = 0; i < cs->bufs.size(); ++i) {
                 if (cs->bufs[i].type != GCN_BUFFER_GUEST) continue;
                 uint32_t v[4];
@@ -9076,7 +9266,7 @@ void DispatchEncode(DispatchRec*& rp) {
                 if (!gcn_shader_fetch_buffer_sharp(cs->sh, i, flat.data(), cs->code_addr, v)) continue;
                 gcn_decode_buffer(v, &bd);
                 if (!S.meta.count(bd.base_address)) continue;
-                if (cs->bufs[i].is_written) meta_written = bd.base_address;
+                if (cs->bufs[i].is_written) meta_written = bd.base_address, meta_bytes = bd.size_bytes;
                 else reads_meta = true;
             }
             // Surface copies through buffers (shadPS4 Rasterizer::IsComputeImageCopy): one read and
@@ -9130,7 +9320,7 @@ void DispatchEncode(DispatchRec*& rp) {
             }
             if (meta_written && !reads_meta) {
                 cap::SetSkipped("CMASK/HTILE clear by a compute shader (tracked, not run)");
-                S.meta[meta_written].cleared = true;
+                ArmMetaClear(S.meta[meta_written], meta_bytes, S.committed_seq + 1);
                 if (ShouldTrace()) fprintf(stderr, "[gnm-trace] %s CS 0x%llx: meta clear of 0x%llx\n", queue,
                                            (unsigned long long)addr, (unsigned long long)meta_written);
                 return;
@@ -9646,13 +9836,23 @@ bool ReplayReadTexture(const ps4gnm_capture::GpuTextureId& gid, std::vector<uint
     return ok;
 }
 
-void ReplaySetMetaCleared(uint64_t cmask_address) {
+void ReplaySetMetaCleared(uint64_t cmask_address, int slice) {
     if (!S.enabled.load(std::memory_order_acquire)) return;
     // S.meta belongs to the encoder (NotifyGuestWriteImpl): set it there, behind queued work
     encq::Run([=] {
         MetaState& m = S.meta[cmask_address];
-        m.cleared = true;
-        m.cleared_seq = S.committed_seq + 1;
+        ArmMetaClear(m, kAllMeta, S.committed_seq + 1);
+        // only the slice that took it: every other slice counts as taken (slice < 0, a capture
+        // without meta_cleared_slices: every slice, until ReplayDisarmMetaCleared after the pass)
+        if (slice >= 0 && slice < 64) m.taken_slices = ~(1ull << slice);
+    });
+}
+
+void ReplayDisarmMetaCleared(uint64_t cmask_address) {
+    if (!S.enabled.load(std::memory_order_acquire)) return;
+    encq::Run([=] {
+        auto it = S.meta.find(cmask_address);
+        if (it != S.meta.end()) it->second.cleared = false;
     });
 }
 
@@ -9725,6 +9925,17 @@ extern "C" void ps4_gnm_guest_remapped(uint64_t addr, uint64_t size) {
 extern "C" void* ps4_gnm_debug_backend(void) { return ps4draw::S.be.get(); }
 // windows the idle sweep released since startup (SweepGuestWindows; remaps are not counted)
 extern "C" uint64_t ps4_gnm_debug_sweep_released(void) { return ps4draw::g_mem.released.load(); }
+// Tests: maps the 64 MiB guest pages as a draw's harvest does (GmMapPages for draws); returns the
+// pages mapped. *copies: read-only copies made so far (g_mem.copies).
+extern "C" uint32_t ps4_gnm_debug_map_draw_pages(const uint32_t* pages, uint32_t n, uint64_t* copies) {
+    size_t mapped = 0;
+    ps4draw::encq::Run([&] {
+        if (!ps4draw::EnsureGuestMemoryState()) return;
+        ps4draw::GmMapPages(ps4draw::GmPages(pages, pages + n), nullptr, 0, &mapped);
+    });
+    if (copies) *copies = ps4draw::g_mem.copies.load();
+    return (uint32_t)mapped;
+}
 extern "C" uint32_t ps4_gnm_debug_window_count(void) {
     uint32_t n = 0;
     ps4draw::encq::Run([&] { n = (uint32_t)ps4draw::S.guest_bufs.size(); });

@@ -71,6 +71,10 @@ clang++ -std=c++17 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/
 # The PS4_SCREENSHOT_EVERY_SEC cadence: one shot at the first flip after each multiple of the period.
 clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/modules/libSceVideoOut" "$R/tests/host/screenshot_cadence_test.c" \
   -o "$T/screenshot_cadence_test"
+# sceVideoOutAdjustColor output gamma: identity at 1.0, < 1 darkens, > 1 brightens, monotonic.
+clang -std=gnu11 -Wall -Werror -I "$R/pkg/runtime/modules/libSceVideoOut" "$R/tests/host/output_gamma_test.c" \
+  -lm -o "$T/output_gamma_test"
+"$T/output_gamma_test"
 "$T/screenshot_cadence_test"
 # libSceAudio3d on the real libSceAudioOut (headless device): panner, attribute validation, queue
 # levels and device-clock pacing, bed plus object mixed to a known output.
@@ -254,6 +258,7 @@ done
   "$R/tests/host/gnm_upload_bind_test.mm" "$R/tests/host/gnm_before_init_test.mm" "$R/tools/gnm_replay/gnm_replay.mm" \
   "$R/tests/host/gnm_exit_test.mm" "$R/tests/host/gnm_crash_exit_test.mm" "$R/tests/host/gnm_alias_dma_test.mm" \
   "$R/tests/host/gnm_compute_batch_test.mm" "$R/tests/host/gnm_detile_order_test.mm" \
+  "$R/tests/host/gnm_addr64_test.mm" "$R/tests/host/gnm_htile_slices_test.mm" \
   > "$T/replay_build.txt" 2>&1 || { cat "$T/replay_build.txt"; exit 1; }
 # Each case on both backends, Metal 4 with the residency check.
 for m in 3 4; do rtest $m "$T/replay/gnm_replay_test"; done
@@ -263,6 +268,17 @@ for m in 3 4; do rtest $m "$T/replay/gnm_replay_test"; done
 # a fill after a copy of its bytes through the other window waits for the copy (write after
 # read); a job with two encoders orders its uses in each.
 for m in 3 4; do rtest $m "$T/replay/gnm_alias_dma_test"; done
+# MUBUF ADDR64 loads (TLOU's hair and foliage shadow cascades): the address is the V# base plus
+# the 64-bit VGPR pointer (with carry past 4 GiB) plus soffset and inst_offset, not range checked.
+# Also in a pixel shader: the draw path binds the page table and the draws' fault slot; a page a
+# draw met unmapped is mapped for the next draw.
+for m in 3 4; do rtest $m "$T/replay/gnm_addr64_test"; done
+# A compute HTILE clear of a depth array covers each slice it wrote (TLOU's 3-slice sun shadow
+# array, the capture's registers and V#): every slice's first draw after it clears that slice;
+# a clear of one slice's HTILE leaves the other slices as they were; a clear that arrives before the
+# Metal array has grown still covers slices 1..n; HTILE slice sizes for 2, 8 and 16 pipes and linear
+# HTILE (addrlib), and none for a Neo depth target (one-slice clears there).
+for m in 3 4; do rtest $m "$T/replay/gnm_htile_slices_test"; done
 # Batched compute commits (ps4draw::FlushCompute): while 2 seqs are in flight the end of a
 # compute submission is held; two submissions share one compute encoder, a guest wait between them
 # is a barrier in it; a Flush commits held work at once, the release thread within the bound

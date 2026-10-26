@@ -592,6 +592,7 @@ struct DepthTarget {
     bool tiled = false;
     uint32_t tile_split = 0, stencil_tile_split = 0;
     bool htile_enable = false;   // DB_Z_INFO.TILE_SURFACE_ENABLE
+    bool htile_linear = false;   // DB_HTILE_SURFACE.LINEAR
     bool allow_expclear = false;
     uint64_t z_read_address = 0, stencil_read_address = 0;
     uint64_t z_write_address = 0, stencil_write_address = 0;
@@ -705,6 +706,15 @@ struct RenderState {
 // regs must hold at least 0xD000 dwords (the runtime uses uint32_t regs[0x10000]).
 void DecodeColorTarget(const uint32_t* regs, uint32_t index, ColorTarget* out);
 void DecodeDepthTarget(const uint32_t* regs, DepthTarget* out);
+// HTILE bytes of one slice of a depth surface of pitch x height texels on a GPU with `pipes` pipes
+// (AMD addrlib ComputeHtileInfo for SI/CI: 32 bits per 8x8 tile, the surface aligned to the HTILE
+// macro tile, ComputeTileDataWidthAndHeight with 16 KiB cache bits; linear HTILE
+// (DB_HTILE_SURFACE.LINEAR): 128 x 8*pipes texels). 0 for an unsupported pipe count.
+uint64_t HtileSliceBytes(uint32_t pitch, uint32_t height, uint32_t pipes, bool linear);
+// The same for a decoded depth target: its pipe config from its tile mode on the base PS4. 0 when
+// the layout is not known exactly: Neo mode (the depth target's alternate tiling, with 16 pipes,
+// is not decoded) and pipe configs other than 2 / 8 pipes.
+uint64_t DepthHtileSliceBytes(const DepthTarget& d, bool neo_mode);
 void DecodeRenderState(const uint32_t* regs, RenderState* out);
 void PrintRenderState(const RenderState& rs, FILE* f, bool verbose = false);
 

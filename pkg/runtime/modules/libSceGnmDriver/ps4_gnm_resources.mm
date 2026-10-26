@@ -2020,6 +2020,7 @@ void DecodeDepthTarget(const uint32_t* regs, DepthTarget* d) {
     d->tile_mode = (TileMode)Bits(zi, 20, 3);
     d->allow_expclear = Bits(zi, 27, 1) != 0;
     d->htile_enable = Bits(zi, 29, 1) != 0;
+    d->htile_linear = (regs[0xA2AF] & 1) != 0; // DB_HTILE_SURFACE
     d->stencil_format = (StencilFormat)Bits(si, 0, 1);
     d->stencil_tile_split = Bits(si, 13, 3);
     d->tiled = d->tile_mode != TileMode::DisplayLinearAligned && d->tile_mode != TileMode::DisplayLinearGeneral;
@@ -2047,6 +2048,30 @@ void DecodeDepthTarget(const uint32_t* regs, DepthTarget* d) {
     bool exact = true;
     d->mtl_format = GetDepthPixelFormat(d->z_format, d->stencil_format, &exact);
     d->format_exact = exact;
+}
+
+uint64_t HtileSliceBytes(uint32_t pitch, uint32_t height, uint32_t pipes, bool linear) {
+    if (pipes != 2 && pipes != 8 && pipes != 16) return 0;
+    constexpr uint32_t kHtileBpp = 32, kHtileCacheBits = 16384;
+    uint32_t mw, mh;
+    if (linear) {
+        mw = 8 * 512 / kHtileBpp; // SiLib::HwlComputeTileDataWidthAndHeightLinear
+        mh = 8 * pipes;
+    } else {
+        uint32_t w = kHtileCacheBits / kHtileBpp, h = 1; // Lib::ComputeTileDataWidthAndHeight
+        while (w > h * 2 * pipes && !(w & 1)) w /= 2, h *= 2;
+        mw = 8 * w;
+        mh = 8 * h * pipes;
+    }
+    const uint64_t p = (pitch + mw - 1) / mw * mw, hh = (height + mh - 1) / mh * mh;
+    return p * hh / 64 * kHtileBpp / 8;
+}
+
+uint64_t DepthHtileSliceBytes(const DepthTarget& d, bool neo_mode) {
+    if (neo_mode) return 0;
+    const PipeConfig pc = GetPipeConfig(d.tile_mode);
+    if (pc != PipeConfig::P8_32x32_16x16 && pc != PipeConfig::P8_32x32_8x16 && pc != PipeConfig::P2) return 0;
+    return HtileSliceBytes(d.pitch, d.height, GetPipeCount(pc), d.htile_linear);
 }
 
 SurfaceDesc DepthTarget::ToSurfaceDesc() const {

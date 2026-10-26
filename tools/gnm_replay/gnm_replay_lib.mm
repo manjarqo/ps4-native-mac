@@ -224,7 +224,10 @@ Result ReplayLoaded(const Options& o, const FrameRec& f) {
             return r.error = "cannot load " + t.pre_file, r;
         if (!ps4draw::ReplayAdoptTexture(t.id, &raw)) return r.error = "cannot create the texture of " + t.role, r;
     }
-    for (uint64_t a : p.meta_cleared) ps4draw::ReplaySetMetaCleared(a);
+    // the slice that took each clear (older captures do not have it: every slice, disarmed after the pass)
+    const bool meta_slices = p.meta_cleared_slices.size() == p.meta_cleared.size();
+    for (size_t i = 0; i < p.meta_cleared.size(); ++i)
+        ps4draw::ReplaySetMetaCleared(p.meta_cleared[i], meta_slices ? (int)p.meta_cleared_slices[i] : -1);
     std::vector<uint32_t> regs;
     if (!LoadRegs(o.frame_dir, p.regs_file, &regs, &err)) return r.error = err, r;
 
@@ -258,6 +261,8 @@ Result ReplayLoaded(const Options& o, const FrameRec& f) {
     }
     ps4draw::Flush(true);
     if (o.around_render) o.around_render(o.around_ctx, false);
+    if (!meta_slices)
+        for (uint64_t a : p.meta_cleared) ps4draw::ReplayDisarmMetaCleared(a);
     if (ps4draw::SkippedCount() != skipped0) return r.error = "the renderer skipped the pass (see the [gnm-draw] log)", r;
     r.ran = true;
 

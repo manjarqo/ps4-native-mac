@@ -319,6 +319,7 @@ static void TestWriterRoundTrip() {
     p.inputs.push_back(a);
     p.outputs.push_back(w.Snapshot(mem.data(), 0x14000, kPage));
     p.meta_cleared.push_back(0x9900);
+    p.meta_cleared_slices.push_back(2);
     p.unstable = {"input 0x1000+0x4000", "texture t3_sampled"};
     p.state.viewport[2] = 1920.5;
     p.state.blend_enable[3] = true;
@@ -346,6 +347,7 @@ static void TestWriterRoundTrip() {
               "T# table entry marks");
         CHECK(q.inputs.size() == 1 && q.inputs[0].file == a.file && q.inputs[0].hash == a.hash, "inputs");
         CHECK(q.meta_cleared.size() == 1 && q.meta_cleared[0] == 0x9900, "meta");
+        CHECK(q.meta_cleared_slices.size() == 1 && q.meta_cleared_slices[0] == 2, "meta slice");
         CHECK(q.unstable.size() == 2 && q.unstable[0] == "input 0x1000+0x4000" && q.unstable[1] == "texture t3_sampled", "unstable");
         CHECK(q.state.viewport[2] == 1920.5 && q.state.blend_enable[3], "state");
         std::vector<uint32_t> r2;

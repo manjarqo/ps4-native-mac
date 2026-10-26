@@ -61,6 +61,9 @@ union BufferInstInfo {
     BitField<17, 4, AmdGpu::DataFormat> inst_data_fmt;
     BitField<21, 3, AmdGpu::NumberFormat> inst_num_fmt;
     BitField<24, 1, u64> sharp_source;
+    // PS4Recomp: MUBUF/MTBUF ADDR64 (CI): the address args are the 64-bit VGPR address (lo, hi)
+    // and soffset; index_enable and voffset_enable are 0 (LowerDynamicBufferAccess)
+    BitField<25, 1, u64> addr64;
     BitField<32, 16, u64> pc;
     BitField<48, 16, u64> flatbuf_off_dw;
 };

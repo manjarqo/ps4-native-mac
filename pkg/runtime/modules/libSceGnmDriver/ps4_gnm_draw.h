@@ -160,8 +160,11 @@ bool DebugTwoEncoderCopy(uint64_t src, uint64_t dst, uint32_t n);
 bool ReplayAdoptTexture(const ps4gnm_capture::GpuTextureId& gid, const std::vector<uint8_t>* raw);
 // Contents of the entry with that identity; false if the renderer has none.
 bool ReplayReadTexture(const ps4gnm_capture::GpuTextureId& gid, std::vector<uint8_t>* raw);
-// The fast clear of the CMASK/HTILE at this address is pending (as the captured pass found it).
-void ReplaySetMetaCleared(uint64_t cmask_address);
+// The fast clear of the CMASK/HTILE at this address is pending (as the captured pass found it),
+// for `slice` only (the slice whose draw took it; -1: not recorded, every slice).
+void ReplaySetMetaCleared(uint64_t cmask_address, int slice);
+// It is no longer pending (after a replayed pass whose capture did not record the slice).
+void ReplayDisarmMetaCleared(uint64_t cmask_address);
 // Draws and dispatches skipped so far (a replayed pass must not add one).
 uint64_t SkippedCount();
 // Draws skipped by PS4_GNM_MTL4_ONLY_CLEARS (debug) after their render pass began, so far.
@@ -184,6 +187,10 @@ struct GuestMemoryStats {
     uint64_t no_slot = 0, no_indirect = 0, pass_failed = 0; // skipped: no fault buffer, no
                                                             // indirect argument buffer, binding failed
     uint64_t final_ticket = 0; // the last fast dispatch whose result is final
+    uint64_t draw_mapped = 0;   // 64 MiB pages mapped after draws met them unmapped (GmDrawSlot)
+    uint64_t draw_harvests = 0; // harvests of the draws' fault slot (one per present with such draws)
+    uint64_t draw_unmappable = 0; // tries to map a 64 MiB page for draws that failed (one per page
+                                  // until a remap or the refused spans' idle reset)
 };
 GuestMemoryStats GetGuestMemoryStats();
 // Renderer gave up on the GPU (a GPU watchdog fired): nothing more is rendered.

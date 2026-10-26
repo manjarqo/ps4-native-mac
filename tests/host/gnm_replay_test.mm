@@ -391,7 +391,9 @@ GpuTextureId SampledId() {
 }
 
 // Writes <root>/frame_1 with the draw as pass 0; `pending`: the CMASK fast clear is pending.
-std::string WriteDrawCapture(const std::string& root, bool pending, std::vector<uint8_t>* want) {
+// pending: 0 no fast clear pending, 1 pending (a capture without meta_cleared_slices), 2 pending
+// with the slice that took it recorded (slice 0)
+std::string WriteDrawCapture(const std::string& root, int pending, std::vector<uint8_t>* want) {
     uint8_t* mem = (uint8_t*)mmap(nullptr, kMemSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     // VS: buffer_load_format_xyzw v[1:4], v0, s[0:3] idxen; exp param0, pos0 done
     const auto vs = WithFooter({0xE00C2000, 0x80000100, 0xBF8C0F70, 0xF800020F, 0x04030201, 0xF80008CF, 0x04030201,
@@ -435,6 +437,7 @@ std::string WriteDrawCapture(const std::string& root, bool pending, std::vector<
     p.cb_extent[0] = 8 | 8 << 16;
     p.regs_file = w.SaveRegs(regs.data(), &p.regs_hash);
     if (pending) p.meta_cleared.push_back(kCmask);
+    if (pending == 2) p.meta_cleared_slices.push_back(0);
     TextureRec t;
     t.role = "t0_color0";
     t.written = true;
@@ -457,10 +460,11 @@ std::string WriteDrawCapture(const std::string& root, bool pending, std::vector<
 }
 
 void TestDrawReplay(const std::string& root) {
-    for (int pending = 0; pending < 2; ++pending) {
+    for (int pending = 0; pending < 3; ++pending) {
         ps4replay::Options o;
         std::vector<uint8_t> want;
-        o.frame_dir = WriteDrawCapture(root + (pending ? "/draw_clear" : "/draw"), pending, &want);
+        o.frame_dir = WriteDrawCapture(root + (pending == 2 ? "/draw_clear_slice" : pending ? "/draw_clear" : "/draw"),
+                                       pending, &want);
         o.keep_outputs = true;
         const ps4replay::Result r = ps4replay::ReplayPass(o);
         CHECK(r.ran, "draw (fast clear pending %d) not replayed: %s", pending, r.error.c_str());
@@ -763,7 +767,7 @@ void TestOnlyClearsDraw(const std::string& root) {
     CHECK(oc && !strcmp(oc, "1"), "only-clears: run with PS4_GNM_MTL4_ONLY_CLEARS=1");
     std::vector<uint8_t> want;
     ps4replay::Options o;
-    o.frame_dir = WriteDrawCapture(root + "/only_clears", true, &want);
+    o.frame_dir = WriteDrawCapture(root + "/only_clears", 1, &want);
     o.keep_outputs = true;
     const uint64_t before = ps4draw::OnlyClearsSkippedCount();
     const ps4replay::Result r = ps4replay::ReplayPass(o);

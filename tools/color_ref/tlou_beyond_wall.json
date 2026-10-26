@@ -1,0 +1,45 @@
+{
+  "pairs": [
+    {
+      "name": "interior",
+      "ours": "ours/interior.png",
+      "ref": "video/all_001.png",
+      "regions": {
+        "frame": {"limits": "frame", "ours": [0, 0.12, 1, 0.76], "ref": [0, 0.02, 1, 0.84]}
+      }
+    },
+    {
+      "name": "courtyard",
+      "ours": "ours/courtyard.png",
+      "ref": "video/courtyard.png",
+      "regions": {
+        "frame": {"limits": "frame", "ours": [0, 0.12, 1, 0.76], "ref": [0, 0.02, 1, 0.84]}
+      }
+    },
+    {
+      "name": "joel_back",
+      "ours": "ours/joel_back.png",
+      "ref": "video/joel_back.png",
+      "regions": {
+        "frame": {"limits": "frame", "ours": [0, 0.12, 1, 0.76], "ref": [0, 0.02, 1, 0.84]},
+        "hair": {"limits": "detail", "ours": [0.406, 0.452, 0.078, 0.133], "ref": [0.328, 0.443, 0.042, 0.083]}
+      }
+    },
+    {
+      "name": "bluecloth",
+      "ours": "ours/bluecloth.png",
+      "ref": "video/bluecloth.png",
+      "regions": {
+        "frame": {"limits": "frame", "ours": [0, 0.12, 1, 0.76], "ref": [0, 0.02, 1, 0.84]}
+      }
+    },
+    {
+      "name": "plank",
+      "ours": "ours/plank.png",
+      "ref": "video/plank.png",
+      "regions": {
+        "frame": {"limits": "frame", "ours": [0, 0.12, 1, 0.76], "ref": [0, 0.02, 1, 0.84]}
+      }
+    }
+  ]
+}

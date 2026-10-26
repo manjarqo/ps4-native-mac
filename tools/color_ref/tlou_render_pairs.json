@@ -1,0 +1,85 @@
+{
+  "pairs": [
+    {
+      "name": "interior",
+      "ours": "render/interior.png",
+      "ref": "video/interior.png",
+      "regions": {
+        "frame": {
+          "limits": "frame",
+          "ours": [
+            0,
+            0,
+            1,
+            1
+          ],
+          "ref": [
+            0,
+            0.02,
+            1,
+            0.84
+          ]
+        }
+      }
+    },
+    {
+      "name": "courtyard",
+      "ours": "render/courtyard.png",
+      "ref": "video/courtyard.png",
+      "regions": {
+        "frame": {
+          "limits": "frame",
+          "ours": [
+            0,
+            0,
+            1,
+            1
+          ],
+          "ref": [
+            0,
+            0.02,
+            1,
+            0.84
+          ]
+        }
+      }
+    },
+    {
+      "name": "joel_back",
+      "ours": "render/joel_back.png",
+      "ref": "video/joel_back.png",
+      "regions": {
+        "frame": {
+          "limits": "frame",
+          "ours": [
+            0,
+            0,
+            1,
+            1
+          ],
+          "ref": [
+            0,
+            0.02,
+            1,
+            0.84
+          ]
+        },
+        "hair": {
+          "limits": "detail",
+          "ours": [
+            0.45,
+            0.45,
+            0.07,
+            0.12
+          ],
+          "ref": [
+            0.328,
+            0.443,
+            0.042,
+            0.083
+          ]
+        }
+      }
+    }
+  ]
+}

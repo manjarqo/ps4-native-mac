@@ -12,6 +12,12 @@ on a scripted chapter 1 route on an M1 Pro. **Uncharted 4: A Thief's End** is in
 and reaches gameplay in chapter 1 at about 20 fps, with visible rendering differences from a PS4
 still open. See [Supported games](#supported-games-on-mac) for the exact status.
 
+![The Last of Us Remastered on a Mac: Joel and Ellie in the Beyond the Wall warehouse](images/tlou_beyond_the_wall.jpg)
+
+*The Last of Us Remastered, "Beyond the Wall", on the Metal 3 renderer with MetalFX upscaling
+from 1920x1080 to 2560x1440: about 89 fps on the developer's Mac (the overlay at the top left is
+the frame-rate HUD).*
+
 **Based on:** forked from [PS4Recomp](https://github.com/wie-project/PS4Recomp) by its authors, and
 developed independently under the new name since 2026-10. License: GPL-2.0.
 
@@ -50,7 +56,7 @@ not measured yet.
 
 | Game | Stage | fps | Resolution | Notes |
 | --- | --- | --- | --- | --- |
-| The Last of Us Remastered (CUSA00557) | Playable: boot, menus, movies, gameplay, saves | Chapter 1 courtyard route (300 s, median of 5 runs): **98.9 fps** on Metal 3 (the default), 85.5 fps on Metal 4. Earlier walking and standing numbers: see below. | 1920x1080 (base PS4 mode, `PS4_PRO=0`), MetalFX off. Pro mode: TBD | 30-minute courtyard soak (commit 8145002): no fatal errors, no hangs, memory footprint flat at ~3.5 GB. Exit: 3/3 by closing the window, 3/3 by terminate, no crash reports. 300 s route on Metal 3 and on Metal 4: no fatal errors, GPU errors or watchdog reports. |
+| The Last of Us Remastered (CUSA00557) | Playable: boot, menus, movies, gameplay, saves | Chapter 1 courtyard route (300 s, median of 5 runs): **98.9 fps** on Metal 3 (the default), 85.5 fps on Metal 4. Earlier walking and standing numbers: see below. | 1920x1080 (base PS4 mode, `PS4_PRO=0`), MetalFX off. Pro mode: TBD | 30-minute courtyard soak (commit 8145002): no fatal errors, no hangs, memory footprint flat at ~3.5 GB. Exit: 3/3 by closing the window, 3/3 by terminate, no crash reports. 300 s route on Metal 3 and on Metal 4: no fatal errors, GPU errors or watchdog reports. Since v0.3.0 the colours are close to a PS4 reference in interiors and on characters; sunlit daylight surfaces are still darker (see [Colour fidelity](#colour-fidelity-tlou)). |
 | Uncharted 4: A Thief's End (CUSA04529) | In progress: boots, menus, New Game, chapter 1 (boat cutscene and boat gameplay), saves, audio | Title screen about 21–22 fps, boat gameplay about 20–21 fps (`PS4_PRO=0`, 1080p, measured while other work ran on the machine). Pro mode: not re-measured (TBD) | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Title screen: the scene is lit, but fog and light shafts are missing. Boat cutscene: Drake and Sully are lit and the motion-blur smear is fixed. Gameplay: water colour and foam differ from a PS4 and the sky is too dark. Base mode is recommended. |
 
 How the TLOU numbers were taken:
@@ -68,6 +74,27 @@ How the TLOU numbers were taken:
   over 100 ms; standing courtyard 78.5–78.9 fps and Sarah's house 113.7–114.5 fps.
 - The frame rate is uncapped. The bench window is in the background, so vsync does not limit it.
   The machine's background load moves these numbers by a few fps between runs.
+- The route numbers were taken before the v0.3.0 colour fixes. The hair and foliage shadow work
+  that now runs costs about 0.4 ms of GPU time per frame in scenes with much hair and foliage; the
+  route was not re-measured.
+
+### Colour fidelity (TLOU)
+
+The colours were compared with a PS4 reference video on location-matched frames, as CIE L\*C\*h
+statistics (`tools/color_compare.py`, [docs/color-measurement.md](docs/color-measurement.md)):
+
+| Frame | Before v0.3.0 | v0.3.0 | PS4 reference |
+| --- | --- | --- | --- |
+| Interior save point, median lightness (L\* p50) | 10.2 | 3.2 | 2.6 |
+| Joel's hair, lightness (L\*) | 32 | 9 | 4 (hue within 20 degrees) |
+| Plank courtyard in daylight, median lightness (L\* p50) | not measured | 11–19 (two captures) | 32 |
+
+What was fixed in v0.3.0: the output gamma of `sceVideoOutAdjustColor` was applied inverted (the
+image was brightened and washed out, and the in-game brightness slider went the wrong way); hair
+and foliage were never shadowed (a shader buffer load mode, `addr64`, was not translated); two of
+the three sun shadow cascades were always in shadow (an HTILE fast clear covered only the first
+slice of the shadow depth array). Sunlit daylight surfaces are still darker than on a PS4 (see
+[Known issues](#known-issues)).
 
 **Upstream milestones (not verified in this fork):**
 
@@ -78,6 +105,14 @@ How the TLOU numbers were taken:
 
 ## Known issues
 
+- **The Last of Us: daylight.** Sunlit daylight surfaces are darker than on a PS4 (plank courtyard
+  L\* 11–19 against 32). The sun direction is the game's own data, so the remaining difference is in
+  the evaluation of lighting or shadows; it is under investigation.
+- **HTILE on Pro depth arrays.** A compute HTILE fast clear of a depth array in Pro (Neo) mode
+  covers only its first slice (logged); in base mode each cleared slice is covered.
+- **Window colour space.** The window layer is tagged sRGB, so macOS colour-matches the frame to a
+  wide-gamut panel. The effect on screen is expected, not measured; `PS4_COLORSPACE=native`
+  restores the untagged layer.
 - **Uncharted 4.**
   - The title screen has no fog and no light shafts.
   - In gameplay the water colour and foam differ from a PS4, and the sky is too dark.
@@ -352,6 +387,8 @@ your own from your own game copy.
 | `PS4_GNM_STATS=1`, `PS4_AUDIO_LOG=1`, `PS4_NP_LOG_ALL=1` | Command processor, audio and NP logging |
 | `PS4_GNM_GPU_TIMEOUT=<ms>` | Command buffer watchdog (default 4000) |
 | `PS4_SCREENSHOT_DIR=<dir>`, `PS4_SCREENSHOT_EVERY=<frames>` | Save presented frames as PNG |
+| `PS4_SCREENSHOT_STAGE=render\|output` | Take screenshots before (`render`, the default) or after (`output`) the output gamma pass |
+| `PS4_COLORSPACE=native` | Leave the window layer untagged instead of tagging it sRGB (the behaviour before v0.3.0) |
 | `PS4_SCREENSHOT_EVERY_SEC=<s>` | Save the first frame after every `s` seconds of wall time instead, as `sec_<seconds>.png` (to compare runs at the same moments) |
 | `PS4_RECOMP_HEADLESS=1`, `PS4_BACKGROUND_WINDOW=1`, `PS4_PAD_SCRIPT=...` | Automated test runs |
 | `PS4_PRESENT_MODE=uncapped\|vsync\|mailbox` | Frame pacing (default `uncapped`; see [docs/present-pacing.md](docs/present-pacing.md)) |
@@ -384,7 +421,9 @@ The benchmark scripts behind the TLOU numbers are `tools/metal4_route.sh` (one r
   minimal frame for a host test. A pass from a game's capture is game data: keep it as a local
   fixture (see [tests/host/README.md](tests/host/README.md)).
 - **Reference comparison.** `tools/refcompare.py <frame.png> <reference.png>` compares mean colour
-  and luminance on a 4x4 grid plus a luminance histogram.
+  and luminance on a 4x4 grid plus a luminance histogram. `tools/color_compare.py` compares regions
+  of frame pairs as CIE L\*C\*h statistics against limits; `tools/tlou_color_run.sh` takes window
+  captures through the macOS display path (see [docs/color-measurement.md](docs/color-measurement.md)).
 - **Shader dumps.** `PS4_DUMP_SHADERS=<dir>` writes each distinct VS/PS/CS program as
   `<stage>_<addr>.bin` with its registers in `<stage>_<addr>.txt`.
   `3rdparty/gcn-recompiler/tools/gcn_test` translates such dumps and checks the MSL with Metal;
@@ -487,13 +526,21 @@ The table also covers what Uncharted 4 needs: AAC decoding (`libSceAudiodec`, Au
   buffer ([docs/compute-batching.md](docs/compute-batching.md)).
 - Guest memory is mapped zero-copy into Metal buffers on unified memory.
 - Textures are detiled and cached. GPU writes invalidate the cached copies.
-- The frame is presented through `CAMetalLayer`, with optional MetalFX spatial upscaling.
+- The frame is presented through `CAMetalLayer`, with optional MetalFX spatial upscaling. The
+  output gamma the game sets with `sceVideoOutAdjustColor` is applied in a pass before the
+  present: the encoded value is raised to 1/gamma (gamma below 1 darkens, 1.0 is the identity).
+  The layer is tagged sRGB.
 - Compute queues run beside the graphics ring. A compute queue that waits on memory
   (`WAIT_REG_MEM`) is suspended and resumed, so cross-queue ordering follows the guest's own
   synchronisation.
 - Buffer accesses through descriptors (V#) that a shader loads at run time read and write guest
   memory directly, through a page table of zero-copy windows. Uncharted 4 builds its per-draw
-  matrices this way.
+  matrices this way. `addr64` buffer loads (a 64-bit address in VGPRs) are guest-memory loads in
+  compute and in draw shaders; TLOU's hair and foliage shaders load their shadow-cascade matrices
+  this way. Draw shaders read guest memory through read-only windows; a draw-stage store, or an
+  `addr64` form that is not supported, stops the shader's translation with an error.
+- A compute HTILE fast clear of a depth array covers each slice it cleared (sized from the cleared
+  bytes and the HTILE layout); in Pro (Neo) mode only the first slice.
 - A compute shader that reads and writes guest memory through descriptors it loads at run time
   is probed first for the guest pages it touches, which are then mapped for it. By default the
   command processor waits for each such dispatch, so later reads of guest memory see its writes.
@@ -571,8 +618,8 @@ Boost subset (BSL-1.0). Its README lists every change made to the shadPS4 source
 │       ├── kernel/          # memory, threading, sync, vfs, aio, equeue, syscalls
 │       └── modules/         # libSce* HLE modules (GnmDriver, VideoOut, AudioOut, Ajm, ...)
 ├── tests/                   # host unit tests and runtime test programs
-├── tools/                   # capture viewer, pass replay, fixture extraction, reference comparison
-├── docs/                    # renderer notes (backends, ordering, compute batching, capture, GPU memory budget, present pacing), plans
+├── tools/                   # capture viewer, pass replay, fixture extraction, reference and colour comparison
+├── docs/                    # renderer notes (backends, ordering, compute batching, capture, GPU memory budget, present pacing, colour measurement), plans
 └── 3rdparty/                # see "Third-party components"
 ```
 

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps4_metal_screen.h"
+#include "ps4_output_gamma.h"
 #include "ps4_present_queue.h"
 #include "ps4_present_stats.h"
 #include "ps4_screenshot_cadence.h"
@@ -171,6 +172,8 @@ static int metal_screen_init_main(int width, int height, const char *title) {
         NSString *titleStr = title ? [NSString stringWithUTF8String:title] : @"PS4Recomp - Display";
         [g_window setTitle:titleStr];
         [g_window setDelegate:g_screenDelegate];
+        // tools/tlou_color_run.sh captures this window with `screencapture -l <id>`
+        fprintf(stderr, "[metal-screen] window id=%ld\n", (long)[g_window windowNumber]);
 
         g_view = [[PS4MetalView alloc] initWithFrame:frame];
         [g_view setWantsLayer:YES];
@@ -179,6 +182,16 @@ static int metal_screen_init_main(int width, int height, const char *title) {
         g_metalLayer.device = g_device;
         g_metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         g_metalLayer.framebufferOnly = NO;
+        // The frame holds sRGB values; the tag declares that, so macOS colour-matches the layer to
+        // the panel (P3 on Mac displays). Untagged, the values go to the panel unmatched. The
+        // on-screen effect is expected, not measured: window captures (screencapture) come out the
+        // same either way (docs/color-measurement.md). PS4_COLORSPACE=native keeps it untagged.
+        const char *cs_env = getenv("PS4_COLORSPACE");
+        if (!(cs_env && strcmp(cs_env, "native") == 0)) {
+            CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            g_metalLayer.colorspace = srgb;
+            CGColorSpaceRelease(srgb);
+        }
         // The FPS display is the presenter's own overlay (hud_texture); the system Metal HUD
         // still appears when MTL_HUD_ENABLED=1 is set in the environment at launch.
         g_metalLayer.drawableSize = CGSizeMake(g_width, g_height);
@@ -683,9 +696,7 @@ static id<MTLTexture> upscale_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src
     return g_up.out;
 }
 
-// Output gamma (sceVideoOutAdjustColor). 1.0 presents the frame as is; other values re-encode
-// it like the PS4 video output does: the sRGB-encoded frame is decoded to linear and encoded
-// again with the exponent 1 / (3.4 - gamma), so gamma > 1 brightens the image.
+// Output gamma (sceVideoOutAdjustColor), see ps4_output_gamma.h. 1.0 presents the frame as is.
 static _Atomic uint32_t g_gamma_bits = 0x3f800000u; // 1.0f
 static id<MTLRenderPipelineState> g_gamma_pso;
 
@@ -711,14 +722,13 @@ static id<MTLRenderPipelineState> gamma_pipeline(void) {
                                   "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
                                   "    VOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;\n"
                                   "}\n"
-                                  "// prm: xy = destination origin of the frame, z = gamma, w = 1 if the source\n"
+                                  "// prm: xy = destination origin of the frame, z = encoding exponent (ps4_output_gamma_param), w = 1 if the source\n"
                                   "// view already decodes sRGB\n"
                                   "fragment float4 gamma_fs(VOut in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
                                   "                         constant float4& prm [[buffer(0)]]) {\n"
                                   "    float3 e = src.read(uint2(in.pos.xy - prm.xy)).rgb;\n"
-                                  "    float3 lin = prm.w > 0.5 ? e : select(pow((e + 0.055) / 1.055, 2.4), e / 12.92, e <= 0.04045);\n"
-                                  "    float k = 1.0 / (3.4 - prm.z);\n"
-                                  "    float3 o = select(1.055 * pow(lin, k) - 0.055, 12.92 * lin, lin <= 0.0031308);\n"
+                                  "    float3 enc = prm.w > 0.5 ? select(1.055 * pow(e, 1.0 / 2.4) - 0.055, 12.92 * e, e <= 0.0031308) : e;\n"
+                                  "    float3 o = pow(enc, prm.z);\n"
                                   "    return float4(saturate(o), 1.0);\n"
                                   "}\n";
     NSError *err = nil;
@@ -863,6 +873,18 @@ static id<MTLTexture> hud_texture(NSUInteger target_h) {
     return tex;
 }
 
+// PS4_SCREENSHOT_STAGE=output saves screenshots after the output gamma pass (what the window
+// shows, without the HUD and the layer's colour matching); the default "render" saves the frame
+// as rendered, before it.
+static bool screenshot_after_gamma(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("PS4_SCREENSHOT_STAGE");
+        v = s && strcmp(s, "output") == 0;
+    }
+    return v == 1;
+}
+
 // Presenter thread: encodes the presentation of `src` into `cb`: the frame (MetalFX-upscaled if
 // enabled) is copied into the window's drawable, which is presented when `cb` has executed, at
 // least `min_duration` seconds after the previous frame appeared (0 = next refresh). shot_idx
@@ -881,6 +903,10 @@ static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long sho
             });
         }
         const NSUInteger iw = img.width, ih = img.height;
+        const float gamma = current_gamma();
+        const float gamma_prm_z = ps4_output_gamma_param(gamma);
+        id<MTLRenderPipelineState> gamma_pso = fabsf(gamma - 1.0f) > 0.001f ? gamma_pipeline() : nil;
+        const bool shot_gamma = shot_idx >= 0 && gamma_pso && screenshot_after_gamma();
         id<MTLTexture> shot = nil;
         if (shot_idx >= 0) {
             MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -888,6 +914,7 @@ static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long sho
                                                                                          height:ih
                                                                                       mipmapped:NO];
             td.storageMode = MTLStorageModeShared;
+            if (shot_gamma) td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             shot = [g_device newTextureWithDescriptor:td];
         }
         // The drawable was taken before the frame's size was known: a resize needs a new one. A nil
@@ -898,8 +925,6 @@ static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long sho
             drawable = next_drawable_timed();
         }
         NSUInteger ox = 0, oy = 0;
-        const float gamma = current_gamma();
-        id<MTLRenderPipelineState> gamma_pso = fabsf(gamma - 1.0f) > 0.001f ? gamma_pipeline() : nil;
         if (drawable && gamma_pso) {
             // copy with the output gamma applied (letterbox bars cleared by the same pass)
             const NSUInteger tw = drawable.texture.width, th = drawable.texture.height;
@@ -913,7 +938,7 @@ static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long sho
             id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
             [enc setRenderPipelineState:gamma_pso];
             [enc setViewport:(MTLViewport){(double)ox, (double)oy, (double)MIN(iw, tw), (double)MIN(ih, th), 0.0, 1.0}];
-            const float prm[4] = {(float)ox, (float)oy, gamma, is_srgb_format(img.pixelFormat) ? 1.0f : 0.0f};
+            const float prm[4] = {(float)ox, (float)oy, gamma_prm_z, is_srgb_format(img.pixelFormat) ? 1.0f : 0.0f};
             [enc setFragmentBytes:prm length:sizeof(prm) atIndex:0];
             [enc setFragmentTexture:img atIndex:0];
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -932,6 +957,20 @@ static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long sho
                 [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
             }
         }
+        if (shot_gamma) {
+            MTLRenderPassDescriptor *sp = [MTLRenderPassDescriptor renderPassDescriptor];
+            sp.colorAttachments[0].texture = shot;
+            sp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            sp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> se = [cb renderCommandEncoderWithDescriptor:sp];
+            [se setRenderPipelineState:gamma_pso];
+            [se setViewport:(MTLViewport){0.0, 0.0, (double)iw, (double)ih, 0.0, 1.0}];
+            const float sprm[4] = {0.0f, 0.0f, gamma_prm_z, is_srgb_format(img.pixelFormat) ? 1.0f : 0.0f};
+            [se setFragmentBytes:sprm length:sizeof(sprm) atIndex:0];
+            [se setFragmentTexture:img atIndex:0];
+            [se drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [se endEncoding];
+        }
         if (drawable || shot) {
             id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
             if (drawable && !gamma_pso) {
@@ -947,7 +986,7 @@ static void present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, long sho
                      destinationLevel:0
                     destinationOrigin:MTLOriginMake(ox, oy, 0)];
             }
-            if (shot) [blit copyFromTexture:img toTexture:shot];
+            if (shot && !shot_gamma) [blit copyFromTexture:img toTexture:shot];
             if (drawable && hud_enabled()) {
                 hud_tick(src.width, src.height, iw, ih);
                 const NSUInteger tw = drawable.texture.width, th = drawable.texture.height;

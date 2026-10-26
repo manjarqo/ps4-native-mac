@@ -266,13 +266,16 @@ static bool IsFlattenedSharp(const SharpReference& sharp) {
     return true;
 }
 
-// PS4Recomp: a buffer access through a V# the shader loads at run time (IsFlattenedSharp false).
-// No binding can stand for it: it becomes guest memory loads and stores (LoadGuestU32 /
-// StoreGuestU32) addressed from the V# dwords as the shader holds them, with GCN's addressing
-// and range check (address = base + index * stride + offset; a dword is accessed only when it
-// lies below stride * num_records bytes, num_records bytes when stride is 0, and the V# type is
-// 0). Formatted accesses convert 32-bit data formats (no conversion: the dwords are moved as they
-// are) with dst_sel applied to loads; a V# with another data or number format, a swizzled V#, an
+// PS4Recomp: a buffer access through a V# the shader loads at run time (IsFlattenedSharp false),
+// or any MUBUF/MTBUF access with ADDR64. No binding can stand for it: it becomes guest memory
+// loads and stores (LoadGuestU32 / StoreGuestU32) addressed from the V# dwords as the shader
+// holds them, with GCN's addressing and range check (address = base + index * stride + offset; a
+// dword is accessed only when it lies below stride * num_records bytes, num_records bytes when
+// stride is 0, and the V# type is 0). With ADDR64 the offset is the 64-bit VGPR address plus
+// soffset and inst_offset, without the num_records check (see in_range below). Compute shaders
+// load and store; draw stages only load (their stores fail the translation). Formatted accesses
+// convert 32-bit data formats (no conversion: the dwords are moved as they are) with dst_sel
+// applied to loads; a V# with another data or number format, a swizzled V#, an
 // unaligned dword or an address past 40 bits is reported to the renderer through the fault
 // buffer and that access is not made. Accesses that cannot be lowered (8/16/64-bit, atomics, a
 // tbuffer format other than 32-bit) fail the translation.
@@ -281,11 +284,6 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
     const IR::Opcode op = inst.GetOpcode();
     const auto flags = inst.Flags<IR::BufferInstInfo>();
     const u32 pc = static_cast<u32>(flags.pc.Value());
-    if (info.sw_stage != SwStage::Compute) {
-        UNREACHABLE_MSG("{} at pc {:#x}: buffer access through a V# loaded at run time in a "
-                        "non-compute shader (guest memory access is only implemented for compute)",
-                        IR::NameOf(op), pc);
-    }
 
     bool is_store = false;
     bool is_format = false;
@@ -340,6 +338,13 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
                         "implemented for this operation",
                         IR::NameOf(op), pc);
     }
+    // Draw stages reach guest memory for loads only (the renderer's draw path binds the page
+    // table and a fault slot that never probes; see GmDrawSlot in ps4_gnm_draw.mm).
+    if (is_store && info.sw_stage != SwStage::Compute) {
+        UNREACHABLE_MSG("{} at pc {:#x}: buffer store to guest memory ({}) in a non-compute shader "
+                        "(guest memory stores are only implemented for compute)",
+                        IR::NameOf(op), pc, flags.addr64 ? "ADDR64" : "a V# loaded at run time");
+    }
     static_assert(u32(IR::Opcode::LoadBufferF32x4) - u32(IR::Opcode::LoadBufferF32) == 3);
     static_assert(u32(IR::Opcode::StoreBufferU32x4) - u32(IR::Opcode::StoreBufferU32) == 3);
     static_assert(u32(IR::Opcode::StoreBufferF32x4) - u32(IR::Opcode::StoreBufferF32) == 3);
@@ -384,7 +389,15 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
 
     // byte offset of the access in the buffer, in 64 bits (index * stride does not wrap)
     IR::U64 offset;
-    if (op == IR::Opcode::ReadConstBuffer) {
+    if (flags.addr64) {
+        // ADDR64 (CI ISA, MUBUF/MTBUF): address = V#.base + VGPR[vaddr:vaddr+1] (64 bits) +
+        // soffset + inst_offset; idxen and offen are not used.
+        // the address args hold (VGPR[vaddr], VGPR[vaddr + 1], soffset) (Translator::BufferAddress)
+        const IR::U64 vaddr64 = ir.PackUint2x32(
+            ir.CompositeConstruct(IR::GetBufferIndexArg(&inst), IR::GetBufferVOffsetArg(&inst)));
+        const IR::U32 rest = ir.IAdd(ir.Imm32(u32(flags.inst_offset.Value())), IR::GetBufferSOffsetArg(&inst));
+        offset = ir.IAdd(vaddr64, ir.UConvert(64, rest));
+    } else if (op == IR::Opcode::ReadConstBuffer) {
         offset = ir.ShiftLeftLogical(ir.UConvert(64, IR::U32{inst.Arg(1)}), ir.Imm32(2u));
     } else {
         IR::U32 index = flags.index_enable ? IR::GetBufferIndexArg(&inst) : ir.Imm32(0u);
@@ -397,7 +410,16 @@ static void LowerDynamicBufferAccess(IR::Inst& inst, Info& info) {
         }
         offset = ir.IAdd(ir.IMul(ir.UConvert(64, index), ir.UConvert(64, stride)), ir.UConvert(64, voffset));
     }
+    // ADDR64 is not range checked against num_records: the 64-bit VGPR address is a pointer, not
+    // an offset into the V#'s records (CI ISA: idxen/offen and the record index are not used with
+    // it). TLOU's hair and foliage shaders read their shadow cascades through a V# of base 0,
+    // stride 4, num_records 0xFFFFFFFF (16 GiB) at addresses near 0x11_2006_xxxx (68 GiB): a range
+    // check would return 0, and the PS4 frame shows those surfaces shadowed (Task 7 of the TLOU
+    // colour plan). The page table still checks the 40-bit address and the mapping.
     const auto in_range = [&](const IR::U64& byte) {
+        if (flags.addr64) {
+            return ir.Imm1(true);
+        }
         return ir.ILessThanEqual(ir.IAdd(byte, ir.Imm64(u64(4))), size, false);
     };
     // Reports only for an access that reaches the buffer: through a null V# (num_records 0, as
@@ -1925,7 +1947,11 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
         const auto& usage = resources[i];
         IR::Inst& inst = *usage.user;
         if (IsBufferInstruction(inst)) {
-            if (!IsFlattenedSharp(usage.sharps[0])) {
+            // ADDR64 accesses address guest memory through a 64-bit VGPR pointer: no binding
+            // stands for them either
+            const bool addr64 = inst.GetOpcode() != IR::Opcode::ReadConstBuffer &&
+                                inst.Flags<IR::BufferInstInfo>().addr64;
+            if (addr64 || !IsFlattenedSharp(usage.sharps[0])) {
                 LowerDynamicBufferAccess(inst, info);
                 lowered[i] = true;
                 continue;

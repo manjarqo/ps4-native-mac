@@ -83,6 +83,7 @@ extern "C" void* ps4_gnm_debug_backend(void);
 extern "C" uint32_t ps4_gnm_debug_window_count(void);
 extern "C" uint32_t ps4_gnm_debug_arena_chunks(void);
 extern "C" uint64_t ps4_gnm_debug_sweep_released(void);
+extern "C" uint32_t ps4_gnm_debug_map_draw_pages(const uint32_t* pages, uint32_t n, uint64_t* copies);
 
 namespace {
 
@@ -1265,6 +1266,36 @@ void TestInflightDrops() {
     CheckGuestResidency(Entry{kSrc, kDst, 24, 24, 24}, "residency after in-flight drops");
 }
 
+// A 64 MiB page draws met unmapped that has a hole (16 KiB PROT_NONE), mapped as a draw harvest
+// does: it is not mapped, no read-only copy of it is made (only the no-copy window would do, and a
+// 64 MiB copy used to be made and dropped), a second harvest does not try it again, a clean page
+// in the same harvest is still mapped, and after the page is remapped without the hole it maps.
+void TestDrawPageWithHoles() {
+    constexpr uint32_t kHoled = 40, kClean = 41; // guest 0xA0000000, 0xA4000000: no other test uses them
+    uint8_t* hole = g_mem + (uint64_t(kHoled) << GCN_GUEST_PAGE_SHIFT) + 0x100000;
+    CHECK(mprotect(hole, 0x4000, PROT_NONE) == 0, "mprotect the hole");
+    const ps4draw::GuestMemoryStats s0 = ps4draw::GetGuestMemoryStats();
+    uint64_t c0 = 0, c1 = 0, c2 = 0;
+    ps4_gnm_debug_map_draw_pages(nullptr, 0, &c0);
+    const uint32_t holed[] = {kHoled};
+    const uint32_t n1 = ps4_gnm_debug_map_draw_pages(holed, 1, &c1);
+    const uint32_t n2 = ps4_gnm_debug_map_draw_pages(holed, 1, &c2);
+    const ps4draw::GuestMemoryStats s1 = ps4draw::GetGuestMemoryStats();
+    CHECK(n1 == 0 && n2 == 0, "a page with a hole was mapped for draws (%u, %u)", n1, n2);
+    CHECK(c1 == c0 && c2 == c0, "read-only copies were made of the holed page (%llu, %llu after %llu)",
+          (unsigned long long)c1, (unsigned long long)c2, (unsigned long long)c0);
+    CHECK(s1.draw_unmappable - s0.draw_unmappable == 1, "the holed page was tried %llu times (want 1)",
+          (unsigned long long)(s1.draw_unmappable - s0.draw_unmappable));
+    const uint32_t both[] = {kHoled, kClean};
+    CHECK(ps4_gnm_debug_map_draw_pages(both, 2, nullptr) == 1, "the clean page of the harvest was not mapped");
+    CHECK(mprotect(hole, 0x4000, PROT_READ | PROT_WRITE) == 0, "mprotect back");
+    ps4_gnm_guest_remapped(uint64_t(kHoled) << GCN_GUEST_PAGE_SHIFT, 1ull << GCN_GUEST_PAGE_SHIFT);
+    CHECK(ps4_gnm_debug_map_draw_pages(holed, 1, nullptr) == 1, "the page was not mapped after its remap");
+    printf("gnm_guest_memory_test holed draw page: tried %llu times, copies %llu -> %llu\n",
+           (unsigned long long)(s1.draw_unmappable - s0.draw_unmappable), (unsigned long long)c0,
+           (unsigned long long)c2);
+}
+
 void OnAlarm(int) {
     static const char msg[] = "gnm_guest_memory_test: FAIL a wait did not end (60 s)\n";
     (void)!write(2, msg, sizeof(msg) - 1);
@@ -1385,6 +1416,7 @@ int main(int argc, char** argv) {
             {"chained_miss", TestChainedMiss, false},
             {"sampled_image", TestSampledImage, false},
             {"rerun_without_further_work", TestRerunWithoutFurtherWork, true},
+            {"draw_page_with_holes", TestDrawPageWithHoles, false},
         };
         int run = 0, skipped = 0;
         for (const Case& c : kCases) {
