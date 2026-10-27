@@ -44,9 +44,21 @@ void ps4_gnm_metal_reset_compute_queue(uint32_t queue_slot);
 // memory instead (all GPU work has then completed). tiling_mode/pixel_format as given to
 // sceVideoOutSetBufferAttribute. The presentation is queued behind the frame's GPU work without
 // waiting; on 1, on_done(arg) (if non-NULL) runs once the GPU has executed it (possibly on another
-// thread, possibly before this function returns), in order with the GPU fences.
+// thread, possibly before this function returns), in order with the GPU fences, and before it
+// on_reached(arg) (if non-NULL) runs when the command processor reaches the flip: after the
+// command buffers submitted before it, also when they wait (WAIT_REG_MEM) behind other work.
+// On 0 on_done does not run; on_reached may have.
 int ps4_gnm_metal_present(GuestContext *ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
-                          uint32_t tiling_mode, uint32_t pixel_format, void (*on_done)(void *), void *arg);
+                          uint32_t tiling_mode, uint32_t pixel_format, void (*on_reached)(void *),
+                          void (*on_done)(void *), void *arg);
+
+// A flip completed and cleared a VideoOut flip label (ps4_videoout.c): wakes the command
+// processor's wait thread so a graphics queue suspended at sceGnmInsertWaitFlipDone continues at
+// once. Any thread; takes only the wait thread's own lock.
+void ps4_gnm_metal_flip_label_released(void);
+// Flip-label waits so far: suspensions of the graphics queue, waits given up, wake-ups by a
+// released label (any out pointer may be NULL; no lock).
+void ps4_gnm_metal_flip_wait_stats(uint64_t *suspends, uint64_t *timeouts, uint64_t *wakes);
 
 // Synchronize / wait for GPU to become idle
 void ps4_gnm_metal_wait_gpu_idle(void);
@@ -54,6 +66,9 @@ void ps4_gnm_metal_wait_gpu_idle(void);
 // process started with PS4_TEST_HOOKS=1 (read once, by ps4_gnm_metal_init); otherwise it refuses.
 // Returns 0 when the GPU was stalled, -1 when refused.
 int ps4_gnm_metal_debug_stall_gpu(void);
+// Test hook: ends the stall (ps4draw::DebugReleaseGpu): the stalled work completes. Same
+// PS4_TEST_HOOKS=1 rule; returns 0, or -1 when refused.
+int ps4_gnm_metal_debug_release_gpu(void);
 
 // Shut down Metal Command Processor
 void ps4_gnm_metal_destroy(void);

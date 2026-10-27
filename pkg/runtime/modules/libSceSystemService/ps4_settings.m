@@ -4,10 +4,13 @@
 //   - PS4 Pro (Neo) mode reported to the game (sceKernelIsNeoMode; on by default),
 //   - MetalFX upscaling of the presented frame (PS4_UPSCALE),
 //   - the Metal performance HUD (FPS counter).
-// Values come from ~/Library/Application Support/PS4Recomp/settings/<app dir name>.cfg; a Cocoa
-// dialog asks for them on the first launch and whenever Option is held at startup. Environment
-// variables override the stored values: PS4_LANG, PS4_PRO=0|1, PS4_UPSCALE=off|metalfx,
-// MTL_HUD_ENABLED=0|1; PS4_NO_DIALOGS=1 never shows the dialog.
+// Values come from ~/Library/Application Support/PS4Recomp/settings/<TITLE_ID>.cfg (the app dir
+// name when param.sfo has no TITLE_ID); a Cocoa dialog asks for them on the first launch and
+// whenever Option is held at startup. Environment variables override the stored values: PS4_LANG,
+// PS4_PRO=0|1, PS4_UPSCALE=off|metalfx, MTL_HUD_ENABLED=0|1; PS4_NO_DIALOGS=1 never shows the
+// dialog. The file's metal=3|4 (the renderer chosen in the PS4 Native app) becomes PS4_GNM_METAL
+// when the environment has none, so a launch outside the app uses it too. Saving the dialog
+// rewrites only the four keys above and keeps every other line (core/ps4_settings_file.h).
 //
 // The language is the console system language. Games typically use it only as the default
 // for a new profile: e.g. The Last of Us Remastered stores its text/subtitle/speech language
@@ -21,6 +24,8 @@
 #include <sys/stat.h>
 
 #include "ps4_vfs.h"
+#include "ps4_game_key.h"
+#include "ps4_settings_file.h"
 
 typedef struct {
     const char *pack;  // speech pack / folder name used by the game data
@@ -93,14 +98,9 @@ static int system_default(const int *idx, int n) {
 }
 
 
-typedef struct {
-    int lang;    // Orbis language code
-    int pro;     // PS4 Pro mode
-    int upscale; // MetalFX upscaling
-    int hud;     // Metal performance HUD
-} HostSettings;
+typedef Ps4SettingsFile HostSettings;
 
-static HostSettings g_settings = {-1, 1, 0, 1};
+static HostSettings g_settings = {-1, 1, 0, 1, 0};
 static bool g_settings_ready = false;
 
 static void settings_dir(char *out, size_t n) {
@@ -118,38 +118,24 @@ static void settings_dir(char *out, size_t n) {
 static void settings_path(char *out, size_t n, const char *ext) {
     char dir[1500];
     settings_dir(dir, sizeof(dir));
-    const char *root = ps4_vfs_get_app_root();
-    const char *base = root ? strrchr(root, '/') : NULL;
-    base = base && base[1] ? base + 1 : (root && *root ? root : "default");
-    snprintf(out, n, "%s/%s.%s", dir, base, ext);
+    // Keyed by the game's TITLE_ID (param.sfo), so the file survives a renamed dump directory.
+    char key[512];
+    if (!ps4_current_game_key(key, sizeof(key))) snprintf(key, sizeof(key), "default");
+    snprintf(out, n, "%s/%s.%s", dir, key, ext);
 }
 
 static bool load_settings(HostSettings *s) {
     char p[2048];
     settings_path(p, sizeof(p), "cfg");
+    if (ps4_settings_file_read(p, s)) return true;
+    // Older builds stored only the language in <name>.lang.
+    settings_path(p, sizeof(p), "lang");
     FILE *f = fopen(p, "r");
-    if (!f) {
-        // Older builds stored only the language in <name>.lang.
-        settings_path(p, sizeof(p), "lang");
-        f = fopen(p, "r");
-        if (!f) return false;
-        int v = -1;
-        if (fscanf(f, "%d", &v) == 1) s->lang = v;
-        fclose(f);
-        return false; // ask once for the new settings
-    }
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        char key[64];
-        int v;
-        if (sscanf(line, "%63[^=]=%d", key, &v) != 2) continue;
-        if (!strcmp(key, "lang")) s->lang = v;
-        else if (!strcmp(key, "pro")) s->pro = v != 0;
-        else if (!strcmp(key, "upscale")) s->upscale = v != 0;
-        else if (!strcmp(key, "hud")) s->hud = v != 0;
-    }
+    if (!f) return false;
+    int v = -1;
+    if (fscanf(f, "%d", &v) == 1) s->lang = v;
     fclose(f);
-    return true;
+    return false; // ask once for the new settings
 }
 
 static void save_settings(const HostSettings *s) {
@@ -158,10 +144,7 @@ static void save_settings(const HostSettings *s) {
     [[NSFileManager defaultManager] createDirectoryAtPath:[NSString stringWithUTF8String:dir]
                               withIntermediateDirectories:YES attributes:nil error:nil];
     settings_path(p, sizeof(p), "cfg");
-    FILE *f = fopen(p, "w");
-    if (!f) return;
-    fprintf(f, "lang=%d\npro=%d\nupscale=%d\nhud=%d\n", s->lang, s->pro, s->upscale, s->hud);
-    fclose(f);
+    if (!ps4_settings_file_write(p, s)) fprintf(stderr, "[ps4-settings] cannot write %s\n", p);
 }
 
 static void show_settings_dialog(HostSettings *s) {
@@ -239,10 +222,17 @@ void ps4_host_settings_init(void) {
     // Consumers that read the environment (presentation) see the resolved values.
     if (s.upscale && !getenv("PS4_UPSCALE")) setenv("PS4_UPSCALE", "metalfx", 0);
     if (!s.hud) setenv("MTL_HUD_ENABLED", "0", 1);
+    // The renderer stored by the manager app; the GNM backend is chosen later, at its first use.
+    if (s.metal == 3 || s.metal == 4) {
+        const char *m = getenv("PS4_GNM_METAL");
+        if (!m || !*m) setenv("PS4_GNM_METAL", s.metal == 4 ? "4" : "3", 1);
+    }
     g_settings = s;
     g_settings_ready = true;
-    fprintf(stderr, "[ps4-settings] language %d, PS4 Pro mode %s, MetalFX upscaling %s, FPS HUD %s\n", s.lang,
-            s.pro ? "on" : "off", s.upscale ? "on" : "off", s.hud ? "on" : "off");
+    const char *renderer = getenv("PS4_GNM_METAL");
+    fprintf(stderr, "[ps4-settings] language %d, PS4 Pro mode %s, MetalFX upscaling %s, FPS HUD %s, renderer %s\n",
+            s.lang, s.pro ? "on" : "off", s.upscale ? "on" : "off", s.hud ? "on" : "off",
+            renderer && *renderer ? renderer : "automatic");
 }
 
 int ps4_host_choose_language(void) {

@@ -17,6 +17,9 @@ struct VsAttribSpecialization {
     u32 divisor{};
     AmdGpu::NumberClass num_class{};
     AmdGpu::CompMapping dst_select{};
+    // PS4Recomp: Gcn::IsVertexFetchable of the V#: a shader translated with Metal vertex
+    // attributes is not one for a draw whose V# needs the fetch shader translated inline
+    bool fetchable{};
 
     bool operator==(const VsAttribSpecialization&) const = default;
 };
@@ -52,6 +55,9 @@ struct ImageSpecialization {
     bool is_integer = false;
     bool is_storage = false;
     bool is_srgb = false;
+    // PS4Recomp: a 1D image read as 2D (Image::Is1DAs2D): its view type is Color2D(Array) like a
+    // 2D image's, but its instructions' address VGPRs are 1D ones
+    bool is_1d_as_2d = false;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
     // FIXME any pipeline cache changes needed?
@@ -87,6 +93,8 @@ struct StageSpecialization {
     RuntimeInfo runtime_info{};
     std::bitset<MaxStageResources> bitset{};
     Gcn::FetchShaderData fetch_shader_data{};
+    // PS4Recomp: Gcn::InlinedFetchShaderHash of a VS with Info::fetch_shader_inlined, else 0
+    u64 inlined_fetch_hash{};
     SmallVector<VsAttribSpecialization, 32> vs_attribs;
     SmallVector<BufferSpecialization, 16> buffers;
     SmallVector<ImageSpecialization, 16> images;
@@ -116,7 +124,11 @@ struct StageSpecialization {
                              }
                              spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
                              spec.dst_select = sharp.DstSelect();
+                             spec.fetchable = Gcn::IsVertexFetchable(sharp);
                          });
+        }
+        if (info_.sw_stage == SwStage::Vertex && info_.fetch_shader_inlined) {
+            inlined_fetch_hash = Gcn::InlinedFetchShaderHash(info_);
         }
         u32 binding{};
         ForEachSharp(binding, buffers, info->buffers,
@@ -140,6 +152,7 @@ struct StageSpecialization {
         ForEachSharp(binding, images, info->images,
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.type = sharp.GetViewType(desc.is_array);
+                         spec.is_1d_as_2d = sharp.Is1DAs2D();
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                          spec.is_storage = desc.is_written;
                          if (spec.is_storage) {
@@ -218,6 +231,10 @@ struct StageSpecialization {
         }
 
         if (fetch_shader_data != other.fetch_shader_data) {
+            return false;
+        }
+
+        if (inlined_fetch_hash != other.inlined_fetch_hash) {
             return false;
         }
 

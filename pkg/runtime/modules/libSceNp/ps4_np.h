@@ -278,6 +278,34 @@ void shim_sceNpRegisterStateCallbackForToolkit(GuestContext *ctx);
 void shim_sceNpUnregisterStateCallbackForToolkit(GuestContext *ctx);
 void shim_sceNpCheckCallbackForLib(GuestContext *ctx);
 void shim_sceNpCheckCallback(GuestContext *ctx);
+void shim_sceNpSetNpTitleId(GuestContext *ctx);
+void shim_sceNpRegisterGamePresenceCallbackA(GuestContext *ctx);
+// The title id kept by sceNpSetNpTitleId: 1 once set, with the id copied to out.
+int ps4_np_title_id(char out[13]);
+
+// SceNpAgeRestriction / SceNpContentRestriction as the guest lays them out.
+typedef struct OrbisNpAgeRestriction {
+    OrbisNpCountryCode country;
+    int8_t age;
+    int8_t padding[3];
+} OrbisNpAgeRestriction;
+typedef struct OrbisNpContentRestriction {
+    uint64_t size;
+    int8_t defaultAgeRestriction;
+    int8_t padding[3];
+    int32_t ageRestrictionCount;
+    uint64_t ageRestriction; // guest address of the entries
+} OrbisNpContentRestriction;
+_Static_assert(sizeof(OrbisNpAgeRestriction) == 8, "SceNpAgeRestriction is 8 bytes");
+_Static_assert(sizeof(OrbisNpContentRestriction) == 0x18, "SceNpContentRestriction is 0x18 bytes");
+
+void shim_sceNpSetContentRestriction(GuestContext *ctx);
+// The restriction kept by sceNpSetContentRestriction: 1 once set, with the default age and the
+// number of per-country entries; 0 when none is set.
+int ps4_np_content_restriction(int8_t *default_age, int32_t *count);
+// The age limit for a country (two characters): the stored entry, or the default age when the
+// country has none. Returns -1 when no restriction is set.
+int ps4_np_age_for_country(const char cc[2], int8_t *age);
 
 void shim_sceNpAuthCreateRequest(GuestContext *ctx);
 void shim_sceNpAuthCreateAsyncRequest(GuestContext *ctx);

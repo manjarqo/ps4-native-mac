@@ -51,9 +51,14 @@ uint64_t recomp_vm_alloc_named_aligned(GuestContext *ctx, size_t size, size_t al
     (void)ctx, (void)size, (void)alignment, (void)prot, (void)flags, (void)name;
     return 0;
 }
-int32_t sceVideoOutSubmitFlip(GuestContext *ctx, int32_t handle, int32_t idx, uint32_t mode, int64_t arg) {
-    (void)ctx, (void)handle, (void)idx, (void)mode, (void)arg;
+int32_t ps4_videoout_submit_flip(GuestContext *ctx, int32_t handle, int32_t idx, uint32_t mode, int64_t arg,
+                                 int gpu_flip) {
+    (void)ctx, (void)handle, (void)idx, (void)mode, (void)arg, (void)gpu_flip;
     return 0;
+}
+int32_t sceVideoOutGetBufferLabelAddress(GuestContext *ctx, int32_t handle, uint64_t *label_addr) {
+    (void)ctx, (void)handle, (void)label_addr;
+    return (int32_t)0x8029000Bu; // no VideoOut here: SCE_VIDEO_OUT_ERROR_INVALID_HANDLE
 }
 
 int main(void) {

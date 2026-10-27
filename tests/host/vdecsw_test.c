@@ -16,18 +16,25 @@
 // wraps). Also: corrupt access units, a stream without parameter sets and a rejected SPS (error
 // pictures, one picture per access unit), a too-small output buffer, guest ranges that wrap
 // around, two decoders interleaved, DeleteDecoder racing calls on another thread, stale handles,
-// and libSceVideodec.
+// and libSceVideodec. S5 (640x368, software encoder) has 5 slices per picture: it checks the
+// access-unit census (h264_au_census) and libSceVideodec's per-decoder counts
+// (ps4_videodec_stats). With the local fixture given as argv[1] (inFAMOUS's
+// splash_europe.bsf, game data, git-ignored), the movie is split into access units, fed through
+// libSceVideodec and must give 309 pictures in display order.
 #include "recomp_runtime.h"
 #include "ps4_h264_vt.h"
+#include "ps4_videodec.h"
 
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
 #include <VideoToolbox/VideoToolbox.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 void shim_sceVdecswQueryComputeMemoryInfo(GuestContext *ctx);
 void shim_sceVdecswAllocateComputeQueue(GuestContext *ctx);
@@ -108,6 +115,7 @@ typedef struct Stream {
     uint8_t sps[256], pps[256];
     size_t sps_len, pps_len;
     int keys, reordered;
+    uint32_t max_slices; // most slices in one access unit (census)
 } Stream;
 
 static pthread_mutex_t g_enc_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -176,11 +184,28 @@ static void enc_cb(void *refcon, void *frame_refcon, OSStatus status, VTEncodeIn
     pthread_mutex_unlock(&g_enc_lock);
 }
 
-static void make_stream(Stream *st, const char *name, int n, int gop, bool reorder) {
+// Encoder options beyond the defaults of make_stream (352x200, default encoder).
+// kVTCompressionPropertyKey_MaxH264SliceBytes is refused by both encoders of the macOS this was
+// written on (kVTPropertyNotSupportedErr), but Apple's software encoder cuts a 640x368 picture
+// into 5 slices by itself; the hardware encoder makes one. The slice count is checked where the
+// stream is used (test_au_census), so the test never runs on single-slice pictures.
+typedef struct StreamOpts {
+    int w, h;
+    bool software; // kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder = false
+} StreamOpts;
+
+static void make_stream_opts(Stream *st, const char *name, int n, int gop, bool reorder, const StreamOpts *o) {
     memset(st, 0, sizeof(*st));
     st->name = name;
+    const int w = o->w, h = o->h;
     VTCompressionSessionRef s = NULL;
-    OSStatus rc = VTCompressionSessionCreate(NULL, W, H, kCMVideoCodecType_H264, NULL, NULL, NULL, enc_cb, st, &s);
+    CFMutableDictionaryRef spec = NULL;
+    if (o->software) {
+        spec = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(spec, kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder, kCFBooleanFalse);
+    }
+    OSStatus rc = VTCompressionSessionCreate(NULL, w, h, kCMVideoCodecType_H264, spec, NULL, NULL, enc_cb, st, &s);
+    if (spec) CFRelease(spec);
     if (rc != noErr) {
         fprintf(stderr, "VTCompressionSessionCreate: %d\n", (int)rc);
         exit(1);
@@ -193,13 +218,13 @@ static void make_stream(Stream *st, const char *name, int n, int gop, bool reord
     CFRelease(g);
     for (int i = 0; i < n; i++) {
         CVPixelBufferRef pb = NULL;
-        CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pb);
+        CVPixelBufferCreate(NULL, w, h, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pb);
         CVPixelBufferLockBaseAddress(pb, 0);
         uint8_t *y = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
         uint8_t *c = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-        for (int r = 0; r < H; r++)
-            memset(y + r * CVPixelBufferGetBytesPerRowOfPlane(pb, 0), r < H / 2 ? level_top(i) : level_bottom(i), W);
-        for (int r = 0; r < H / 2; r++) memset(c + r * CVPixelBufferGetBytesPerRowOfPlane(pb, 1), 128, W);
+        const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        for (int r = 0; r < h; r++) memset(y + r * ys, r < h / 2 ? level_top(i) : level_bottom(i), (size_t)w);
+        for (int r = 0; r < h / 2; r++) memset(c + r * CVPixelBufferGetBytesPerRowOfPlane(pb, 1), 128, (size_t)w);
         CVPixelBufferUnlockBaseAddress(pb, 0);
         rc = VTCompressionSessionEncodeFrame(s, pb, CMTimeMake(i, 30), CMTimeMake(1, 30), NULL, NULL, NULL);
         CVPixelBufferRelease(pb);
@@ -222,6 +247,11 @@ static void make_stream(Stream *st, const char *name, int n, int gop, bool reord
             name, st->count, st->keys, st->reordered, sps.pic_order_cnt_type, sps.log2_max_pic_order_cnt_lsb,
             sps.bitstream_restriction_flag, sps.max_num_reorder_frames);
     CHECK(st->count == n, "%s: encoder produced %d samples", name, st->count);
+}
+
+static void make_stream(Stream *st, const char *name, int n, int gop, bool reorder) {
+    const StreamOpts o = {W, H, false};
+    make_stream_opts(st, name, n, gop, reorder, &o);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -575,7 +605,7 @@ static void set_input(Dec *d, const Au *au, int j) {
 
 // ---------------------------------------------------------------------------------------------
 
-static Stream S1, S2, S3, S4;
+static Stream S1, S2, S3, S4, S5;
 
 static void test_setup_and_errors(void) {
     // Compute queue, as U4 does at 0x16993c3.
@@ -1026,11 +1056,770 @@ static void test_videodec(void) {
     fprintf(stderr, "videodec: %d pictures\n", got);
 }
 
-int main(void) {
+// ---------------------------------------------------------------------------------------------
+// Access-unit census, per-decoder counts (Ps4VideodecStats) and the inFAMOUS splash fixture
+// ---------------------------------------------------------------------------------------------
+
+// Calls fn for each NAL unit of an Annex-B buffer (start code excluded, trailing zeros trimmed).
+typedef void (*NalFn)(void *u, const uint8_t *nal, size_t n, size_t sc_off);
+static void for_each_nal(const uint8_t *p, size_t size, NalFn fn, void *u) {
+    size_t i = 0;
+    while (i + 3 <= size && !(p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1)) i++;
+    while (i + 3 <= size) {
+        const size_t s = i + 3;
+        size_t e = s;
+        while (e + 3 <= size && !(p[e] == 0 && p[e + 1] == 0 && p[e + 2] == 1)) e++;
+        if (e + 3 > size) e = size;
+        const size_t next = e;
+        while (e > s && p[e - 1] == 0) e--;
+        if (e > s) fn(u, p + s, e - s, i);
+        i = next;
+    }
+}
+
+typedef struct NthSlice {
+    int want, seen;
+    const uint8_t *nal;
+    size_t n;
+} NthSlice;
+static void nth_slice_fn(void *u, const uint8_t *nal, size_t n, size_t sc_off) {
+    (void)sc_off;
+    NthSlice *t = (NthSlice *)u;
+    const int type = nal[0] & 0x1f;
+    if (type >= 1 && type <= 5 && ++t->seen == t->want) {
+        t->nal = nal;
+        t->n = n;
+    }
+}
+
+static void test_au_census(void) {
+    H264AuCensus c;
+    // S1's first access unit as built by enc_cb: AUD, SPS, PPS, then the encoder's IDR slice.
+    h264_au_census(S1.aus[0].data, S1.aus[0].size, &c);
+    fprintf(stderr, "census S1 au 0: %u NAL units [", c.nal_count);
+    for (uint32_t k = 0; k < c.nal_count && k < 32; k++) fprintf(stderr, "%s%u", k ? " " : "", c.nal_types[k]);
+    fprintf(stderr, "], slices %u, first_mb %d\n", c.slices, c.first_mb_first_slice);
+    CHECK(c.nal_count >= 4 && c.nal_types[0] == 9 && c.nal_types[1] == 7 && c.nal_types[2] == 8 &&
+              c.nal_types[c.nal_count - 1] == 5,
+          "S1 au 0 NAL types");
+    for (uint32_t k = 3; k + 1 < c.nal_count; k++) CHECK(c.nal_types[k] == 6, "S1 au 0 NAL %u type %u", k, c.nal_types[k]);
+    CHECK(c.slices == 1 && c.first_mb_first_slice == 0 && c.has_idr && c.has_sps, "S1 au 0: slices %u first_mb %d",
+          c.slices, c.first_mb_first_slice);
+    h264_au_census(S1.aus[1].data, S1.aus[1].size, &c);
+    CHECK(c.slices == 1 && c.first_mb_first_slice == 0 && !c.has_idr && !c.has_sps, "S1 au 1: slices %u", c.slices);
+
+    // S5: multi-slice pictures. Without them the test proves nothing, so it fails.
+    uint32_t min_slices = UINT32_MAX, max_slices = 0;
+    for (int j = 0; j < S5.count; j++) {
+        h264_au_census(S5.aus[j].data, S5.aus[j].size, &c);
+        if (c.slices < min_slices) min_slices = c.slices;
+        if (c.slices > max_slices) max_slices = c.slices;
+        CHECK(c.first_mb_first_slice == 0, "S5 au %d: first_mb %d", j, c.first_mb_first_slice);
+    }
+    fprintf(stderr, "census S5: slices per picture %u..%u\n", min_slices, max_slices);
+    CHECK(min_slices >= 4, "S5: the encoder made %u slices in a picture; the test needs >= 4", min_slices);
+    S5.max_slices = max_slices;
+    S1.max_slices = 1;
+
+    // S5's second slice NAL alone: one slice that starts mid-picture.
+    NthSlice t = {2, 0, NULL, 0};
+    for_each_nal(S5.aus[0].data, S5.aus[0].size, nth_slice_fn, &t);
+    CHECK(t.nal != NULL, "S5 au 0 has no second slice");
+    if (t.nal) {
+        uint8_t *buf = NULL;
+        size_t len = 0;
+        put_nal(&buf, &len, t.nal, t.n);
+        h264_au_census(buf, len, &c);
+        CHECK(c.nal_count == 1 && c.slices == 1 && c.first_mb_first_slice > 0, "S5 slice 2: slices %u first_mb %d",
+              c.slices, c.first_mb_first_slice);
+        free(buf);
+    }
+
+    // An SPS alone: no slice.
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    put_nal(&buf, &len, S1.sps, S1.sps_len);
+    static const uint8_t zeros[3] = {0, 0, 0};
+    put(&buf, &len, zeros, sizeof(zeros)); // trailing_zero_8bits are not a NAL unit
+    h264_au_census(buf, len, &c);
+    CHECK(c.nal_count == 1 && c.nal_types[0] == 7 && c.slices == 0 && c.first_mb_first_slice == -1 && c.has_sps &&
+              !c.has_idr,
+          "SPS only: %u NAL units, slices %u, first_mb %d", c.nal_count, c.slices, c.first_mb_first_slice);
+    free(buf);
+    h264_au_census(NULL, 0, &c);
+    CHECK(c.nal_count == 0 && c.slices == 0 && c.first_mb_first_slice == -1, "empty AU");
+
+    // 3-byte start codes (00 00 01) between all NAL units, as some muxers write them.
+    buf = NULL;
+    len = 0;
+    static const uint8_t sc3[3] = {0, 0, 1};
+    static const uint8_t aud[2] = {0x09, 0xF0};
+    put(&buf, &len, sc3, 3);
+    put(&buf, &len, aud, 2);
+    put(&buf, &len, sc3, 3);
+    put(&buf, &len, S1.sps, S1.sps_len);
+    put(&buf, &len, sc3, 3);
+    put(&buf, &len, S1.pps, S1.pps_len);
+    NthSlice t1 = {1, 0, NULL, 0};
+    for_each_nal(S1.aus[0].data, S1.aus[0].size, nth_slice_fn, &t1);
+    put(&buf, &len, sc3, 3);
+    put(&buf, &len, t1.nal, t1.n);
+    h264_au_census(buf, len, &c);
+    CHECK(c.nal_count == 4 && c.nal_types[0] == 9 && c.nal_types[1] == 7 && c.nal_types[2] == 8 && c.nal_types[3] == 5 &&
+              c.slices == 1 && c.first_mb_first_slice == 0,
+          "3-byte start codes: %u NAL units, slices %u, first_mb %d", c.nal_count, c.slices, c.first_mb_first_slice);
+    free(buf);
+
+    // An emulation-prevention byte inside first_mb_in_slice: ue(v) with 30 leading zeros (the
+    // first three RBSP bytes are 00, so the NAL carries 00 00 03 00). Hand-built: the value is
+    // only right if the census strips the 03 and reads the 61 bits of the ue(v) in full.
+    const uint32_t big = (1u << 30) - 1 + 0x2ABCDEFu;
+    uint8_t rbsp[16] = {0};
+    size_t bit = 0;
+    for (int k = 0; k < 30; k++) bit++; // leading zeros
+    rbsp[bit >> 3] |= (uint8_t)(0x80 >> (bit & 7)), bit++;
+    const uint32_t suffix = big + 1 - (1u << 30);
+    for (int k = 29; k >= 0; k--, bit++)
+        if ((suffix >> k) & 1) rbsp[bit >> 3] |= (uint8_t)(0x80 >> (bit & 7));
+    rbsp[bit >> 3] |= (uint8_t)(0x80 >> (bit & 7)), bit++; // slice_type ue 0, then padding
+    const size_t rbsp_len = (bit + 7) / 8 + 4;
+    uint8_t nal[32];
+    size_t nn = 0, ep_zeros = 0;
+    nal[nn++] = 0x01; // nal_ref_idc 0, type 1
+    for (size_t k = 0; k < rbsp_len; k++) {
+        if (ep_zeros >= 2 && rbsp[k] <= 3) {
+            nal[nn++] = 3;
+            ep_zeros = 0;
+        }
+        nal[nn++] = rbsp[k];
+        ep_zeros = rbsp[k] == 0 ? ep_zeros + 1 : 0;
+    }
+    CHECK(nal[1] == 0 && nal[2] == 0 && nal[3] == 3, "the hand-built NAL has no emulation-prevention byte");
+    buf = NULL;
+    len = 0;
+    put_nal(&buf, &len, nal, nn);
+    h264_au_census(buf, len, &c);
+    CHECK(c.slices == 1 && c.first_mb_first_slice == (int32_t)big, "emulation prevention: first_mb %d, want %u",
+          c.first_mb_first_slice, big);
+    free(buf);
+}
+
+// One libSceVideodec decoder on the fake guest memory.
+typedef struct VRun {
+    uint64_t cfg, ri, ctrl, in, fb, pic, buf, au_buf, buf_size, au_cap;
+    int32_t expect_rc; // what Decode/Flush must return (0, or an error a test provokes)
+    int32_t last_rc;
+} VRun;
+
+static void vrun_open(VRun *r, int w, int h, uint64_t buf_size, uint64_t au_cap) {
+    memset(r, 0, sizeof(*r));
+    r->cfg = galloc(0x30, 16);
+    r->ri = galloc(0x40, 16);
+    r->ctrl = galloc(0x18, 16);
+    r->in = galloc(0x30, 16);
+    r->fb = galloc(0x18, 16);
+    r->pic = galloc(0x70, 16);
+    r->buf_size = buf_size;
+    r->au_cap = au_cap;
+    r->buf = galloc(buf_size, 0x100);
+    r->au_buf = galloc(au_cap, 0x100);
+    wr64(r->cfg, 0x28);
+    wr32(r->cfg + 0x0c, 0x64);
+    wr32(r->cfg + 0x10, 0x2a);
+    wr32(r->cfg + 0x14, (uint32_t)w);
+    wr32(r->cfg + 0x18, (uint32_t)h);
+    wr32(r->cfg + 0x1c, (uint32_t)-1);
+    CHECK(call(shim_sceVideodecQueryResourceInfo, r->cfg, r->ri, 0, 0) == 0, "QueryResourceInfo");
+    wr64(r->ctrl, 0x18);
+    CHECK(call(shim_sceVideodecCreateDecoder, r->cfg, r->ri, r->ctrl, 0) == 0, "Videodec CreateDecoder");
+}
+
+static void vrun_fb(VRun *r) {
+    wr64(r->fb, 0x18);
+    wr64(r->fb + 8, r->buf);
+    wr64(r->fb + 0x10, r->buf_size);
+}
+
+// Decodes one access unit; returns whether a picture came out.
+static bool vrun_decode(VRun *r, const uint8_t *au, size_t n, uint64_t pts, uint64_t dts, uint64_t attached) {
+    CHECK(n <= r->au_cap, "access unit of %zu bytes", n);
+    if (n > r->au_cap) return false;
+    vrun_fb(r);
+    memcpy(gp(r->au_buf), au, n);
+    wr64(r->in, 0x30);
+    wr64(r->in + 0x08, r->au_buf);
+    wr64(r->in + 0x10, n);
+    wr64(r->in + 0x18, pts);
+    wr64(r->in + 0x20, dts);
+    wr64(r->in + 0x28, attached);
+    const int32_t rc = r->last_rc = call(shim_sceVideodecDecode, r->ctrl, r->in, r->fb, r->pic);
+    CHECK(rc == 0 || rc == r->expect_rc, "Videodec Decode 0x%x", rc);
+    return rd32(r->pic + 0x08) != 0;
+}
+
+static bool vrun_flush(VRun *r) {
+    vrun_fb(r);
+    const int32_t rc = r->last_rc = call(shim_sceVideodecFlush, r->ctrl, r->fb, r->pic, 0);
+    CHECK(rc == 0 || rc == r->expect_rc, "Videodec Flush 0x%x", rc);
+    return rd32(r->pic + 0x08) != 0;
+}
+
+static Ps4VideodecStats vrun_stats(VRun *r) {
+    Ps4VideodecStats st;
+    memset(&st, 0xEE, sizeof(st));
+    CHECK(ps4_videodec_stats(g.mem_base, r->ctrl, &st) == 0, "ps4_videodec_stats");
+    return st;
+}
+
+static void vrun_close(VRun *r) {
+    CHECK(call(shim_sceVideodecDeleteDecoder, r->ctrl, 0, 0, 0) == 0, "Videodec DeleteDecoder");
+    Ps4VideodecStats st;
+    CHECK(ps4_videodec_stats(g.mem_base, r->ctrl, &st) != 0, "ps4_videodec_stats on a deleted decoder");
+}
+
+// Display index of a picture of size w x h at pitch (luma levels as level_top/level_bottom).
+static int display_of_dims(uint64_t fb, int w, int h, int pitch) {
+    long st = 0, nt = 0, sb = 0, nb = 0;
+    for (int y = 20; y < h - 20; y += 7)
+        for (int x = 20; x < w - 20; x += 7) {
+            if (y < h / 2 - 20) st += rd8(fb + (uint64_t)y * (uint64_t)pitch + (uint64_t)x), nt++;
+            else if (y >= h / 2 + 20) sb += rd8(fb + (uint64_t)y * (uint64_t)pitch + (uint64_t)x), nb++;
+        }
+    const int top = (int)(st / nt), bot = (int)(sb / nb);
+    const int lo = (top - 40 + 2) / 5, hi = (bot - 40 + 20) / 40;
+    const int i = hi * 30 + lo;
+    if (lo < 0 || lo >= 30 || hi < 0 || abs(top - level_top(i)) > 3 || abs(bot - level_bottom(i)) > 3) return -1;
+    return i;
+}
+
+// Feeds a whole stream through Decode then Flush; checks display order and the counters.
+static void videodec_counts(const Stream *s, int w, int h) {
+    VRun r;
+    const uint64_t buf_size = 0x200000;
+    vrun_open(&r, w, h, buf_size, AU_BUF);
+    const int pitch = (int)h264vt_pitch((uint32_t)w);
+    int got = 0, order_ok = 1;
+    for (int j = 0; j < s->count + MAXN; j++) {
+        const bool pic = j < s->count ? vrun_decode(&r, s->aus[j].data, s->aus[j].size,
+                                                    (uint64_t)s->aus[j].display * 3003, (uint64_t)j * 3003, (uint64_t)j)
+                                      : vrun_flush(&r);
+        if (!pic) {
+            if (j >= s->count) break;
+            continue;
+        }
+        if (display_of_dims(r.buf, w, h, pitch) != got || rd64(r.pic + 0x20) != (uint64_t)got * 3003) order_ok = 0;
+        got++;
+    }
+    const Ps4VideodecStats st = vrun_stats(&r);
+    fprintf(stderr,
+            "videodec counts %s: AUs %llu (slices %llu, max per AU %u, mid-picture %llu), pictures %llu (flushed %llu, "
+            "error %llu), mono %.3f..%.3f, pts %lld..%lld, fb min 0x%llx need 0x%llx\n",
+            s->name, (unsigned long long)st.aus, (unsigned long long)st.slices, st.max_slices_per_au,
+            (unsigned long long)st.mid_picture_aus, (unsigned long long)st.pictures,
+            (unsigned long long)st.flush_pictures, (unsigned long long)st.error_pictures, st.first_picture_mono,
+            st.last_picture_mono, (long long)st.first_pts, (long long)st.last_pts, (unsigned long long)st.min_fb_size,
+            (unsigned long long)st.need_fb_size);
+    CHECK(got == s->count && order_ok, "%s: %d pictures (order %d)", s->name, got, order_ok);
+    CHECK(st.aus == (uint64_t)s->count, "%s: aus %llu", s->name, (unsigned long long)st.aus);
+    CHECK(st.pictures == (uint64_t)s->count, "%s: pictures %llu", s->name, (unsigned long long)st.pictures);
+    CHECK(st.flush_pictures >= 1 && st.flush_pictures < st.pictures, "%s: flushed %llu", s->name,
+          (unsigned long long)st.flush_pictures);
+    CHECK(st.error_pictures == 0 && st.mid_picture_aus == 0, "%s: error %llu mid-picture %llu", s->name,
+          (unsigned long long)st.error_pictures, (unsigned long long)st.mid_picture_aus);
+    CHECK(st.max_slices_per_au == s->max_slices, "%s: max slices per AU %u, census %u", s->name, st.max_slices_per_au,
+          s->max_slices);
+    CHECK(st.min_fb_size == buf_size, "%s: min_fb_size 0x%llx", s->name, (unsigned long long)st.min_fb_size);
+    CHECK(st.need_fb_size == h264vt_nv12_size((uint32_t)w, (uint32_t)h), "%s: need_fb_size 0x%llx", s->name,
+          (unsigned long long)st.need_fb_size);
+    CHECK(st.first_pts == 0 && st.last_pts == (int64_t)(s->count - 1) * 3003, "%s: pts %lld..%lld", s->name,
+          (long long)st.first_pts, (long long)st.last_pts);
+    CHECK(st.first_picture_mono > 0 && st.last_picture_mono >= st.first_picture_mono, "%s: mono %.3f..%.3f", s->name,
+          st.first_picture_mono, st.last_picture_mono);
+    vrun_close(&r);
+}
+
+// Two corrupt access units of S1, made as in test_error_pictures (a): two error pictures,
+// dropped. They are the last two in decode order: after bad data VideoToolbox fails every access
+// unit up to the next IDR, also ones that do not predict from it (test_error_pictures (a) gets
+// 25 error pictures from two corrupt ones in a one-IDR stream).
+static void videodec_error_counts(void) {
+    const int bad[2] = {S1.count - 2, S1.count - 1};
+    VRun r;
+    vrun_open(&r, W, H, 0x100000, AU_BUF);
+    int got = 0;
+    for (int j = 0; j < S1.count + MAXN; j++) {
+        bool pic;
+        if (j < S1.count) {
+            uint8_t *buf = (uint8_t *)malloc(S1.aus[j].size);
+            memcpy(buf, S1.aus[j].data, S1.aus[j].size);
+            if (j == bad[0] || j == bad[1]) {
+                size_t s = nth_start(&S1.aus[j], 2) + 4;
+                for (size_t i = s + 3; i < S1.aus[j].size; i++) buf[i] = (uint8_t)(0xA5 ^ (i * 7));
+            }
+            pic = vrun_decode(&r, buf, S1.aus[j].size, (uint64_t)S1.aus[j].display * 3003, (uint64_t)j * 3003,
+                              (uint64_t)j);
+            free(buf);
+        } else {
+            pic = vrun_flush(&r);
+            if (!pic) break;
+        }
+        got += pic;
+    }
+    const Ps4VideodecStats st = vrun_stats(&r);
+    fprintf(stderr, "videodec corrupt AUs %d and %d: pictures %llu, error %llu\n", bad[0], bad[1],
+            (unsigned long long)st.pictures, (unsigned long long)st.error_pictures);
+    CHECK(st.error_pictures == 2, "corrupt: error_pictures %llu", (unsigned long long)st.error_pictures);
+    CHECK(st.pictures == (uint64_t)S1.count - 2 && got == S1.count - 2, "corrupt: pictures %llu (got %d)",
+          (unsigned long long)st.pictures, got);
+    vrun_close(&r);
+}
+
+// PS4_VIDEODEC_DUMP=<dir>:5 writes S1's picture 5 (display order) as dec<n>_pic5.nv12: a 16-byte
+// header (u16 width, u16 height, u32 pitch, i64 pts, little-endian) and the NV12 bytes the guest
+// frame buffer received.
+static void videodec_dump(void) {
+    char dir[] = "/tmp/vdecsw_dump_XXXXXX";
+    CHECK(mkdtemp(dir) != NULL, "mkdtemp");
+    char env[64];
+    snprintf(env, sizeof(env), "%s:5", dir);
+    setenv("PS4_VIDEODEC_DUMP", env, 1);
+    VRun r;
+    vrun_open(&r, W, H, 0x100000, AU_BUF);
+    unsetenv("PS4_VIDEODEC_DUMP"); // read when the decoder is created
+    uint8_t *want = (uint8_t *)malloc(FRAME_SIZE);
+    int got = 0;
+    for (int j = 0; j < S1.count + MAXN; j++) {
+        const bool pic = j < S1.count ? vrun_decode(&r, S1.aus[j].data, S1.aus[j].size,
+                                                    (uint64_t)S1.aus[j].display * 3003, (uint64_t)j * 3003, (uint64_t)j)
+                                      : vrun_flush(&r);
+        if (!pic) {
+            if (j >= S1.count) break;
+            continue;
+        }
+        if (got == 5) memcpy(want, gp(r.buf), FRAME_SIZE);
+        got++;
+    }
+    vrun_close(&r);
+    CHECK(got == S1.count, "dump run: %d pictures", got);
+    // Exactly one file, dec<n>_pic5.nv12.
+    char path[256] = "";
+    int files = 0;
+    DIR *dd = opendir(dir);
+    for (struct dirent *e; dd && (e = readdir(dd)) != NULL;) {
+        if (e->d_name[0] == '.') continue;
+        files++;
+        unsigned n;
+        char tail[32];
+        CHECK(sscanf(e->d_name, "dec%u_pic5%31s", &n, tail) == 2 && strcmp(tail, ".nv12") == 0, "dump file %s",
+              e->d_name);
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+    }
+    if (dd) closedir(dd);
+    CHECK(files == 1, "%d dump files", files);
+    FILE *f = files == 1 ? fopen(path, "rb") : NULL;
+    if (f) {
+        uint8_t hdr[16];
+        uint8_t *data = (uint8_t *)malloc(FRAME_SIZE + 1);
+        const size_t nh = fread(hdr, 1, sizeof(hdr), f);
+        const size_t nd = fread(data, 1, FRAME_SIZE + 1, f);
+        fclose(f);
+        uint16_t w, h;
+        uint32_t pitch;
+        int64_t pts;
+        memcpy(&w, hdr, 2);
+        memcpy(&h, hdr + 2, 2);
+        memcpy(&pitch, hdr + 4, 4);
+        memcpy(&pts, hdr + 8, 8);
+        CHECK(nh == 16 && w == W && h == H && pitch == PITCH && pts == 5 * 3003, "dump header %ux%u pitch %u pts %lld",
+              w, h, pitch, (long long)pts);
+        CHECK(nd == FRAME_SIZE, "dump data %zu bytes", nd);
+        CHECK(memcmp(data, want, FRAME_SIZE) == 0, "dump differs from the guest frame buffer");
+        // The luma levels: the dump shows display index 5, as the guest frame buffer did.
+        const uint64_t scratch = galloc(FRAME_SIZE, 0x100);
+        memcpy(gp(scratch), data, FRAME_SIZE);
+        CHECK(display_of_dims(scratch, W, H, PITCH) == 5, "dump shows frame %d", display_of_dims(scratch, W, H, PITCH));
+        free(data);
+    }
+    if (path[0]) unlink(path);
+    rmdir(dir);
+    free(want);
+}
+
+// Captures stderr into a temporary file between cap_begin and cap_end.
+typedef struct Cap {
+    int saved;
+    char path[64];
+} Cap;
+static void cap_begin(Cap *c) {
+    fflush(stderr);
+    snprintf(c->path, sizeof(c->path), "/tmp/vdecsw_err_XXXXXX");
+    const int fd = mkstemp(c->path);
+    c->saved = dup(2);
+    dup2(fd, 2);
+    close(fd);
+}
+static char *cap_end(Cap *c) {
+    fflush(stderr);
+    dup2(c->saved, 2);
+    close(c->saved);
+    FILE *f = fopen(c->path, "rb");
+    char *text = (char *)calloc(1, 1 << 20);
+    if (f) {
+        fread(text, 1, (1 << 20) - 1, f);
+        fclose(f);
+    }
+    unlink(c->path);
+    fputs(text, stderr); // still in the test output
+    return text;
+}
+
+static int count_files(const char *dir) {
+    int n = 0;
+    DIR *dd = opendir(dir);
+    for (struct dirent *e; dd && (e = readdir(dd)) != NULL;) n += e->d_name[0] != '.';
+    if (dd) closedir(dd);
+    return n;
+}
+
+// A PS4_VIDEODEC_DUMP that cannot be used: no file, the reason in the log, decoding unchanged.
+static void videodec_dump_bad(const char *value, const char *dir_to_check, const char *expect) {
+    setenv("PS4_VIDEODEC_DUMP", value, 1);
+    Cap cap;
+    cap_begin(&cap);
+    VRun r;
+    vrun_open(&r, W, H, 0x100000, AU_BUF);
+    unsetenv("PS4_VIDEODEC_DUMP");
+    int got = 0, order_ok = 1;
+    for (int j = 0; j < S1.count + MAXN; j++) {
+        const bool pic = j < S1.count ? vrun_decode(&r, S1.aus[j].data, S1.aus[j].size,
+                                                    (uint64_t)S1.aus[j].display * 3003, (uint64_t)j * 3003, (uint64_t)j)
+                                      : vrun_flush(&r);
+        if (!pic) {
+            if (j >= S1.count) break;
+            continue;
+        }
+        if (display_of_dims(r.buf, W, H, PITCH) != got) order_ok = 0;
+        got++;
+    }
+    const Ps4VideodecStats st = vrun_stats(&r);
+    vrun_close(&r);
+    char *log = cap_end(&cap);
+    CHECK(got == S1.count && order_ok && st.pictures == (uint64_t)S1.count && st.error_pictures == 0,
+          "dump %s: %d pictures (order %d)", value, got, order_ok);
+    CHECK(strstr(log, expect) != NULL, "dump %s: no \"%s\" in the log", value, expect);
+    CHECK(count_files(dir_to_check) == 0, "dump %s: files written in %s", value, dir_to_check);
+    free(log);
+}
+
+static void videodec_dump_failures(void) {
+    char dir[] = "/tmp/vdecsw_dump_XXXXXX";
+    CHECK(mkdtemp(dir) != NULL, "mkdtemp");
+    char v[128], missing[96];
+    snprintf(missing, sizeof(missing), "%s/missing", dir);
+    snprintf(v, sizeof(v), "%s:5", missing); // a directory that does not exist
+    videodec_dump_bad(v, dir, "could not write");
+    snprintf(v, sizeof(v), "%s:abc", dir);
+    videodec_dump_bad(v, dir, "PS4_VIDEODEC_DUMP");
+    snprintf(v, sizeof(v), "%s:-1", dir);
+    videodec_dump_bad(v, dir, "PS4_VIDEODEC_DUMP");
+    rmdir(dir);
+}
+
+// A frame buffer too small for the picture: Decode and Flush report the error, the picture is
+// dropped and counted, so access units and pictures reconcile.
+static void videodec_refused(void) {
+    VRun r;
+    vrun_open(&r, W, H, 0x1000, AU_BUF);
+    r.expect_rc = (int32_t)0x80C10008; // SCE_VIDEODEC_ERROR_FRAME_BUFFER_SIZE
+    int errors = 0;
+    for (int j = 0; j < S1.count; j++) {
+        CHECK(!vrun_decode(&r, S1.aus[j].data, S1.aus[j].size, (uint64_t)S1.aus[j].display * 3003, (uint64_t)j * 3003,
+                           (uint64_t)j),
+              "a picture in a 4 KiB buffer");
+        errors += r.last_rc != 0;
+    }
+    for (int k = 0; k < MAXN; k++) {
+        const bool pic = vrun_flush(&r);
+        CHECK(!pic, "a flushed picture in a 4 KiB buffer");
+        if (r.last_rc == 0) break;
+        errors++;
+    }
+    const Ps4VideodecStats st = vrun_stats(&r);
+    fprintf(stderr, "videodec refused: AUs %llu, pictures %llu, error %llu, refused %llu (%d calls failed)\n",
+            (unsigned long long)st.aus, (unsigned long long)st.pictures, (unsigned long long)st.error_pictures,
+            (unsigned long long)st.refused_pictures, errors);
+    CHECK(st.pictures == 0 && st.error_pictures == 0 && st.refused_pictures == (uint64_t)S1.count &&
+              errors == S1.count,
+          "refused: %llu pictures, %llu refused, %d failed calls", (unsigned long long)st.pictures,
+          (unsigned long long)st.refused_pictures, errors);
+    CHECK(st.pictures + st.error_pictures + st.refused_pictures == st.aus, "AUs and pictures do not reconcile");
+    CHECK(st.min_fb_size == 0x1000 && st.need_fb_size == FRAME_SIZE, "refused: fb min 0x%llx need 0x%llx",
+          (unsigned long long)st.min_fb_size, (unsigned long long)st.need_fb_size);
+    vrun_close(&r);
+}
+
+// ---- The inFAMOUS splash (tests/host/data/game/infamous/splash_europe.bsf, game data) ----
+
+typedef struct MiniBits {
+    const uint8_t *p;
+    size_t n, pos; // pos in bits over the RBSP
+    bool bad;
+} MiniBits;
+static uint32_t mb_u(MiniBits *b, int k) {
+    uint32_t v = 0;
+    while (k--) {
+        if (b->pos >= b->n * 8) {
+            b->bad = true;
+            return 0;
+        }
+        v = (v << 1) | ((b->p[b->pos >> 3] >> (7 - (b->pos & 7))) & 1u);
+        b->pos++;
+    }
+    return v;
+}
+static uint32_t mb_ue(MiniBits *b) {
+    int lz = 0;
+    while (mb_u(b, 1) == 0 && !b->bad)
+        if (++lz > 31) b->bad = true;
+    return lz ? ((1u << lz) - 1u) + mb_u(b, lz) : 0;
+}
+static size_t to_rbsp(const uint8_t *src, size_t n, uint8_t *dst, size_t cap) {
+    size_t o = 0;
+    int z = 0;
+    for (size_t i = 0; i < n && o < cap; i++) {
+        if (z >= 2 && src[i] == 3) {
+            z = 0;
+            continue;
+        }
+        z = src[i] == 0 ? z + 1 : 0;
+        dst[o++] = src[i];
+    }
+    return o;
+}
+
+// The splash's split into access units (7.4.1.2.3) and its display order, from the test's own
+// slice-header reading (POC type 0, frames only; the x264 encode of the splash is that).
+typedef struct Splash {
+    const uint8_t *data;
+    size_t *start, *end; // access unit byte ranges
+    int *rank;           // display index of each access unit
+    int count, cap;
+    uint32_t max_slices;
+    // parser state
+    bool in_au, after_slice;
+    size_t au_start;
+    uint32_t log2_max_frame_num, log2_max_poc_lsb, poc_type;
+    bool frame_mbs_only, pps_bottom_field_poc;
+    int32_t prev_msb, prev_lsb;
+    int64_t *key; // (IDR period << 32) + POC, per access unit
+    int64_t period;
+    bool bad;
+} Splash;
+
+static void splash_sps(Splash *sp, const uint8_t *nal, size_t n) {
+    uint8_t r[64];
+    MiniBits b = {r, to_rbsp(nal + 1, n - 1, r, sizeof(r)), 0, false};
+    const uint32_t profile = mb_u(&b, 8);
+    mb_u(&b, 16); // constraint flags, level_idc
+    mb_ue(&b);    // seq_parameter_set_id
+    if (profile == 100) {
+        if (mb_ue(&b) == 3) mb_u(&b, 1); // chroma_format_idc, separate_colour_plane_flag
+        mb_ue(&b);
+        mb_ue(&b);
+        mb_u(&b, 1);
+        if (mb_u(&b, 1)) sp->bad = true; // seq_scaling_matrix_present_flag: not in the splash
+    }
+    sp->log2_max_frame_num = mb_ue(&b) + 4;
+    sp->poc_type = mb_ue(&b);
+    if (sp->poc_type == 0) sp->log2_max_poc_lsb = mb_ue(&b) + 4;
+    else sp->bad = true;
+    mb_ue(&b);   // max_num_ref_frames
+    mb_u(&b, 1); // gaps_in_frame_num_value_allowed_flag
+    mb_ue(&b);
+    mb_ue(&b);
+    sp->frame_mbs_only = mb_u(&b, 1);
+    if (!sp->frame_mbs_only) sp->bad = true;
+    if (b.bad) sp->bad = true;
+}
+
+static void splash_pps(Splash *sp, const uint8_t *nal, size_t n) {
+    uint8_t r[16];
+    MiniBits b = {r, to_rbsp(nal + 1, n - 1, r, sizeof(r)), 0, false};
+    mb_ue(&b); // pic_parameter_set_id
+    mb_ue(&b); // seq_parameter_set_id
+    mb_u(&b, 1); // entropy_coding_mode_flag
+    sp->pps_bottom_field_poc = mb_u(&b, 1);
+    if (b.bad) sp->bad = true;
+}
+
+// Room for the access unit being opened (index count).
+static void splash_grow(Splash *sp) {
+    if (sp->count < sp->cap) return;
+    sp->cap = sp->cap ? sp->cap * 2 : 512;
+    sp->start = (size_t *)realloc(sp->start, sizeof(size_t) * (size_t)sp->cap);
+    sp->end = (size_t *)realloc(sp->end, sizeof(size_t) * (size_t)sp->cap);
+    sp->key = (int64_t *)realloc(sp->key, sizeof(int64_t) * (size_t)sp->cap);
+}
+
+static void splash_close_au(Splash *sp, size_t end) {
+    if (!sp->in_au) return;
+    sp->start[sp->count] = sp->au_start;
+    sp->end[sp->count] = end;
+    sp->count++;
+    sp->in_au = false;
+}
+
+static void splash_nal(void *u, const uint8_t *nal, size_t n, size_t sc_off) {
+    Splash *sp = (Splash *)u;
+    const int type = nal[0] & 0x1f;
+    const bool vcl = type >= 1 && type <= 5;
+    int32_t first_mb = -1;
+    H264AuCensus c;
+    if (vcl) {
+        // The census of the NAL alone gives first_mb_in_slice.
+        uint8_t hdr[4 + 32];
+        const size_t k = n < 32 ? n : 32;
+        hdr[0] = hdr[1] = hdr[2] = 0;
+        hdr[3] = 1;
+        memcpy(hdr + 4, nal, k);
+        h264_au_census(hdr, 4 + k, &c);
+        first_mb = c.first_mb_first_slice;
+    }
+    const bool starts = sp->after_slice && ((type >= 6 && type <= 9) || (type >= 14 && type <= 18) || (vcl && first_mb == 0));
+    // A leading zero byte belongs to the start code of the new access unit.
+    const size_t sc = sc_off > 0 && sp->data[sc_off - 1] == 0 ? sc_off - 1 : sc_off;
+    if (starts) splash_close_au(sp, sc);
+    if (!sp->in_au) {
+        splash_grow(sp);
+        sp->key[sp->count] = INT64_MAX; // an access unit without a first slice sorts last
+        sp->in_au = true;
+        sp->au_start = sc;
+        sp->after_slice = false;
+    }
+    if (type == 7) splash_sps(sp, nal, n);
+    if (type == 8) splash_pps(sp, nal, n);
+    if (vcl && first_mb == 0) {
+        uint8_t r[48];
+        MiniBits b = {r, to_rbsp(nal + 1, n - 1, r, sizeof(r)), 0, false};
+        mb_ue(&b); // first_mb_in_slice
+        mb_ue(&b); // slice_type
+        mb_ue(&b); // pic_parameter_set_id
+        mb_u(&b, (int)sp->log2_max_frame_num);
+        if (type == 5) mb_ue(&b); // idr_pic_id
+        const int32_t lsb = (int32_t)mb_u(&b, (int)sp->log2_max_poc_lsb);
+        if (b.bad || sp->log2_max_poc_lsb == 0) sp->bad = true;
+        const int32_t max_lsb = 1 << sp->log2_max_poc_lsb;
+        if (type == 5) {
+            sp->period++;
+            sp->prev_msb = sp->prev_lsb = 0;
+        }
+        int32_t msb = sp->prev_msb;
+        if (lsb < sp->prev_lsb && sp->prev_lsb - lsb >= max_lsb / 2) msb += max_lsb;
+        else if (lsb > sp->prev_lsb && lsb - sp->prev_lsb > max_lsb / 2) msb -= max_lsb;
+        if (nal[0] >> 5) { // reference picture
+            sp->prev_msb = msb;
+            sp->prev_lsb = lsb;
+        }
+        sp->key[sp->count] = (sp->period << 32) + (int64_t)(msb + lsb);
+    }
+    if (vcl) sp->after_slice = true;
+}
+
+static const int64_t *g_sort_key;
+static int cmp_key(const void *a, const void *b) {
+    const int64_t x = g_sort_key[*(const int *)a], y = g_sort_key[*(const int *)b];
+    return x < y ? -1 : x > y;
+}
+
+static void test_videodec_splash(const char *path) {
+    FILE *f = path ? fopen(path, "rb") : NULL;
+    if (!f) {
+        printf("SKIP: videodec splash fixture: needs local fixture tests/host/data/game/infamous/splash_europe.bsf (game "
+               "data, not distributed)\n");
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    const long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *data = (uint8_t *)malloc((size_t)size);
+    CHECK(fread(data, 1, (size_t)size, f) == (size_t)size, "read %s", path);
+    fclose(f);
+    Splash sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.data = data;
+    for_each_nal(data, (size_t)size, splash_nal, &sp);
+    splash_close_au(&sp, (size_t)size);
+    CHECK(!sp.bad, "splash: slice headers the test does not read");
+    // Display order: by IDR period, then POC. The first access unit (SEI, SPS, PPS, the first
+    // IDR's slices) is a picture too, so every access unit has a key.
+    int *order = (int *)malloc(sizeof(int) * (size_t)sp.count);
+    sp.rank = (int *)malloc(sizeof(int) * (size_t)sp.count);
+    for (int i = 0; i < sp.count; i++) order[i] = i;
+    g_sort_key = sp.key;
+    qsort(order, (size_t)sp.count, sizeof(int), cmp_key);
+    for (int i = 0; i < sp.count; i++) sp.rank[order[i]] = i;
+    uint32_t max_slices = 0;
+    uint64_t slices = 0, max_au = 0;
+    for (int i = 0; i < sp.count; i++) {
+        H264AuCensus c;
+        h264_au_census(data + sp.start[i], sp.end[i] - sp.start[i], &c);
+        slices += c.slices;
+        if (c.slices > max_slices) max_slices = c.slices;
+        if (sp.end[i] - sp.start[i] > max_au) max_au = sp.end[i] - sp.start[i];
+        CHECK(c.slices >= 1 && c.first_mb_first_slice == 0, "splash au %d: slices %u first_mb %d", i, c.slices,
+              c.first_mb_first_slice);
+    }
+    fprintf(stderr, "splash census: %d access units, %llu slices, max per AU %u, largest AU %llu bytes\n", sp.count,
+            (unsigned long long)slices, max_slices, (unsigned long long)max_au);
+
+    VRun r;
+    const uint64_t fb_size = h264vt_nv12_size(1920, 1080);
+    vrun_open(&r, 1920, 1088, fb_size, (max_au + 0xFFFF) & ~0xFFFFULL);
+    int got = 0, order_ok = 1;
+    for (int i = 0; i < sp.count + 64; i++) {
+        bool pic;
+        if (i < sp.count)
+            pic = vrun_decode(&r, data + sp.start[i], sp.end[i] - sp.start[i], (uint64_t)sp.rank[i] * 3003,
+                              (uint64_t)i * 3003, (uint64_t)i);
+        else if (!(pic = vrun_flush(&r)))
+            break;
+        if (!pic) continue;
+        if (rd64(r.pic + 0x20) != (uint64_t)got * 3003) order_ok = 0;
+        CHECK(rd32(r.pic + 0x10) == 1920 && rd32(r.pic + 0x14) == 1920 && rd32(r.pic + 0x18) == 1088,
+              "splash picture %d: %ux%u pitch %u", got, rd32(r.pic + 0x10), rd32(r.pic + 0x18), rd32(r.pic + 0x14));
+        got++;
+    }
+    const Ps4VideodecStats st = vrun_stats(&r);
+    fprintf(stderr, "splash decode: pictures %llu (flushed %llu, error %llu), max slices per AU %u, mid-picture %llu\n",
+            (unsigned long long)st.pictures, (unsigned long long)st.flush_pictures,
+            (unsigned long long)st.error_pictures, st.max_slices_per_au, (unsigned long long)st.mid_picture_aus);
+    CHECK(sp.count == 309 && st.aus == 309, "splash: %d access units (%llu fed)", sp.count, (unsigned long long)st.aus);
+    CHECK(st.pictures == 309 && got == 309, "splash: %llu pictures (%d seen)", (unsigned long long)st.pictures, got);
+    CHECK(st.error_pictures == 0 && st.mid_picture_aus == 0, "splash: error %llu mid-picture %llu",
+          (unsigned long long)st.error_pictures, (unsigned long long)st.mid_picture_aus);
+    CHECK(order_ok, "splash: pictures not in display order");
+    CHECK(st.max_slices_per_au == 17 && max_slices == 17, "splash: max slices per AU %u (census %u)",
+          st.max_slices_per_au, max_slices);
+    CHECK(st.first_pts == 0 && st.last_pts == 308 * 3003, "splash: pts %lld..%lld", (long long)st.first_pts,
+          (long long)st.last_pts);
+    vrun_close(&r);
+    free(order);
+    free(sp.rank);
+    free(sp.start);
+    free(sp.end);
+    free(sp.key);
+    free(data);
+}
+
+int main(int argc, char **argv) {
     make_stream(&S1, "S1", 30, 1000, true);
     make_stream(&S2, "S2", 30, 10, false);
     make_stream(&S3, "S3", 40, 10, true);
     make_stream(&S4, "S4", MAXN, 1000, true);
+    // S5: multi-slice pictures (the inFAMOUS movies have about 17 per picture), from the
+    // software encoder (see StreamOpts).
+    const StreamOpts s5 = {640, 368, true};
+    make_stream_opts(&S5, "S5", 30, 1000, true, &s5);
     // The test is about display reordering: the encoder must have produced B-frames.
     CHECK(S1.reordered > 0 && S3.reordered > 0 && S4.reordered > 0, "the encoder produced no B-frames");
     CHECK(S2.reordered == 0 && S2.keys >= 3, "S2: %d reordered, %d keys", S2.reordered, S2.keys);
@@ -1058,6 +1847,16 @@ int main(void) {
     test_reset_forgets_last_poc();
     test_idr_error_flush();
     test_videodec();
+    test_au_census();
+    videodec_counts(&S1, W, H);
+    setenv("PS4_VIDEODEC_LOG", "1", 1); // the trace path runs too (under ASan)
+    videodec_counts(&S5, 640, 368);
+    unsetenv("PS4_VIDEODEC_LOG");
+    videodec_error_counts();
+    videodec_dump();
+    videodec_dump_failures();
+    videodec_refused();
+    test_videodec_splash(argc > 1 ? argv[1] : NULL);
     if (atomic_load(&failures)) {
         fprintf(stderr, "vdecsw_test: %d failure(s)\n", atomic_load(&failures));
         return 1;

@@ -197,6 +197,75 @@ static void test_coredump(void) {
   CHECK(call(shim_sceCoredumpGetStopInfoGpu, 0x2000, 0, 0) == (int32_t)0x81180003, "stop info outside a handler");
 }
 
+void shim_sceNpSetNpTitleId(GuestContext *ctx);
+void shim_sceNpRegisterGamePresenceCallbackA(GuestContext *ctx);
+
+// inFAMOUS: the title id is kept; presence callbacks register while signed out.
+static void test_np_title_and_presence(void) {
+  char *id = (char *)g_mem + 0x5000;
+  memset(id, 0, 16);
+  memcpy(id, "CUSA00004_00", 12);
+  memset(g_mem + 0x5100, 0xab, 128);
+  CHECK(call(shim_sceNpSetNpTitleId, 0, 0x5100, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "NULL title id");
+  CHECK(call(shim_sceNpSetNpTitleId, 0x5000, 0, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "NULL secret");
+  CHECK(call(shim_sceNpSetNpTitleId, 0x5000, 0x5100, 0) == 0, "set title id");
+  char got[13];
+  CHECK(ps4_np_title_id(got) == 1 && !strcmp(got, "CUSA00004_00"), "title id kept");
+  CHECK(call(shim_sceNpRegisterGamePresenceCallbackA, 0, 0, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "NULL callback");
+  const int32_t a = call(shim_sceNpRegisterGamePresenceCallbackA, 0x6000, 0x6100, 0);
+  const int32_t b = call(shim_sceNpRegisterGamePresenceCallbackA, 0x6000, 0x6200, 0);
+  CHECK(a >= 1 && b >= 1 && a != b, "callback ids %d %d", a, b);
+}
+
+void shim_sceNpSetContentRestriction(GuestContext *ctx);
+
+// inFAMOUS: the content restriction is validated and kept (SceNpContentRestriction: u64 size 0x18,
+// s8 default age, s32 count, pointer to count 8-byte {country code, age} entries).
+static void test_np_content_restriction(void) {
+  uint8_t *r = g_mem + 0x5200;
+  memset(r, 0, 0x18);
+  *(uint64_t *)r = 0x18;
+  *(int32_t *)(r + 12) = 1;
+  *(uint64_t *)(r + 16) = 0x5300;
+  memset(g_mem + 0x5300, 0, 8);
+  memcpy(g_mem + 0x5300, "us", 2);
+  g_mem[0x5304] = 17;
+  CHECK(call(shim_sceNpSetContentRestriction, 0, 0, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "NULL restriction");
+  *(uint64_t *)r = 0x10;
+  CHECK(call(shim_sceNpSetContentRestriction, 0x5200, 0, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_SIZE, "size 0x10");
+  *(uint64_t *)r = 0x18;
+  r[8] = (uint8_t)-1;
+  CHECK(call(shim_sceNpSetContentRestriction, 0x5200, 0, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "default age -1");
+  r[8] = 0;
+  *(int32_t *)(r + 12) = 0x101;
+  CHECK(call(shim_sceNpSetContentRestriction, 0x5200, 0, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "count 0x101");
+  *(int32_t *)(r + 12) = 1;
+  *(uint64_t *)(r + 16) = 0;
+  CHECK(call(shim_sceNpSetContentRestriction, 0x5200, 0, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "count 1, NULL array");
+  *(int32_t *)(r + 12) = -1;
+  CHECK(call(shim_sceNpSetContentRestriction, 0x5200, 0, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "count -1");
+  *(int32_t *)(r + 12) = 1;
+  *(uint64_t *)(r + 16) = MEM_SIZE - 4;
+  CHECK(call(shim_sceNpSetContentRestriction, 0x5200, 0, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "array past guest memory");
+  *(uint64_t *)(r + 16) = ~0ull - 3;
+  CHECK(call(shim_sceNpSetContentRestriction, 0x5200, 0, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "array address wraps");
+  int8_t def = 99;
+  int32_t cnt = 99;
+  CHECK(ps4_np_content_restriction(&def, &cnt) == 0, "nothing kept after the rejected calls");
+  CHECK(ps4_np_age_for_country("us", &def) != 0, "no restriction set: error");
+  *(uint64_t *)(r + 16) = 0x5300;
+  CHECK(call(shim_sceNpSetContentRestriction, 0x5200, 0, 0) == 0, "valid restriction");
+  CHECK(ps4_np_content_restriction(&def, &cnt) == 1 && def == 0 && cnt == 1, "kept: default %d count %d", def, cnt);
+  int8_t age = 99;
+  CHECK(ps4_np_age_for_country("us", &age) == 0 && age == 17, "us reads back %d", age);
+  CHECK(ps4_np_age_for_country("de", &age) == 0 && age == 0, "absent country gets the default, got %d", age);
+  // A later call replaces the earlier entries: "us" now gets the new default.
+  *(int32_t *)(r + 12) = 0;
+  r[8] = 12;
+  CHECK(call(shim_sceNpSetContentRestriction, 0x5200, 0, 0) == 0, "empty restriction");
+  CHECK(ps4_np_age_for_country("us", &age) == 0 && age == 12, "earlier us entry replaced, got %d", age);
+}
+
 int main(void) {
   g_ctx.mem_base = g_mem;
   g_ctx.mem_size = MEM_SIZE;
@@ -206,6 +275,8 @@ int main(void) {
   test_https_load_cert();
   test_netctl_net();
   test_coredump();
+  test_np_title_and_presence();
+  test_np_content_restriction();
   fflush(stdout);
   if (g_failures) {
     printf("boot_hle_test: %d FAILED\n", g_failures);

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "gcn_recompiler.h"
@@ -21,6 +22,7 @@
 #include "api/gcn_shader_internal.h"
 #include "common/assert.h"
 #include "compat/guest_memory.h"
+#include "compat/host_fp_env.h"
 #include "compat/shim.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -625,6 +627,58 @@ GCN_API bool gcn_find_binary_info(gcn_read_guest_fn read, void* ctx, uint64_t co
     return false;
 }
 
+namespace {
+// PS4Recomp: one view of guest memory for a whole translation. A translation reads the sharps
+// more than once: the translator decides from them (Translator::EmitFetch: Metal vertex fetch or
+// the fetch shader inline; buffer misalignment, formats), and the specialization recorded after
+// it (StageSpecialization, what the permutation lookup compares draws against) reads them again.
+// The game rewrites its per-draw V#/T# tables while a translation runs (on the renderer's worker,
+// after the draw that asked for it), so two reads could disagree: a VS translated for a
+// dword-aligned V# was recorded as serving draws whose V# Metal cannot fetch, and the renderer
+// skipped them all. Every read is served from a copy of the 256-byte chunks taken at their first
+// read. A chunk the reader refuses as a whole (the end of a mapping) is read as asked, uncached.
+struct CompileSnapshot {
+    static constexpr u64 kChunk = 256;
+    static constexpr u32 kUnreadable = ~0u;
+    Shader::SrtReadFn read;
+    void* ctx;
+    std::unordered_map<u64, u32> chunks; // chunk address -> offset of its copy in data
+    std::vector<u8> data;
+
+    static bool Read(void* self, u64 addr, void* dst, u64 size) {
+        auto* s = static_cast<CompileSnapshot*>(self);
+        if (addr == 0 || size == 0 || addr + size < addr) {
+            return Shader::SrtRead(s->read, s->ctx, addr, dst, size);
+        }
+        u8* out = static_cast<u8*>(dst);
+        for (u64 a = addr, end = addr + size; a < end;) {
+            const u64 c = a & ~(kChunk - 1);
+            const u64 n = std::min(end, c + kChunk) - a;
+            auto it = s->chunks.find(c);
+            if (it == s->chunks.end()) {
+                const u32 off = u32(s->data.size());
+                s->data.resize(off + kChunk);
+                const bool ok = Shader::SrtRead(s->read, s->ctx, c, s->data.data() + off, kChunk);
+                if (!ok) {
+                    s->data.resize(off);
+                }
+                it = s->chunks.emplace(c, ok ? off : kUnreadable).first;
+            }
+            if (it->second == kUnreadable) {
+                if (!Shader::SrtRead(s->read, s->ctx, a, out, n)) {
+                    return false;
+                }
+            } else {
+                std::memcpy(out, s->data.data() + it->second + (a - c), n);
+            }
+            out += n;
+            a += n;
+        }
+        return true;
+    }
+};
+} // namespace
+
 GCN_API gcn_status gcn_compile(const gcn_compile_desc* desc, gcn_shader** out, char* err,
                                size_t err_size) {
     if (!desc || !out || !desc->runtime) {
@@ -636,7 +690,14 @@ GCN_API gcn_status gcn_compile(const gcn_compile_desc* desc, gcn_shader** out, c
         CopyErr(err, err_size, "invalid stage");
         return GCN_ERR_INVALID_ARG;
     }
-    GcnShim::GuestMemoryScope scope{desc->read_guest, desc->read_ctx};
+    CompileSnapshot snapshot{desc->read_guest, desc->read_ctx, {}, {}};
+    if (desc->read_guest) {
+        snapshot.chunks.reserve(64);
+        snapshot.data.reserve(64 * CompileSnapshot::kChunk);
+    }
+    GcnShim::GuestMemoryScope scope{desc->read_guest ? CompileSnapshot::Read : nullptr,
+                                    desc->read_guest ? &snapshot : nullptr};
+    const GcnShim::HostFpEnvScope fp_env; // exact float bits whatever the caller's FZ
     GcnShim::LastError().clear();
 
     // Locate & copy the program.
@@ -783,6 +844,7 @@ GCN_API char* gcn_spirv_to_msl(const uint32_t* spirv, size_t num_words, const gc
     }
     std::vector<u32> words(spirv, spirv + num_words);
     std::string msl, e;
+    const GcnShim::HostFpEnvScope fp_env; // SPIRV-Cross prints float literals through a double
     if (!GcnMsl::Convert(words, mo, msl, e, nullptr)) {
         CopyErr(err, err_size, e);
         return nullptr;
@@ -814,6 +876,9 @@ GCN_API void gcn_shader_get_info(const gcn_shader* s, gcn_shader_info* o) {
     o->num_vertex_attribs = s->spec.fetch_shader_data.attributes.size();
     o->flatbuf_size_dw = info.srt_info.flattened_bufsize_dw;
     o->has_fetch_shader = info.has_fetch_shader;
+    o->fetch_shader_inlined = info.fetch_shader_inlined;
+    o->fetch_inline_reason = info.fetch_inline_reason;
+    o->fetch_inline_attrib = info.fetch_inline_attrib;
     o->fetch_shader_sgpr_base = info.fetch_shader_sgpr_base;
     o->vertex_offset_sgpr = s->spec.fetch_shader_data.vertex_offset_sgpr;
     o->instance_offset_sgpr = s->spec.fetch_shader_data.instance_offset_sgpr;
@@ -970,6 +1035,12 @@ GCN_API bool gcn_shader_get_sampler(const gcn_shader* s, uint32_t index, gcn_sam
         o->msl_sampler = it->second;
     }
     return true;
+}
+
+GCN_API bool gcn_vertex_format_fetchable(uint32_t dfmt, uint32_t nfmt) {
+    const auto d = AmdGpu::DataFormat(dfmt);
+    return Gcn::IsVertexFormatFetchable(AmdGpu::RemapDataFormat(d),
+                                        AmdGpu::RemapNumberFormat(AmdGpu::NumberFormat(nfmt), d));
 }
 
 GCN_API bool gcn_shader_get_vertex_attrib(const gcn_shader* s, uint32_t index,
@@ -1170,6 +1241,9 @@ GCN_API bool gcn_shader_explain_mismatch(const gcn_shader* s, const uint32_t use
             put("vertex attributes");
         } else if (have.fetch_shader_data != spec.fetch_shader_data) {
             put("fetch shader");
+        } else if (have.inlined_fetch_hash != spec.inlined_fetch_hash) {
+            put(fmt::format("inlined fetch shader code {:#x}/{:#x}", have.inlined_fetch_hash,
+                            spec.inlined_fetch_hash));
         } else if (have.image_tables != spec.image_tables) {
             std::string m = "T# table entry buckets";
             for (size_t i = 0; i < std::max(have.image_tables.size(), spec.image_tables.size()); ++i) {
@@ -1351,7 +1425,8 @@ u64 SpecHash(const Shader::StageSpecialization& sp, const u64 mask[2]) {
         if (MaskBit(mask, binding++)) {
             HashMix(h, 2000 + binding);
             HashMix(h, static_cast<u64>(im.type));
-            HashMix(h, (u64(im.is_integer) << 2) | (u64(im.is_storage) << 1) | im.is_srgb);
+            HashMix(h, (u64(im.is_1d_as_2d) << 3) | (u64(im.is_integer) << 2) | (u64(im.is_storage) << 1) |
+                           im.is_srgb);
             HashMap(h, im.dst_select);
             HashMix(h, static_cast<u64>(im.num_conversion));
             HashMix(h, im.num_bindings);

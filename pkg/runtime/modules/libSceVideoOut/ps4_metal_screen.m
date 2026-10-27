@@ -318,9 +318,12 @@ static long screenshot_due(void) {
         if (ms < 0 && __atomic_exchange_n(&g_ps4_screenshot_request, 0, __ATOMIC_ACQ_REL))
             ms = (long)floor((now - cadence.t0) * 1000.0) | PS4_SHOT_REQ_BIT;
         pthread_mutex_unlock(&cadence_mu);
-        if (first) // compare between runs: an offset here shifts every pair by the same time
-            fprintf(stderr, "[metal-screen] time cadence: every %ld s, first flip at %.3f s after start\n",
-                    g_shot_every_sec, now - g_shot_process_start);
+        // Compare between runs: an offset here shifts every pair by the same time. `mono` is the
+        // first flip's raw CLOCK_MONOTONIC time: sec_<s>.png was presented at about mono + s, the
+        // clock of the other runtime traces (e.g. PS4_VIDEODEC_LOG).
+        if (first)
+            fprintf(stderr, "[metal-screen] time cadence: every %ld s, first flip at %.3f s after start (mono %.3f)\n",
+                    g_shot_every_sec, now - g_shot_process_start, now);
         return ms;
     }
     if (__atomic_exchange_n(&g_ps4_screenshot_request, 0, __ATOMIC_ACQ_REL)) return n;

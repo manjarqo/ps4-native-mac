@@ -29,6 +29,7 @@
 #import <Foundation/Foundation.h>
 
 #include "ps4_gnm_shader_cache.h"
+#include "ps4_game_key.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -53,7 +54,6 @@
 #include <unordered_set>
 #include <vector>
 
-extern "C" const char* ps4_vfs_get_app_root(void);
 
 namespace ps4gnm_shader_cache {
 namespace {
@@ -389,11 +389,12 @@ std::string TitleDir() {
             return std::string();
         }
         while (r.size() > 1 && r.back() == '/') r.pop_back();
-        const char* root = ps4_vfs_get_app_root();
-        const char* base = root ? strrchr(root, '/') : nullptr;
-        base = base && base[1] ? base + 1 : "default";
+        // Keyed like the settings file: the TITLE_ID, else the app root's name (a dump directory
+        // named after its TITLE_ID keeps the caches it had under the old app-root naming).
+        char key[256];
+        if (!ps4_current_game_key(key, sizeof(key))) snprintf(key, sizeof(key), "default");
         r += "/";
-        r += base;
+        r += key;
         fprintf(stderr, "[gnm-cache] shader caches of this title: %s\n", r.c_str());
         return r;
     }();

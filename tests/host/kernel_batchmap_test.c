@@ -8,13 +8,16 @@
 //  - the failure rules: length 0, unknown operation, NULL array, a failing operation;
 //  - type protect splits extents at the range edges and fails on an unmapped range;
 //  - the guest-ABI shim reads the entries and the out count from guest memory;
-//  - the provably unmapped ranges (recomp_vm_unmapped_ranges) and their generation.
+//  - the provably unmapped ranges (recomp_vm_unmapped_ranges) and their generation;
+//  - syscall(SYS_mprotect) protects every mapping in its range, as sceKernelMprotect.
 #include "ps4_direct_mem.h"
+#include "ps4_syscalls.h"
 
 #include <pthread.h>
 #include <stdio.h>
 #include <sys/mman.h>
 
+#define RUNTIME_STUBS_HAVE_VFS // ps4_vfs.c is linked for ps4_syscalls.c
 #include "runtime_stubs.h"
 
 // GPU hooks of the direct-memory code (weak in the runtime). The remap hook is not needed; the
@@ -89,7 +92,7 @@ static int count_used_extents(GuestContext *ctx) {
 // All five operations in one batch, in order, on real mappings.
 static void test_all_operations(GuestContext *ctx) {
   off_t phys = 0;
-  CHECK(sceKernelAllocateDirectMemory(0, PS4_DIRECT_MEM_TOTAL_SIZE, 4 * MB, 2 * MB, 0, &phys) == 0, "alloc");
+  CHECK(sceKernelAllocateDirectMemory(0, (off_t)sceKernelGetDirectMemorySize(), 4 * MB, 2 * MB, 0, &phys) == 0, "alloc");
   const uint64_t direct = 0x20000000, flex = 0x30000000;
   OrbisKernelBatchMapEntry e[6] = {
       entry(direct, (uint64_t)phys, 4 * MB, 3, 0, ORBIS_KERNEL_BATCH_MAP_DIRECT),
@@ -288,6 +291,28 @@ static void test_unmapped_ranges(GuestContext *ctx) {
   CHECK(recomp_vm_free(ctx, 0x70000000, 4 * MB) == 0, "free the reservation");
 }
 
+// syscall(SYS_mprotect, addr, len, prot) on a range over two mappings changes both; the
+// mapping after the range keeps its protection.
+static void test_syscall_mprotect(GuestContext *ctx) {
+  const uint64_t base = 0x64000000;
+  void *a = (void *)base, *b = (void *)(base + 2 * MB), *c = (void *)(base + 4 * MB);
+  CHECK(sceKernelMapNamedFlexibleMemory(ctx, &a, 2 * MB, 3, 0x10, "a") == 0, "map a");
+  CHECK(sceKernelMapNamedFlexibleMemory(ctx, &b, 2 * MB, 3, 0x10, "b") == 0, "map b");
+  CHECK(sceKernelMapNamedFlexibleMemory(ctx, &c, 2 * MB, 3, 0x10, "c") == 0, "map c");
+  ctx->rsp = 0x1000;
+  ctx->rdi = 74;
+  ctx->rsi = base;
+  ctx->rdx = 4 * MB;
+  ctx->rcx = 1; // PROT_READ
+  shim_syscall(ctx);
+  CHECK(ctx->rax == 0 && ctx->rsp == 0x1008, "SYS_mprotect result 0x%llx", (unsigned long long)ctx->rax);
+  GuestVMExtent *ea = find(ctx, base), *eb = find(ctx, base + 2 * MB), *ec = find(ctx, base + 4 * MB);
+  CHECK(ea && ea->prot == 1, "first mapping protected (prot 0x%x)", ea ? ea->prot : -1);
+  CHECK(eb && eb->prot == 1, "second mapping protected (prot 0x%x)", eb ? eb->prot : -1);
+  CHECK(ec && ec->prot == 3, "mapping after the range unchanged (prot 0x%x)", ec ? ec->prot : -1);
+  CHECK(recomp_vm_free(ctx, base, 6 * MB) == 0, "free");
+}
+
 int main(void) {
   GuestContext *ctx = new_ctx();
   test_all_operations(ctx);
@@ -296,6 +321,7 @@ int main(void) {
   test_mtypeprotect_split(ctx);
   test_shim(ctx);
   test_unmapped_ranges(ctx);
+  test_syscall_mprotect(ctx);
   fflush(stdout);
   if (g_failures) {
     printf("kernel_batchmap_test: %d FAILED\n", g_failures);

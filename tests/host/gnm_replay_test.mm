@@ -6,7 +6,8 @@
 // captured contents (mip levels, depth and stencil planes); replay_props decodes and measures
 // replayed outputs; each draw kind (32-bit indexed with a start index and base vertex, instanced
 // with a start instance, indexed indirect up to max_index, indirect) draws exactly its columns,
-// and an indirect dispatch takes its dimensions from the argument record; a settled replay (--settle)
+// also with vertices Metal's vertex fetch cannot read (a stride that is not a multiple of 4, a
+// base address that is not dword-aligned), and an indirect dispatch takes its dimensions from the argument record; a settled replay (--settle)
 // reports a first replay that differs as UNSTABLE-FIRST and never a stable one.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -17,6 +18,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <string>
 #include <vector>
@@ -392,8 +394,10 @@ GpuTextureId SampledId() {
 
 // Writes <root>/frame_1 with the draw as pass 0; `pending`: the CMASK fast clear is pending.
 // pending: 0 no fast clear pending, 1 pending (a capture without meta_cleared_slices), 2 pending
-// with the slice that took it recorded (slice 0)
-std::string WriteDrawCapture(const std::string& root, int pending, std::vector<uint8_t>* want) {
+// with the slice that took it recorded (slice 0). `stages`: VGT_SHADER_STAGES_EN (non-zero:
+// tessellation/geometry stages the renderer does not support).
+std::string WriteDrawCapture(const std::string& root, int pending, std::vector<uint8_t>* want,
+                             uint32_t stages = 0) {
     uint8_t* mem = (uint8_t*)mmap(nullptr, kMemSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     // VS: buffer_load_format_xyzw v[1:4], v0, s[0:3] idxen; exp param0, pos0 done
     const auto vs = WithFooter({0xE00C2000, 0x80000100, 0xBF8C0F70, 0xF800020F, 0x04030201, 0xF80008CF, 0x04030201,
@@ -407,7 +411,8 @@ std::string WriteDrawCapture(const std::string& root, int pending, std::vector<u
     memcpy(mem + kPs, ps.data(), ps.size() * 4);
     const float verts[12] = {0, -3, 0.5f, 1, 0, 3, 0.5f, 1, -4, 0, 0.5f, 1};
     memcpy(mem + kVb, verts, sizeof(verts));
-    const std::vector<uint32_t> regs = DrawRegs();
+    std::vector<uint32_t> regs = DrawRegs();
+    regs[0xA2D5] = stages;
     const GpuTextureId tid = TargetId(regs), sid = SampledId();
     std::vector<uint8_t> tpre(RawSize(tid)), sraw(RawSize(sid));
     for (size_t i = 0; i < tpre.size(); ++i) tpre[i] = (uint8_t)(i * 13 + 5);
@@ -522,7 +527,8 @@ void TestDrawReplay(const std::string& root) {
 // The 8x8 RGBA16Float target of DrawRegs, cut into 8 one-column rectangles: vertices 6r..6r+5 of
 // the vertex buffer cover column r. The VS calls a fetch shader (s_swappc_b64) that loads the
 // position per vertex (v0 + s4, the base vertex) and an x offset per instance (v3 + s5, the start
-// instance) from the V# table at s[2:3], and adds the offset (whole columns) to x; the PS exports
+// instance) from the V# table at s[2:3], adds the offset (whole columns) to x and sets z = 0.5,
+// w = 1; the PS exports
 // (1, 0.5, 0, 1). Each case draws its columns with every argument mattering: the columns of a
 // renderer that ignored one of them are named in the case. The translator turns the fetch shader
 // into vertex attributes (the offset steps per instance), so base vertex and base instance reach
@@ -561,17 +567,56 @@ std::vector<uint32_t> KindRegs(const DrawCase& c) {
     return regs;
 }
 
-std::string WriteKindCapture(const std::string& root, const DrawCase& c, std::vector<uint8_t>* want) {
+// How the positions of WriteKindCapture's vertex buffer are stored: a V# stride, data and number
+// format, and a byte offset of the V# base from kVb. The default is Metal's own vertex fetch case
+// (float4, stride 16, dword-aligned); the others are GCN layouts Metal's vertex descriptors cannot
+// express (a stride that is not a multiple of 4, a base address that is not dword-aligned): the
+// translator reads those attributes from the buffer in the shader instead.
+struct VertexLayout {
+    const char* name;
+    uint32_t stride, dfmt, nfmt, base_off;
+    uint32_t inst_off = 0; // the fetch shader's instruction offset (a position at this byte of a vertex)
+};
+constexpr VertexLayout kFloat4Layout = {"float4, stride 16", 16, 14, 7, 0};
+
+// Position (x, y) of a vertex in the layout's format at dst; z and w are what the format leaves
+// (0 and 1 for two components).
+void PutPosition(const VertexLayout& l, uint8_t* dst, float x, float y) {
+    if (l.dfmt == 14) { // 32_32_32_32 float
+        const float v[4] = {x, y, 0.5f, 1};
+        memcpy(dst, v, sizeof(v));
+    } else if (l.dfmt == 3 && l.nfmt == 1) { // 8_8 snorm
+        dst[0] = (uint8_t)(int8_t)lrintf(x * 127);
+        dst[1] = (uint8_t)(int8_t)lrintf(y * 127);
+    } else if (l.dfmt == 5 && l.nfmt == 7) { // 16_16 float (the positions are exact halves)
+        const _Float16 h[2] = {(_Float16)x, (_Float16)y};
+        memcpy(dst, h, sizeof(h));
+    } else {
+        CHECK(false, "layout %s: no encoder for dfmt %u nfmt %u", l.name, l.dfmt, l.nfmt);
+    }
+}
+
+// offset_per_vertex: the fetch shader loads the x offset by the vertex index (v0) instead of the
+// instance index (v3): the same VS with another fetch shader. offset_cols: the offset table (in
+// columns; default kColOffset), its V# holding that many records.
+std::string WriteKindCapture(const std::string& root, const DrawCase& c, std::vector<uint8_t>* want,
+                             const VertexLayout& layout = kFloat4Layout, bool offset_per_vertex = false,
+                             const std::vector<float>* offset_cols = nullptr) {
     uint8_t* mem = (uint8_t*)mmap(nullptr, kMemSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     // fetch shader: s_load_dwordx4 s[8:11], s[2:3], 0; s_load_dwordx4 s[12:15], s[2:3], 4;
     // v_add_i32 v0, s4, v0; v_add_i32 v3, s5, v3; s_waitcnt lgkmcnt(0);
     // buffer_load_format_xyzw v[4:7], v0, s[8:11] idxen; buffer_load_format_x v8, v3, s[12:15] idxen;
     // s_waitcnt vmcnt(0); s_setpc_b64 s[16:17]
-    const uint32_t fetch[] = {0xC0840300, 0xC0860304, 0x4A000004, 0x4A060605, 0xBF8C007F, 0xE00C2000,
-                              0x80020400, 0xE0002000, 0x80030803, 0xBF8C0F70, 0xBE802010};
-    // VS: s_swappc_b64 s[16:17], s[0:1]; v_add_f32 v4, v8, v4; exp param0 v[4:7]; exp pos0 v[4:7] done
-    const auto vs = WithFooter({0xBE902100, 0x06080908, 0xF800020F, 0x07060504, 0xF80008CF, 0x07060504, kEnd},
-                               0x5CA1AB1E000000B3ull);
+    // (offset_per_vertex: buffer_load_format_x v8, v0; layout.inst_off: the position load's offset)
+    const uint32_t fetch[] = {0xC0840300, 0xC0860304, 0x4A000004, 0x4A060605, 0xBF8C007F,
+                              0xE00C2000 | layout.inst_off, 0x80020400, 0xE0002000,
+                              offset_per_vertex ? 0x80030800u : 0x80030803u, 0xBF8C0F70, 0xBE802010};
+    // VS: s_swappc_b64 s[16:17], s[0:1]; v_add_f32 v4, v8, v4; v_mov_b32 v6, 0.5; v_mov_b32 v7, 1.0;
+    // exp param0 v[4:7]; exp pos0 v[4:7] done (z and w are the VS's own: the layouts with two
+    // components leave them to the format's defaults)
+    const auto vs = WithFooter({0xBE902100, 0x06080908, 0x7E0C02F0, 0x7E0E02F2, 0xF800020F, 0x07060504, 0xF80008CF,
+                                0x07060504, kEnd},
+                               0x5CA1AB1E000000B5ull);
     // PS: v0 = 1.0; v1 = 0.5; v2 = 0; v3 = 1.0; exp mrt0 v[0:3] done vm
     const auto ps = WithFooter({0x7E0002F2, 0x7E0202F0, 0x7E040280, 0x7E0602F2, 0xF800180F, 0x03020100, kEnd},
                                0x5CA1AB1E000000B4ull);
@@ -580,16 +625,20 @@ std::string WriteKindCapture(const std::string& root, const DrawCase& c, std::ve
     memcpy(mem + kPs2, ps.data(), ps.size() * 4);
     for (uint32_t r = 0; r < 8; ++r) { // column r: x in [r / 4 - 1, (r + 1) / 4 - 1], two triangles
         const float x0 = r * 0.25f - 1, x1 = x0 + 0.25f;
-        const float v[6][4] = {{x0, -1, 0.5f, 1}, {x1, -1, 0.5f, 1}, {x0, 1, 0.5f, 1},
-                               {x1, -1, 0.5f, 1}, {x1, 1, 0.5f, 1},  {x0, 1, 0.5f, 1}};
-        memcpy(mem + kVb + r * sizeof(v), v, sizeof(v));
+        const float v[6][2] = {{x0, -1}, {x1, -1}, {x0, 1}, {x1, -1}, {x1, 1}, {x0, 1}};
+        for (uint32_t k = 0; k < 6; ++k)
+            PutPosition(layout, mem + kVb + layout.base_off + layout.inst_off + (6 * r + k) * layout.stride, v[k][0],
+                        v[k][1]);
     }
-    for (uint32_t i = 0; i < 8; ++i) {
-        const float x = kColOffset[i] * 0.25f;
+    const uint32_t num_offs = offset_cols ? uint32_t(offset_cols->size()) : 8;
+    for (uint32_t i = 0; i < num_offs; ++i) {
+        const float x = (offset_cols ? (*offset_cols)[i] : kColOffset[i]) * 0.25f;
         memcpy(mem + kOffs + 4 * i, &x, 4);
     }
-    uint32_t vsharp[8] = {uint32_t(kVb), 16u << 16, 48, 4 | (5 << 3) | (6 << 6) | (7 << 9) | (7 << 12) | (14 << 15),
-                          uint32_t(kOffs), 4u << 16, 8, 4 | (5 << 3) | (6 << 6) | (7 << 9) | (7 << 12) | (4 << 15)};
+    uint32_t vsharp[8] = {uint32_t(kVb + layout.base_off), layout.stride << 16, 48,
+                          4 | (5 << 3) | (6 << 6) | (7 << 9) | (layout.nfmt << 12) | (layout.dfmt << 15),
+                          uint32_t(kOffs), 4u << 16, num_offs,
+                          4 | (5 << 3) | (6 << 6) | (7 << 9) | (7 << 12) | (4 << 15)};
     memcpy(mem + kVsharps, vsharp, sizeof(vsharp));
     for (size_t i = 0; i < c.indices.size(); ++i) {
         if (c.index_type) memcpy(mem + kIb + 4 * i, &c.indices[i], 4);
@@ -647,6 +696,55 @@ std::string WriteKindCapture(const std::string& root, const DrawCase& c, std::ve
 }
 
 std::vector<uint32_t> Rect(uint32_t r) { return {6 * r, 6 * r + 1, 6 * r + 2, 6 * r + 3, 6 * r + 4, 6 * r + 5}; }
+// Skips by reason: the draw of WriteDrawCapture with a geometry stage enabled is counted as
+// shader-stages, the same draw with an implausible vertex count as implausible-count; each adds
+// one to its reason and to SkippedCount, nothing to any other reason, and the replay's error
+// names the reason. The reason names are distinct.
+void TestSkipReasons(const std::string& root) {
+    using ps4draw::SkipReason;
+    constexpr size_t kReasons = (size_t)SkipReason::Count;
+    for (size_t i = 0; i < kReasons; ++i)
+        for (size_t j = i + 1; j < kReasons; ++j)
+            CHECK(strcmp(ps4draw::SkipReasonName((SkipReason)i), ps4draw::SkipReasonName((SkipReason)j)),
+                  "skip reasons %zu and %zu share the name %s", i, j, ps4draw::SkipReasonName((SkipReason)i));
+    std::vector<uint8_t> want;
+    const std::string stages_dir = WriteDrawCapture(root + "/skip_stages", false, &want, 1);
+    const std::string count_dir = WriteDrawCapture(root + "/skip_count", false, &want);
+    FrameRec f;
+    std::string err;
+    CHECK(LoadFrame(count_dir, &f, &err) && f.passes.size() == 1, "skip_count manifest: %s", err.c_str());
+    if (f.passes.size() != 1) return;
+    f.passes[0].count = 17u << 20; // more vertices than any draw (Draw's bound is 16M)
+    const std::string text = WriteManifest(f);
+    CHECK(WriteFile(count_dir + "/manifest.json", text.data(), text.size()), "skip_count: manifest");
+    const struct {
+        const char* what;
+        std::string dir;
+        SkipReason reason;
+    } cases[] = {{"shader stages", stages_dir, SkipReason::ShaderStages},
+                 {"implausible count", count_dir, SkipReason::DrawCount}};
+    for (const auto& c : cases) {
+        uint64_t before[kReasons];
+        for (size_t i = 0; i < kReasons; ++i) before[i] = ps4draw::SkippedCount((SkipReason)i);
+        const uint64_t total0 = ps4draw::SkippedCount();
+        ps4replay::Options o;
+        o.frame_dir = c.dir;
+        const ps4replay::Result r = ps4replay::ReplayPass(o);
+        CHECK(!r.ran, "skip reasons (%s): the draw ran", c.what);
+        CHECK(ps4draw::SkippedCount() - total0 == 1, "skip reasons (%s): %llu skipped, want 1", c.what,
+              (unsigned long long)(ps4draw::SkippedCount() - total0));
+        for (size_t i = 0; i < kReasons; ++i) {
+            const uint64_t d = ps4draw::SkippedCount((SkipReason)i) - before[i];
+            const uint64_t want_d = (SkipReason)i == c.reason ? 1 : 0;
+            CHECK(d == want_d, "skip reasons (%s): %s counted %llu, want %llu", c.what,
+                  ps4draw::SkipReasonName((SkipReason)i), (unsigned long long)d, (unsigned long long)want_d);
+        }
+        CHECK(r.error.find(ps4draw::SkipReasonName(c.reason)) != std::string::npos,
+              "skip reasons (%s): the error does not name %s: %s", c.what, ps4draw::SkipReasonName(c.reason),
+              r.error.c_str());
+    }
+}
+
 std::vector<uint32_t> Cat(std::initializer_list<std::vector<uint32_t>> parts) {
     std::vector<uint32_t> v;
     for (const auto& x : parts) v.insert(v.end(), x.begin(), x.end());
@@ -672,16 +770,83 @@ void TestDrawKinds(const std::string& root) {
         // From vertex 0: 3; from instance 0: 2.
         {"indirect", "DRAW_INDIRECT", false, 0, true, 0, 0, 0, 1, 0, 0, {}, {6, 1, 12, 3}, 1 << 5},
     };
+    // The positions in each layout, the same VS and fetch shader (one shader, whose permutations
+    // switch between Metal vertex attributes and loads from the buffer in the shader):
+    // - 8_8 snorm at stride 2 (inFAMOUS Second Son's DRAW_INDEX_2: "vertex stride 2"), and at
+    //   stride 6 from an odd address;
+    // - 16_16 float at stride 4 from a base address 2 bytes past a dword (a fetch shader's
+    //   instruction offset can do that), which Metal's vertex fetch would read from the dword below.
+    // The vertex and instance offsets reach the buffer loads through the fetch shader's own adds
+    // (s4, s5). An indirect draw of such a shader is refused: its base vertex / start instance
+    // SGPRs come from the CP, which then issues the draw as a direct one (the direct cases).
+    const VertexLayout layouts[] = {
+        kFloat4Layout,
+        {"8_8 snorm, stride 2", 2, 3, 1, 0},
+        {"8_8 snorm, stride 6, odd base address", 6, 3, 1, 1},
+        {"16_16 float, stride 4, base address 2 past a dword", 4, 5, 7, 2},
+        // a 12-bit instruction offset past 255 (the attribute at byte 256 of a vertex), through
+        // Metal's vertex fetch and through the inlined fetch shader
+        {"float4, stride 272, instruction offset 256", 272, 14, 7, 0, 256},
+        {"8_8 snorm, stride 258, instruction offset 256", 258, 3, 1, 0, 256},
+    };
     int k = 0;
-    for (const DrawCase& c : cases) {
+    for (const VertexLayout& l : layouts) {
+        const bool pulled = l.stride % 4 != 0 || (l.base_off + l.inst_off) % 4 != 0;
+        for (const DrawCase& c : cases) {
+            ps4replay::Options o;
+            std::vector<uint8_t> want;
+            o.frame_dir = WriteKindCapture(root + "/kind" + std::to_string(k++), c, &want, l);
+            o.keep_outputs = true;
+            const ps4replay::Result r = ps4replay::ReplayPass(o);
+            if (pulled && c.indirect) {
+                CHECK(!r.ran && r.error.find("refused the indirect draw") != std::string::npos,
+                      "%s, %s: an indirect draw of a shader reading its vertices from the buffer was not "
+                      "refused: %s",
+                      c.name, l.name, r.ran ? "it ran" : r.error.c_str());
+                continue;
+            }
+            CHECK(r.ran, "%s, %s: not replayed: %s", c.name, l.name, r.error.c_str());
+            const ps4replay::OutputResult* out = replay_props::Find(r, "_color0");
+            CHECK(out && out->compared && out->match, "%s, %s: %llu bytes differ", c.name, l.name,
+                  out ? (unsigned long long)out->diff_bytes : 0ull);
+            if (out && out->bytes.size() == want.size() && !out->match) {
+                char drawn[9] = "........";
+                for (uint32_t x = 0; x < 8; ++x) {
+                    uint16_t h[4];
+                    memcpy(h, out->bytes.data() + (4 * 8 + x) * 8, 8);
+                    if (h[0] == 0x3C00 && h[1] == 0x3800 && h[2] == 0 && h[3] == 0x3C00) drawn[x] = 'x';
+                }
+                fprintf(stderr, "  %s, %s: columns drawn in row 4: %s, want %02x\n", c.name, l.name, drawn,
+                        c.columns);
+            }
+        }
+    }
+}
+
+// One VS with two fetch shaders (Gnmx builds one per remap table and instancing mode), whose
+// vertices Metal cannot fetch (8_8 at stride 2), so both are translated inline: the first loads
+// the x offset per instance (offset[instance 0] = 0: rectangle 6 at column 6), the second per
+// vertex (offset[36..41] = -4 columns: column 2). Vertices 36..41 (base vertex 36) are rectangle
+// 6. The second draw must not reuse the first's permutation, whose code holds the first fetch
+// shader.
+void TestFetchShaderIdentity(const std::string& root) {
+    const VertexLayout l = {"8_8 snorm, stride 2", 2, 3, 1, 0};
+    std::vector<float> offs(48, 0.f);
+    for (uint32_t i = 36; i < 42; ++i) offs[i] = -4;
+    const DrawCase c = {"base vertex 36", "DRAW_INDEX_AUTO", false, 0, false, 6, 0, 0, 1, 36, 0, {}, {}, 1 << 6};
+    for (int per_vertex = 0; per_vertex < 2; ++per_vertex) {
+        DrawCase cc = c;
+        cc.columns = per_vertex ? 1 << 2 : 1 << 6;
         ps4replay::Options o;
         std::vector<uint8_t> want;
-        o.frame_dir = WriteKindCapture(root + "/kind" + std::to_string(k++), c, &want);
+        o.frame_dir = WriteKindCapture(root + "/fetch_identity" + std::to_string(per_vertex), cc, &want, l,
+                                       per_vertex != 0, &offs);
         o.keep_outputs = true;
         const ps4replay::Result r = ps4replay::ReplayPass(o);
-        CHECK(r.ran, "%s: not replayed: %s", c.name, r.error.c_str());
+        const char* what = per_vertex ? "the per-vertex fetch shader" : "the per-instance fetch shader";
+        CHECK(r.ran, "%s: not replayed: %s", what, r.error.c_str());
         const ps4replay::OutputResult* out = replay_props::Find(r, "_color0");
-        CHECK(out && out->compared && out->match, "%s: %llu bytes differ", c.name,
+        CHECK(out && out->compared && out->match, "%s: %llu bytes differ", what,
               out ? (unsigned long long)out->diff_bytes : 0ull);
         if (out && out->bytes.size() == want.size() && !out->match) {
             char drawn[9] = "........";
@@ -690,9 +855,26 @@ void TestDrawKinds(const std::string& root) {
                 memcpy(h, out->bytes.data() + (4 * 8 + x) * 8, 8);
                 if (h[0] == 0x3C00 && h[1] == 0x3800 && h[2] == 0 && h[3] == 0x3C00) drawn[x] = 'x';
             }
-            fprintf(stderr, "  %s: columns drawn in row 4: %s, want %02x\n", c.name, drawn, c.columns);
+            fprintf(stderr, "  %s: columns drawn in row 4: %s, want %02x\n", what, drawn, cc.columns);
         }
     }
+}
+
+// The translator's test of the V# formats Metal's vertex fetch reads (gcn_vertex_format_fetchable:
+// a V# that fails it is read in the shader) agrees with the renderer's table of Metal vertex
+// formats for every raw data / number format pair: a V# the translator leaves to Metal's vertex
+// fetch always has a Metal format (the renderer skips a draw with one that has none).
+void TestVertexFormatTable() {
+    int disagree = 0;
+    for (uint32_t d = 0; d < 16; ++d)
+        for (uint32_t n = 0; n < 8; ++n) {
+            const bool gcn = gcn_vertex_format_fetchable(d, n);
+            const bool mtl = ps4gnm::GetVertexFormat(d, n).mtl_vertex_format != 0;
+            if (gcn != mtl && disagree++ < 8)
+                fprintf(stderr, "  dfmt %u nfmt %u: translator %s, renderer %s\n", d, n, gcn ? "fetchable" : "inline",
+                        mtl ? "has a Metal format" : "has none");
+        }
+    CHECK(disagree == 0, "vertex formats: %d pairs where the translator and the renderer's table disagree", disagree);
 }
 
 // An indirect dispatch: 2 workgroups from the argument record while the PM4 dimensions (the pass's
@@ -780,6 +962,53 @@ void TestOnlyClearsDraw(const std::string& root) {
     size_t cleared = 0;
     for (size_t i = 0; i < 64; ++i) cleared += !memcmp(c->bytes.data() + i * 8, kClear, 8);
     CHECK(cleared == 64, "only-clears: %zu of 64 texels hold the clear colour", cleared);
+}
+
+// Background compiles (PS4_GNM_REPLAY_ASYNC_COMPILE=1, the game's mode): the first draw of a
+// program waits for its shaders and pipeline, and the renderer counts it as pending, not as lost
+// work. The pass is replayed again until it draws; every skip on the way is a pending one. A draw
+// really lost (a shader stage the renderer does not support) is counted as skipped only.
+void TestPendingCompile(const std::string& root) {
+    const char* ac = getenv("PS4_GNM_REPLAY_ASYNC_COMPILE");
+    CHECK(ac && !strcmp(ac, "1"), "pending-compile: run with PS4_GNM_REPLAY_ASYNC_COMPILE=1");
+    std::vector<uint8_t> want;
+    {
+        ps4replay::Options o;
+        o.frame_dir = WriteDrawCapture(root + "/lost", false, &want, 1);
+        const uint64_t skipped0 = ps4draw::SkippedCount(), pending0 = ps4draw::PendingCompileCount();
+        const ps4replay::Result r = ps4replay::ReplayPass(o);
+        CHECK(!r.ran, "pending-compile: a draw with an unsupported shader stage ran");
+        CHECK(ps4draw::SkippedCount() - skipped0 == 1, "pending-compile: lost draw: %llu skipped, want 1",
+              (unsigned long long)(ps4draw::SkippedCount() - skipped0));
+        CHECK(ps4draw::PendingCompileCount() == pending0, "pending-compile: a lost draw was counted as pending");
+    }
+    ps4replay::Options o;
+    o.frame_dir = WriteDrawCapture(root + "/draw", false, &want);
+    o.keep_outputs = true;
+    const uint64_t skipped0 = ps4draw::SkippedCount(), pending0 = ps4draw::PendingCompileCount();
+    ps4replay::Result r;
+    int tries = 0;
+    for (; tries < 400; ++tries) {
+        const uint64_t s = ps4draw::SkippedCount(), p = ps4draw::PendingCompileCount();
+        r = ps4replay::ReplayPass(o);
+        if (r.ran) {
+            CHECK(ps4draw::SkippedCount() == s, "pending-compile: the draw that ran added a skip");
+            break;
+        }
+        CHECK(ps4draw::SkippedCount() - s == 1 && ps4draw::PendingCompileCount() - p == 1,
+              "pending-compile: try %d: %llu skipped, %llu of them pending (%s)", tries,
+              (unsigned long long)(ps4draw::SkippedCount() - s), (unsigned long long)(ps4draw::PendingCompileCount() - p),
+              r.error.c_str());
+        if (g_fail) return;
+        usleep(25 * 1000);
+    }
+    CHECK(r.ran, "pending-compile: the draw never ran in %d tries: %s", tries, r.error.c_str());
+    CHECK(tries > 0, "pending-compile: the first draw of a new program was not deferred by a compile");
+    const uint64_t pending = ps4draw::PendingCompileCount() - pending0, skipped = ps4draw::SkippedCount() - skipped0;
+    CHECK(pending == skipped && pending == (uint64_t)tries, "pending-compile: %llu skipped, %llu pending, %d deferrals",
+          (unsigned long long)skipped, (unsigned long long)pending, tries);
+    const ps4replay::OutputResult* c = replay_props::Find(r, "_color0");
+    CHECK(c && c->compared && c->match, "pending-compile: the draw that ran differs from the capture");
 }
 
 // ScanGcnStores (the replay's note on passes with no recorded output) on the programs above:
@@ -1149,13 +1378,22 @@ int main(int argc, char** argv) {
         }
         // only-clears: the draw under PS4_GNM_MTL4_ONLY_CLEARS=1 alone (run_host_tests.sh sets it)
         const bool only_clears = argc == 2 && !strcmp(argv[1], "only-clears");
-        if (argc > 1 && !only_clears) {
-            fprintf(stderr, "usage: gnm_replay_test [only-clears | write-capture <dir>]\n");
+        // pending-compile: the background compile counters (run_host_tests.sh sets the environment)
+        const bool pending_compile = argc == 2 && !strcmp(argv[1], "pending-compile");
+        if (argc > 1 && !only_clears && !pending_compile) {
+            fprintf(stderr, "usage: gnm_replay_test [only-clears | pending-compile | write-capture <dir>]\n");
             return 2;
         }
         char tmpl[] = "/tmp/gnm_replay_test.XXXXXX";
         const char* root = mkdtemp(tmpl);
         if (!root) return 1;
+        if (pending_compile) {
+            TestPendingCompile(root);
+            const std::string rm = std::string("rm -rf '") + root + "'";
+            if (system(rm.c_str()) != 0) g_fail++;
+            printf("gnm_replay_test pending-compile: %s\n", g_fail ? "FAIL" : "PASS");
+            return g_fail ? 1 : 0;
+        }
         if (only_clears) {
             TestOnlyClearsDraw(root);
             const std::string rm = std::string("rm -rf '") + root + "'";
@@ -1169,7 +1407,10 @@ int main(int argc, char** argv) {
         TestExtractedFixture(root);
         TestIndirectDispatch(root);
         TestDrawReplay(root);
+        TestSkipReasons(root);
         TestDrawKinds(root);
+        TestFetchShaderIdentity(root);
+        TestVertexFormatTable();
         TestRange(root);
         TestSettle(root);
         TestSettleRestore(root);

@@ -145,6 +145,23 @@ void h264vt_copy_nv12(const H264VtFrame *f, uint8_t *dst);
 // Parses an SPS NAL unit (starting with the NAL header byte). Returns false on a malformed SPS.
 bool h264_parse_sps(const uint8_t *nal, size_t size, H264SpsInfo *out);
 
+// The NAL units of one Annex-B buffer (an access unit, or whatever the guest passed as one).
+// Start codes may be 3 or 4 bytes. nal_unit_type 1..5 count as slices (2..4 are data
+// partitions A..C); 14 and 20 (prefix and extension NAL units of SVC/MVC) and every other type
+// are counted in nal_count and nal_types only. libSceVideodec runs it on every Decode call: one
+// linear scan for start codes plus at most 12 bytes of the first slice header.
+typedef struct H264AuCensus {
+    uint32_t nal_count;
+    uint8_t nal_types[32];        // the first 32 nal_unit_types, in stream order
+    uint32_t slices;              // coded slices (nal_unit_type 1..5)
+    int32_t first_mb_first_slice; // first_mb_in_slice of the first slice; -1 without a slice
+    bool has_idr;
+    bool has_sps;
+} H264AuCensus;
+
+// Counts the NAL units of an Annex-B buffer. Portable, makes no allocation.
+void h264_au_census(const uint8_t *au, size_t size, H264AuCensus *out);
+
 #ifdef __cplusplus
 }
 #endif

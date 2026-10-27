@@ -1,4 +1,5 @@
 #include "recomp_runtime.h"
+#include "ps4_direct_mem.h"
 #include "ps4_sysmodule.h"
 #include "ps4_vfs.h"
 #include "ps4_log.h"
@@ -32,6 +33,73 @@ void recomp_set_current_ctx(GuestContext *ctx) {
 static _Atomic int g_crashing = 0;
 
 int ps4_host_crashing(void) { return g_crashing; }
+
+// The host thread the crash handler runs on, and what brought the signal. A fault is delivered to
+// the thread that faulted. A signal sent with kill() goes to any thread that does not block it,
+// usually the main thread in its run loop, and macOS fills its siginfo like a fault at address 0
+// (SIGSEGV: si_code SEGV_ACCERR, si_addr 0, si_pid 0). The exception state tells them apart: a
+// fault's syndrome (ESR) has the class of the fault, and for an abort its fault address (FAR) is
+// si_addr; a sent signal finds the syndrome of the thread's last exception, a system call when it
+// was blocked in one.
+static void crash_report_source(int sig, const siginfo_t *si, const void *ucontext) {
+  char name[64] = "";
+  pthread_getname_np(pthread_self(), name, sizeof name);
+  uint64_t tid = 0;
+  pthread_threadid_np(NULL, &tid);
+  fprintf(stderr, "Signal %d on host thread %llu '%s'%s\n", sig, (unsigned long long)tid, name,
+          pthread_main_np() ? " (the main thread)" : "");
+#if defined(__APPLE__) && defined(__arm64__)
+  const arm_exception_state64_t *es = &((const ucontext_t *)ucontext)->uc_mcontext->__es;
+  const uint32_t esr = es->__esr;
+  const uint32_t ec = esr >> 26;
+  const uint64_t addr = (uint64_t)(uintptr_t)si->si_addr;
+  int fault = 0;
+  const char *kind = "";
+  switch (ec) {
+  case 0x20: case 0x21: kind = "instruction abort"; fault = (sig == SIGSEGV || sig == SIGBUS) && es->__far == addr; break;
+  case 0x24: case 0x25: kind = "data abort"; fault = (sig == SIGSEGV || sig == SIGBUS) && es->__far == addr; break;
+  case 0x22: kind = "PC alignment"; fault = sig == SIGBUS; break;
+  case 0x26: kind = "SP alignment"; fault = sig == SIGBUS; break;
+  case 0x00: kind = "undefined instruction"; fault = sig == SIGILL; break;
+  case 0x3c: kind = "brk"; fault = sig == SIGTRAP || sig == SIGILL; break;
+  case 0x15: kind = "system call"; break;
+  default: kind = "other"; break;
+  }
+  if (fault) {
+    fprintf(stderr, "Cause: a fault of this thread (ESR 0x%x: %s, FAR 0x%llx)\n", esr, kind,
+            (unsigned long long)es->__far);
+  } else {
+    fprintf(stderr,
+            "Cause: sent to the process (kill or pthread_kill), not a fault of this thread: its last exception "
+            "is a %s (ESR 0x%x, FAR 0x%llx)\n",
+            kind, esr, (unsigned long long)es->__far);
+  }
+#else
+  (void)ucontext;
+  fprintf(stderr, "Cause: si_code %d, si_pid %d\n", si->si_code, (int)si->si_pid);
+#endif
+}
+
+// The host registers of the interrupted thread.
+static void crash_report_host_registers(const void *ucontext) {
+#if defined(__APPLE__) && defined(__arm64__)
+  const arm_thread_state64_t *state = &((const ucontext_t *)ucontext)->uc_mcontext->__ss;
+  Dl_info di;
+  const int named = dladdr((void *)state->__pc, &di) && di.dli_sname;
+  fprintf(stderr, "Host PC: 0x%llx (ARM64)%s%s", (unsigned long long)state->__pc, named ? " " : "",
+          named ? di.dli_sname : "");
+  if (named) fprintf(stderr, "+0x%llx", (unsigned long long)(state->__pc - (uint64_t)(uintptr_t)di.dli_saddr));
+  fprintf(stderr, "\n");
+  for (int i = 0; i < 29; i++) {
+    fprintf(stderr, "x%d=0x%llx ", i, (unsigned long long)state->__x[i]);
+    if ((i + 1) % 4 == 0) fprintf(stderr, "\n");
+  }
+  fprintf(stderr, "\nfp=0x%llx lr=0x%llx sp=0x%llx\n", (unsigned long long)state->__fp,
+          (unsigned long long)state->__lr, (unsigned long long)state->__sp);
+#else
+  (void)ucontext;
+#endif
+}
 
 static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
   g_crashing = 1; // before exit(1): the exit handlers it runs skip their waits
@@ -123,16 +191,9 @@ static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
         fprintf(stderr, "\n");
       }
     }
-    fprintf(stderr, "Host PC: 0x%llx (ARM64)\n", (unsigned long long)state->__pc);
-    for (int i = 0; i < 29; i++) {
-      fprintf(stderr, "x%d=0x%llx ", i, (unsigned long long)state->__x[i]);
-      if ((i + 1) % 4 == 0) fprintf(stderr, "\n");
-    }
-    fprintf(stderr, "\nfp=0x%llx lr=0x%llx sp=0x%llx\n",
-            (unsigned long long)state->__fp,
-            (unsigned long long)state->__lr,
-            (unsigned long long)state->__sp);
 #endif
+    crash_report_source(sig, si, ucontext);
+    crash_report_host_registers(ucontext);
     void *callstack[64];
     int frames = backtrace(callstack, 64);
     fprintf(stderr, "Call stack (%d frames):\n", frames);
@@ -141,6 +202,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ucontext) {
     fprintf(stderr,
             "\nFATAL: Signal %d at host address %p (no guest context)\n", sig,
             si->si_addr);
+    crash_report_source(sig, si, ucontext);
+    crash_report_host_registers(ucontext);
     void *callstack[64];
     int frames = backtrace(callstack, 64);
     fprintf(stderr, "Call stack (%d frames):\n", frames);
@@ -618,6 +681,9 @@ void recomp_init_process_param(GuestContext *ctx, uint64_t proc_param_addr) {
   if (ctx->process_ctx) {
     ctx->process_ctx->proc_param_addr = proc_param_addr;
   }
+  // The kernel sizes direct memory from the process's memory parameters at process start,
+  // before the game's malloc init below allocates any.
+  ps4_direct_mem_configure(ctx, proc_param_addr);
   if (!ctx->mem_base || proc_param_addr == 0)
     return;
   if (proc_param_addr + 0x40 > ctx->mem_size)
@@ -682,53 +748,70 @@ void recomp_init_process_param(GuestContext *ctx, uint64_t proc_param_addr) {
   }
 }
 
-// x86-64 static TLS is TLS variant II: the main module's block ends at the thread pointer
-// (fs base) and starts at fs - round_up(p_memsz, p_align). The linker resolves the eboot's
-// fs-relative TLS accesses with this offset, so the .tdata template is copied there.
-uint64_t recomp_tls_block_offset(const GuestContext *ctx) {
-  if (!ctx || ctx->tls_memsz == 0) return 0;
-  uint64_t align = ctx->tls_align ? ctx->tls_align : 1;
-  return (ctx->tls_memsz + align - 1) / align * align;
+// x86-64 static TLS is TLS variant II: module id's block is at FS - offset (the generator lays
+// the blocks out as FreeBSD's rtld does: the executable first, its block ending at FS, as its
+// fs-relative accesses expect). The table is process-wide and written once, before any guest
+// thread exists.
+static RecompTlsModule g_tls_modules[RECOMP_TLS_MAX_MODULES];
+static size_t g_tls_module_count;
+
+uint64_t recomp_tls_module_offset(uint64_t module_id) {
+  if (module_id == 0 || module_id > g_tls_module_count) return 0;
+  return g_tls_modules[module_id - 1].offset;
 }
 
-void recomp_init_tls(GuestContext *ctx, uint64_t tls_vaddr, uint64_t tls_filesz, uint64_t tls_memsz, uint64_t tls_align) {
-  if (!ctx) return;
-  uint64_t align = tls_align ? tls_align : 16;
-  if (align < 16) align = 16;
-  uint64_t static_tls_size = (tls_memsz + (align - 1)) & ~(align - 1);
-  if (static_tls_size < 0x100ULL) {
-    static_tls_size = 0x100ULL;
+// Zeroes the static TLS area [tcb - static_tls_size, tcb) and copies every module's .tdata
+// template into its block.
+static void tls_init_area(uint8_t *mem_base, uint64_t tcb, uint64_t static_tls_size) {
+  memset(mem_base + tcb - static_tls_size, 0, static_tls_size);
+  for (size_t i = 0; i < g_tls_module_count; i++) {
+    const RecompTlsModule *m = &g_tls_modules[i];
+    if (m->filesz) memcpy(mem_base + tcb - m->offset, mem_base + m->vaddr, m->filesz);
   }
-  ctx->tls_vaddr = tls_vaddr;
-  ctx->tls_filesz = tls_filesz;
-  ctx->tls_memsz = tls_memsz;
-  ctx->tls_align = tls_align;
-  ctx->static_tls_size = static_tls_size;
-  if (ctx->process_ctx) {
-    ctx->process_ctx->tls_vaddr = tls_vaddr;
-    ctx->process_ctx->tls_filesz = tls_filesz;
-    ctx->process_ctx->tls_memsz = tls_memsz;
-    ctx->process_ctx->tls_align = tls_align;
-    ctx->process_ctx->static_tls_size = static_tls_size;
-  }
+}
 
-  // Main thread static TLS area [fs_base - static_tls_size, fs_base): zeroed, with the .tdata
-  // template at fs_base - recomp_tls_block_offset() (variant II). recomp_init_runtime
-  // reserves 64 KB below the TCB for it.
+void recomp_init_tls_modules(GuestContext *ctx, const RecompTlsModule *mods, size_t count) {
+  if (!ctx) return;
+  if (count > RECOMP_TLS_MAX_MODULES) {
+    fprintf(stderr, "[ps4-recomp] FATAL: %zu static TLS modules, the runtime holds %d\n", count, RECOMP_TLS_MAX_MODULES);
+    abort();
+  }
+  uint64_t end = 0;
+  for (size_t i = 0; i < count; i++) {
+    const RecompTlsModule *m = &mods[i];
+    const uint64_t align = m->align ? m->align : 1;
+    if (m->id != i + 1 || m->offset < m->memsz || m->offset % align != 0 || m->filesz > m->memsz ||
+        (m->filesz && m->vaddr + m->filesz > ctx->mem_size)) {
+      fprintf(stderr,
+              "[ps4-recomp] FATAL: malformed static TLS module %zu: id %llu vaddr 0x%llx filesz 0x%llx memsz 0x%llx "
+              "align 0x%llx offset 0x%llx\n",
+              i, (unsigned long long)m->id, (unsigned long long)m->vaddr, (unsigned long long)m->filesz,
+              (unsigned long long)m->memsz, (unsigned long long)m->align, (unsigned long long)m->offset);
+      abort();
+    }
+    g_tls_modules[i] = *m;
+    if (m->offset > end) end = m->offset;
+  }
+  g_tls_module_count = count;
+  // At least 0x100 bytes, 16-byte aligned.
+  uint64_t static_tls_size = (end + 15) & ~15ULL;
+  if (static_tls_size < 0x100ULL) static_tls_size = 0x100ULL;
+  ctx->static_tls_size = static_tls_size;
+  if (ctx->process_ctx) ctx->process_ctx->static_tls_size = static_tls_size;
+
+  // recomp_init_runtime reserves 64 KB below the main thread's TCB for its static TLS.
   if (static_tls_size > 0x10000ULL) {
     fprintf(stderr, "[ps4-recomp] FATAL: static TLS 0x%llx exceeds the 64 KB main thread TLS area\n",
             (unsigned long long)static_tls_size);
     abort();
   }
   if (ctx->mem_base && ctx->fs_base >= static_tls_size) {
-    memset(ctx->mem_base + ctx->fs_base - static_tls_size, 0, static_tls_size);
-    uint64_t block = ctx->fs_base - recomp_tls_block_offset(ctx);
-    if (tls_filesz > 0 && tls_filesz <= tls_memsz && tls_vaddr > 0 && tls_vaddr + tls_filesz <= ctx->mem_size) {
-      memcpy(ctx->mem_base + block, ctx->mem_base + tls_vaddr, tls_filesz);
-    }
-    printf("[ps4-recomp] TLS initialized: vaddr=0x%llx filesz=0x%llx memsz=0x%llx align=%llu static_tls_size=0x%llx (fs_base=0x%llx)\n",
-           (unsigned long long)tls_vaddr, (unsigned long long)tls_filesz,
-           (unsigned long long)tls_memsz, (unsigned long long)tls_align,
+    tls_init_area(ctx->mem_base, ctx->fs_base, static_tls_size);
+    for (size_t i = 0; i < count; i++)
+      printf("[ps4-recomp] TLS module %llu: vaddr=0x%llx filesz=0x%llx memsz=0x%llx align=%llu at fs-0x%llx\n",
+             (unsigned long long)mods[i].id, (unsigned long long)mods[i].vaddr, (unsigned long long)mods[i].filesz,
+             (unsigned long long)mods[i].memsz, (unsigned long long)mods[i].align, (unsigned long long)mods[i].offset);
+    printf("[ps4-recomp] TLS initialized: %zu modules, static_tls_size=0x%llx (fs_base=0x%llx)\n", count,
            (unsigned long long)static_tls_size, (unsigned long long)ctx->fs_base);
   }
 }
@@ -1373,14 +1456,9 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   }
   uint64_t tcb_base = stack_base + stack_size + tls_size;
 
-  // Static TLS area for the new thread [tcb_base - tls_size, tcb_base): zeroed, with the
-  // .tdata template at tcb_base - recomp_tls_block_offset() (variant II, see recomp_init_tls).
-  memset(parent->mem_base + tcb_base - tls_size, 0, tls_size);
-  if (proc->tls_filesz > 0 && proc->tls_filesz <= proc->tls_memsz && proc->tls_vaddr > 0 &&
-      proc->tls_vaddr + proc->tls_filesz <= parent->mem_size) {
-    memcpy(parent->mem_base + tcb_base - recomp_tls_block_offset(proc), parent->mem_base + proc->tls_vaddr,
-           proc->tls_filesz);
-  }
+  // Static TLS area for the new thread [tcb_base - tls_size, tcb_base): zeroed, with every
+  // module's .tdata template in its block (recomp_init_tls_modules).
+  tls_init_area(parent->mem_base, tcb_base, tls_size);
 
   // Initialize FS TCB base and stack canary
   *(uint64_t *)(parent->mem_base + tcb_base) = tcb_base;
@@ -1401,12 +1479,10 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   t_ctx->stack_alloc_size = alloc_total;
   t_ctx->rsp = (stack_base + stack_size - 0x100ULL) & ~0xFFULL;
   t_ctx->rbp = t_ctx->rsp;
-  t_ctx->fpu_cw = 0x037F;
-  t_ctx->mxcsr = 0x1F80; // x86 default: all exceptions masked, round to nearest
-  t_ctx->tls_vaddr = proc->tls_vaddr;
-  t_ctx->tls_filesz = proc->tls_filesz;
-  t_ctx->tls_memsz = proc->tls_memsz;
-  t_ctx->tls_align = proc->tls_align;
+  // The creator's control words, as FreeBSD's cpu_copy_thread copies the user FPU state at
+  // thr_new; the guest entry trampoline applies mxcsr to FPCR (RMode, FZ).
+  t_ctx->fpu_cw = parent->fpu_cw;
+  t_ctx->mxcsr = parent->mxcsr;
   t_ctx->static_tls_size = proc->static_tls_size;
 
   return t_ctx;

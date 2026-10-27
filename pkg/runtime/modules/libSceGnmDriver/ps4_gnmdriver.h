@@ -158,7 +158,8 @@ int32_t sceGnmInsertPushColorMarker(uint32_t *cmdbuf, uint32_t size, const char 
 int32_t sceGnmInsertSetMarker(uint32_t *cmdbuf, uint32_t size, const char *marker);
 int32_t sceGnmInsertSetColorMarker(void);
 int32_t sceGnmInsertThreadTraceMarker(void);
-int32_t sceGnmInsertWaitFlipDone(uint32_t *cmdbuf, uint32_t size, int32_t vo_handle, uint32_t buf_idx);
+int32_t sceGnmInsertWaitFlipDone(GuestContext *ctx, uint32_t *cmdbuf, uint32_t size, int32_t vo_handle,
+                                 uint32_t buf_idx);
 
 // Resource registration & ownership
 int32_t sceGnmRegisterOwner(void *handle, const char *name);

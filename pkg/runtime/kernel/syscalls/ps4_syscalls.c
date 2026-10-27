@@ -1,6 +1,7 @@
 #include "ps4_hitch.h"
 #include "recomp_runtime.h"
 #include "ps4_syscalls.h"
+#include "ps4_direct_mem.h"
 #include "ps4_vfs.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -356,6 +357,57 @@ void shim_fcntl(GuestContext *ctx) {
   SHIM_RETURN();
 }
 
+// Read-only mounts (ps4_vfs_is_read_only: /app0). Each helper returns the errno FreeBSD gives
+// for the operation on a read-only file system, or 0 when the operation may go to the host. The
+// errors of the name lookup (ENOENT, ENOTDIR, EEXIST) come before EROFS, as in namei.
+
+// 0 when the parent directory of host_path exists, else the errno of looking it up.
+static int ro_parent_errno(const char *host_path) {
+  char parent[1024];
+  const char *slash = strrchr(host_path, '/');
+  if (!slash) return 0;
+  size_t n = (size_t)(slash - host_path);
+  if (n == 0) return 0;
+  if (n >= sizeof(parent)) return ENAMETOOLONG;
+  memcpy(parent, host_path, n);
+  parent[n] = '\0';
+  struct stat st;
+  if (stat(parent, &st) != 0) return errno;
+  return S_ISDIR(st.st_mode) ? 0 : ENOTDIR;
+}
+
+// open(2): creating a missing file is EROFS; on an existing one O_CREAT|O_EXCL is EEXIST, and
+// write access or O_TRUNC is EISDIR for a directory and EROFS otherwise (vn_open_vnode).
+static int ro_open_errno(const char *guest_path, const char *host_path, int flags) {
+  if (!ps4_vfs_is_read_only(guest_path)) return 0;
+  struct stat st;
+  if (stat(host_path, &st) != 0) {
+    if (errno != ENOENT || !(flags & O_CREAT)) return 0; // the host open reports the lookup error
+    int perr = ro_parent_errno(host_path);
+    return perr ? perr : EROFS;
+  }
+  if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) return EEXIST;
+  if ((flags & O_ACCMODE) != O_RDONLY || (flags & O_TRUNC)) return S_ISDIR(st.st_mode) ? EISDIR : EROFS;
+  return 0;
+}
+
+// unlink, rmdir, rename (either side), truncate, chmod, utimes on an existing name: EROFS.
+static int ro_modify_errno(const char *guest_path, const char *host_path) {
+  if (!ps4_vfs_is_read_only(guest_path)) return 0;
+  struct stat st;
+  return lstat(host_path, &st) != 0 ? errno : EROFS;
+}
+
+// mkdir: an existing name is EEXIST, a new one EROFS.
+static int ro_create_errno(const char *guest_path, const char *host_path) {
+  if (!ps4_vfs_is_read_only(guest_path)) return 0;
+  struct stat st;
+  if (lstat(host_path, &st) == 0) return EEXIST;
+  if (errno != ENOENT) return errno;
+  int perr = ro_parent_errno(host_path);
+  return perr ? perr : EROFS;
+}
+
 // open
 void shim_open(GuestContext *ctx) {
   uint64_t path_addr = ctx->rdi;
@@ -367,9 +419,16 @@ void shim_open(GuestContext *ctx) {
   if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
     actual_path = resolved_path;
   }
-  int ret = open(actual_path, flags, mode);
-  if (ret < 0) {
-    set_guest_errno(ctx, errno);
+  int ret;
+  int ro_err = ro_open_errno(path, actual_path, flags);
+  if (ro_err) {
+    set_guest_errno(ctx, ro_err);
+    ret = -1;
+  } else {
+    ret = open(actual_path, flags, mode);
+    if (ret < 0) {
+      set_guest_errno(ctx, errno);
+    }
   }
   printf("[ps4-sys] open: '%s' (resolved='%s', flags=0x%x) -> fd=%d\n",
          path ? path : "(null)", actual_path ? actual_path : "(null)", flags, ret);
@@ -506,10 +565,17 @@ void shim_fstat(GuestContext *ctx) {
 void shim_chmod(GuestContext *ctx) {
   uint64_t path_addr = ctx->rdi;
   mode_t mode = (mode_t)ctx->rsi;
-  const char *path = (const char *)(ctx->mem_base + path_addr);
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
   char resolved_path[1024];
   if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
     path = resolved_path;
+  }
+  int ro_err = ro_modify_errno(guest_path, path);
+  if (ro_err) {
+    set_guest_errno(ctx, ro_err);
+    ctx->rax = (uint64_t)-1;
+    SHIM_RETURN();
   }
   int ret = chmod(path, mode);
   if (ret < 0) {
@@ -539,10 +605,17 @@ void shim_fchmod(GuestContext *ctx) {
 void shim_utimes(GuestContext *ctx) {
   uint64_t path_addr = ctx->rdi;
   uint64_t times_addr = ctx->rsi;
-  const char *path = (const char *)(ctx->mem_base + path_addr);
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
   char resolved_path[1024];
   if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
     path = resolved_path;
+  }
+  int ro_err = ro_modify_errno(guest_path, path);
+  if (ro_err) {
+    set_guest_errno(ctx, ro_err);
+    ctx->rax = (uint64_t)-1;
+    SHIM_RETURN();
   }
   const struct timeval *host_times = NULL;
   struct timeval tv[2];
@@ -689,10 +762,17 @@ void shim_sceKernelPwrite(GuestContext *ctx) {
 // unlink
 void shim_unlink(GuestContext *ctx) {
   uint64_t path_addr = ctx->rdi;
-  const char *path = (const char *)(ctx->mem_base + path_addr);
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
   char resolved_path[1024];
   if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
     path = resolved_path;
+  }
+  int ro_err = ro_modify_errno(guest_path, path);
+  if (ro_err) {
+    set_guest_errno(ctx, ro_err);
+    ctx->rax = (uint64_t)-1;
+    SHIM_RETURN();
   }
   int ret = unlink(path);
   if (ret < 0) {
@@ -708,10 +788,17 @@ void shim_unlink(GuestContext *ctx) {
 void shim_mkdir(GuestContext *ctx) {
   uint64_t path_addr = ctx->rdi;
   mode_t mode = (mode_t)ctx->rsi;
-  const char *path = (const char *)(ctx->mem_base + path_addr);
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
   char resolved_path[1024];
   if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
     path = resolved_path;
+  }
+  int ro_err = ro_create_errno(guest_path, path);
+  if (ro_err) {
+    set_guest_errno(ctx, ro_err);
+    ctx->rax = (uint64_t)-1;
+    SHIM_RETURN();
   }
   int ret = mkdir(path, mode);
   if (ret < 0) {
@@ -726,10 +813,17 @@ void shim_mkdir(GuestContext *ctx) {
 // rmdir
 void shim_rmdir(GuestContext *ctx) {
   uint64_t path_addr = ctx->rdi;
-  const char *path = (const char *)(ctx->mem_base + path_addr);
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
   char resolved_path[1024];
   if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
     path = resolved_path;
+  }
+  int ro_err = ro_modify_errno(guest_path, path);
+  if (ro_err) {
+    set_guest_errno(ctx, ro_err);
+    ctx->rax = (uint64_t)-1;
+    SHIM_RETURN();
   }
   int ret = rmdir(path);
   if (ret < 0) {
@@ -743,10 +837,16 @@ void shim_rmdir(GuestContext *ctx) {
 
 void shim_sceKernelRmdir(GuestContext *ctx) {
   uint64_t path_addr = ctx->rdi;
-  const char *path = (const char *)(ctx->mem_base + path_addr);
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
   char resolved_path[1024];
   if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
     path = resolved_path;
+  }
+  int ro_err = ro_modify_errno(guest_path, path);
+  if (ro_err) {
+    ctx->rax = 0x80020000 | (uint32_t)ro_err;
+    SHIM_RETURN();
   }
   int ret = rmdir(path);
   if (ret < 0) {
@@ -763,9 +863,21 @@ void shim_rename(GuestContext *ctx) {
   uint64_t new_addr = ctx->rsi;
   const char *oldpath = (const char *)(ctx->mem_base + old_addr);
   const char *newpath = (const char *)(ctx->mem_base + new_addr);
+  const char *guest_old = oldpath, *guest_new = newpath;
   char res_old[1024], res_new[1024];
   if (ps4_vfs_resolve(oldpath, res_old, sizeof(res_old)) == 0) oldpath = res_old;
   if (ps4_vfs_resolve(newpath, res_new, sizeof(res_new)) == 0) newpath = res_new;
+  // Renaming from or into a read-only file system: the source lookup first, then EROFS.
+  int ro_err = 0;
+  if (ps4_vfs_is_read_only(guest_old) || ps4_vfs_is_read_only(guest_new)) {
+    struct stat st;
+    ro_err = lstat(oldpath, &st) != 0 ? errno : EROFS;
+  }
+  if (ro_err) {
+    set_guest_errno(ctx, ro_err);
+    ctx->rax = (uint64_t)-1;
+    SHIM_RETURN();
+  }
   int ret = rename(oldpath, newpath);
   if (ret < 0) {
     set_guest_errno(ctx, errno);
@@ -780,10 +892,17 @@ void shim_rename(GuestContext *ctx) {
 void shim_truncate(GuestContext *ctx) {
   uint64_t path_addr = ctx->rdi;
   off_t length = (off_t)ctx->rsi;
-  const char *path = (const char *)(ctx->mem_base + path_addr);
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
   char resolved_path[1024];
   if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
     path = resolved_path;
+  }
+  int ro_err = ro_modify_errno(guest_path, path);
+  if (ro_err) {
+    set_guest_errno(ctx, ro_err);
+    ctx->rax = (uint64_t)-1;
+    SHIM_RETURN();
   }
   int ret = truncate(path, length);
   if (ret < 0) {
@@ -1178,8 +1297,14 @@ void shim_syscall(GuestContext *ctx) {
     if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
       actual_path = resolved_path;
     }
-    int ret = open(actual_path, flags, mode);
-    if (ret < 0) set_guest_errno(ctx, errno);
+    int ret = -1;
+    int ro_err = ro_open_errno(path, actual_path, flags);
+    if (ro_err) {
+      set_guest_errno(ctx, ro_err);
+    } else {
+      ret = open(actual_path, flags, mode);
+      if (ret < 0) set_guest_errno(ctx, errno);
+    }
     printf("[ps4-sys] syscall 5 (SYS_open): '%s' (resolved='%s', flags=0x%x) -> fd=%d\n",
            path ? path : "(null)", actual_path ? actual_path : "(null)", flags, ret);
     fflush(stdout);
@@ -1213,15 +1338,16 @@ void shim_syscall(GuestContext *ctx) {
     }
     SHIM_RETURN();
   }
-  case 74: { // SYS_mprotect
+  case 74: { // SYS_mprotect(addr, len, prot): the whole range, as sceKernelMprotect
     uint64_t addr = ctx->rsi;
     size_t len = (size_t)ctx->rdx;
     int prot = (int)ctx->rcx;
-    GuestVMExtent *ext = recomp_vm_find(ctx, addr);
-    if (ext) {
-      ext->prot = prot;
+    if (sceKernelMprotect(ctx, (const void *)addr, len, prot) != 0) {
+      set_guest_errno(ctx, EINVAL);
+      ctx->rax = (uint64_t)-1;
+    } else {
+      ctx->rax = 0;
     }
-    ctx->rax = 0;
     SHIM_RETURN();
   }
   case 432: // SYS_thr_self

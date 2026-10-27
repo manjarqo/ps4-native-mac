@@ -1,9 +1,11 @@
 #include "recomp_runtime.h"
 #include "ps4_sync.h"
+#include "ps4_sync_objects.h"
 #include "ps4_threading.h"
 #include <errno.h>
 #include <mach/mach_time.h>
 #include <stdatomic.h>
+#include <time.h>
 
 // scePthread* report failures as SCE kernel errors (0x80020000 | errno),
 // while the POSIX shims they forward to return plain errno values.
@@ -16,38 +18,39 @@
 
 #define MUTEX_MAP_SIZE 1024
 
-// Guest sync objects are identified by the value stored in the guest handle
-// variable, not by its address: on Orbis a ScePthreadMutex/Cond/Rwlock is a
-// pointer to a kernel object, and games copy handles around (e.g. Scream
-// passes the address of a stack copy to scePthreadMutexUnlock). Init stores
-// a fresh tagged id in the variable; an uninitialized (static initializer)
-// variable is assigned one on first use.
-#define SYNC_HANDLE_TAG 0x5EC0000000000000ULL
-#define SYNC_HANDLE_MASK 0xFFFF000000000000ULL
+// Guest sync objects are identified by the value stored in the guest handle variable, not by
+// its address: games copy handles around (e.g. Scream passes the address of a stack copy to
+// scePthreadMutexUnlock). The value is the guest address of the object (ps4_sync_objects.h).
+// Init stores a fresh object in the variable; an uninitialized (static initializer, 0) variable
+// is given one on first use.
 static pthread_mutex_t g_sync_handle_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t g_sync_next_handle = 1;
 
 static uint64_t sync_handle(GuestContext *ctx, uint64_t addr, int fresh) {
   if (!addr) return 0;
   uint64_t *p = (uint64_t *)(ctx->mem_base + addr);
   uint64_t v = __atomic_load_n(p, __ATOMIC_ACQUIRE);
-  if (!fresh && (v & SYNC_HANDLE_MASK) == SYNC_HANDLE_TAG) return v;
+  if (!fresh && sync_obj_slot(v) >= 0) return v;
   pthread_mutex_lock(&g_sync_handle_lock);
   v = *p;
-  if (fresh || (v & SYNC_HANDLE_MASK) != SYNC_HANDLE_TAG) {
-    v = SYNC_HANDLE_TAG | (g_sync_next_handle++ << 3);
+  if (fresh || sync_obj_slot(v) < 0) {
+    v = sync_obj_alloc(ctx);
+    if (!v) {
+      fprintf(stderr, "FATAL: no guest memory for sync objects (%llu in use at most)\n",
+              (unsigned long long)SYNC_OBJ_SLOTS);
+      abort();
+    }
     __atomic_store_n(p, v, __ATOMIC_RELEASE);
   }
   pthread_mutex_unlock(&g_sync_handle_lock);
   return v;
 }
 
-// Returns the id held by the guest variable (0 if none) and clears it.
+// Returns the object held by the guest variable (0 if none) and clears the variable.
 static uint64_t sync_handle_take(GuestContext *ctx, uint64_t addr) {
   if (!addr) return 0;
   uint64_t *p = (uint64_t *)(ctx->mem_base + addr);
   uint64_t v = __atomic_exchange_n(p, 0, __ATOMIC_ACQ_REL);
-  return ((v & SYNC_HANDLE_MASK) == SYNC_HANDLE_TAG) ? v : 0;
+  return sync_obj_slot(v) >= 0 ? v : 0;
 }
 
 // Guest mutexes track ownership by guest thread id rather than host pthread:
@@ -198,7 +201,11 @@ static uint64_t guest_owner_id(GuestContext *ctx) {
   return (uint64_t)(uintptr_t)pthread_self() | (1ULL << 63);
 }
 
-static inline uint64_t gm_id(uint64_t handle) { return (handle & ~SYNC_HANDLE_MASK) >> 3; }
+// handle comes from sync_handle/sync_handle_take, so it was validated already.
+static inline uint64_t gm_id(uint64_t handle) {
+  const int64_t slot = sync_obj_index(handle);
+  return slot >= 0 ? (uint64_t)slot + 1 : 0;
+}
 
 static GuestMutex *gm_alloc_locked(int type) {
   GuestMutex *m = g_mutex_free;
@@ -241,7 +248,7 @@ static GuestMutex *gm_get_locked(uint64_t handle, int guest_type) {
     }
     return m;
   }
-  uint64_t bucket = (handle >> 3) % MUTEX_MAP_SIZE;
+  uint64_t bucket = sync_obj_hash(handle) % MUTEX_MAP_SIZE;
   for (MutexNode *curr = g_mutex_map[bucket]; curr; curr = curr->next)
     if (curr->guest_addr == handle) return curr->gm;
   MutexNode *node = (MutexNode *)calloc(1, sizeof(MutexNode));
@@ -278,10 +285,43 @@ static GuestMutex *gm_lookup(GuestContext *ctx, uint64_t addr) {
   return m;
 }
 
-// Type 1 (ERRORCHECK) and 3 (NORMAL) reject relocking; the rest are recursive,
-// matching the previous host mapping.
-static int gm_relock(GuestMutex *m) {
-  if (m->type == 1 || m->type == 3) return EDEADLK;
+// Sleeps until the absolute CLOCK_REALTIME time abs.
+static void gm_sleep_until(const struct timespec *abs) {
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+  int64_t ns = (int64_t)(abs->tv_sec - now.tv_sec) * 1000000000 + (abs->tv_nsec - now.tv_nsec);
+  if (ns <= 0) return;
+  struct timespec d = {(time_t)(ns / 1000000000), (long)(ns % 1000000000)};
+  while (nanosleep(&d, &d) != 0 && errno == EINTR) {
+  }
+}
+
+// Relocks by the owner, counted by mutex type (0..4; 5 = any other value). Reported with
+// PS4_MUTEX_STATS, to measure what the type-0 divergence below covers.
+#define RELOCK_TYPES 6
+static _Atomic uint64_t g_relocks[RELOCK_TYPES];
+
+void ps4_sync_relocks_by_type(uint64_t out[6]) {
+  for (int i = 0; i < RELOCK_TYPES; i++) out[i] = atomic_load_explicit(&g_relocks[i], memory_order_relaxed);
+}
+
+// Lock of a mutex the caller already owns, by type (FreeBSD libthr mutex_self_lock):
+// RECURSIVE (2) counts. ERRORCHECK (1) and ADAPTIVE_NP (4) fail with EDEADLK without
+// waiting, so a caller that tracks its own nesting unlocks once. NORMAL (3) would deadlock on
+// Orbis; it fails with EDEADLK here as well. With a timeout, the non-recursive types wait it
+// out and fail with ETIMEDOUT.
+// Type 0 (no type set: a NULL attribute, or an attribute never given a type) stays recursive.
+// This is a known divergence: on Orbis that default is ERRORCHECK (shadPS4 mutex.cpp
+// PthreadMutexattrDefault, used by MutexInit for a NULL attribute and by
+// posix_pthread_mutexattr_init), and the static adaptive initializer gives ADAPTIVE_NP.
+static int gm_relock(GuestMutex *m, const struct timespec *abs) {
+  const unsigned t = (unsigned)m->type < RELOCK_TYPES - 1 ? (unsigned)m->type : RELOCK_TYPES - 1;
+  atomic_fetch_add_explicit(&g_relocks[t], 1, memory_order_relaxed);
+  if (m->type == 1 || m->type == 3 || m->type == 4) {
+    if (!abs) return EDEADLK;
+    gm_sleep_until(abs);
+    return ETIMEDOUT;
+  }
   m->count++;
   return 0;
 }
@@ -301,8 +341,8 @@ static inline void gm_released(GuestMutex *m, uint64_t now) {
 
 // Wait until m is free or owned by me; m->lk held. abs == NULL waits forever.
 // t0 is when the caller started waiting for m.
+// The caller does not own m (gm_lock handles a relock before taking m->lk).
 static int gm_acquire_locked(GuestMutex *m, uint64_t me, const struct timespec *abs, MStat *s, uint64_t t0) {
-  if (GM_OWNER(m) == me) return gm_relock(m);
   uint64_t now = t0;
   if (GM_OWNER(m) != 0) {
     MSTAT_ADD(s, contended, 1);
@@ -407,14 +447,16 @@ static inline void gm_release(GuestMutex *m) {
 // ---- Entry points used by the shims.
 
 static int gm_lock(GuestMutex *m, uint64_t me, const struct timespec *abs, MStat *s, uint64_t t0) {
+  // Only this thread makes m owned by it or not, so the check needs no lock, and a timed
+  // relock waits without holding m->lk.
+  const uint64_t o = GM_OWNER(m);
+  if (o == me) return gm_relock(m, abs);
   if (g_mutex_legacy) {
     gm_lk_lock(m, s);
     int r = gm_acquire_locked(m, me, abs, s, t0);
     pthread_mutex_unlock(&m->lk);
     return r;
   }
-  const uint64_t o = GM_OWNER(m);
-  if (o == me) return gm_relock(m);
   if (__builtin_expect(o == 0, 1) && gm_cas(m, me, memory_order_acquire)) {
     gm_acquired(m, t0);
     return 0;
@@ -437,7 +479,7 @@ static int gm_trylock(GuestMutex *m, uint64_t me, MStat *s, uint64_t t0) {
   if (g_mutex_legacy) gm_lk_lock(m, s);
   const uint64_t o = GM_OWNER(m);
   if (o == me) {
-    r = gm_relock(m);
+    r = gm_relock(m, NULL);
     if (r == EDEADLK) r = EBUSY;
   } else if (o != 0) {
     r = EBUSY;
@@ -487,7 +529,9 @@ void shim_pthread_mutex_init(GuestContext *ctx) {
   if (attr_addr) {
     guest_type = *(int *)(ctx->mem_base + attr_addr);
   }
-  (void)get_host_mutex_with_type(sync_handle(ctx, mtx_addr, 1), guest_type);
+  const uint64_t h = sync_handle(ctx, mtx_addr, 1);
+  (void)get_host_mutex_with_type(h, guest_type);
+  *(uint32_t *)(ctx->mem_base + h + SYNC_OBJ_MUTEX_FLAGS) = (uint32_t)guest_type & 0xff;
   ctx->rax = 0;
   SHIM_RETURN();
 }
@@ -564,7 +608,7 @@ void shim_pthread_mutex_destroy(GuestContext *ctx) {
     MtabEntry *page = atomic_load_explicit(&g_mtab[id >> MTAB_PAGE_BITS], memory_order_relaxed);
     if (page) m = atomic_exchange_explicit(&page[id & ((1u << MTAB_PAGE_BITS) - 1)], NULL, memory_order_relaxed);
   } else {
-    uint64_t bucket = (handle >> 3) % MUTEX_MAP_SIZE;
+    uint64_t bucket = sync_obj_hash(handle) % MUTEX_MAP_SIZE;
     for (MutexNode **curr = &g_mutex_map[bucket]; *curr; curr = &(*curr)->next) {
       if ((*curr)->guest_addr == handle) {
         MutexNode *to_free = *curr;
@@ -580,6 +624,7 @@ void shim_pthread_mutex_destroy(GuestContext *ctx) {
     g_mutex_free = m;
   }
   pthread_mutex_unlock(&g_mutex_map_lock);
+  sync_obj_free(handle);
   ctx->rax = 0;
   SHIM_RETURN();
 }
@@ -653,6 +698,16 @@ void ps4_sync_print_stats(int frames) {
     n += snprintf(line + n, sizeof line - n, "%s%s %.2f ms/%.0f", k ? ", " : "", top[k].name,
                   top[k].wait / tpu / 1000.0 / fr, top[k].cont / fr);
   if (n) fprintf(stderr, "[ps4-mutex] waiting threads (ms/contended per frame): %s\n", line);
+  if (g_mstat_detail) {
+    static uint64_t prev[RELOCK_TYPES];
+    uint64_t cur[RELOCK_TYPES];
+    ps4_sync_relocks_by_type(cur);
+    fprintf(stderr, "[ps4-mutex] relocks by the owner per frame: type 0 (none set) %.1f, 1 ERRORCHECK %.1f, "
+                    "2 RECURSIVE %.1f, 3 NORMAL %.1f, 4 ADAPTIVE_NP %.1f, other %.1f\n",
+            (cur[0] - prev[0]) / fr, (cur[1] - prev[1]) / fr, (cur[2] - prev[2]) / fr, (cur[3] - prev[3]) / fr,
+            (cur[4] - prev[4]) / fr, (cur[5] - prev[5]) / fr);
+    memcpy(prev, cur, sizeof prev);
+  }
 
   // Busiest mutexes by contended wait.
   struct {
@@ -687,6 +742,8 @@ void ps4_sync_print_stats(int frames) {
   if (n) fprintf(stderr, "[ps4-mutex] top mutexes per frame: %s\n", line);
 }
 
+// The attribute starts with type 0, which gm_relock keeps recursive; on Orbis a fresh
+// attribute is ERRORCHECK (a known divergence, see gm_relock).
 void shim_pthread_mutexattr_init(GuestContext *ctx) {
   uint64_t attr_addr = ctx->rdi;
   if (attr_addr) {
@@ -724,7 +781,7 @@ static CondNode *g_cond_map[COND_MAP_SIZE] = {0};
 static pthread_mutex_t g_cond_map_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static CondNode *get_host_cond(uint64_t guest_addr) {
-  uint64_t bucket = (guest_addr >> 3) % COND_MAP_SIZE;
+  uint64_t bucket = sync_obj_hash(guest_addr) % COND_MAP_SIZE;
   pthread_mutex_lock(&g_cond_map_lock);
   CondNode *curr = g_cond_map[bucket];
   while (curr) {
@@ -839,7 +896,7 @@ void shim_pthread_cond_broadcast(GuestContext *ctx) {
 
 void shim_pthread_cond_destroy(GuestContext *ctx) {
   uint64_t cond_addr = sync_handle_take(ctx, ctx->rdi);
-  uint64_t bucket = (cond_addr >> 3) % COND_MAP_SIZE;
+  uint64_t bucket = sync_obj_hash(cond_addr) % COND_MAP_SIZE;
   pthread_mutex_lock(&g_cond_map_lock);
   CondNode **curr = &g_cond_map[bucket];
   while (*curr) {
@@ -853,6 +910,7 @@ void shim_pthread_cond_destroy(GuestContext *ctx) {
     curr = &(*curr)->next;
   }
   pthread_mutex_unlock(&g_cond_map_lock);
+  sync_obj_free(cond_addr);
   ctx->rax = 0;
   SHIM_RETURN();
 }
@@ -869,7 +927,7 @@ static RwlockNode *g_rwlock_map[RWLOCK_MAP_SIZE] = {0};
 static pthread_mutex_t g_rwlock_map_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_rwlock_t *get_host_rwlock(uint64_t guest_addr) {
-  uint64_t bucket = (guest_addr >> 3) % RWLOCK_MAP_SIZE;
+  uint64_t bucket = sync_obj_hash(guest_addr) % RWLOCK_MAP_SIZE;
   pthread_mutex_lock(&g_rwlock_map_lock);
   RwlockNode *curr = g_rwlock_map[bucket];
   while (curr) {
@@ -956,7 +1014,7 @@ void shim_pthread_rwlock_init(GuestContext *ctx) {
 
 void shim_pthread_rwlock_destroy(GuestContext *ctx) {
   uint64_t rw_addr = sync_handle_take(ctx, ctx->rdi);
-  uint64_t bucket = (rw_addr >> 3) % RWLOCK_MAP_SIZE;
+  uint64_t bucket = sync_obj_hash(rw_addr) % RWLOCK_MAP_SIZE;
   pthread_mutex_lock(&g_rwlock_map_lock);
   RwlockNode **curr = &g_rwlock_map[bucket];
   while (*curr) {
@@ -970,6 +1028,7 @@ void shim_pthread_rwlock_destroy(GuestContext *ctx) {
     curr = &(*curr)->next;
   }
   pthread_mutex_unlock(&g_rwlock_map_lock);
+  sync_obj_free(rw_addr);
   ctx->rax = 0;
   SHIM_RETURN();
 }

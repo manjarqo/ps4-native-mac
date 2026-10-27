@@ -4,13 +4,17 @@ tools/
 !/tools/gnm_capture_view.py
 !/tools/gnm_capture_extract.py
 !/tools/refcompare.py
+!/tools/nv12_to_png.py
 !/tools/metal4_replay_cmp.py
 !/tools/metal4_route_report.py
 !/tools/metal4_route.sh
+!/tools/make_engine_kit.sh
 !/tools/metal4_perf_ab.sh
 !/tools/metal4_shot_diff.py
+!/tools/wav_activity.py
 !/tools/tests/
 !/tools/gnm_replay/
+!/tools/gmfixtures/
 !/3rdparty/gcn-recompiler/tools/
 *.DS_Store
 .DS_Store

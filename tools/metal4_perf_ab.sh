@@ -21,7 +21,9 @@
 # (medians of fps, encoder ms and CP ms per side, the B-vs-A line). Exit status: that of
 # --verdict (0: B >= A), 1 when fewer than N pairs were kept. After every run it sleeps PAUSE s
 # (default 60) outside the lock, so that other agents' jobs waiting for a slot get a window.
-# usage: N=5 A=<build>:<3|4> B=<build>:<3|4> TAG=<name> [SECS=300] [PAIR_MARGIN=40] tools/metal4_perf_ab.sh
+# usage: N=5 A=<build>:<3|4> B=<build>:<3|4> TAG=<name> [SECS=300] [PAIR_MARGIN=40] tools/metal4_perf_ab.sh [VAR=value...]
+#        (trailing arguments go to every metal4_route.sh run after its own settings, so
+#        PS4_UPSCALE=metalfx overrides the route's PS4_UPSCALE=0 on both sides)
 #        SUMMARY_ONLY=1 KEPT_A="<tag>..." KEPT_B="<tag>..." TAG=<name> N=<n> tools/metal4_perf_ab.sh
 #        (no runs: the same summary over the logs of runs already made)
 # Tests (tools/tests/test_metal4_perf_ab.py): ROUTE=<program> replaces the heavy_lock'ed
@@ -30,6 +32,7 @@
 set -u
 : "${TAG:?}"
 [ -n "${SUMMARY_ONLY:-}" ] || : "${A:?} ${B:?}"
+EXTRA=("$@")
 N=${N:-5}; SECS=${SECS:-300}; PAUSE=${PAUSE:-60}; PAIR_MARGIN=${PAIR_MARGIN:-40}
 R=$(cd "$(dirname "$0")/.." && pwd)
 W=$HOME/ps4recomp-work
@@ -46,10 +49,10 @@ run_side() { # side build metal index: returns 0 for a kept run; the run line go
   local side=$1 build=$2 metal=$3 i=$4 tag="${TAG}_$1$4"
   if [ -n "${ROUTE:-}" ]; then
     env BUILD="$build" TAG="$tag" METAL="$metal" SECS="$SECS" EVERY="${EVERY:-0}" \
-      CACHE="$W/metal4_research/cache_${TAG}_$side" "$ROUTE" > /dev/null 2>&1
+      CACHE="$W/metal4_research/cache_${TAG}_$side" "$ROUTE" ${EXTRA[@]+"${EXTRA[@]}"} > /dev/null 2>&1
   else
     HEAVY_EXCLUSIVE=1 "$W/tools/heavy_lock.sh" env BUILD="$build" TAG="$tag" METAL="$metal" SECS="$SECS" EVERY="${EVERY:-0}" \
-      OUT="$OUT" CACHE="$W/metal4_research/cache_${TAG}_$side" "$R/tools/metal4_route.sh" > /dev/null 2>&1
+      OUT="$OUT" CACHE="$W/metal4_research/cache_${TAG}_$side" "$R/tools/metal4_route.sh" ${EXTRA[@]+"${EXTRA[@]}"} > /dev/null 2>&1
   fi
   sleep "$PAUSE"
   MED=0

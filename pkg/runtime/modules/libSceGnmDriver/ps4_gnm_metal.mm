@@ -23,6 +23,7 @@
 #include "ps4_gnm_ib.h"
 #include "ps4_gnm_wait_queue.h"
 #include "ps4_gnmdriver.h"
+#include "ps4_videoout.h"
 #include "gcn_recompiler.h"
 
 extern "C" int32_t sceKernelIsNeoMode(void);
@@ -32,6 +33,8 @@ extern "C" int32_t sceKernelIsNeoMode(void);
 #include <string.h>
 #include <unistd.h>
 #include <mutex>
+#include <errno.h>
+#include <pthread.h>
 #include <atomic>
 #include <time.h>
 #include <unordered_map>
@@ -529,8 +532,8 @@ static void DumpShaderAtDraw(GuestContext *ctx, const char *stage, uint32_t pgm_
     if (!dir || !ctx || !ctx->mem_base) return;
     uint64_t addr = ((uint64_t)g_liverpool_regs[pgm_lo_reg] | ((uint64_t)(g_liverpool_regs[pgm_lo_reg + 1] & 0xFF) << 32)) << 8;
     if (addr == 0 || addr >= ctx->mem_size) return;
-    static std::mutex dump_mutex;
-    static std::unordered_map<uint64_t, int> seen;
+    static std::mutex& dump_mutex = *new std::mutex;
+    static std::unordered_map<uint64_t, int>& seen = *new std::unordered_map<uint64_t, int>;
     std::lock_guard<std::mutex> lk(dump_mutex);
     if (seen.count(addr) || seen.size() > 4096) return;
     seen[addr] = 1;
@@ -1204,7 +1207,8 @@ static bool AnyComputeSuspended() {
 // ---- Graphics queue: command buffers run in order; a WAIT_REG_MEM that is not satisfied yet
 // suspends the queue (later submissions wait behind it). The queue continues after compute
 // submissions, on the next graphics submission, or from a watchdog thread, which also gives
-// up after kGfxWaitLimitMs so a wait for something that never comes cannot stall the game.
+// up after kGfxWaitLimitMs (kFlipWaitLimitMs for a flip label) so a wait for something that never
+// comes cannot stall the game.
 struct GfxSubmit {
     GuestContext *ctx = nullptr;
     const uint32_t *dcb = nullptr, *ccb = nullptr;
@@ -1218,8 +1222,38 @@ static struct {
     GfxStream cur;
     uint64_t suspended_at = 0; // ns, 0 = running
     uint64_t suspends = 0, timeouts = 0;
+    bool flip_wait = false; // the wait it is suspended at polls a VideoOut flip label
 } g_gfx;
+// Flip-label waits (sceGnmInsertWaitFlipDone): suspensions, waits given up after kFlipWaitLimitMs,
+// and wake-ups of the wait thread by a released label (ps4_gnm_metal_flip_label_released): label
+// releases seen while a flip-label wait was suspended, not resumptions (one release may find the
+// wait still unsatisfied, and the 1 ms poll may resume a wait before the wake-up is counted).
+// The counters are ps4draw::FlipWaits(); read without the CP lock by ps4_gnm_metal_flip_wait_stats.
+static std::atomic<bool> g_flip_wait_suspended{false};
+// The wait thread (StartGfxWatchdog) sleeps on g_wake_cv for at most 1 ms; a released flip label
+// wakes it at once. Its own lock, never the CP lock: the flip completes on the presenter's or the
+// GPU's completion thread.
+static pthread_mutex_t g_wake_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_wake_cv = PTHREAD_COND_INITIALIZER;
+static bool g_wake_pending = false;
+// The wait thread's end at exit (StopGfxWatchdog): it takes the CP lock and reads the queues'
+// state, all static objects that exit() destroys; locking the destroyed recursive_mutex threw
+// ("recursive_mutex lock failed", an abort after the process's last line). Under g_wake_mu.
+static bool g_watchdog_exit = false, g_watchdog_stopped = false;
+static pthread_cond_t g_watchdog_stopped_cv = PTHREAD_COND_INITIALIZER;
 static constexpr uint64_t kGfxWaitLimitMs = 50;
+// A wait for a VideoOut flip label (sceGnmInsertWaitFlipDone) lasts until the display takes the
+// next frame, as on the PS4: every flip completes within the held-frame timeout of the Metal
+// screen (1 s) or when the GPU watchdog gives the renderer up. Only a wait that outlasts both (no
+// queued flip can release the label) is given up.
+static constexpr uint64_t kFlipWaitLimitMs = 2000;
+
+// The guest address a WAIT_REG_MEM packet (header at words[0]) polls in memory; 0 for a register.
+static uint64_t WaitPollAddress(const uint32_t *words) {
+    const uint32_t *p = words + 1;
+    if (((p[0] >> 4) & 1u) == 0) return 0;
+    return ((uint64_t)p[1] & ~3ULL) | ((uint64_t)(p[2] & 0xFFFFu) << 32);
+}
 
 static void StartGfxWatchdog();
 
@@ -1251,11 +1285,21 @@ static void RunGfxQueue(bool force) {
             f.pc += ((f.words[f.pc] >> 16) & 0x3FFF) + 2;
             g_gfx.timeouts++;
             force = false;
+            // the next wait the stream reaches is a new suspension with its own kind and limit
+            g_gfx.suspended_at = 0;
+            g_gfx.flip_wait = false;
+            g_flip_wait_suspended.store(false, std::memory_order_relaxed);
         }
         if (!ProcessGfxPackets(ctx, g_gfx.cur)) {
             if (!g_gfx.suspended_at) {
                 g_gfx.suspended_at = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
                 g_gfx.suspends++;
+                const GfxStream::Frame &wf = g_gfx.cur.frames.back();
+                g_gfx.flip_wait = ps4_videoout_is_flip_label(WaitPollAddress(&wf.words[wf.pc]));
+                // Stored for every new suspension: a resume after a release does not clear it.
+                g_flip_wait_suspended.store(g_gfx.flip_wait, std::memory_order_release);
+                if (g_gfx.flip_wait)
+                    ps4draw::FlipWaits().suspends.fetch_add(1, std::memory_order_relaxed);
                 if ((g_gfx.suspends & (g_gfx.suspends - 1)) == 0)
                     fprintf(stderr, "[ps4-gnm] graphics queue waits for another queue: %llu times, %llu timed out\n",
                             (unsigned long long)g_gfx.suspends, (unsigned long long)g_gfx.timeouts);
@@ -1266,6 +1310,8 @@ static void RunGfxQueue(bool force) {
             return;
         }
         g_gfx.suspended_at = 0;
+        g_gfx.flip_wait = false;
+        g_flip_wait_suspended.store(false, std::memory_order_relaxed);
         if (!g_gfx.cur.ce.Done()) RunCe(ctx, g_gfx.cur.ce, true);
         g_gfx.active = false;
     }
@@ -1279,8 +1325,20 @@ static void ResumeGfxQueue() {
     const GfxStream::Frame &f = g_gfx.cur.frames.back();
     const uint32_t payload_dw = ((f.words[f.pc] >> 16) & 0x3FFF) + 1;
     const bool ready = WaitRegMemReady(g_gfx.cur_sub.ctx, &f.words[f.pc + 1], payload_dw);
-    const bool timed_out = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_gfx.suspended_at > kGfxWaitLimitMs * 1000000ull;
+    const uint64_t limit_ms = g_gfx.flip_wait ? kFlipWaitLimitMs : kGfxWaitLimitMs;
+    const uint64_t waited_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_gfx.suspended_at;
+    const bool timed_out = waited_ns > limit_ms * 1000000ull;
     if (!ready && !timed_out) return;
+    if (!ready && g_gfx.flip_wait) {
+        // no queued flip released the label: the guest waits for a buffer that stays on screen
+        const uint64_t n = ps4draw::FlipWaits().timeouts.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0) {
+            int32_t handle = -1, index = -1, prev = -1;
+            ps4_videoout_flip_label_info(WaitPollAddress(&f.words[f.pc]), &handle, &index, &prev);
+            fprintf(stderr, "[ps4-gnm] flip-label wait given up after %.0f ms: handle %d, buffer %d, last flipped buffer %d "
+                            "(%llu so far)\n", waited_ns / 1e6, handle, index, prev, (unsigned long long)n);
+        }
+    }
     if (ready) g_gfx.suspended_at = 0;
     RunGfxQueue(!ready);
     g_queue_progress++;
@@ -1302,13 +1360,44 @@ static void PumpQueues() {
     if (g_queue_progress != start && ps4draw::HasPendingWork()) ps4draw::Flush(false);
 }
 
+// Exit handler (registered by StartGfxWatchdog, after the static objects the thread uses were
+// constructed, so it runs before they are destroyed): the thread ends at its next turn, and exit
+// waits until it has. Its turn takes the CP lock: a thread that holds it forever (a crashed
+// process) bounds the wait at 2 s, after which exit goes on.
+static void StopGfxWatchdog() {
+    pthread_mutex_lock(&g_wake_mu);
+    g_watchdog_exit = true;
+    g_wake_pending = true;
+    pthread_cond_broadcast(&g_wake_cv);
+    const struct timespec s2 = {2, 0};
+    while (!g_watchdog_stopped)
+        if (pthread_cond_timedwait_relative_np(&g_watchdog_stopped_cv, &g_wake_mu, &s2) == ETIMEDOUT) {
+            fprintf(stderr, "[ps4-gnm] exit: the queue wait thread did not end within 2 s\n");
+            break;
+        }
+    pthread_mutex_unlock(&g_wake_mu);
+}
+
 static void StartGfxWatchdog() {
     static bool started = false;
     if (started) return;
     started = true;
+    atexit(StopGfxWatchdog);
     std::thread([] {
         for (;;) {
-            usleep(1000);
+            pthread_mutex_lock(&g_wake_mu);
+            if (!g_wake_pending) {
+                const struct timespec ms1 = {0, 1000000};
+                pthread_cond_timedwait_relative_np(&g_wake_cv, &g_wake_mu, &ms1);
+            }
+            g_wake_pending = false;
+            if (g_watchdog_exit) {
+                g_watchdog_stopped = true;
+                pthread_cond_broadcast(&g_watchdog_stopped_cv);
+                pthread_mutex_unlock(&g_wake_mu);
+                return;
+            }
+            pthread_mutex_unlock(&g_wake_mu);
             std::scoped_lock lock(g_state.mutex);
             if ((g_gfx.active && g_gfx.suspended_at) || AnyComputeSuspended()) {
                 @autoreleasepool {
@@ -1321,6 +1410,20 @@ static void StartGfxWatchdog() {
 }
 
 } // namespace
+
+extern "C" void ps4_gnm_metal_flip_label_released(void) {
+    if (g_flip_wait_suspended.load(std::memory_order_acquire)) ps4draw::FlipWaits().wakes.fetch_add(1, std::memory_order_relaxed);
+    pthread_mutex_lock(&g_wake_mu);
+    g_wake_pending = true;
+    pthread_cond_signal(&g_wake_cv);
+    pthread_mutex_unlock(&g_wake_mu);
+}
+
+extern "C" void ps4_gnm_metal_flip_wait_stats(uint64_t *suspends, uint64_t *timeouts, uint64_t *wakes) {
+    if (suspends) *suspends = ps4draw::FlipWaits().suspends.load(std::memory_order_relaxed);
+    if (timeouts) *timeouts = ps4draw::FlipWaits().timeouts.load(std::memory_order_relaxed);
+    if (wakes) *wakes = ps4draw::FlipWaits().wakes.load(std::memory_order_relaxed);
+}
 
 // PS4_TEST_HOOKS=1 enables the host tests' hooks (ps4_gnm_metal_debug_stall_gpu). Read once, at init.
 static std::atomic<bool> g_test_hooks{false};
@@ -1425,7 +1528,8 @@ int32_t ps4_gnm_metal_process_command_buffers(GuestContext *ctx, uint32_t count,
 }
 
 int ps4_gnm_metal_present(GuestContext *ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
-                          uint32_t tiling_mode, uint32_t pixel_format, void (*on_done)(void *), void *arg) {
+                          uint32_t tiling_mode, uint32_t pixel_format, void (*on_reached)(void *),
+                          void (*on_done)(void *), void *arg) {
     std::scoped_lock lock(g_state.mutex);
     std::function<void()> fn;
     if (on_done) fn = [on_done, arg]() { on_done(arg); };
@@ -1434,6 +1538,7 @@ int ps4_gnm_metal_present(GuestContext *ctx, uint64_t addr, uint32_t width, uint
         GfxSubmit sub;
         sub.ctx = ctx;
         sub.present = [=]() {
+            if (on_reached) on_reached(arg);
             std::function<void()> done = fn;
             if (!ps4draw::Present(ctx, addr, width, height, pitch, tiling_mode, pixel_format, std::move(done)) && fn)
                 fn(); // no GPU target any more: complete the flip without a new picture
@@ -1441,6 +1546,7 @@ int ps4_gnm_metal_present(GuestContext *ctx, uint64_t addr, uint32_t width, uint
         g_gfx.pending.push_back(std::move(sub));
         return 1;
     }
+    if (on_reached) on_reached(arg); // the command processor is at the flip now
     return ps4draw::Present(ctx, addr, width, height, pitch, tiling_mode, pixel_format, std::move(fn)) ? 1 : 0;
 }
 
@@ -1451,6 +1557,15 @@ int ps4_gnm_metal_debug_stall_gpu(void) {
     }
     std::scoped_lock lock(g_state.mutex);
     ps4draw::DebugStallGpu();
+    return 0;
+}
+
+int ps4_gnm_metal_debug_release_gpu(void) {
+    if (!g_test_hooks.load(std::memory_order_relaxed)) {
+        fprintf(stderr, "[gnm-metal] debug GPU release refused: the process did not start with PS4_TEST_HOOKS=1\n");
+        return -1;
+    }
+    ps4draw::DebugReleaseGpu();
     return 0;
 }
 

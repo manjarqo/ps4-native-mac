@@ -1,5 +1,6 @@
 #include "ps4_direct_mem.h"
 #include "ps4_hitch.h"
+#include "ps4_kernel_sys.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,20 +153,106 @@ static bool dm_lookup(uint64_t addr, uint64_t *start, uint64_t *end, uint64_t *p
     return ok;
 }
 static int g_direct_inited = 0;
+static size_t g_direct_size;       // set by ps4_direct_mem_configure
+static bool g_direct_configured;  // ps4_direct_mem_configure ran
 
-static size_t get_total_direct_mem_size(void) {
-    const char *env = getenv("PS4_DIRECT_MEM_SIZE");
-    if (env && *env) {
-        char *end = NULL;
-        unsigned long long val = strtoull(env, &end, 0);
-        if (end && *end) {
-            if (*end == 'g' || *end == 'G') val *= 1024ULL * 1024 * 1024;
-            else if (*end == 'm' || *end == 'M') val *= 1024ULL * 1024;
-            else if (*end == 'k' || *end == 'K') val *= 1024ULL;
-        }
-        if (val > 0) return (size_t)val;
+// Flexible memory of a process: its flexible_memory_size plus the base, or the default.
+static uint64_t flexible_mem_size(int has_flex, uint64_t flex) {
+    return has_flex ? flex + (PS4_MEM_FLEXIBLE_BASE_MIB << 20) : (PS4_MEM_FLEXIBLE_DEFAULT_MIB << 20);
+}
+
+uint64_t ps4_direct_mem_size_rule(uint32_t sdk, int neo, int has_flex, uint64_t flex, int ext1, int ext2) {
+    const uint64_t mib = 1ULL << 20;
+    uint64_t total = (neo ? PS4_MEM_TOTAL_NEO_MIB : PS4_MEM_TOTAL_MIB) * mib;
+    const uint64_t flexible = flexible_mem_size(has_flex, flex);
+    if (sdk >= PS4_MEM_SDK_EXTENDED_ALWAYS) {
+        ext1 = 1;
+        ext2 = 1;
     }
-    return PS4_DIRECT_MEM_TOTAL_SIZE;
+    if (neo && !ext1) total -= PS4_MEM_NO_EXTENDED_1_NEO_MIB * mib;
+    if (!neo && !ext2) total -= PS4_MEM_NO_EXTENDED_2_BASE_MIB * mib;
+    return flexible < total ? total - flexible : 0;
+}
+
+// PS4_DIRECT_MEM_SIZE=<n>[k|m|g]: an explicit size in place of the process's (not console behaviour).
+static size_t direct_mem_size_override(void) {
+    const char *env = getenv("PS4_DIRECT_MEM_SIZE");
+    if (!env || !*env) return 0;
+    char *end = NULL;
+    unsigned long long val = strtoull(env, &end, 0);
+    if (end && *end) {
+        if (*end == 'g' || *end == 'G') val *= 1024ULL * 1024 * 1024;
+        else if (*end == 'm' || *end == 'M') val *= 1024ULL * 1024;
+        else if (*end == 'k' || *end == 'K') val *= 1024ULL;
+    }
+    return (size_t)val;
+}
+
+// The size before ps4_direct_mem_configure ran is the one of a process without parameters.
+static size_t get_total_direct_mem_size(void) {
+    if (g_direct_configured) return g_direct_size;
+    size_t over = direct_mem_size_override();
+    if (over) return over;
+    return (size_t)ps4_direct_mem_size_rule(0, sceKernelIsNeoMode() != 0, 0, 0, 0, 0);
+}
+
+// Reads `n` bytes of guest memory at `addr` into `out`; false when the range is outside it.
+static bool guest_read(const GuestContext *proc, uint64_t addr, void *out, size_t n) {
+    if (!proc || !proc->mem_base || addr == 0 || addr > proc->mem_size || n > proc->mem_size - addr) return false;
+    memcpy(out, proc->mem_base + addr, n);
+    return true;
+}
+
+void ps4_direct_mem_configure(GuestContext *ctx, uint64_t proc_param_addr) {
+    const GuestContext *proc = ctx ? (ctx->process_ctx ? ctx->process_ctx : ctx) : NULL;
+    uint64_t pp_size = 0, sdk = 0, mp_addr = 0, mp_size = 0, flex_ptr = 0, flex = 0, ext1_ptr = 0, ext2_ptr = 0;
+    uint8_t ext1 = 0, ext2 = 0;
+    int has_flex = 0;
+    if (guest_read(proc, proc_param_addr, &pp_size, 8)) {
+        if (pp_size >= 0x18) guest_read(proc, proc_param_addr + 0x10, &sdk, 8);
+        if (pp_size >= 0x48) guest_read(proc, proc_param_addr + 0x40, &mp_addr, 8);
+    }
+    if (guest_read(proc, mp_addr, &mp_size, 8)) {
+        if (mp_size >= 0x18 && guest_read(proc, mp_addr + 0x10, &flex_ptr, 8))
+            has_flex = guest_read(proc, flex_ptr, &flex, 8);
+        if (mp_size >= 0x20 && guest_read(proc, mp_addr + 0x18, &ext1_ptr, 8)) guest_read(proc, ext1_ptr, &ext1, 1);
+        if (mp_size >= 0x30 && guest_read(proc, mp_addr + 0x28, &ext2_ptr, 8)) guest_read(proc, ext2_ptr, &ext2, 1);
+    }
+    const int neo = sceKernelIsNeoMode() != 0;
+    const int sdk_ext = (uint32_t)sdk >= PS4_MEM_SDK_EXTENDED_ALWAYS;
+    const int use_ext1 = sdk_ext || ext1 != 0, use_ext2 = sdk_ext || ext2 != 0;
+    const uint64_t size = ps4_direct_mem_size_rule((uint32_t)sdk, neo, has_flex, flex, ext1 != 0, ext2 != 0);
+    const uint64_t flexible = flexible_mem_size(has_flex, flex);
+    printf("[ps4-mem] direct memory %llu MiB (sdk 0x%llx, flexible %llu MiB, ext1 %d, ext2 %d)\n",
+           (unsigned long long)(size >> 20), (unsigned long long)sdk, (unsigned long long)(flexible >> 20), use_ext1,
+           use_ext2);
+    size_t total = (size_t)size;
+    const size_t over = direct_mem_size_override();
+    if (over) {
+        printf("[ps4-mem] PS4_DIRECT_MEM_SIZE: direct memory %zu MiB instead (not console behaviour)\n", over >> 20);
+        total = over;
+    }
+    fflush(stdout);
+
+    pthread_mutex_lock(&g_direct_mutex);
+    const size_t old_total = get_total_direct_mem_size();
+    if (g_direct_inited && total != old_total) {
+        // Direct memory already exists: resize its free end, as the kernel does when it sets up
+        // the process's regions. When the end is in use, the size stays what the blocks cover.
+        DirectMemBlock *last = g_direct_blocks;
+        while (last && last->next) last = last->next;
+        if (last && last->is_free && (size_t)last->phys_offset + last->size == old_total &&
+            (total > old_total || last->size >= old_total - total)) {
+            last->size = total - (size_t)last->phys_offset;
+        } else {
+            fprintf(stderr, "[ps4-mem] ERROR: cannot resize direct memory from %zu to %zu MiB: its end is in use\n",
+                    old_total >> 20, total >> 20);
+            total = old_total;
+        }
+    }
+    g_direct_size = total;
+    g_direct_configured = true;
+    pthread_mutex_unlock(&g_direct_mutex);
 }
 
 int ps4_direct_mem_init(void) {
@@ -221,81 +308,54 @@ size_t sceKernelAvailableDirectMemorySize(void) {
     return free_total;
 }
 
+// Direct memory covers [0, sceKernelGetDirectMemorySize()) and never grows. An allocation is the
+// lowest aligned range of `length` bytes in a free block within [searchStart, searchEnd), as in
+// shadPS4's MemoryManager::Allocate. Errors as shadPS4's sceKernelAllocateDirectMemory: EINVAL for
+// a negative bound, EAGAIN for a range smaller than the length or when nothing fits.
 int sceKernelAllocateDirectMemory(off_t searchStart, off_t searchEnd, size_t length, size_t alignment, int type, off_t *physAddrOut) {
     (void)type;
     printf("[ps4-mem] sceKernelAllocateDirectMemory: start=0x%llx end=0x%llx len=%zu (%.2f MB) align=%zu type=%d\n",
            (unsigned long long)searchStart, (unsigned long long)searchEnd, length, (double)length / (1024.0 * 1024.0), alignment, type);
     fflush(stdout);
 
-    if (!physAddrOut || length == 0) return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+    if (!physAddrOut || length == 0 || searchStart < 0 || searchEnd < 0) return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
     if (alignment == 0) alignment = 4096;
-    size_t aligned_len = (length + alignment - 1) & ~(alignment - 1);
+    const size_t aligned_len = (length + alignment - 1) & ~(alignment - 1);
+    if (searchEnd <= searchStart || (size_t)(searchEnd - searchStart) < aligned_len)
+        return 0x80020023; // ORBIS_KERNEL_ERROR_EAGAIN
 
     ps4_direct_mem_init();
 
     pthread_mutex_lock(&g_direct_mutex);
-    DirectMemBlock *curr = g_direct_blocks;
     DirectMemBlock *best = NULL;
-
-    while (curr) {
-        if (curr->is_free) {
-            off_t aligned_start = (curr->phys_offset + alignment - 1) & ~(alignment - 1);
-            off_t offset_padding = aligned_start - curr->phys_offset;
-            if (curr->size >= aligned_len + offset_padding) {
-                if (searchEnd > 0 && aligned_start + aligned_len > (size_t)searchEnd) {
-                    curr = curr->next;
-                    continue;
-                }
-                if (aligned_start >= searchStart) {
-                    best = curr;
-                    break;
-                }
-            }
-        }
-        curr = curr->next;
+    size_t alloc_start = 0;
+    for (DirectMemBlock *curr = g_direct_blocks; curr; curr = curr->next) {
+        if (!curr->is_free) continue;
+        const size_t block_start = (size_t)curr->phys_offset, block_end = block_start + curr->size;
+        const size_t from = block_start > (size_t)searchStart ? block_start : (size_t)searchStart;
+        const size_t start = (from + alignment - 1) & ~(alignment - 1);
+        if (start < from || start + aligned_len > block_end) continue;
+        if (start + aligned_len > (size_t)searchEnd) break; // blocks are in address order
+        best = curr;
+        alloc_start = start;
+        break;
     }
 
-    // If no existing free block is large enough and searchEnd is not constrained, dynamically expand direct memory
-    if (!best && searchEnd <= 0) {
-        DirectMemBlock *last = g_direct_blocks;
-        while (last && last->next) last = last->next;
-        if (last) {
-            size_t expand_sz = aligned_len + 1024ULL * 1024 * 1024; // Requested size + 1GB headroom
-            if (last->is_free) {
-                last->size += expand_sz;
-                best = last;
-            } else {
-                DirectMemBlock *expand = (DirectMemBlock *)calloc(1, sizeof(DirectMemBlock));
-                if (expand) {
-                    expand->phys_offset = last->phys_offset + last->size;
-                    expand->size = expand_sz;
-                    expand->is_free = 1;
-                    expand->prev = last;
-                    last->next = expand;
-                    best = expand;
-                }
-            }
-            if (best) {
-                printf("[ps4-mem] Dynamically expanded direct memory pool by %.2f MB (total headroom)\n",
-                       (double)expand_sz / (1024.0 * 1024.0));
-                fflush(stdout);
-            }
-        }
-    }
-
-    if (!best) {
-        fprintf(stderr, "[ps4-mem] ERROR: sceKernelAllocateDirectMemory FAILED! len=%zu (%.2f MB)\n",
-                length, (double)length / (1024.0 * 1024.0));
+    // Bookkeeping for the split: a leading free block and a trailing one, made before any change.
+    const size_t front_pad = best ? alloc_start - (size_t)best->phys_offset : 0;
+    DirectMemBlock *pad_block = best && front_pad ? (DirectMemBlock *)calloc(1, sizeof(DirectMemBlock)) : NULL;
+    DirectMemBlock *tail = best && best->size - front_pad > aligned_len ? (DirectMemBlock *)calloc(1, sizeof(DirectMemBlock)) : NULL;
+    if (!best || (front_pad && !pad_block) || (best->size - front_pad > aligned_len && !tail)) {
         pthread_mutex_unlock(&g_direct_mutex);
-        return 0x8002000c; // ORBIS_KERNEL_ERROR_ENOMEM
+        free(pad_block);
+        free(tail);
+        fprintf(stderr, "[ps4-mem] sceKernelAllocateDirectMemory: no free %zu MiB in [0x%llx, 0x%llx) of %zu MiB\n",
+                aligned_len >> 20, (unsigned long long)searchStart, (unsigned long long)searchEnd,
+                get_total_direct_mem_size() >> 20);
+        return 0x80020023; // ORBIS_KERNEL_ERROR_EAGAIN
     }
 
-    off_t alloc_start = (best->phys_offset + alignment - 1) & ~(alignment - 1);
-    size_t front_pad = alloc_start - best->phys_offset;
-
-    // Split leading padding if necessary
-    if (front_pad > 0) {
-        DirectMemBlock *pad_block = (DirectMemBlock *)calloc(1, sizeof(DirectMemBlock));
+    if (pad_block) {
         pad_block->phys_offset = best->phys_offset;
         pad_block->size = front_pad;
         pad_block->is_free = 1;
@@ -304,14 +364,11 @@ int sceKernelAllocateDirectMemory(off_t searchStart, off_t searchEnd, size_t len
         if (best->prev) best->prev->next = pad_block;
         else g_direct_blocks = pad_block;
         best->prev = pad_block;
-        best->phys_offset = alloc_start;
+        best->phys_offset = (off_t)alloc_start;
         best->size -= front_pad;
     }
-
-    // Split trailing remainder
-    if (best->size > aligned_len) {
-        DirectMemBlock *tail = (DirectMemBlock *)calloc(1, sizeof(DirectMemBlock));
-        tail->phys_offset = best->phys_offset + aligned_len;
+    if (tail) {
+        tail->phys_offset = best->phys_offset + (off_t)aligned_len;
         tail->size = best->size - aligned_len;
         tail->is_free = 1;
         tail->prev = best;
@@ -600,7 +657,8 @@ int sceKernelAllocateMainDirectMemory(size_t length, size_t alignment, int type,
     printf("[ps4-mem] sceKernelAllocateMainDirectMemory: len=%zu (%.2f MB) align=%zu type=%d\n",
            length, (double)length / (1024.0 * 1024.0), alignment, type);
     fflush(stdout);
-    return sceKernelAllocateDirectMemory(0, -1, length, alignment, type, physAddrOut);
+    // shadPS4 (and the SDK's description): the whole direct memory is the search range.
+    return sceKernelAllocateDirectMemory(0, (off_t)sceKernelGetDirectMemorySize(), length, alignment, type, physAddrOut);
 }
 
 // Memory Pool implementation
@@ -643,9 +701,11 @@ int sceKernelMemoryPoolExpand(GuestContext *ctx, off_t searchStart, off_t search
     printf("[ps4-mem] sceKernelMemoryPoolExpand: start=0x%llx end=0x%llx len=%zu (%.2f MB) align=%zu\n",
            (unsigned long long)searchStart, (unsigned long long)searchEnd, len, (double)len / (1024.0 * 1024.0), alignment);
     fflush(stdout);
-    if (len == 0 || !physAddrOut) return 0x80020016;
+    // Errors as shadPS4's sceKernelMemoryPoolExpand: EINVAL for a bad range, ENOMEM when nothing fits.
+    if (len == 0 || !physAddrOut || searchStart < 0 || searchEnd <= searchStart) return 0x80020016;
     if (alignment == 0) alignment = 64ULL * 1024; // 64KB default alignment
-    return sceKernelAllocateDirectMemory(searchStart, searchEnd, len, alignment, 3 /* POOLED */, physAddrOut);
+    const int rc = sceKernelAllocateDirectMemory(searchStart, searchEnd, len, alignment, 3 /* POOLED */, physAddrOut);
+    return rc == (int)0x80020023 ? (int)0x8002000c : rc; // EAGAIN -> ORBIS_KERNEL_ERROR_ENOMEM
 }
 
 int sceKernelMemoryPoolCommit(GuestContext *ctx, void *addr, size_t len, int type, int prot, int flags) {

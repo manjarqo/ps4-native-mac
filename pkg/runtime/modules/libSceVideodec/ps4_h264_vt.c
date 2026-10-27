@@ -294,6 +294,40 @@ static size_t next_start(const uint8_t *p, size_t i, size_t size) {
     return size;
 }
 
+// first_mb_in_slice, the first field of a slice header (7.3.3); -1 if the NAL is cut short.
+// A ue(v) takes at most 63 bits (8 RBSP bytes); with emulation-prevention bytes (at most one in
+// every three) that is at most 12 bytes of the NAL.
+static int32_t slice_first_mb(const uint8_t *nal, size_t n) {
+    uint8_t rbsp[12];
+    const size_t len = nal_to_rbsp(nal + 1, n - 1 < sizeof(rbsp) ? n - 1 : sizeof(rbsp), rbsp);
+    BitReader b = {rbsp, len * 8, 0, false};
+    const uint32_t v = br_ue(&b);
+    return b.overrun || v > INT32_MAX ? -1 : (int32_t)v;
+}
+
+void h264_au_census(const uint8_t *au, size_t size, H264AuCensus *out) {
+    memset(out, 0, sizeof(*out));
+    out->first_mb_first_slice = -1;
+    if (!au) return;
+    size_t sc = next_start(au, 0, size);
+    while (sc < size) {
+        const size_t s = sc + 3;
+        const size_t nsc = next_start(au, s, size);
+        size_t e = nsc;
+        while (e > s && au[e - 1] == 0) e--; // zero bytes before the next start code
+        sc = nsc;
+        if (e == s) continue;
+        const uint8_t type = au[s] & 0x1f;
+        if (out->nal_count < sizeof(out->nal_types)) out->nal_types[out->nal_count] = type;
+        out->nal_count++;
+        if (type == 5) out->has_idr = true;
+        if (type == 7) out->has_sps = true;
+        if (type >= 1 && type <= 5) {
+            if (out->slices++ == 0) out->first_mb_first_slice = e - s > 1 ? slice_first_mb(au + s, e - s) : -1;
+        }
+    }
+}
+
 #if defined(__APPLE__)
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>

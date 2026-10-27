@@ -293,6 +293,27 @@ int ps4_vfs_resolve(const char *guest_path, char *host_path, size_t host_path_sz
     return 0;
 }
 
+static int path_has_prefix(const char *path, const char *prefix) {
+    size_t n = strlen(prefix);
+    return strncmp(path, prefix, n) == 0 && (path[n] == '/' || path[n] == '\0');
+}
+
+int ps4_vfs_is_read_only(const char *guest_path) {
+    if (!guest_path) {
+        return 0;
+    }
+    pthread_mutex_lock(&g_vfs_mutex);
+    // A registered mount takes precedence over the default /app0 mapping (ps4_vfs_resolve).
+    for (int i = 0; i < g_mount_count; i++) {
+        if (g_mounts[i].active && path_has_prefix(guest_path, g_mounts[i].guest_prefix)) {
+            pthread_mutex_unlock(&g_vfs_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_vfs_mutex);
+    return path_has_prefix(guest_path, "/app0");
+}
+
 void ps4_vfs_destroy(void) {
     pthread_mutex_lock(&g_vfs_mutex);
     if (g_app_root) {

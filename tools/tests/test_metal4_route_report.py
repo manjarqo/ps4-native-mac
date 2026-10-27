@@ -12,7 +12,10 @@ LOG = """[gnm-draw] perf: 10.0 fps over last 300 presents; per frame: 9.0 commit
 [gnm-draw] backend metal4: split commits per frame 0.5; allocators 6 (384 KiB); resident 120 (900 MiB)
 [gnm-draw] perf: 50.0 fps over last 300 presents; per frame: 4.0 commits, 0.0 waits, 0.0 ms waiting, 9.0 ms GPU busy, 7.0 ms CP (CPU), 6.0 ms encoder, 0.3 ms screen
 [gnm-draw] backend metal4: split commits per frame 1.5; allocators 6 (384 KiB); resident 121 (901 MiB)
-[gnm-draw] present #601 from GPU target 0x1000 (1920x1080 fmt 80); totals: draws 100 dispatches 7 skipped 3 shaders 5 pipelines 6 submit 9
+[gnm-draw] present #301 from GPU target 0x1000 (1920x1080 fmt 80); totals: draws 50 dispatches 3 skipped 1 (pending compile 1) shaders 5 pipelines 6 submit 4
+[gnm-draw] skipped by reason: pending-compile 1
+[gnm-draw] present #601 from GPU target 0x1000 (1920x1080 fmt 80); totals: draws 100 dispatches 7 skipped 3 (pending compile 2) shaders 5 pipelines 6 submit 9
+[gnm-draw] skipped by reason: pending-compile 2, vertex-align 1
 [gnm-draw] GPU watchdog: command buffer gnm-5 did not complete in 4000 ms; disabling GPU rendering (fences keep being signaled)
 [gnm-residency] ASSERT buffer 0x1234 bound for VS slot 3 is in no residency set
 FATAL something
@@ -65,8 +68,33 @@ class RouteReportTest(unittest.TestCase):
         self.write("r.mon", MON)
         rc, out, err = run(log, "--skip", "1")
         self.assertEqual(rc, 0, err)
-        self.assertEqual(out, "fps 55.0 enc_ms 5.0 cp_ms 6.0 commits 3.5 split 1.0 skipped 3 fatal 1 gpu_err 0 "
-                              "watchdog 1 flips 601 load 12.5 asserts 1")
+        self.assertEqual(out, "fps 55.0 enc_ms 5.0 cp_ms 6.0 commits 3.5 split 1.0 skipped 3 pending 2 fatal 1 gpu_err 0 "
+                              "watchdog 1 flips 601 load 12.5 asserts 1 reasons pending-compile:2,vertex-align:1")
+
+    def test_reasons_top_three_of_the_last_line(self):
+        # the last "skipped by reason" line, its three largest counts (ties in the line's order)
+        log = self.write("r.log", perf(30, 2, 3) +
+                         "[gnm-draw] skipped by reason: vertex-align 9\n"
+                         "[gnm-draw] skipped by reason: pending-compile 137, empty-scissor 11099, cs-pipeline 2145, "
+                         "arena 2145, gm-status 3\n")
+        rc, out, _ = run(log, "--skip", "0")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.endswith(" reasons empty-scissor:11099,cs-pipeline:2145,arena:2145"), out)
+
+    def test_reasons_none_and_absent(self):
+        rc, out, _ = run(self.write("n.log", perf(30, 2, 3) + "[gnm-draw] skipped by reason: none\n"), "--skip", "0")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.endswith(" reasons none"), out)
+        # logs that predate the line
+        rc, out, _ = run(self.write("o.log", perf(30, 2, 3)), "--skip", "0")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.endswith(" reasons -"), out)
+
+    def test_pending_absent_in_old_logs_is_zero(self):
+        old = LOG.replace(" (pending compile 2)", "")
+        rc, out, err = run(self.write("o.log", old), "--skip", "1")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("skipped 3 pending 0 fatal 1", out)
 
     def test_report_without_mon_and_with_gpu_error(self):
         log = self.write("r.log", perf(30, 2, 3) + "[gnm-draw] GPU hang report: x\n")

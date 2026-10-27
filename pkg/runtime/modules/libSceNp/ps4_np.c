@@ -428,6 +428,114 @@ void shim_sceNpCheckCallback(GuestContext *ctx) {
     SHIM_RETURN();
 }
 
+// sceNpSetNpTitleId: the title id (12 characters, 16 bytes with padding) and its 128-byte
+// secret identify the title to later Np requests.
+static char g_np_title_id[13];
+static uint8_t g_np_title_secret[128];
+static int g_np_title_set;
+
+int ps4_np_title_id(char out[13]) {
+  if (!g_np_title_set) return 0;
+  memcpy(out, g_np_title_id, sizeof g_np_title_id);
+  return 1;
+}
+
+void shim_sceNpSetNpTitleId(GuestContext *ctx) {
+  if (!ctx->rdi || !ctx->rsi) {
+    ctx->rax = (uint64_t)(int64_t)ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    SHIM_RETURN();
+  }
+  memcpy(g_np_title_id, ctx->mem_base + ctx->rdi, 12);
+  g_np_title_id[12] = 0;
+  memcpy(g_np_title_secret, ctx->mem_base + ctx->rsi, sizeof g_np_title_secret);
+  g_np_title_set = 1;
+  ctx->rax = 0;
+  SHIM_RETURN();
+}
+
+// sceNpRegisterGamePresenceCallbackA: registered with a fresh id. While signed out there is no
+// game presence, so the callback is never called.
+static int32_t g_np_presence_next = 1;
+
+void shim_sceNpRegisterGamePresenceCallbackA(GuestContext *ctx) {
+  if (!ctx->rdi) {
+    ctx->rax = (uint64_t)(int64_t)ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    SHIM_RETURN();
+  }
+  ctx->rax = (uint64_t)(int64_t)__atomic_fetch_add(&g_np_presence_next, 1, __ATOMIC_RELAXED);
+  SHIM_RETURN();
+}
+
+// sceNpSetContentRestriction: validates the struct and keeps it for the availability checks
+// (sceNpCheckNpAvailability returns SIGNED_OUT before any age check while no user is signed in).
+#define NP_MAX_AGE_RESTRICTIONS 0x100
+
+static pthread_mutex_t g_restriction_mutex = PTHREAD_MUTEX_INITIALIZER;
+static OrbisNpAgeRestriction g_restriction_table[NP_MAX_AGE_RESTRICTIONS];
+static int8_t g_restriction_default_age;
+static int32_t g_restriction_count;
+static int g_restriction_set;
+
+int ps4_np_content_restriction(int8_t *default_age, int32_t *count) {
+  pthread_mutex_lock(&g_restriction_mutex);
+  const int set = g_restriction_set;
+  if (set) {
+    *default_age = g_restriction_default_age;
+    *count = g_restriction_count;
+  }
+  pthread_mutex_unlock(&g_restriction_mutex);
+  return set;
+}
+
+int ps4_np_age_for_country(const char cc[2], int8_t *age) {
+  pthread_mutex_lock(&g_restriction_mutex);
+  const int set = g_restriction_set;
+  if (set) {
+    *age = g_restriction_default_age;
+    for (int32_t i = 0; i < g_restriction_count; i++) {
+      if (g_restriction_table[i].country.country_code[0] == cc[0] &&
+          g_restriction_table[i].country.country_code[1] == cc[1]) {
+        *age = g_restriction_table[i].age;
+        break;
+      }
+    }
+  }
+  pthread_mutex_unlock(&g_restriction_mutex);
+  return set ? 0 : -1;
+}
+
+void shim_sceNpSetContentRestriction(GuestContext *ctx) {
+  const OrbisNpContentRestriction *r = NP_GPTR(ctx, ctx->rdi);
+  int32_t ret = 0;
+  if (!r) {
+    ret = (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT;
+  } else if (r->size != sizeof(OrbisNpContentRestriction)) {
+    ret = (int32_t)ORBIS_NP_ERROR_INVALID_SIZE;
+  } else if (r->defaultAgeRestriction < 0 || r->ageRestrictionCount < 0 ||
+             r->ageRestrictionCount > NP_MAX_AGE_RESTRICTIONS ||
+             (r->ageRestrictionCount > 0 &&
+              (!r->ageRestriction || r->ageRestriction > ctx->mem_size ||
+               (uint64_t)r->ageRestrictionCount * sizeof(OrbisNpAgeRestriction) >
+                   ctx->mem_size - r->ageRestriction))) {
+    ret = (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT;
+  } else {
+    pthread_mutex_lock(&g_restriction_mutex);
+    g_restriction_default_age = r->defaultAgeRestriction;
+    const size_t keep = (size_t)r->ageRestrictionCount;
+    if (keep > 0)
+      memcpy(g_restriction_table, ctx->mem_base + r->ageRestriction, keep * sizeof(OrbisNpAgeRestriction));
+    // Readers stop at the count; clearing the rest keeps the table equal to the last set.
+    memset(g_restriction_table + keep, 0, (NP_MAX_AGE_RESTRICTIONS - keep) * sizeof(OrbisNpAgeRestriction));
+    g_restriction_count = r->ageRestrictionCount;
+    g_restriction_set = 1;
+    pthread_mutex_unlock(&g_restriction_mutex);
+    NP_LOG("sceNpSetContentRestriction: default age %d, %d country entries", r->defaultAgeRestriction,
+           r->ageRestrictionCount);
+  }
+  ctx->rax = (uint64_t)(int64_t)ret;
+  SHIM_RETURN();
+}
+
 //=============================================================================
 // libSceNpAuth
 //=============================================================================

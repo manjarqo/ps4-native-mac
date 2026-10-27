@@ -20,6 +20,7 @@
 
 #include "api/gcn_msl.h"
 #include "api/gcn_shader_internal.h"
+#include "compat/host_fp_env.h"
 
 namespace {
 
@@ -237,6 +238,7 @@ GCN_API gcn_status gcn_shader_rectlist_msl(const gcn_shader* vs, const gcn_msl_o
         gcn_msl_options_default(&mo);
     }
     std::string capture;
+    const GcnShim::HostFpEnvScope fp_env; // SPIRV-Cross prints float literals through a double
     if (!GcnMsl::ConvertCapture(vs->spirv, mo, vs->msl_bindings, slots, capture, e)) {
         SetErr(err, err_size, "SPIRV-Cross: " + e);
         return GCN_ERR_MSL;

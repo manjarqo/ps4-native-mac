@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"io"
 	"os"
 	"testing"
 )
@@ -28,4 +29,27 @@ func TestAnalyzeBinary(t *testing.T) {
 	}
 
 	t.Logf("\n%s", report.SummaryString())
+}
+
+// AnalyzeBinary's progress goes to stderr: callers that print JSON on stdout rely on it.
+func TestAnalyzeBinaryWritesNothingToStdout(t *testing.T) {
+	if _, err := os.Stat("../../hello_world.elf"); err != nil {
+		t.Skip("sample ELF not found")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	_, aerr := AnalyzeBinary("../../hello_world.elf")
+	os.Stdout = old
+	w.Close()
+	out, _ := io.ReadAll(r)
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	if len(out) != 0 {
+		t.Errorf("AnalyzeBinary wrote to stdout: %q", out)
+	}
 }

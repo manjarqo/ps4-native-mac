@@ -49,7 +49,29 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
     if (!info.has_fetch_shader) {
         return false;
     }
+    return ParseFetchShaderAt(info, info.fetch_shader_sgpr_base, out_fetch_data);
+}
 
+u64 InlinedFetchShaderHash(const Shader::Info& info) {
+    // the encodings ParseFetchShaderAt accepts: MUBUF / MTBUF take 2 dwords, the others 1;
+    // the fetch shader ends with s_setpc_b64 (SOP1). 256 dwords bound a corrupt one.
+    const u32* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    u64 h = 0xcbf29ce484222325ULL; // FNV-1a over the dwords
+    for (u32 i = 0; i < 256; ++i) {
+        const u32 word = code[i];
+        h = (h ^ word) * 0x100000001b3ULL;
+        const auto encoding = GetInstructionEncoding(word);
+        if (encoding == InstEncoding::SOP1) {
+            break;
+        }
+        if (encoding == InstEncoding::MUBUF || encoding == InstEncoding::MTBUF) {
+            h = (h ^ code[++i]) * 0x100000001b3ULL;
+        }
+    }
+    return h;
+}
+
+bool ParseFetchShaderAt(const Shader::Info& info, u32 sgpr_base, FetchShaderData& out_fetch_data) {
     out_fetch_data.attributes.clear();
 
     struct VsharpLoad {
@@ -58,7 +80,7 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
     };
     std::array<VsharpLoad, 104> loads{};
 
-    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    const auto* code = GetFetchShaderCode(info, sgpr_base);
     const u32* ptr = code;
     while (true) {
         const u32 word0 = *(ptr++);

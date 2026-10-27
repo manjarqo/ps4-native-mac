@@ -445,7 +445,7 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 				nextPC := inst.Address + uint64(inst.Inst.Len)
 				lines, err := e.lifter.LiftInstructionToBuf(inst, nextPC, fn, e.linesBuf[:0])
 				if err != nil {
-					fmt.Fprintf(w, "    // 0x%x: %s [UNSUPPORTED: %v]\n    brk #0\n", inst.Address, inst.Inst.String(), err)
+					fmt.Fprintf(w, "    // 0x%x: %s [UNSUPPORTED: %v]\n    brk #0\n", inst.Address, disasm.InstString(inst.Inst), err)
 				} else {
 					e.linesBuf = lines
 					for _, line := range lines {
@@ -603,9 +603,11 @@ static void *guest_main(void *p) {
         exit(1);
     }
 
-    recomp_init_process_param(ctx, 0x%xULL);
+    // Static TLS first: rtld allocates the initial TLS before any guest code runs, and
+    // recomp_init_process_param runs the game's malloc replacement init.
+%s
 
-    recomp_init_tls(ctx, 0x%xULL, 0x%xULL, 0x%xULL, 0x%xULL);
+    recomp_init_process_param(ctx, 0x%xULL);
 
     recomp_setup_entry_args(ctx, argc, argv, 0x%xULL);
 
@@ -628,8 +630,9 @@ int main(int argc, char **argv) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 64 * 1024 * 1024);
-    // Startup settings (language, PS4 Pro mode, upscaling, FPS HUD) are resolved before the
-    // guest starts; the dialog needs the application directory for the language list.
+    // Startup settings (language, PS4 Pro mode, upscaling, FPS HUD, renderer) are resolved
+    // before the guest starts, so the GNM backend sees PS4_GNM_METAL from the settings file; the
+    // dialog needs the application directory for the language list.
     ps4_vfs_init(%s);
     ps4_host_settings_init();
     pthread_t guest_thread;
@@ -641,9 +644,27 @@ int main(int argc, char **argv) {
     ps4_host_run_main_loop();
     return 0;
 }
-`, vfsInitArg, e.elf.ProcParamAddr, e.elf.TLSVaddr, e.elf.TLSFilesz, e.elf.TLSMemsz, e.elf.TLSAlign, entryAddr, entryName, entryAddr, entryAddr, entryAddr, vfsInitArg)
+`, vfsInitArg, tlsInitSource(e.elf.TLSModules), e.elf.ProcParamAddr, entryAddr, entryName, entryAddr, entryAddr, entryAddr, vfsInitArg)
 
 	return writeFileIfChanged(path, []byte(content))
+}
+
+// tlsInitSource returns the main.c statements that hand the process's static TLS layout
+// (elfloader.LayoutStaticTLS) to the runtime.
+func tlsInitSource(mods []elfloader.TLSModule) string {
+	if len(mods) == 0 {
+		return "    recomp_init_tls_modules(ctx, NULL, 0);"
+	}
+	var b strings.Builder
+	b.WriteString("    // Static TLS by module index: id, template vaddr, filesz, memsz, align, offset below FS.\n")
+	b.WriteString("    static const RecompTlsModule tls_modules[] = {\n")
+	for _, m := range mods {
+		fmt.Fprintf(&b, "        {%d, 0x%xULL, 0x%xULL, 0x%xULL, 0x%xULL, 0x%xULL}, // %s\n",
+			m.ID, m.Vaddr, m.Filesz, m.Memsz, m.Align, m.Offset, m.Name)
+	}
+	b.WriteString("    };\n")
+	fmt.Fprintf(&b, "    recomp_init_tls_modules(ctx, tls_modules, %d);", len(mods))
+	return b.String()
 }
 
 // ownSegments returns the segments of the main image itself. MergeImages appends the

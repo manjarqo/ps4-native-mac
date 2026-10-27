@@ -91,7 +91,9 @@ bool PrepareProcess(const FrameRec& f, Result* r) {
     // what the game's renderer runs with, minus everything that would read or write state
     // outside this process (shader caches, pipeline archive, library store)
     setenv("PS4_GNM_SYNC_ENCODE", "1", 1);
-    setenv("PS4_GNM_SYNC_COMPILE", "1", 1);
+    // PS4_GNM_REPLAY_ASYNC_COMPILE=1 (host tests) keeps the game's background compiles, whose
+    // pending draws the renderer counts apart from the lost ones
+    if (!getenv("PS4_GNM_REPLAY_ASYNC_COMPILE")) setenv("PS4_GNM_SYNC_COMPILE", "1", 1);
     setenv("PS4_GNM_NO_SHADER_CACHE", "1", 1);
     setenv("PS4_GNM_NO_PSO_ARCHIVE", "1", 1);
     setenv("PS4_GNM_NO_LIB_STORE", "1", 1);
@@ -232,6 +234,9 @@ Result ReplayLoaded(const Options& o, const FrameRec& f) {
     if (!LoadRegs(o.frame_dir, p.regs_file, &regs, &err)) return r.error = err, r;
 
     const uint64_t skipped0 = ps4draw::SkippedCount();
+    constexpr size_t kReasons = (size_t)ps4draw::SkipReason::Count;
+    uint64_t by_reason0[kReasons];
+    for (size_t i = 0; i < kReasons; ++i) by_reason0[i] = ps4draw::SkippedCount((ps4draw::SkipReason)i);
     ps4draw::SetExtentHints(p.cb_extent, p.db_extent);
     if (o.around_render) o.around_render(o.around_ctx, true);
     if (p.type == "draw") {
@@ -263,7 +268,14 @@ Result ReplayLoaded(const Options& o, const FrameRec& f) {
     if (o.around_render) o.around_render(o.around_ctx, false);
     if (!meta_slices)
         for (uint64_t a : p.meta_cleared) ps4draw::ReplayDisarmMetaCleared(a);
-    if (ps4draw::SkippedCount() != skipped0) return r.error = "the renderer skipped the pass (see the [gnm-draw] log)", r;
+    if (ps4draw::SkippedCount() != skipped0) {
+        r.error = "the renderer skipped the pass (";
+        for (size_t i = 0; i < kReasons; ++i)
+            if (ps4draw::SkippedCount((ps4draw::SkipReason)i) != by_reason0[i])
+                r.error = r.error + ps4draw::SkipReasonName((ps4draw::SkipReason)i) + ", ";
+        r.error += "see the [gnm-draw] log)";
+        return r;
+    }
     r.ran = true;
 
     for (const TextureRec& t : p.textures) {

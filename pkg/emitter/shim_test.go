@@ -327,6 +327,7 @@ func TestPack1AudioAndUlobjmgrShims(t *testing.T) {
 		{"sceAjmBatchWait", "-qLsfDAywIY", "shim_sceAjmBatchWait"},
 		{"sceAjmBatchCancel", "NVDXiUesSbA", "shim_sceAjmBatchCancel"},
 		{"sceAjmBatchErrorDump", "WfAiBW8Wcek", "shim_sceAjmBatchErrorDump"},
+		{"sceAjmDecAt9ParseConfigData", "1t3ixYNXyuc", "shim_sceAjmDecAt9ParseConfigData"},
 		{"sceAudioOutGetPortState", "GrQ9s4IrNaQ", "shim_sceAudioOutGetPortState"},
 		{"sceAudioOutSetVolume", "b+uAV89IlxE", "shim_sceAudioOutSetVolume"},
 		{"sceAudioOutSetMixLevelPadSpk", "wVwPU50pS1c", "shim_sceAudioOutSetMixLevelPadSpk"},
@@ -533,6 +534,16 @@ func TestAudiodecShimsByNID(t *testing.T) {
 		encoded := tc.nid + "#u#s"
 		if shim, ok := LookupShim(encoded); !ok || shim != "shim_"+tc.plain {
 			t.Fatalf("LookupShim(%s)=%q ok=%v want shim_%s", encoded, shim, ok, tc.plain)
+		}
+	}
+}
+
+// The imports inFAMOUS Second Son (CUSA00004) links that had no shim: each NID resolves to its shim.
+func TestInfamousBootImportShims(t *testing.T) {
+	for _, name := range []string{"sigfillset", "sceNpSetNpTitleId", "sceNpRegisterGamePresenceCallbackA", "scePlayGoSetToDoList"} {
+		got, ok := LookupShim(name)
+		if !ok || got != "shim_"+name {
+			t.Errorf("LookupShim(%q) = %q, %v; want shim_%s", name, got, ok, name)
 		}
 	}
 }

@@ -5,8 +5,6 @@ import (
 	"encoding/binary"
 
 	"ps4-recomp/pkg/elfloader"
-
-	"golang.org/x/arch/x86/x86asm"
 )
 
 // SeedEntryPoints collects CFG roots from the ELF entry point, .init_array,
@@ -115,7 +113,7 @@ func looksLikeFuncStart(img []byte, addr uint64) bool {
 	if addr >= uint64(len(img)) || !prologueByte(img[addr]) {
 		return false
 	}
-	inst, err := x86asm.Decode(img[addr:], 64)
+	inst, err := Decode(img[addr:])
 	if err != nil || inst.Len == 0 || isPrivileged(inst.Op) {
 		return false
 	}

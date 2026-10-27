@@ -298,6 +298,7 @@ func (l *LoadedELF) ApplyBias(delta uint64) error {
 		l.CanaryAddr += delta
 	}
 	l.Seg0Addr = shift(l.Seg0Addr)
+	l.TLSVaddr = shift(l.TLSVaddr)
 	l.EHFrameHdrAddr = shift(l.EHFrameHdrAddr)
 	l.EHFrameAddr = shift(l.EHFrameAddr)
 	l.MemoryImage = newImg
@@ -331,8 +332,9 @@ func (l *LoadedELF) ApplyBias(delta uint64) error {
 		l.DataRanges[i].End += delta
 	}
 
+	// An STT_TLS symbol's value is an offset in the module's TLS block, not an address.
 	for i := range l.Symbols {
-		if l.Symbols[i].Address != 0 {
+		if l.Symbols[i].Address != 0 && l.Symbols[i].Type != elf.STT_TLS {
 			l.Symbols[i].Address += delta
 		}
 	}
@@ -347,7 +349,7 @@ func (l *LoadedELF) ApplyBias(delta uint64) error {
 		}
 	}
 	for i := range l.DynSymbols {
-		if l.DynSymbols[i].Address != 0 {
+		if l.DynSymbols[i].Address != 0 && l.DynSymbols[i].Type != elf.STT_TLS {
 			l.DynSymbols[i].Address += delta
 		}
 	}
@@ -428,13 +430,6 @@ func MergeImages(dst, src *LoadedELF) error {
 	dst.UnwindRanges = mergeRanges(append(dst.UnwindRanges, src.UnwindRanges...))
 	dst.DataRanges = mergeRanges(append(dst.DataRanges, src.DataRanges...))
 	dst.Relocations = append(dst.Relocations, src.Relocations...)
-
-	if dst.TLSVaddr == 0 && src.TLSVaddr != 0 {
-		dst.TLSVaddr = src.TLSVaddr
-		dst.TLSFilesz = src.TLSFilesz
-		dst.TLSMemsz = src.TLSMemsz
-		dst.TLSAlign = src.TLSAlign
-	}
 
 	canaryTarget := dst.CanaryAddr
 	if canaryTarget == 0 {

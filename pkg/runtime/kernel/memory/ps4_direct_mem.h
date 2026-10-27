@@ -10,7 +10,19 @@
 extern "C" {
 #endif
 
-#define PS4_DIRECT_MEM_TOTAL_SIZE (32ULL * 1024ULL * 1024ULL * 1024ULL) // 32 GB unified Direct Memory
+// Memory the kernel gives a game process, in MiB. The direct memory size is derived from the
+// process's SceKernelMemParam (see ps4_direct_mem_size_rule); the values are the ones shadPS4
+// uses (linker.cpp, memory.cpp SetupMemoryRegions). The Naughty Dog engine of The Last of Us
+// Remastered and Uncharted 4 tells a retail console from a development kit by comparing
+// sceKernelGetDirectMemorySize() with exactly 4608 MiB (base) and 5120 MiB (Neo), the rule's
+// values for their parameters.
+#define PS4_MEM_TOTAL_MIB 5248ULL                // base mode, flexible memory included
+#define PS4_MEM_TOTAL_NEO_MIB 5888ULL            // Neo (PS4 Pro) mode
+#define PS4_MEM_FLEXIBLE_DEFAULT_MIB 512ULL      // flexible memory without flexible_memory_size
+#define PS4_MEM_FLEXIBLE_BASE_MIB 64ULL          // added to flexible_memory_size
+#define PS4_MEM_NO_EXTENDED_2_BASE_MIB 128ULL    // taken in base mode without extended memory 2
+#define PS4_MEM_NO_EXTENDED_1_NEO_MIB 256ULL     // taken in Neo mode without extended memory 1
+#define PS4_MEM_SDK_EXTENDED_ALWAYS 0x05000000u  // from SDK 5.00 on, both extended memories are on
 
 typedef struct OrbisKernelVirtualQueryInfo {
     void *start;
@@ -52,6 +64,17 @@ typedef struct OrbisDirectMemoryQueryInfo {
     int32_t memoryType;
 } OrbisDirectMemoryQueryInfo;
 
+// Direct memory size of a process with SDK version `sdk` in Neo mode `neo`. `has_flex` says
+// whether the SceKernelMemParam holds a flexible_memory_size pointer, `flex` is its value in
+// bytes; `ext1` and `ext2` are the param's extended memory flags (used before SDK 5.00 only).
+// Returns bytes; 0 when the flexible memory leaves no direct memory.
+uint64_t ps4_direct_mem_size_rule(uint32_t sdk, int neo, int has_flex, uint64_t flex, int ext1, int ext2);
+// Sets the direct memory size from the guest SceProcParam at `proc_param_addr` (0: none): its size,
+// sdk_version (+0x10) and mem_param (+0x40), and the SceKernelMemParam fields within its size:
+// flexible_memory_size (+0x10), extended_memory_1 (+0x18), extended_memory_2 (+0x28).
+// PS4_DIRECT_MEM_SIZE=<n>[k|m|g] overrides the result; that is a debugging aid, not console
+// behaviour. Runs at process start, before the game allocates direct memory.
+void ps4_direct_mem_configure(GuestContext *ctx, uint64_t proc_param_addr);
 int ps4_direct_mem_init(void);
 void ps4_direct_mem_on_unmap(GuestContext *ctx, uint64_t addr, size_t size);
 void ps4_direct_mem_destroy(void);

@@ -54,6 +54,7 @@ int32_t scePlayGoSetLanguageMask(OrbisPlayGoHandle handle, OrbisPlayGoLanguageMa
 int32_t scePlayGoGetInstallSpeed(OrbisPlayGoHandle handle, int32_t *outSpeed);
 int32_t scePlayGoSetInstallSpeed(OrbisPlayGoHandle handle, int32_t speed);
 int32_t scePlayGoGetToDoList(OrbisPlayGoHandle handle, OrbisPlayGoToDo *outToDoList, uint32_t maxEntries, uint32_t *outNumEntries);
+int32_t scePlayGoSetToDoList(OrbisPlayGoHandle handle, const OrbisPlayGoToDo *toDoList, uint32_t numEntries);
 int32_t scePlayGoGetEta(OrbisPlayGoHandle handle, const OrbisPlayGoChunkId *chunkIds, uint32_t count, OrbisPlayGoEta *outEta);
 int32_t scePlayGoPrefetch(OrbisPlayGoHandle handle, const OrbisPlayGoChunkId *chunkIds, uint32_t count);
 
@@ -69,6 +70,7 @@ void shim_scePlayGoSetLanguageMask(GuestContext *ctx);
 void shim_scePlayGoGetInstallSpeed(GuestContext *ctx);
 void shim_scePlayGoSetInstallSpeed(GuestContext *ctx);
 void shim_scePlayGoGetToDoList(GuestContext *ctx);
+void shim_scePlayGoSetToDoList(GuestContext *ctx);
 void shim_scePlayGoGetEta(GuestContext *ctx);
 void shim_scePlayGoPrefetch(GuestContext *ctx);
 

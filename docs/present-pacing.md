@@ -87,6 +87,22 @@ Code: `pkg/runtime/modules/libSceVideoOut/ps4_metal_screen.m` (presenter), `ps4_
   - Relative to the display, the flip completes at the same point as before, so `uncapped`, `vsync` and
     the guest flip rate pace as before. The difference is that the guest waits in its own flip wait, not
     inside the submit call, and the encoder thread never waits for the display either.
+  - **Flip labels.** One of the flip waits is on the GPU: `sceGnmInsertWaitFlipDone` puts a `WAIT_REG_MEM`
+    in the command buffer that waits for the VideoOut flip label of a display buffer to be 0
+    (`sceVideoOutGetBufferLabelAddress`: one 64-bit label per buffer index, in guest memory). The GPU
+    flips (`sceGnmSubmitAndFlipCommandBuffers`, `sceGnmRequestFlipAndSubmitDone`) set their buffer's
+    label to 1 when the command processor reaches the flip, and each completed flip clears the label of
+    the buffer flipped before it: a buffer's label is cleared when the next flip completes, as in
+    shadPS4's driver (`VideoOutDriver::Flip` clears `prev_index`'s label). The
+    graphics queue stays suspended at such a wait until the flip completes; it gives the wait up only
+    after 2 s (other waits: 50 ms), which no flip reaches (a held frame is dropped after 1 s); a
+    give-up is logged (`flip-label wait given up`, handle, buffer, last flipped buffer). A completed
+    flip that clears a label wakes the command processor's wait thread at once (a condition variable
+    with a 1 ms timeout, without the command-processor lock). The `[gnm-draw] perf:` line counts
+    flip-label waits per 300 presents (given up, woken) and in total. A game
+    that paces itself this way (inFAMOUS Second Son: the wait, and `sceVideoOutIsFlipPending` on the
+    CPU) therefore runs at the display's rate. Before, the packet waited on register 0 and passed at
+    once, and such a game flipped as fast as it could submit, its held frames dropped one after another.
   - **Hold depth.** At most `min(3, display buffers - 1)` frames are held, counting the buffers of the
     flipped buffer's set (the buffers one `sceVideoOutRegisterBuffers` call registered; the call returns
     the set index, at most 4 sets, and the system library's `SCE_VIDEO_OUT_ERROR_*` codes on bad
@@ -105,7 +121,9 @@ Code: `pkg/runtime/modules/libSceVideoOut/ps4_metal_screen.m` (presenter), `ps4_
     the system keeps for the display depends on the window (an occluded window's are returned on the
     system's own schedule), so 1 or 2 slot frames hang there, and the test reports how many. The GPU stall it uses
     (`ps4_gnm_metal_debug_stall_gpu`) only works in a process started with `PS4_TEST_HOOKS=1`; the
-    `nohooks` mode checks that it refuses otherwise.
+    `nohooks` mode checks that it refuses otherwise. The test ends the stall at its end
+    (`ps4_gnm_metal_debug_release_gpu`), so the hung command buffers complete and the exit does not wait for
+    the system's GPU timeout.
 - **Display buffers that are not GPU targets** are copied from guest memory on the GPU, in the renderer's
   stream behind the frame's work (`GuestDisplayTexture`: an image resource over the buffer with the
   VideoOut format, a compute detile for tiled buffers, then a blit). They are then presented like a render

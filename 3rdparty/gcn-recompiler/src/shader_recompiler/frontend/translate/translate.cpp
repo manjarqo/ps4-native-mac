@@ -1234,8 +1234,31 @@ template void Translator::SetDstPk<IR::F32, false>(const InstOperand& operand,
 void Translator::EmitFetch(const GcnInst& inst) {
     const auto code_sgpr_base = inst.src[0].code;
 
-    if (EmulatorSettings.IsInlineFetchShader()) {
-        // Translate fetch shader inline using regular buffer bindings; useful for debugging.
+    info.has_fetch_shader = true;
+    info.fetch_shader_sgpr_base = code_sgpr_base;
+    ASSERT(ParseFetchShader(info, fetch_data));
+
+    // PS4Recomp: an attribute Metal's vertex fetch cannot read (Gcn::IsVertexFetchable) makes the
+    // whole fetch shader translate inline: its s_load / buffer_load instructions read the V#s and
+    // the vertex buffers like any other buffer access (stride, offsets, bounds and number formats
+    // as GCN applies them), and the vertex and instance offsets reach the loads through the fetch
+    // shader's own adds of its offset SGPRs. Its V#s are part of the shader's specialization
+    // (VsAttribSpecialization::fetchable before, BufferSpecialization after).
+    bool inline_fetch = EmulatorSettings.IsInlineFetchShader();
+    for (u32 i = 0; i < fetch_data.attributes.size(); ++i) {
+        const auto sharp = fetch_data.attributes[i].GetSharp(info);
+        const u8 problems = sharp ? VertexFetchProblems(sharp) : u8(0);
+        if (problems != 0 && !inline_fetch) {
+            info.fetch_inline_reason = problems;
+            info.fetch_inline_attrib = u8(i);
+            inline_fetch = true;
+        }
+    }
+    if (inline_fetch) {
+        info.has_fetch_shader = false;
+        info.fetch_shader_inlined = true;
+        fetch_data = {};
+        // Translate fetch shader inline using regular buffer bindings.
         const auto* code = GetFetchShaderCode(info, code_sgpr_base);
         GcnCodeSlice slice(code, code + std::numeric_limits<u32>::max());
         GcnDecodeContext decoder;
@@ -1251,10 +1274,6 @@ void Translator::EmitFetch(const GcnInst& inst) {
         }
         return;
     }
-
-    info.has_fetch_shader = true;
-    info.fetch_shader_sgpr_base = code_sgpr_base;
-    ASSERT(ParseFetchShader(info, fetch_data));
 
     if (EmulatorSettings.IsDumpShaders()) {
         using namespace Common::FS;

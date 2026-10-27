@@ -208,9 +208,11 @@ _recomp_call_shim:
 
 HOST_SECTION
 Lcall_shim_host:
-    // Host code runs with round to nearest. FZ stays as the guest set it (flush to zero only
-    // changes denormal results of host float math), so a guest with the default rounding mode
-    // - TLOU's threads run with FTZ|DAZ - costs no FPCR write (msr fpcr serialises: ~12 ns).
+    // Host code runs with round to nearest. FZ stays as the guest set it, so a guest with the
+    // default rounding mode - TLOU's threads run with FTZ|DAZ - costs no FPCR write (msr fpcr
+    // serialises: ~12 ns). FZ flushes denormal inputs as well as results of host float math
+    // (float -> double too): host code that needs exact bits sets its own environment for the
+    // call (the shader translator: GcnShim::HostFpEnvScope in libgcn_recompiler).
     mrs  x3, fpcr
     str  x3, [sp, #32]
     tst  x3, #0xc00000           // RMode
