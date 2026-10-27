@@ -9,7 +9,9 @@
 //  2. gcn_shader_same_srt tells whether the flattened user data built for one permutation can be
 //     bound for another (the renderer's StageFlat reuse).
 //  3. gcn_shader_explain_mismatch names why a permutation does not fit a draw (debug log).
-//  4. The push constants: the MSL struct the translated shaders declare must be exactly
+//  4. A VS permutation that reads its vertices through Metal's vertex fetch does not serve a
+//     draw whose V# Metal cannot fetch, even when the V#s changed while it was translated.
+//  5. The push constants: the MSL struct the translated shaders declare must be exactly
 //     ps4gnm_push::kBindBytes long, with gcn_push_data's member offsets (Metal reflection).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -179,6 +181,115 @@ void TestPermutationsWithAnotherSrtProgram() {
     gcn_shader_destroy(sb);
 }
 
+// A vertex shader and its fetch shader (as gnm_replay_test's draw kinds):
+//   fetch: s_load_dwordx4 s[8:11], s[2:3], 0; s_load_dwordx4 s[12:15], s[2:3], 4;
+//          v_add_i32 v0, s4, v0; v_add_i32 v3, s5, v3; s_waitcnt lgkmcnt(0);
+//          buffer_load_format_xyzw v[4:7], v0, s[8:11] idxen; buffer_load_format_x v8, v3, s[12:15] idxen;
+//          s_waitcnt vmcnt(0); s_setpc_b64 s[16:17]
+//   VS:    s_swappc_b64 s[16:17], s[0:1]; v_add_f32 v4, v8, v4; v_mov_b32 v6, 0.5; v_mov_b32 v7, 1.0;
+//          exp param0 v[4:7]; exp pos0 v[4:7] done
+// User data: s[0:1] the fetch shader, s[2:3] the V# table, s4 / s5 the vertex / instance offsets.
+struct FetchVs {
+    // the fetch shader after the table: reads of its code (which run on past its end) do not
+    // cover the table
+    static constexpr uint64_t kVs = kGuestBase, kTable = kGuestBase + 0x1000, kVb = kGuestBase + 0x2000,
+                              kFetch = kGuestBase + 0x3000;
+    uint32_t ud[16] = {uint32_t(kFetch), uint32_t(kFetch >> 32), uint32_t(kTable), uint32_t(kTable >> 32)};
+    gcn_runtime_info rt{};
+    explicit FetchVs(Guest& g) {
+        const uint32_t fetch[] = {0xC0840300, 0xC0860304, 0x4A000004, 0x4A060605, 0xBF8C007F, 0xE00C2000,
+                                  0x80020400, 0xE0002000, 0x80030803, 0xBF8C0F70, 0xBE802010};
+        std::memcpy(g.p(kFetch), fetch, sizeof(fetch));
+        const auto vs = WithFooter({0xBE902100, 0x06080908, 0x7E0C02F0, 0x7E0E02F2, 0xF800020F, 0x07060504,
+                                    0xF80008CF, 0x07060504, 0xBF810000},
+                                   0x5CA1AB1E000000F1ULL);
+        std::memcpy(g.p(kVs), vs.data(), vs.size() * 4);
+        rt.hw_stage = GCN_HW_VS;
+        rt.sw_stage = GCN_SW_VERTEX;
+        rt.num_allocated_vgprs = 12;
+        rt.num_user_data = 6;
+        rt.num_input_vgprs = 3;
+        rt.vs.num_outputs = 1;
+    }
+    // The position V# (16_16 float, stride 8, at kVb + pos_off) and the offsets V# (32 float,
+    // stride 4).
+    static void Table(uint8_t* dst, uint32_t pos_off) {
+        const uint32_t v[8] = {uint32_t(kVb + pos_off), 8u << 16, 64,
+                               4 | (5 << 3) | (6 << 6) | (7 << 9) | (7 << 12) | (5 << 15),
+                               uint32_t(kVb + 0x800), 4u << 16, 64,
+                               4 | (5 << 3) | (6 << 6) | (7 << 9) | (7 << 12) | (4 << 15)};
+        std::memcpy(dst, v, sizeof(v));
+    }
+};
+
+// Guest memory the game rewrites while a translation runs: the first read that covers the V#
+// table sees the V#s as they were, every later read the rewritten ones (a worker translation
+// reads the draw's memory after the draw, while the game rewrites its per-draw V# tables).
+struct RewrittenGuest : Guest {
+    uint8_t later[32];
+    bool rewritten = false;
+    static bool Read(void* ctx, uint64_t addr, void* dst, uint64_t size) {
+        auto* g = static_cast<RewrittenGuest*>(ctx);
+        const bool table = addr < FetchVs::kTable + 32 && addr + size > FetchVs::kTable;
+        const bool ok = Guest::Read(ctx, addr, dst, size);
+        if (table && !g->rewritten) {
+            std::memcpy(g->p(FetchVs::kTable), g->later, sizeof(g->later));
+            g->rewritten = true;
+        }
+        return ok;
+    }
+};
+
+// A permutation must describe the draws its code serves. A VS translated while its position V#
+// was dword-aligned reads it through Metal's vertex fetch (not inlined); if the V# table changed
+// before the specialization was recorded (2 bytes off a dword), the permutation claimed to serve
+// draws whose V# Metal cannot fetch, and the renderer skipped every such draw ("not a multiple of
+// 4 in a shader with vertex attributes"). The draw with that V# must not fit it; the draw with
+// the aligned V# must. The other way round, the permutation translated inline for the V# 2 bytes
+// off a dword (its loads shift by that misalignment) must fit that draw and not the aligned one.
+void TestVertexFetchDecisionKept() {
+    gcn_profile prof;
+    gcn_profile_default_metal(&prof);
+    for (int inline_first = 0; inline_first < 2; ++inline_first) {
+        RewrittenGuest g;
+        FetchVs v(g);
+        FetchVs::Table(g.p(FetchVs::kTable), inline_first ? 2 : 0);
+        FetchVs::Table(g.later, inline_first ? 0 : 2);
+        gcn_compile_desc d{};
+        d.hw_stage = GCN_HW_VS;
+        d.sw_stage = GCN_SW_VERTEX;
+        d.code_addr = FetchVs::kVs;
+        std::memcpy(d.user_data, v.ud, 64);
+        d.runtime = &v.rt;
+        d.profile = &prof;
+        d.read_guest = RewrittenGuest::Read;
+        d.read_ctx = &g;
+        d.flags = GCN_COMPILE_EMIT_MSL;
+        gcn_shader* sh = nullptr;
+        char err[512] = {};
+        const gcn_status st = gcn_compile(&d, &sh, err, sizeof(err));
+        CHECK(st == GCN_OK && sh, "fetch VS does not compile: %s", err);
+        if (!sh) continue;
+        CHECK(g.rewritten, "the V# table was never read");
+        gcn_shader_info info;
+        gcn_shader_get_info(sh, &info);
+        CHECK(info.fetch_shader_inlined == (inline_first != 0), "translated from the %s V#: fetch shader inlined %d",
+              inline_first ? "unaligned" : "aligned", (int)info.fetch_shader_inlined);
+        Guest aligned, unaligned;
+        FetchVs va(aligned), vu(unaligned);
+        FetchVs::Table(aligned.p(FetchVs::kTable), 0);
+        FetchVs::Table(unaligned.p(FetchVs::kTable), 2);
+        const bool fits_aligned = gcn_shader_is_compatible(sh, va.ud, &va.rt, Guest::Read, &aligned);
+        const bool fits_unaligned = gcn_shader_is_compatible(sh, vu.ud, &vu.rt, Guest::Read, &unaligned);
+        const char* what = inline_first ? "inlined permutation" : "Metal-fetch permutation";
+        CHECK(fits_aligned == !inline_first, "%s: the draw with the aligned V# %s", what,
+              fits_aligned ? "fits" : "does not fit");
+        CHECK(fits_unaligned == (inline_first != 0), "%s: the draw whose V# is 2 bytes off a dword %s", what,
+              fits_unaligned ? "fits" : "does not fit");
+        gcn_shader_destroy(sh);
+    }
+}
+
 void TestPushDataSize(id<MTLDevice> dev) {
     Guest g;
     const uint64_t code = kGuestBase, table = kGuestBase + 0x1000, out = kGuestBase + 0x2000;
@@ -238,6 +349,7 @@ int main() {
             return 1;
         }
         TestPermutationsWithAnotherSrtProgram();
+        TestVertexFetchDecisionKept();
         TestPushDataSize(dev);
         if (g_fail) {
             std::fprintf(stderr, "gnm_shader_perm_test: %d failure(s)\n", g_fail);

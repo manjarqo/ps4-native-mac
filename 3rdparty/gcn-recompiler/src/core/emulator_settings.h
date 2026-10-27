@@ -15,8 +15,10 @@ struct EmulatorSettingsShim {
     bool IsDumpShaders() const {
         return DumpShadersEnabled();
     }
-    // Inline fetch shader is a debug path in shadPS4; the Metal backend uses the
-    // parsed fetch-shader attribute description instead (vertex descriptor).
+    // Inline fetch shader is a debug path in shadPS4 (every fetch shader inline). The Metal
+    // backend uses the parsed fetch-shader attribute description (vertex descriptor), and
+    // inlines only a fetch shader with an attribute Metal's vertex fetch cannot read
+    // (Gcn::IsVertexFetchable, Translator::EmitFetch).
     constexpr bool IsInlineFetchShader() const {
         return false;
     }

@@ -372,7 +372,10 @@ struct ImageDesc {
     uint32_t pitch = 0;                               // texels (PITCH+1)
     uint32_t base_level = 0, last_level = 0;
     uint32_t base_array = 0, last_array = 0;
-    uint32_t num_levels = 1, num_layers = 1, num_samples = 1;
+    // num_layers: the slices the image has and its Metal texture holds (depth + 1, 6 per cube,
+    // 1 for 3D); layout_layers: the slices of its guest layout, num_layers padded to a power of
+    // two with POW2PAD (shadPS4 Image::NumLayers), which only moves the levels after the first
+    uint32_t num_levels = 1, num_layers = 1, num_samples = 1, layout_layers = 1;
     float min_lod = 0.f;
     ImageType type = ImageType::Invalid;
     TileMode tile_mode = TileMode::DisplayLinearAligned;

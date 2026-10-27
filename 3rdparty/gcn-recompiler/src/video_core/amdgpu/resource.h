@@ -304,8 +304,22 @@ struct Image {
         return base_type;
     }
 
+    // PS4Recomp: every 1D image is made and read as a 2D image of height 1 (a 2D array for a
+    // Color1DArray read as an array): the SPIR-V declares 1D images as Dim2D, and Metal cannot
+    // make a 1D texture with a block-compressed format or with mips. GCN samples a 1D image along
+    // x, so the same texels read the same way; resource_patching_pass builds the 2D coordinates
+    // from the instruction's 1D ones.
+    bool Is1DAs2D() const {
+        const auto base_type = GetType();
+        return base_type == ImageType::Color1D || base_type == ImageType::Color1DArray;
+    }
+
     ImageType GetViewType(const bool is_array) const {
         const auto base_type = GetType();
+        if (Is1DAs2D()) {
+            return base_type == ImageType::Color1DArray && is_array ? ImageType::Color2DArray
+                                                                    : ImageType::Color2D;
+        }
         if (base_type == ImageType::Color1DArray && !is_array) {
             return ImageType::Color1D;
         }

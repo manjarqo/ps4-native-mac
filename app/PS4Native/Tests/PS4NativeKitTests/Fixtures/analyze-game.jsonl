@@ -1,0 +1,2 @@
+{"event":"progress","op":"analyze-game","stage":"analyze","done":0,"total":1,"unit":"stages","message":"analysing eboot.bin"}
+{"event":"done","op":"analyze-game","result":{"title_id":"CUSA00557","title":"Test Game","app_ver":"01.05","category":"gp","verdict":{"status":"other_version","name":"The Last of Us Remastered","tested_versions":["01.00"],"recommended":{"pro":0},"known_issues":["Sunlit daylight surfaces are darker than on a PS4."]},"coverage":99.958743237668,"unresolved":0,"missing_ops":15,"modules":null}}

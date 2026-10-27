@@ -40,6 +40,11 @@ Vendored externals, each under its own license:
 - `backend/spirv/emit_spirv_context_get_set.cpp` (`EmitReadConstBuffer`): `s_buffer_load` past
   the V#'s `num_records` reads 0, as on GCN (bounds from `push_data.buf_sizes`, like the vector
   buffer loads).
+- `compat/host_fp_env.h` (new): `gcn_compile`, `gcn_spirv_to_msl` and `gcn_shader_rectlist_msl`
+  run with the default floating-point environment and restore the caller's. The recompiler
+  carries integer constants through float IR values and SPIRV-Cross prints float literals through
+  a double, so a caller with flush to zero (FPCR.FZ: PS4Recomp's guest threads) turned every
+  integer constant below 0x00800000 into 0.
 - `api/gcn_rectlist.cpp` (new) and `api/gcn_msl.cpp` (`ConvertCapture`):
   `gcn_shader_rectlist_msl()` for RectList draws on Metal, which has no stage between the vertex
   and fragment shaders for shadPS4's RectList tessellation control shader

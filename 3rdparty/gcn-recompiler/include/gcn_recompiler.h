@@ -317,6 +317,12 @@ GCN_API char* gcn_spirv_to_msl(const uint32_t* spirv, size_t num_words, const gc
                                char* err, size_t err_size);
 GCN_API void gcn_free(void* p);
 
+enum {
+    GCN_FETCH_INLINE_STRIDE = 1,  /* V# stride not a multiple of 4 */
+    GCN_FETCH_INLINE_ADDRESS = 2, /* V# address (with the instruction offset) not a multiple of 4 */
+    GCN_FETCH_INLINE_FORMAT = 4,  /* no Metal vertex format for the V#'s format */
+};
+
 typedef struct gcn_shader_info {
     uint32_t hw_stage, sw_stage;
     uint64_t pgm_hash;
@@ -325,7 +331,17 @@ typedef struct gcn_shader_info {
     uint32_t num_buffers, num_images, num_samplers, num_fmasks, num_vertex_attribs;
     uint32_t flatbuf_size_dw;      /* size of the flattened user data buffer (>= 16) */
     bool has_fetch_shader;
-    uint32_t fetch_shader_sgpr_base;  /* user SGPR pair holding the fetch shader address */
+    bool fetch_shader_inlined;        /* the VS calls a fetch shader translated into it: an attribute
+                                         V# Metal's vertex fetch cannot read (a stride or address
+                                         that is not a multiple of 4) makes the shader read every
+                                         attribute from its buffers (no vertex attributes,
+                                         has_fetch_shader false; the offset SGPRs are added by the
+                                         shader, not taken from the draw's base vertex/instance) */
+    uint8_t fetch_inline_reason;      /* when inlined: why, for the first attribute Metal cannot
+                                         fetch (GCN_FETCH_INLINE_* bits) */
+    uint8_t fetch_inline_attrib;      /* ... and which attribute that is */
+    uint32_t fetch_shader_sgpr_base;  /* user SGPR pair holding the fetch shader address (also when
+                                         inlined) */
     int32_t vertex_offset_sgpr;       /* fetch shader adds this user SGPR to the vertex index (-1) */
     int32_t instance_offset_sgpr;     /* ... to the instance index (-1) */
     uint32_t mrt_mask;                /* PS: render targets exported (bit n = MRTn => [[color(n)]]) */
@@ -523,7 +539,7 @@ typedef struct gcn_vertex_attrib { /* Shader::Gcn::VertexAttribute (fetch shader
     uint8_t dword_offset;  /* dword offset of the V# in that table */
     uint8_t step_rate;     /* 0 per-vertex, 1 instance/step_rate_0, 2 instance/step_rate_1,
                               3 per-instance (divisor 1) */
-    uint8_t inst_offset;   /* byte offset added to the V# base address */
+    uint16_t inst_offset;  /* byte offset added to the V# base address (12-bit instruction field) */
     uint8_t data_format, num_format; /* typed-load overrides (0 = use V#) */
     uint32_t divisor;      /* instance step divisor resolved from the runtime info (0 = vertex) */
 } gcn_vertex_attrib;
@@ -531,6 +547,12 @@ typedef struct gcn_vertex_attrib { /* Shader::Gcn::VertexAttribute (fetch shader
 GCN_API bool gcn_shader_get_buffer(const gcn_shader* s, uint32_t index, gcn_buffer_binding* out);
 GCN_API bool gcn_shader_get_image(const gcn_shader* s, uint32_t index, gcn_image_binding* out);
 GCN_API bool gcn_shader_get_sampler(const gcn_shader* s, uint32_t index, gcn_sampler_binding* out);
+/* Whether Metal's vertex fetch has a vertex format for a V#'s raw 4-bit data format and 3-bit
+ * number format (Gcn::IsVertexFormatFetchable after the formats' remapping). A fetch shader with
+ * an attribute that has none is translated inline (gcn_shader_info.fetch_shader_inlined). The
+ * renderer's table (ps4_gnm_resources.mm GetVertexFormat) must agree. */
+GCN_API bool gcn_vertex_format_fetchable(uint32_t dfmt, uint32_t nfmt);
+
 GCN_API bool gcn_shader_get_vertex_attrib(const gcn_shader* s, uint32_t index,
                                           gcn_vertex_attrib* out);
 

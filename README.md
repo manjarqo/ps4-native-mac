@@ -23,7 +23,7 @@ developed independently under the new name since 2026-10. License: GPL-2.0.
 
 **Contents:** [What is this](#what-is-ps4-native-mac) ·
 [Supported games](#supported-games-on-mac) · [Known issues](#known-issues) ·
-[Requirements](#requirements) · [Quick start](#quick-start-run-a-ps4-game-on-your-mac) ·
+[Requirements](#requirements) · [PS4 Native app](#ps4-native-app) · [Quick start](#quick-start-run-a-ps4-game-on-your-mac) ·
 [FAQ](#faq) · [Configuration and debugging](#configuration-and-debugging) ·
 [How it works](#how-it-works) · [Legal notice](#legal-notice)
 
@@ -144,10 +144,10 @@ slice of the shadow depth array). Sunlit daylight surfaces are still darker than
   game with a log message naming the import. TLOU has 2, in `libSceGnmDriver`; it was never seen
   calling them.
 - **Screenshot frames.** With screenshots on, the frames that capture one take ~130–150 ms.
-- **Shader cache sharing.** The cache key is the game folder's name, so two games in folders with
-  the same name share a cache.
-- **Bundle ID.** Bundles get the ID `org.ps4recomp.<executable name>`, so every `eboot.app` has the
-  same ID.
+- **Shader cache sharing.** Without a TITLE_ID in `param.sfo`, the cache key falls back to the game
+  folder's name, so two such games in folders with the same name share a cache.
+- **Bundle ID.** Bundles get the ID `org.ps4native.<TITLE_ID>`. Without a TITLE_ID in `param.sfo`
+  they fall back to `org.ps4recomp.<executable name>`, so every such `eboot.app` has the same ID.
 - **macOS metadata files.** On exFAT/FAT volumes, AppleDouble `._*` files next to the PRX modules
   produce harmless "Skipping module" messages.
 
@@ -166,13 +166,263 @@ slice of the shadow depth array). Sunlit daylight surfaces are still darker than
 
 Intel Macs are not supported: the output is arm64 code for Apple Silicon.
 
+## PS4 Native app
+
+![PS4 Native: The Last of Us Remastered's page with its hero art, PLAY, the five tabs and the Overview stats](images/ps4native_game_page.png)
+
+*The Last of Us Remastered (CUSA00557) in PS4 Native, built and ready to play: the OK badge in
+the sidebar, PLAY, and the Overview tab with 99.13 % code coverage, 0 unresolved imports, the
+tested version and the known issue from the compatibility database.*
+
+PS4 Native is a Steam-style library for your own PS4 games on a Mac. It is a native SwiftUI app
+that drives the recompiler in this repository, so you do not need the terminal.
+
+The idea is that it stays simple: one window, a few clear steps.
+
+1. **Add a game.** Drop a fake-signed PKG or a dumped game folder onto the window, or use
+   **Add game**.
+2. **Let it import and analyse.** The app imports the game, analyses it and shows its support
+   badge.
+3. **Build.** One button builds the native version in the background.
+4. **Play.** Press PLAY.
+
+The defaults are safe. Nothing is deleted without asking, saves are kept when you uninstall a game
+unless you turn that off, and removed saves go to the Trash. A game folder added with "Use in
+place" is only referenced, and the app never writes to it.
+
+### Features
+
+**Library and support badges.** The sidebar lists the games, each with its icon, name and a badge
+taken from the analysis:
+
+| Badge | Status | Meaning | Build |
+| --- | --- | --- | --- |
+| OK (green) | Playable | The TITLE_ID and version are listed as playable | Allowed |
+| WIP (yellow) | In progress | The TITLE_ID and version are listed as in progress | Allowed |
+| VER (orange) | Other version | The game is known, this version is not | After a warning that names the tested versions |
+| EXP (purple) | Experimental | The TITLE_ID is not in the database | "Build anyway…" shows the analysis report first |
+| ? (grey) | Not analysed | No analysis yet | — |
+
+A retail PKG, a broken PKG or a folder without `eboot.bin` is refused at the add step and never
+built. Below the games the sidebar has the manager pages: **Builds & imports**, **Saves** (every
+game's saves) and **Settings**.
+
+<table>
+<tr>
+<td width="50%"><img src="images/ps4native_add_in_place.png" alt="Add to the library: the Uncharted 4 folder with Use in place selected; it needs 1.07 GB of 14.13 GB free"></td>
+<td width="50%"><img src="images/ps4native_add_copy_space.png" alt="The same folder with Copy into the library (APFS clone) selected: it needs 96.33 GB of 14.13 GB free, not enough space"></td>
+</tr>
+<tr>
+<td><em>A folder used in place needs only the 1 GiB margin.</em></td>
+<td><em>A copy needs the unpacked size too; the card warns when the library volume is short.</em></td>
+</tr>
+</table>
+
+**Adding a game.** **Add game** accepts several items at once: a fake-signed `.pkg`, or "a game
+folder named like CUSA00557 that contains eboot.bin and sce_sys/param.sfo". Drag and drop onto the
+window works too. Each item is inspected first, and the **Add to the library** sheet shows a card
+with its icon, title, kind, TITLE_ID and version and the space it needs on the library volume.
+
+- A folder can be **copied into the library (APFS clone)** or **used in place**. A copy is an APFS
+  clone when the folder and the library are on the same volume, and a plain copy otherwise. In place,
+  the library holds only a symlink to the folder.
+- The space needed is the unpacked size (nothing for a folder used in place) plus 1 GiB. The card
+  shows it against the free space and warns when it does not fit.
+- A retail PKG is refused with the message "this PKG is encrypted with console keys; use a dump of
+  your own console or an fpkg". The engine never tries to decrypt it.
+- An update (patch) PKG is laid over its game, and DLC goes to `content/addcont/<entitlement>`. A
+  patch that arrives before its game is kept until the game is imported. Updates and DLC need a
+  copied game, not one used in place.
+
+**Automatic analysis.** After an import the app runs the analysis of `eboot.bin`. It reports the
+code coverage (the share of reachable code the lifter handles), the unresolved HLE imports, and the
+support status from the compatibility database (`pkg/compat/compat.json`, built into the engine):
+the tested versions, the recommended settings and the known issues. The result is on the Overview
+tab, with last played, play time, the renderer and the content size. "Analyze again" is in the
+**⋯** menu.
+
+<table>
+<tr>
+<td width="50%"><img src="images/ps4native_queue_compile.png" alt="Builds and imports: TLOU's import and analysis are done, its build is at Compile 90 percent"></td>
+<td width="50%"><img src="images/ps4native_queue_two_games.png" alt="Builds and imports with TLOU built and Uncharted 4 imported, analysed and building at Emit 75 percent"></td>
+</tr>
+<tr>
+<td><em>TLOU: import and analysis done, the build compiling.</em></td>
+<td><em>A second game: Uncharted 4 (WIP) at the emit stage.</em></td>
+</tr>
+</table>
+
+**Builds & imports.** Every import, analysis and build is a row in a queue, with its stage, a
+progress bar, **Cancel** and **Show log**. Builds run one at a time; imports and analyses run one at
+a time in a second lane, so one build and one import can run together. A build's bar fills in four
+quarters: load, cfg and emit, then compile by finished translation units. The page offers a rebuild
+when the engine is newer than the one that built the game ("Rebuild available: v… → v…"), or after
+an update changes the game's version. The offer is a banner with a **Rebuild** button under the
+main button, which stays **PLAY**: the old build still runs.
+
+![Uncharted 4's page on the Settings tab: Language, PS4 Pro mode (Recommended: Off), MetalFX upscaling, FPS counter (Metal HUD), Renderer; the build is running](images/ps4native_game_settings.png)
+
+*Uncharted 4 (WIP, version 1.32) while it builds: the main button shows "Working…", and the
+Settings tab marks the recommended value from the database.*
+
+**The game page** has the hero art (`pic1`, `pic0`, or the blurred icon from `sce_sys`), the title,
+TITLE_ID, version and status, and the main button: **Build**, **Working…** while an operation
+runs, **PLAY** once built, and **Stop** while the game runs. For a game of another version, Build
+first asks for a confirmation that names the tested versions; for an experimental game the button
+is "Build anyway…", which opens the analysis report (coverage, unresolved imports, missing
+operations, modules) and builds from there. The **⋯** menu has
+Show in Finder, Open build log, Add to Applications, Analyze again and Uninstall…. The five tabs:
+
+- **Overview:** last played, play time, renderer, content size, coverage, unresolved imports,
+  tested versions and known issues.
+- **Settings:** Language (the game's speech packs, or the system default), PS4 Pro mode, MetalFX
+  upscaling, FPS counter (Metal HUD) and Renderer (Automatic, Metal 3 or Metal 4). A value
+  recommended by the database is marked under the setting, and **Use recommended** applies them all.
+  Changes are saved at once and apply the next time the game starts.
+- **Saves:** the save slots with title, subtitle, date and size. **Backup** writes a zip to the
+  library's `backups/`; **Restore…** (from a backup or a file) and **Import…** first back up the
+  current saves and move them to the Trash; **Export…** writes a zip; **Delete slot** moves a slot to
+  the Trash after a confirmation. The buttons are disabled while the game runs.
+- **DLC & updates:** the installed version, the applied updates, the installed DLC, and **Add update
+  or DLC…**.
+- **Build log:** the newest build, run or analysis log of the game, chosen with **Build**, **Run**
+  or **Analysis**, with Show in Finder.
+
+**PLAY** starts the built `.app` with `PS4_NO_DIALOGS=1` (no launch dialog) and, when a renderer is
+chosen, `PS4_GNM_METAL`. The game's output goes to `logs/<date>-run.log`. **Stop** sends SIGTERM,
+then SIGKILL after 10 seconds. On exit the app adds the session to the play time and sets Last
+played; after a crash the page shows "The game quit unexpectedly" with **Open log**.
+
+**Uninstall** shows how much space it frees and has **Keep saves**, on by default. It removes
+`games/<TITLE_ID>/` and the app's links in `/Applications`; with Keep saves off, the game's saves go
+to the Trash. A running game, or one with an operation in the queue, cannot be uninstalled or
+rebuilt.
+
+**First run** checks Apple's Command Line Tools (clang 17 or later and the macOS 26 SDK) and the
+free space, offers to install the tools if they are missing, and can import a dumped game folder from
+the earlier command-line setup.
+
+### What's inside the toolchain
+
+| Component | Where | What it does |
+| --- | --- | --- |
+| PS4 Native app | `app/PS4Native` (Swift 6 package, three targets) | `PS4NativeKit`: the engine client, the library store and its lock, settings, saves, the launcher, the operation queue, the toolchain check and the view model. `PS4NativeUI`: the SwiftUI views. `PS4Native`: the executable. |
+| `ps4-recomp` engine | `cmd/ps4-recomp`, `pkg/` (Go) | The `inspect`, `import`, `analyze-game`, `version` and `build` commands. Each runs as its own process; with `--json` it writes one JSON event per line (`progress`, `warning`, `error`, `done`) to stdout. Contract: [docs/game-manager-engine.md](docs/game-manager-engine.md). |
+| PKG and SFO readers | `pkg/fpkg`, `pkg/sfo`, `pkg/library`, `pkg/compat` | Fake-signed PKG and PFS (also PFSC-compressed) extraction, `param.sfo`, the library and its lock, the compatibility database. |
+| Recompiler | `pkg/elfloader`, `pkg/disasm`, `pkg/analyzer`, `pkg/lifter`, `pkg/emitter`, `pkg/cli` | ELF/PRX loading, function discovery, x86-64 → ARM64 assembly, the ninja build and the `.app` bundle (see [How it works](#how-it-works)). |
+| HLE runtime | `pkg/runtime` (C / Objective-C) | The Orbis OS libraries on macOS, linked into every game. It finds a game's settings (`settings/<TITLE_ID>.cfg`) and saves (the save directory ending in `[<TITLE_ID>]`) by the TITLE_ID from its `param.sfo`. |
+| GPU backend | `pkg/runtime/modules/libSceGnmDriver` | The GNM command processor on Metal, with a Metal 3 and a Metal 4 backend in every `.app` ([docs/metal4-backend.md](docs/metal4-backend.md)). Shaders go GCN → SPIR-V (gcn-recompiler) → MSL (SPIRV-Cross) at run time and are cached. |
+| Engine kit | `tools/make_engine_kit.sh` | `ps4-recomp`, the runtime sources, the 3rdparty static libraries, `bin/ninja`, a static FreeType (with libpng) and every licence text. Its self-check builds `hello_world.elf` with no Homebrew in `PATH`. The packaged app carries it in `Contents/Resources/engine`. Licences: [docs/game-manager-app.md](docs/game-manager-app.md#bundled-tools-and-their-licences). |
+| Compiler | Apple's Command Line Tools | `clang` assembles and compiles the generated code and links the game. It is not bundled. |
+
+The library, by default `~/Library/Application Support/PS4Native/`:
+
+```text
+library.json                 the game list: title, version, patches, DLC, status, sizes, last played, play time
+games/<TITLE_ID>/
+  content/                   the game with updates applied, DLC in content/addcont/; a symlink when used in place
+  build/                     the signed eboot.app
+  logs/                      build, run and analysis logs
+  analysis.json              the last analysis
+backups/                     save backups
+pending/<TITLE_ID>/          an update imported before its game
+```
+
+Saves and per-game settings are not in the library. The runtime keeps them in
+`~/Library/Application Support/PS4Recomp/` (`saves/` and `settings/<TITLE_ID>.cfg`, with the keys
+`lang`, `pro`, `upscale`, `hud` and `metal`), so saves from command-line builds keep working.
+`PS4NATIVE_LIBRARY`, `PS4RECOMP_DATA_DIR` and `PS4NATIVE_ENGINE` override the locations.
+
+### How it works, step by step
+
+```text
+ .pkg (fake-signed)            dumped folder (CUSA00557/)
+        |                              |
+        v                              v
+ inspect        param.sfo: kind, TITLE_ID, APP_VER, title, icon0, sizes; retail PKGs refused
+        |
+        v
+ import         PKG: PFS/PFSC extraction to games/<TITLE_ID>/content
+                folder: APFS clone, copy, or a symlink (in place)
+                update -> laid over content/; DLC -> content/addcont/<label>
+        |
+        v
+ analyze-game   eboot.bin: coverage, unresolved imports; compat.json -> status, tested versions,
+                recommended settings, known issues
+        |
+        v
+ build          load     ELF/PRX loader, relocations, NID resolution (eboot.bin + sce_module/*.prx)
+                cfg      disassembly, function discovery, jump tables
+                emit     x86-64 -> ARM64 assembly in chunked .s files, small C glue, build.ninja
+                compile  clang through ninja (the kit's bin/ninja), linked with the HLE runtime
+                bundle   eboot.app: Info.plist from param.sfo (org.ps4native.<TITLE_ID>),
+                         ad-hoc codesign, verified with --deep --strict
+        |
+        v
+ PLAY           eboot.app runs with PS4_NO_DIALOGS=1 [PS4_GNM_METAL=3|4]
+                runtime: settings/<TITLE_ID>.cfg, saves "<TITLE> [<TITLE_ID>]",
+                GNM -> Metal, GCN shaders -> MSL (cached per game)
+```
+
+1. **Inspect.** The engine reads the PKG header and entries, or the folder's
+   `sce_sys/param.sfo`, without writing anything. A PKG's kind comes from CATEGORY (`gd` game, `gp`
+   update, `ac` DLC). The version is `APP_VER`, falling back to `VERSION`.
+2. **Import.** The import holds the library lock, stages its work in `content.partial` and
+   commits it by renames, so a cancel or a crash never leaves a half-written `content/`. A cancelled
+   import resumes where it stopped. The import keeps a 1 GiB margin of free space.
+3. **Analyse.** `analyze-game` runs the recompiler's analysis on `eboot.bin` and looks up the
+   TITLE_ID and version in the database. The app stores the verdict in `library.json` and the full
+   result in `analysis.json`.
+4. **Recompile.** `build` turns the x86-64 code of `eboot.bin` and the game's own PRX modules into
+   ARM64 assembly ahead of time. System library imports go to the HLE runtime. There is no JIT and no
+   interpreter.
+5. **Compile and link.** ninja runs clang on the chunks in parallel. Without ninja the engine calls
+   clang directly. Cancel stops ninja and every clang process.
+6. **Bundle and sign.** The result is a signed `eboot.app` in `games/<TITLE_ID>/build/`. The game's
+   content directory is baked in, so the app needs no `--app-dir`.
+7. **Launch.** The runtime reads the game's settings and finds its saves by TITLE_ID, and the
+   renderer translates the game's GPU commands and shaders to Metal as it runs.
+
+### Limits and notes
+
+- **APFS only for the library.** On exFAT or FAT, macOS writes `._*` AppleDouble files next to
+  files with extended attributes, and the signing of `eboot.app` fails, so every build fails after
+  the compile. A folder used in place may stay on any volume; only the library's `build/` must be
+  on APFS.
+- **Disk use.** In place costs almost nothing beyond the build. A copy costs the game's unpacked
+  size, unless it is an APFS clone on the same volume (the add sheet still counts the full size).
+  The TLOU build in the screenshot is 717 MB.
+- **Requirements.** An Apple Silicon Mac, macOS 26 or later (`Package.swift`, `Info.plist`) and
+  Apple's Command Line Tools with clang 17 or later. The packaged app bundles ninja and FreeType, so
+  Homebrew is not needed.
+- **Games.** The database lists two titles: The Last of Us Remastered CUSA00557 v1.00 (playable)
+  and Uncharted 4 CUSA04529 v1.32 (in progress, see [Supported games](#supported-games-on-mac)). Any other game is
+  experimental.
+- **Signing.** The app and the built games are signed ad hoc, not notarized. On another Mac,
+  Gatekeeper blocks the first launch of a downloaded copy of the app; allow it in System Settings,
+  Privacy & Security, "Open Anyway".
+- **Status: preview.** The v0.4.0 release is the first to ship the app (`PS4Native-0.4.0.dmg`).
+  `app/PS4Native/scripts/package.sh` builds the engine kit and packages `PS4 Native.app` and a
+  `.dmg`; `scripts/smoke.sh` smoke-tests that
+  package with a fake engine. To run it from source, build the engine first
+  (see [Quick start](#quick-start-run-a-ps4-game-on-your-mac)), then run:
+
+```sh
+PS4NATIVE_ENGINE=/path/to/engine-kit-or-repo-root swift run --package-path app/PS4Native
+```
+
+`PS4NATIVE_ENGINE` points at a directory with a built `ps4-recomp`: an engine kit or the repository
+root. The app's packages, tests and environment overrides are in
+[docs/game-manager-app.md](docs/game-manager-app.md); the engine protocol, result schemas and
+library layout are in [docs/game-manager-engine.md](docs/game-manager-engine.md).
+
 ---
 
 ## Quick start: run a PS4 game on your Mac
 
-There is no GUI yet: a game is built into a `.app` from the command line. All commands run from
-the repository root. `/path/to/CUSA00557` stands for your dumped game folder, which contains
-`eboot.bin`, `sce_module/` and `sce_sys/`.
+These are the command-line steps; the [PS4 Native app](#ps4-native-app) runs the same steps for
+you. All commands run from the repository root. `/path/to/CUSA00557` stands for your dumped game
+folder, which contains `eboot.bin`, `sce_module/` and `sce_sys/`.
 
 ### 1. Clone with the third-party sources
 
@@ -208,7 +458,10 @@ go build -o ps4-recomp ./cmd/ps4-recomp
 ```
 
 `ps4-recomp` finds the libraries under `3rdparty/` relative to the current directory or to its own
-location. Run it from the repository root, or keep the binary there.
+location. Run it from the repository root, or keep the binary there. It refuses a
+`libgcn_recompiler.a` that was not built from the gcn-recompiler sources next to it (the build ID
+of `cmake/gcn_build_id.cmake`): rebuild and copy it again after any change there, a branch switch
+or a merge.
 
 ### 3. Dump your own game
 
@@ -292,9 +545,12 @@ A settings window opens before the game starts:
 
 How the settings are stored and overridden:
 
-- **Storage.** Settings are kept per game folder in
-  `~/Library/Application Support/PS4Recomp/settings/<game folder name>.cfg`. With
-  `PS4RECOMP_DATA_DIR` set, they are kept under that directory instead.
+- **Storage.** Settings are kept per game in
+  `~/Library/Application Support/PS4Recomp/settings/<TITLE_ID>.cfg` (the game folder name when
+  `param.sfo` has no TITLE_ID). With `PS4RECOMP_DATA_DIR` set, they are kept under that directory
+  instead. The file also holds `metal=3|4`, the renderer chosen in PS4 Native, which the game uses
+  as `PS4_GNM_METAL` when the environment has none. Saving this window rewrites only its own four
+  keys and keeps the other lines of the file.
 - **Overrides.** Environment variables override the stored values: `PS4_LANG`, `PS4_PRO=0|1`,
   `PS4_UPSCALE=off|metalfx` and `MTL_HUD_ENABLED=0|1`. `PS4_NO_DIALOGS=1` (or setting `PS4_LANG`)
   never shows the window, which is useful for scripts and test runs. The log prints the resolved
@@ -332,8 +588,9 @@ not been tested. Intel Macs are not supported. See [Requirements](#requirements)
 
 ### Do I need my own copy of the game?
 
-Yes. The project works only on a decrypted, extracted game folder that you dumped yourself from a
-copy you legally own. No game files, PS4 system software, firmware or keys are distributed with it.
+Yes. The project works only on a decrypted game that you dumped yourself from a copy you legally
+own: an extracted game folder or a fake-signed PKG made from it. No game files, PS4 system software,
+firmware or console keys are distributed with it; retail PKGs are refused.
 See [Dump your own game](#3-dump-your-own-game) and the [Legal notice](#legal-notice).
 
 ### Does it use Rosetta, Wine or MoltenVK?
@@ -384,7 +641,12 @@ your own from your own game copy.
 | `PS4_GNM_LOG_LONG_FRAMES=<ms>` | Log frames longer than `<ms>`, with a hitch breakdown |
 | `PS4_STALL_PROFILE=<ms>` | Sample all threads during stalls longer than `<ms>` |
 | `PS4_STALL_WATCHDOG=<ms>` | Report what threads do when no frame was presented for `<ms>` |
-| `PS4_GNM_STATS=1`, `PS4_AUDIO_LOG=1`, `PS4_NP_LOG_ALL=1` | Command processor, audio and NP logging |
+| `PS4_GNM_STATS=1`, `PS4_AUDIO_LOG=1`, `PS4_NP_LOG_ALL=1` | Command processor, audio and NP logging. Every ~2 s, `PS4_AUDIO_LOG` prints per port the outputs of the window against the grains it should have had, its longest gap between two grains (`max_gap_ms`), late grains (the ring had run empty; not counted under `PS4_AUDIO_MUTE`) and the frames of silence played (`underrun_frames`), with the `CLOCK_MONOTONIC` time (`mono`) and the longest wait for the mixer lock (`lock_wait_max_ms`); a gap over two grains also gets its own line, printed with the next stats line, with the `mono` time it ended |
+| `PS4_AUDIO_DUMP=<file>` | Write the final mix to a float32 stereo 48 kHz WAV. The `frame 0 at mono` line places it on the `CLOCK_MONOTONIC` timeline of the screenshot and Videodec lines; each port's `first non-silent grain at mono` line says when sound starts. On the CoreAudio device these are the times audio reaches the device, without its own output latency, not when it is heard. The header is rewritten every second of audio and at a normal exit; a file that cannot be opened or written is reported once. A writer thread does the file I/O, never the mixer or the device, so a slow disk cannot stall the audio (the host stats line gives the longest write, `dump_io_max_ms`). If the writer falls 4 s behind, the frames that find its ring full are dropped and the WAV is shorter than the run from there; one line reports it. `tools/wav_activity.py <file>` lists the RMS per window and checks for sound |
+| `PS4_AJM_LOG=1` | Log Ajm codec registration and instance creation, and every ~2 s each live instance's jobs, decoded frames, samples and errors (with the last error's result bits). An instance's totals are always printed when it is destroyed |
+| `PS4_AUDIO_NULL=1`, `PS4_AUDIO_MUTE=1` | Headless audio: a clock thread mixes the ports at the device rate and plays nothing (the dump and the counters work); or no output device at all, paced by wall time |
+| `PS4_VIDEODEC_LOG=1` | libSceVideodec trace: each decoder's config and resource info, its first 8 access units (size, NAL types, slices, first_mb_in_slice, pts/dts) and a progress line every 2 s, timed in raw `CLOCK_MONOTONIC` seconds (`mono`, as in the screenshot `time cadence` line). Without it, each decoder still prints one summary line when it is deleted (access units, slices, pictures, error pictures, first/last picture time and pts, frame buffer sizes) |
+| `PS4_VIDEODEC_DUMP=<dir>:<i>` | Write picture `<i>` (0-based) of every libSceVideodec decoder as `<dir>/dec<n>_pic<i>.nv12` (16-byte header: u16 width, u16 height, u32 pitch, i64 pts; then the NV12 bytes the game received). `tools/nv12_to_png.py` converts it to PNG (BT.709, limited range) |
 | `PS4_GNM_GPU_TIMEOUT=<ms>` | Command buffer watchdog (default 4000) |
 | `PS4_SCREENSHOT_DIR=<dir>`, `PS4_SCREENSHOT_EVERY=<frames>` | Save presented frames as PNG |
 | `PS4_SCREENSHOT_STAGE=render\|output` | Take screenshots before (`render`, the default) or after (`output`) the output gamma pass |
@@ -397,6 +659,24 @@ your own from your own game copy.
 | `PS4_GNM_GUEST_MEMORY_FAST=1` | Opt-in fast path for shaders that access guest memory through descriptors they load at run time (no CPU wait per dispatch; see Known issues) |
 | `PS4_GNM_SYNC_ENCODE=1`, `PS4_GNM_SYNC_COMPILE=1` | Encode and compile synchronously (captures, debugging) |
 | `PS4_DUMP_SHADERS=<dir>` | Write every distinct VS/PS/CS program and its registers (see [Debugging the renderer](#debugging-the-renderer)) |
+
+**Pad motion sensors.** A DualShock 4 or DualSense connected to the Mac reports its gyro and
+accelerometer through the pad data (the motion sensor is on after `scePadOpen`). Without one, the pad reads as a controller
+lying still and flat (orientation (0,0,0,1), +1 g on its y axis). Hold **H** to turn that virtual
+pad sideways (rolled 90 degrees, right side up), for games that ask you to tilt the controller,
+and hold **N** to rattle it up and down (1 g at 6 Hz).
+
+`PS4_PAD_SCRIPT` is a comma-separated list of steps, timed in ms from the first pad read
+(`PS4_PAD_CLOCK=frames` counts flips at 30 fps instead):
+
+| Step | Effect |
+| --- | --- |
+| `<t>:<hex mask>[:<dur>[:<lx>:<ly>]]` | Hold the buttons (and the left stick, 0..255) for `<dur>` ms (default 200) |
+| `<t>:tilt:<roll>[:<pitch>[:<yaw>[:<turn>]]]` | Turn the virtual pad to this pose in degrees over `<turn>` ms (default 500, 0 = at once) and keep it there. From lying flat: roll about the pad's z axis (toward the player; positive raises the right side), then pitch about its own x axis (positive tilts the top face toward the player), then yaw about its own y axis (the top face's normal). Held sideways (roll 90), pitch turns it left and right and yaw up and down |
+| `<t>:shake:<amp>[:<dur>[:<hz>]]` | Rattle the virtual pad up and down: `<amp>` g of vertical acceleration at `<hz>` (default 6) for `<dur>` ms (default 1000), on top of gravity |
+
+Example: `PS4_PAD_SCRIPT=90000:tilt:90,95000:4000,120000:tilt:0` holds the pad sideways from
+90 s to 120 s and presses Cross at 95 s.
 
 Host unit tests: `tests/host/run_host_tests.sh`. Some cases need shaders dumped from your own
 game (local fixtures in `tests/host/data/game/` or `PS4_HOST_GAME_FIXTURES`, never committed);
@@ -437,9 +717,9 @@ them.
 | Data | Default location |
 | --- | --- |
 | Saves | `~/Library/Application Support/PS4Recomp/saves` (or `$PS4RECOMP_DATA_DIR/saves`) |
-| Settings | `~/Library/Application Support/PS4Recomp/settings/<game folder name>.cfg` |
+| Settings | `~/Library/Application Support/PS4Recomp/settings/<TITLE_ID>.cfg` (the game folder name when `param.sfo` has no TITLE_ID) |
 | `/download0`, `/temp0` | `~/Library/Application Support/PS4Recomp/{download0,temp0}/<TITLE_ID>` |
-| Shader caches, pipeline archive | `~/Library/Caches/PS4Recomp/<game folder name>/` (not under `PS4RECOMP_DATA_DIR`) |
+| Shader caches, pipeline archive | `~/Library/Caches/PS4Recomp/<TITLE_ID>/`, the game folder name when `param.sfo` has no TITLE_ID (not under `PS4RECOMP_DATA_DIR`) |
 
 The on-disk names still say `PS4Recomp`; they come from the code and have not been renamed.
 
@@ -606,8 +886,12 @@ Boost subset (BSL-1.0). Its README lists every change made to the shadPS4 source
 ```text
 ├── cmd/ps4-recomp/          # CLI entry point
 ├── cmd/lifter-difftest-asm/ # differential tester for the lifter
+├── app/PS4Native/           # PS4 Native, the SwiftUI game manager (Swift package)
 ├── pkg/
-│   ├── cli/                 # build driver, ninja, .app bundling
+│   ├── cli/                 # build driver, ninja, .app bundling, the engine commands (--json)
+│   ├── fpkg/, sfo/          # fake-signed PKG / PFS extraction, param.sfo
+│   ├── library/, compat/    # game library and its lock, compatibility database
+│   ├── events/              # JSON event stream of the engine commands
 │   ├── analyzer/            # instruction coverage and CFG analysis
 │   ├── disasm/              # disassembly, function discovery, jump tables
 │   ├── elfloader/           # ELF64 / PRX loader and relocations
@@ -649,8 +933,10 @@ Boost subset (BSL-1.0). Its README lists every change made to the shadPS4 source
 
 - **You must own every game you use with this project.** It works only on a game you dumped yourself
   from a copy you legally own.
-- This project does not distribute game files, PS4 system software, firmware, encryption keys or
-  recompiled game binaries. Do not share the `.app` bundles, `guest_image.bin` or other build
+- This project does not distribute game files, PS4 system software, firmware, console or retail
+  encryption keys, or recompiled game binaries. The only keys in the source are the public
+  fake-PKG keysets taken from shadPS4 (GPL, see `pkg/fpkg/keys.go`), which read fake-signed
+  packages only. Do not share the `.app` bundles, `guest_image.bin` or other build
   outputs; they contain the game's code.
 - ps4-native-mac is an independent project. It is not affiliated with, endorsed by or sponsored by
   Sony Interactive Entertainment, Naughty Dog or the original PS4Recomp authors.

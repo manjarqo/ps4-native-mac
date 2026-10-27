@@ -1,5 +1,6 @@
 #include "ps4_savedata.h"
 #include "ps4_sfo.h"
+#include "ps4_game_key.h"
 #include "ps4_vfs.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,6 +126,9 @@ static void get_game_save_dir(char *out_path, size_t out_size) {
     }
 
     sanitize_filename(title, sanitized_title, sizeof(sanitized_title));
+
+    // A directory saved earlier under this TITLE_ID is reused even when the title text changed.
+    if (title_id[0] && ps4_find_save_dir_by_title_id(base_dir, title_id, out_path, out_size)) return;
 
     if (sanitized_title[0] && title_id[0]) {
         snprintf(out_path, out_size, "%s/%s [%s]", base_dir, sanitized_title, title_id);
@@ -1114,8 +1118,8 @@ int32_t sceSaveDataDirNameSearch(GuestContext *ctx, const SdDirNameSearchCond *c
     pthread_mutex_unlock(&g_savedata_mutex);
     free(entries);
 
-    fprintf(stderr, "[ps4-savedata] DirNameSearch: user=%d pattern='%s' -> %zu hit(s)\n",
-            cond->userId, pattern, count);
+    fprintf(stderr, "[ps4-savedata] DirNameSearch: user=%d pattern='%s' key=%u order=%u -> %zu hit(s)\n",
+            cond->userId, pattern, cond->key, cond->order, count);
     return 0;
 }
 

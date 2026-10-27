@@ -125,6 +125,14 @@ struct InfoPersistent {
 
     u8 mrt_mask{};
     bool has_fetch_shader{};
+    // PS4Recomp: the VS calls a fetch shader whose instructions are translated into it (its
+    // buffer loads read the vertex buffers; has_fetch_shader is false: no vertex attributes).
+    // Translator::EmitFetch does it when an attribute's V# is not Gcn::IsVertexFetchable.
+    bool fetch_shader_inlined{};
+    // PS4Recomp: why (Gcn::VertexFetchProblem bits of the first attribute Metal cannot fetch) and
+    // which attribute that is, when fetch_shader_inlined
+    u8 fetch_inline_reason{};
+    u8 fetch_inline_attrib{};
     bool has_bitwise_xor{};
     bool uses_dma{};
     // PS4Recomp: buffer accesses through V#s loaded at run time read and write guest memory

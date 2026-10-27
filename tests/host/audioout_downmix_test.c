@@ -4,6 +4,9 @@
 // played frame identifies each channel's destination and gain:
 //   L = FL + 0.7071 * (FC + BL + SL),  R = FR + 0.7071 * (FC + BR + SR),  LFE dropped.
 // A swapped pair, a lost centre, LFE leaking in or a wrong surround gain all change the frame.
+// A PADSPK (controller speaker) port is mixed into both sides at its mix level: -9 dB
+// (11626 / 32768) as opened, the level sceAudioOutSetMixLevelPadSpk sets after that; and the
+// call's errors carry the SDK's codes.
 #include "ps4_audioout_internal.h"
 #include <math.h>
 #include <stdio.h>
@@ -24,10 +27,13 @@ enum { LEN = 256, GRAINS = 100 };
 
 // Plays GRAINS grains of one constant frame on a fresh port and counts the dumped frames that
 // equal (want_l, want_r); returns that count, *other gets the non-silent mismatches.
-static long play(const char *dump, uint32_t fmt, const float *frame, int ch, float want_l,
-                 float want_r, long *other, long start) {
-  int32_t h = ps4_audioout_port_open(0xFF, PS4_AUDIO_OUT_PORT_MAIN, 0, LEN, 48000, fmt);
+// type: the port type; level >= 0: the PADSPK mix level to set before playing.
+static long play_port(const char *dump, int32_t type, int32_t level, uint32_t fmt,
+                      const float *frame, int ch, float want_l, float want_r, long *other,
+                      long start) {
+  int32_t h = ps4_audioout_port_open(0xFF, type, 0, LEN, 48000, fmt);
   CHECK(h > 0);
+  if (level >= 0) CHECK(ps4_audioout_port_set_mix_level_padspk(h, level) == 0);
   static float buf[LEN * 8];
   for (int f = 0; f < LEN; f++) memcpy(buf + f * ch, frame, (size_t)ch * sizeof(float));
   for (int g = 0; g < GRAINS; g++) CHECK(ps4_audioout_port_output(h, buf) == LEN);
@@ -49,6 +55,11 @@ static long play(const char *dump, uint32_t fmt, const float *frame, int ch, flo
   return match;
 }
 
+static long play(const char *dump, uint32_t fmt, const float *frame, int ch, float want_l,
+                 float want_r, long *other, long start) {
+  return play_port(dump, PS4_AUDIO_OUT_PORT_MAIN, -1, fmt, frame, ch, want_l, want_r, other, start);
+}
+
 static long dump_frames(const char *dump) {
   FILE *fp = fopen(dump, "rb");
   if (!fp) return 0;
@@ -66,6 +77,7 @@ int main(void) {
   setenv("PS4_AUDIO_NULL", "1", 1);
   setenv("PS4_AUDIO_DUMP", dump, 1);
   unsetenv("PS4_AUDIO_MUTE");
+  unsetenv("PS4_AUDIO_PADSPK");
   const float k = 0.7071f;
 
   // 8 channels, FL FR FC LFE BL BR SL SR, distinct values.
@@ -95,6 +107,36 @@ int main(void) {
   start = dump_frames(dump);
   m = play(dump, PS4_AUDIO_OUT_FMT_FLOAT_STEREO, st, 2, 0.3f, -0.15f, &other, start);
   CHECK(m >= (long)GRAINS * LEN * 9 / 10 && other == 0);
+
+  // PADSPK, mono: -9 dB as opened, into both sides.
+  const float pad[1] = {0.8f};
+  const float g9 = 0.8f * 11626.0f / 32768.0f;
+  start = dump_frames(dump);
+  m = play_port(dump, PS4_AUDIO_OUT_PORT_PADSPK, -1, PS4_AUDIO_OUT_FMT_FLOAT_MONO, pad, 1, g9, g9,
+                &other, start);
+  fprintf(stderr,
+          "audioout_downmix_test: padspk at its default mix level: %ld frames (%.6f), %ld other\n",
+          m, g9, other);
+  CHECK(m >= (long)GRAINS * LEN * 9 / 10 && other == 0);
+  // At the 0 dB mix level, as it comes.
+  start = dump_frames(dump);
+  m = play_port(dump, PS4_AUDIO_OUT_PORT_PADSPK, 32768, PS4_AUDIO_OUT_FMT_FLOAT_MONO, pad, 1, 0.8f,
+                0.8f, &other, start);
+  CHECK(m >= (long)GRAINS * LEN * 9 / 10 && other == 0);
+
+  // sceAudioOutSetMixLevelPadSpk's errors, and the stats call's, by their SDK numbers.
+  int32_t hm = ps4_audioout_port_open(0xFF, PS4_AUDIO_OUT_PORT_MAIN, 0, LEN, 48000,
+                                      PS4_AUDIO_OUT_FMT_FLOAT_STEREO);
+  int32_t hp = ps4_audioout_port_open(0xFF, PS4_AUDIO_OUT_PORT_PADSPK, 0, LEN, 48000,
+                                      PS4_AUDIO_OUT_FMT_FLOAT_MONO);
+  CHECK(hm > 0 && hp > 0);
+  CHECK(ps4_audioout_port_set_mix_level_padspk(hm, 11626) == (int32_t)0x8026000A); // port type
+  CHECK(ps4_audioout_port_set_mix_level_padspk(hp, 32769) == (int32_t)0x80260014); // mix level
+  CHECK(ps4_audioout_port_set_mix_level_padspk(0x7FFFFFFF, 0) == (int32_t)0x80260003); // port
+  CHECK(ps4_audioout_port_stats(hm, NULL) == (int32_t)0x80260004);                 // pointer
+  CHECK(ps4_audioout_port_set_mix_level_padspk(hp, 0) == 0);
+  ps4_audioout_port_close(hp);
+  ps4_audioout_port_close(hm);
 
   unlink(dump);
   if (g_fail) {

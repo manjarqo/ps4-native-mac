@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <atomic>
 #include <functional>
 #include <vector>
 
@@ -138,10 +139,19 @@ bool GpuDma(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, bool
 // held by the screen and handed over later). `on_done` (the flip completion) runs once the frame
 // has reached a present slot, or was dropped, in the order of the Present calls. Returns false
 // only without a renderer; the caller then presents on the CPU and `on_done` is not called.
+// Flip-label waits of the command processor (sceGnmInsertWaitFlipDone, counted by
+// ps4_gnm_metal.mm): graphics queue suspensions, waits given up, wake-ups of the wait thread by a
+// released label. Kept here so the per-300-presents perf line can print them.
+struct FlipWaitCounters {
+    std::atomic<uint64_t> suspends{0}, timeouts{0}, wakes{0};
+};
+FlipWaitCounters& FlipWaits();
+
 bool Present(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch,
              uint32_t tiling_mode, uint32_t pixel_format, std::function<void()> on_done);
 // Test hook: the GPU work encoded from now on waits for an event that is never signalled (a hung GPU).
 void DebugStallGpu();
+void DebugReleaseGpu();
 // Test hook: the GPU work encoded from now on waits until `shared_event` (an id<MTLSharedEvent>
 // of the renderer's device) reaches `value`.
 void DebugGpuWait(void* shared_event, uint64_t value);
@@ -167,6 +177,59 @@ void ReplaySetMetaCleared(uint64_t cmask_address, int slice);
 void ReplayDisarmMetaCleared(uint64_t cmask_address);
 // Draws and dispatches skipped so far (a replayed pass must not add one).
 uint64_t SkippedCount();
+// Why a draw or dispatch was skipped: one reason per skip site (or group of sites with one cause).
+// The per-reason counts add up to SkippedCount; the "present #" totals line is followed by a
+// "skipped by reason:" line with the non-zero ones. X(enumerator, name printed in the log).
+#define PS4_GNM_SKIP_REASONS(X)                                                                 \
+    X(PendingCompile, "pending-compile")   /* a shader or pipeline compiles in the background */  \
+    X(DrawCount, "implausible-count")      /* draw count or instances out of range */            \
+    X(ShaderStages, "shader-stages")       /* LS/HS/ES/GS enabled (VGT_SHADER_STAGES_EN) */      \
+    X(VsUnavailable, "vs-unavailable")     /* VS translation or library failed */                \
+    X(RectVariant, "rect-variant")         /* VS without a RectList variant */                   \
+    X(PsUnavailable, "ps-unavailable")     /* PS translation or library failed */                \
+    X(VertexFormat, "vertex-format")       /* attribute without a Metal vertex format or slot */ \
+    X(VertexAlign, "vertex-align")         /* attribute stride or address not a multiple of 4 */ \
+    X(PipelineFailed, "pipeline-failed")   /* render pipeline build failed */                    \
+    X(ScissorEmpty, "empty-scissor")       /* the scissor covers no pixel of the target */       \
+    X(IndirectArgs, "indirect-args")       /* indirect draw arguments or indices not bindable */ \
+    X(QuadIndices, "quad-indices")         /* QuadList index expansion failed */                 \
+    X(Primitive, "primitive")              /* primitive type not supported */                    \
+    X(IndexBuffer, "index-buffer")         /* index buffer not in guest memory */                \
+    X(RectCount, "rect-count")             /* RectList without 3 vertices per rectangle */       \
+    X(RectSize, "rect-size")               /* RectList capture over its 64 MiB bound */          \
+    X(Arena, "arena")                      /* no arena memory for the draw's buffers */          \
+    X(TableHazard, "table-hazard")         /* draw: T# tables no longer fit the permutation */   \
+    X(VsBind, "vs-bind")                   /* VS resources could not be bound */                 \
+    X(PsBind, "ps-bind")                   /* PS resources could not be bound */                 \
+    X(Reencode, "reencode")                /* the encoder restarted after a hazard flush */      \
+    X(PassBegin, "pass-begin")             /* the render pass could not begin */                 \
+    X(NoCompute, "no-compute")             /* backend without compute */                         \
+    X(CsUnavailable, "cs-unavailable")     /* CS translation failed */                           \
+    X(CsLibrary, "cs-library")             /* Metal rejected the CS's MSL */                     \
+    X(CsPipeline, "cs-pipeline")           /* compute pipeline build failed */                   \
+    X(CsWorkgroup, "cs-workgroup")         /* workgroup larger than the pipeline allows */       \
+    X(CsTableHazard, "cs-table-hazard")    /* dispatch: T# tables no longer fit the permutation */ \
+    X(CsBind, "cs-bind")                   /* CS resources could not be bound */                 \
+    X(CsIndirectArgs, "cs-indirect-args")  /* indirect dispatch arguments not bindable */        \
+    X(GmNoState, "gm-no-state")            /* guest memory dispatch: no guest memory state */    \
+    X(GmNoSlot, "gm-no-slot")              /* guest memory dispatch: no fault buffer */          \
+    X(GmPages, "gm-pages")                 /* guest pages missing or not mappable */             \
+    X(GmStatus, "gm-status")               /* refused for a guest memory access status */        \
+    X(GmIndirectSize, "gm-indirect-size")  /* indirect dispatch size unreadable */               \
+    X(GmCmdFailed, "gm-cmdbuf-failed")     /* its command buffer failed */
+enum class SkipReason : uint8_t {
+#define PS4_GNM_SKIP_ENUM(e, n) e,
+    PS4_GNM_SKIP_REASONS(PS4_GNM_SKIP_ENUM)
+#undef PS4_GNM_SKIP_ENUM
+    Count
+};
+const char* SkipReasonName(SkipReason r);
+// Draws and dispatches skipped for this reason so far.
+uint64_t SkippedCount(SkipReason r);
+// The part of SkippedCount that is draws deferred while a shader or pipeline they need compiles in
+// the background (they are drawn once it is ready); SkippedCount() - PendingCompileCount() is the
+// work really lost.
+uint64_t PendingCompileCount();
 // Draws skipped by PS4_GNM_MTL4_ONLY_CLEARS (debug) after their render pass began, so far.
 uint64_t OnlyClearsSkippedCount();
 // Sampled textures copied from guest memory on the GPU while a draw or dispatch was being bound

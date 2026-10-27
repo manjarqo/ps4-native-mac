@@ -31,7 +31,7 @@ namespace {
 constexpr u32 kMagic = 0x534E4347; // "GCNS"
 // Bump when the serialized layout below changes without a source change elsewhere.
 #define GCN_SHADER_CACHE_FORMAT "3"
-constexpr u32 kFormatVersion = 7; // 2: Info::uses_guest_memory, 3: Info::null_image_reads,
+constexpr u32 kFormatVersion = 10; // 2: Info::uses_guest_memory, 3: Info::null_image_reads,
                                    // 4: Info::zeroed_write_lanes,
                                    // 5: Info::unpredicated_wave_regions / per_subgroup_lane_ops,
                                    // 6: Info::per_lane_ends (u4-graphics) or Info::image_tables,
@@ -39,13 +39,18 @@ constexpr u32 kFormatVersion = 7; // 2: Info::uses_guest_memory, 3: Info::null_i
                                    //    StageSpecialization::image_tables (u4-bindless): two
                                    //    different layouts used 6,
                                    // 7: both
+                                   // 8: Info::fetch_shader_inlined,
+                                   //    VsAttribSpecialization::fetchable
+                                   // 9: StageSpecialization::inlined_fetch_hash,
+                                   //    VertexAttribute::inst_offset 16 bits
+                                   // 10: Info::fetch_inline_reason / fetch_inline_attrib
 constexpr char kCacheId[] = GCN_BUILD_ID "-f" GCN_SHADER_CACHE_FORMAT;
 
 // Tripwires: a new member in one of these types must be added to Write()/Read() below.
 static_assert(sizeof(InfoPersistent) == 8696, "update gcn_shader_cache.cpp for InfoPersistent");
 static_assert(sizeof(Info) == 9128, "update gcn_shader_cache.cpp for Info");
-static_assert(sizeof(StageSpecialization) == 1512, "update gcn_shader_cache.cpp for StageSpecialization");
-static_assert(sizeof(gcn_shader) == 11184, "update gcn_shader_cache.cpp for gcn_shader");
+static_assert(sizeof(StageSpecialization) == 1536, "update gcn_shader_cache.cpp for StageSpecialization");
+static_assert(sizeof(gcn_shader) == 11208, "update gcn_shader_cache.cpp for gcn_shader");
 static_assert(std::is_trivially_copyable_v<RuntimeInfo>);
 static_assert(std::is_trivially_copyable_v<Profile>);
 static_assert(StageSpecialization::MaxStageResources % 64 == 0);
@@ -196,6 +201,9 @@ void WriteInfo(Writer& w, const Info& info) {
     w.Pod(info.sw_stage);
     w.Pod(info.mrt_mask);
     w.Pod(info.has_fetch_shader);
+    w.Pod(info.fetch_shader_inlined);
+    w.Pod(info.fetch_inline_reason);
+    w.Pod(info.fetch_inline_attrib);
     w.Pod(info.has_bitwise_xor);
     w.Pod(info.uses_dma);
     w.Pod(info.uses_guest_memory);
@@ -261,6 +269,9 @@ void ReadInfo(Reader& r, Info& info) {
     r.Pod(info.sw_stage);
     r.Pod(info.mrt_mask);
     r.Pod(info.has_fetch_shader);
+    r.Pod(info.fetch_shader_inlined);
+    r.Pod(info.fetch_inline_reason);
+    r.Pod(info.fetch_inline_attrib);
     r.Pod(info.has_bitwise_xor);
     r.Pod(info.uses_dma);
     r.Pod(info.uses_guest_memory);
@@ -323,6 +334,7 @@ void WriteSpec(Writer& w, const StageSpecialization& spec) {
     w.Seq(spec.fetch_shader_data.attributes);
     w.Pod(spec.fetch_shader_data.vertex_offset_sgpr);
     w.Pod(spec.fetch_shader_data.instance_offset_sgpr);
+    w.Pod(spec.inlined_fetch_hash);
     w.Seq(spec.vs_attribs);
     w.Seq(spec.buffers);
     w.Seq(spec.images);
@@ -339,6 +351,7 @@ void ReadSpec(Reader& r, StageSpecialization& spec) {
     r.Seq(spec.fetch_shader_data.attributes, 256);
     r.Pod(spec.fetch_shader_data.vertex_offset_sgpr);
     r.Pod(spec.fetch_shader_data.instance_offset_sgpr);
+    r.Pod(spec.inlined_fetch_hash);
     r.Seq(spec.vs_attribs, 256);
     r.Seq(spec.buffers, NUM_BUFFERS);
     r.Seq(spec.images, NUM_IMAGES);

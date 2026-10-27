@@ -169,7 +169,8 @@ One- and two-channel formats show R (and G). Multisampled textures have no view.
   records no output of the pass: it may still write memory the renderer does not track, and the
   notes on stderr list the store instructions in its shaders' GCN code). `--out <dir>` writes the replayed outputs (`.raw`, `.png`,
   `.bin`). The replay runs the renderer with `PS4_GNM_SYNC_ENCODE`, `PS4_GNM_SYNC_COMPILE` and no
-  shader cache, PSO archive or library store, so it reads and writes nothing outside its process.
+  shader cache, PSO archive or library store, so it reads and writes nothing outside its process
+(`PS4_GNM_REPLAY_ASYNC_COMPILE=1` keeps background compiles, for tests of the pending-compile count).
   `<out>/gnm_replay <frame_dir> <a>-<b>|all --sha` replays a range in one process and prints one
   `P` line per pass and one `O` line (SHA-256) per output (gnm_replay.h, FormatPassResult).
 - `--settle` (single pass or range) is a **diagnostic, not a gate**. It replays each pass twice in

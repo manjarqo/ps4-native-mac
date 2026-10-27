@@ -18,6 +18,7 @@ STUB = textwrap.dedent('''\
     read -r fps load cpu spikes < <(awk -v t="$TAG" '$1 == t {print $2, $3, $4, $5}' "$PLAN")
     fps=${fps:-70}; load=${load:-9}; cpu=${cpu:-50}; spikes=${spikes:-0}
     echo "$TAG" >> "$OUT/runs.txt"
+    echo "$*" >> "$OUT/args.txt"
     for i in $(seq 20); do
       echo "[gnm-draw] perf: $fps fps over last 300 presents; per frame: 3.0 commits, 0.0 waits, 0.0 ms waiting, 9.0 ms GPU busy, 7.0 ms CP (CPU), 13.0 ms encoder, 0.3 ms screen"
     done > "$OUT/$TAG.log"
@@ -42,12 +43,12 @@ class PerfAbTest(unittest.TestCase):
             f.write(STUB)
         os.chmod(self.stub, stat.S_IRWXU)
 
-    def ab(self, plan, n=3):
+    def ab(self, plan, n=3, extra=()):
         with open(os.path.join(self.d, "plan.txt"), "w") as f:
             f.write(plan)
         env = dict(os.environ, ROUTE=self.stub, PLAN=os.path.join(self.d, "plan.txt"), OUT=self.d, PAUSE="0",
                    N=str(n), A="/a:4", B="/b:4", TAG="t", SECS="10")
-        p = subprocess.run(["/bin/bash", TOOL], env=env, capture_output=True, text=True, timeout=60)
+        p = subprocess.run(["/bin/bash", TOOL, *extra], env=env, capture_output=True, text=True, timeout=60)
         with open(os.path.join(self.d, "runs.txt")) as f:
             runs = f.read().split()
         return p.returncode, p.stdout, p.stderr, runs
@@ -57,6 +58,14 @@ class PerfAbTest(unittest.TestCase):
         self.assertEqual(runs, ["t_Aw", "t_Bw", "t_A1", "t_B1", "t_A2", "t_B2", "t_A3", "t_B3"])
         self.assertIn("A kept 3: t_A1 t_A2 t_A3", out)
         self.assertIn("other_cpu medians: A 50 50 50; B 50 50 50", out)
+        self.assertEqual(code, 0, out + err)
+
+    def test_trailing_arguments_reach_every_route_run(self):
+        code, out, err, runs = self.ab("", n=1, extra=("PS4_UPSCALE=metalfx", "X=1"))
+        with open(os.path.join(self.d, "args.txt")) as f:
+            args = f.read().splitlines()
+        self.assertEqual(len(args), len(runs))
+        self.assertTrue(all(a == "PS4_UPSCALE=metalfx X=1" for a in args), args)
         self.assertEqual(code, 0, out + err)
 
     def test_one_side_always_dropped_ends(self):

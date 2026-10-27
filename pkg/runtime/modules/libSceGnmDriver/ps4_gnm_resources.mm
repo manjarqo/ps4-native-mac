@@ -1589,9 +1589,12 @@ static bool DecodeImageUncached(const uint32_t* dwords, uint32_t num_dwords, Ima
     uint32_t slices = depth_field + 1;
     if (out->type == ImageType::Color3D) slices = 1;
     else if (out->type == ImageType::Cube) slices *= 6;
-    if (out->pow2pad) slices = BitCeil(slices);
     // Non-array types: shadPS4 keeps depth+1 layers (games usually set depth 0 there).
     out->num_layers = slices;
+    // POW2PAD pads the slice count of the guest layout only: the padded slices hold no image data
+    // a view can name (last_array stays below depth + 1), so the texture is made of the real ones.
+    // (inFAMOUS Second Son: 256 cubes, 1536 faces, laid out as 2048.)
+    out->layout_layers = out->pow2pad ? BitCeil(slices) : slices;
 
     // Neo bank swizzle (shadPS4 Image::GetBankSwizzle)
     if (out->alt_tile_mode && out->dfmt != DataFormat::FormatInvalid &&
@@ -1606,9 +1609,19 @@ static bool DecodeImageUncached(const uint32_t* dwords, uint32_t num_dwords, Ima
 
     out->pixel = GetPixelFormat(out->dfmt, out->nfmt);
     out->view_swizzle = ComposeViewSwizzle(out->pixel, out->swizzle);
+    // A 1D image has one row (GCN ignores the height field of a 1D T#; the guest layout is sized
+    // with height 1). Every 1D T# is made as a 2D texture of height 1 (a 2D array for
+    // Color1DArray), which holds the same texels and reads the same way, since GCN samples a 1D
+    // image along x: the translator declares every 1D image as a 2D one and reads it as one
+    // (libgcn_recompiler Image::Is1DAs2D): coordinates (x) become (x, 0) for loads and (u, 0.5)
+    // for samples. Metal could not make a 1D texture with a block-compressed format or with mips
+    // anyway. Uploads and detiling take the 2D path; a block row of a level shorter than a block
+    // is padded, as for any level smaller than a block.
+    const bool is1d = out->type == ImageType::Color1D || out->type == ImageType::Color1DArray;
+    if (is1d) out->height = 1;
     switch (out->type) {
-    case ImageType::Color1D: out->mtl_texture_type = MTLTextureType1D; break;
-    case ImageType::Color1DArray: out->mtl_texture_type = MTLTextureType1DArray; break;
+    case ImageType::Color1D: out->mtl_texture_type = MTLTextureType2D; break;
+    case ImageType::Color1DArray: out->mtl_texture_type = MTLTextureType2DArray; break;
     case ImageType::Color2D: out->mtl_texture_type = MTLTextureType2D; break;
     case ImageType::Color2DArray: out->mtl_texture_type = MTLTextureType2DArray; break;
     case ImageType::Color2DMsaa: out->mtl_texture_type = MTLTextureType2DMultisample; break;
@@ -1620,17 +1633,17 @@ static bool DecodeImageUncached(const uint32_t* dwords, uint32_t num_dwords, Ima
     default: out->mtl_texture_type = MTLTextureType2D; break;
     }
     // A T# no Metal texture can be made of (MTLTextureDescriptor validation would abort the
-    // process): 1D with mips or a block-compressed format, multisampled with more than 8
-    // samples, 3D past 2048 texels, a cube that is not square, more layers than an array texture
-    // holds. It decodes as invalid (a null binding), counted and logged. The unused entries of
-    // T# tables, which hold no T# (Uncharted 4's lights: floats), decode to such T#s. The same
-    // check is libgcn_recompiler's IsCreatableImage (resource.h), which makes such a table entry
-    // count as unbound in the shader's specialization.
+    // process): multisampled with more than 8 samples, 3D past 2048 texels, a cube that is not
+    // square, more layers than an array texture holds (Apple GPUs: arrayLength 2048 for a 2D
+    // array, 341 cubes = 2046 faces for a cube array; validation: "arrayLength (342) is set to zero
+    // or greater than the max allowed size (341)"). It decodes as invalid (a null binding),
+    // counted and logged. The unused entries of T# tables, which hold no T# (Uncharted 4's lights:
+    // floats), decode to such T#s. The same check is libgcn_recompiler's IsCreatableImage
+    // (resource.h), which makes such a table entry count as unbound in the shader's specialization.
     if (out->valid && IsValidTileMode((uint32_t)out->tile_mode)) {
-        const bool is1d = out->type == ImageType::Color1D || out->type == ImageType::Color1DArray;
         const bool cube = out->type == ImageType::Cube;
         const bool is3d = out->type == ImageType::Color3D;
-        if ((is1d && (out->num_levels > 1 || IsBlockCoded(out->dfmt))) || (msaa && out->last_level > 3) ||
+        if ((msaa && out->last_level > 3) ||
             (is3d && (out->width > 2048 || out->height > 2048 || out->depth > 2048)) ||
             (cube && out->width != out->height) || out->num_layers > (cube ? 2046u : 2048u)) {
             const uint64_t n = g_uncreatable_images.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1666,7 +1679,7 @@ SurfaceDesc ImageDesc::ToSurfaceDesc(bool neo_mode) const {
     s.depth = type == ImageType::Color3D ? depth : 1;
     s.pitch = pitch;
     s.levels = std::min<uint32_t>(num_levels, kMaxMips);
-    s.layers = num_layers;
+    s.layers = layout_layers;
     s.is_block = IsBlockCoded(dfmt);
     s.is_pow2 = pow2pad;
     s.alt_tile = alt_tile_mode && neo_mode; // shadPS4 ImageInfo: alt_tile = IsNeoMode()

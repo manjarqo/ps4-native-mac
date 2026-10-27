@@ -446,8 +446,25 @@ Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
 
 Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
-    if ((spv_buffer.misalign & 1) != 0)
-        UNREACHABLE_MSG("16-bit load at an odd offset of a buffer whose base is not dword aligned (+{})", spv_buffer.misalign);
+    if ((spv_buffer.misalign & 1) != 0) {
+        // PS4Recomp: the buffer starts at an odd byte of the bound dword (a vertex V# at an odd
+        // address, 8_8 data): halfword i of the guest buffer is bound bytes 2i + misalign and
+        // 2i + misalign + 1 (read through the U8 alias). It exists iff both are inside the guest
+        // buffer (GCN returns 0 for an element crossing the end; the pushed size is the guest
+        // size plus misalign).
+        const auto [id8, pointer8] = spv_buffer.Alias(PointerType::U8);
+        const Id size8 = spv_buffer.Size(PointerSize::B8);
+        const Id lo_at = ctx.OpIAdd(ctx.U32[1], ctx.OpShiftLeftLogical(ctx.U32[1], address, ctx.ConstU32(1U)),
+                                    ctx.ConstU32(spv_buffer.misalign));
+        const Id hi_at = ctx.OpIAdd(ctx.U32[1], lo_at, ctx.ConstU32(1U));
+        const auto load_byte = [&](Id at) {
+            const Id ptr{ctx.OpAccessChain(pointer8, id8, ctx.u32_zero_value, ctx.ClampIndex(at, size8))};
+            return ctx.OpUConvert(ctx.U32[1], ctx.OpLoad(ctx.U8, ptr));
+        };
+        const Id value = ctx.OpBitwiseOr(ctx.U32[1], load_byte(lo_at),
+                                         ctx.OpShiftLeftLogical(ctx.U32[1], load_byte(hi_at), ctx.ConstU32(8U)));
+        return ctx.ZeroIfOutOfBounds(ctx.U16, ctx.u16_zero_value, ctx.OpUConvert(ctx.U16, value), hi_at, size8);
+    }
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }

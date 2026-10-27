@@ -28,7 +28,15 @@
 //      presenter took flips, with the flips after it, and the drawables the presenter kept for a
 //      hung slot frame come back, so later frames are still presented. The frames after the held
 //      one are flipped only while the presenter has a drawable for them: the number of drawables
-//      the system keeps for the display depends on the window's visibility, not on the runtime.
+//      the system keeps for the display depends on the window's visibility, not on the runtime;
+//   7. sceGnmInsertWaitFlipDone (through its guest entry) is a memory wait, equal to 0, on the
+//      flip label of the buffer, one 64-bit label per buffer index; SubmitAndFlip locks the label
+//      of its buffer (1) and the next flip that completes releases it (0): the buffer has left the
+//      screen. With the display behind, a command buffer that starts with the wait for the buffer
+//      still on screen does not run (its EOP label stays unwritten) until the display takes the
+//      next frame, also past the 50 ms after which other waits are given up. Before the fix the
+//      packet waited on register 0 and the frame ran at once, so a game that paces itself with
+//      this wait flipped as fast as the CPU could submit.
 // With "nohooks" (PS4_TEST_HOOKS unset) it checks that the GPU stall hook refuses and that frames
 // still flip.
 // On 199a6e9 the held SubmitAndFlip takes about 1 s (the slot acquire timeout): the test fails.
@@ -125,11 +133,13 @@ struct Guest {
 // One frame: default state, then (draw) a triangle into display buffer 0 (a draw with CB0 =
 // the display buffer makes it a GPU render target, which the GPU present path presents), then
 // EVENT_WRITE_EOP writing `value` to the label.
-void BuildFrame(Guest& g, uint32_t value, bool draw = true) {
+// `prefix` (prefix_dw dwords, e.g. a sceGnmInsertWaitFlipDone packet) follows the default state.
+void BuildFrame(Guest& g, uint32_t value, bool draw = true, const uint32_t* prefix = nullptr, size_t prefix_dw = 7) {
     uint32_t* mem = (uint32_t*)(g.ctx->mem_base + g.dcb);
     const uint32_t init = sceGnmDrawInitDefaultHardwareState350(mem, 0x1000);
     Dcb d;
     d.w.assign(mem, mem + init);
+    if (prefix) d.w.insert(d.w.end(), prefix, prefix + prefix_dw);
     if (draw) {
         // shaders
         d.Sh(0x2C48, (uint32_t)(g.vs >> 8));  // SPI_SHADER_PGM_LO_VS
@@ -204,6 +214,48 @@ double SubmitAndFlip(Guest& g, int64_t flip_arg, int buffer = -1) {
 
 uint32_t Label(const Guest& g) {
     return __atomic_load_n((const uint32_t*)(g.ctx->mem_base + g.label), __ATOMIC_ACQUIRE);
+}
+
+// A sceGnmInsertWaitFlipDone packet for buffer `index`, through the guest entry (the shim), into
+// guest memory at `at`; copied to out[7]. Returns the call's result.
+int32_t WaitFlipDonePacket(Guest& g, uint64_t at, uint32_t index, uint32_t out[7]) {
+    GuestContext* c = g.ctx;
+    const uint64_t rsp = c->rsp;
+    c->rdi = at;
+    c->rsi = 7;
+    c->rdx = (uint64_t)(int64_t)g.vo;
+    c->rcx = index;
+    shim_sceGnmInsertWaitFlipDone(c);
+    c->rsp = rsp;
+    memcpy(out, c->mem_base + at, 7 * 4);
+    return (int32_t)c->rax;
+}
+
+// The 64-bit flip label a WAIT_REG_MEM packet polls (0 when the packet is not a memory wait).
+uint64_t PollAddress(const uint32_t w[7]) {
+    if (((w[1] >> 4) & 1u) == 0) return 0;
+    return ((uint64_t)w[2] & ~3ull) | ((uint64_t)(w[3] & 0xFFFFu) << 32);
+}
+
+uint64_t FlipLabel(const Guest& g, uint64_t addr) {
+    if (addr == 0 || addr + 8 > g.ctx->mem_size) return ~0ull;
+    return __atomic_load_n((const uint64_t*)(g.ctx->mem_base + addr), __ATOMIC_ACQUIRE);
+}
+
+// The command processor's flip-label wait counters (suspends, given up, wake-ups by a released
+// label), looked up at run time: absent (all 0, found = false) before fix round 1.
+struct FlipWaits {
+    uint64_t suspends = 0, timeouts = 0, wakes = 0;
+    bool found = false;
+};
+FlipWaits FlipWaitStats() {
+    FlipWaits w;
+    using Get = void (*)(uint64_t*, uint64_t*, uint64_t*);
+    if (auto f = (Get)dlsym(RTLD_DEFAULT, "ps4_gnm_metal_flip_wait_stats")) {
+        f(&w.suspends, &w.timeouts, &w.wakes);
+        w.found = true;
+    }
+    return w;
 }
 
 OrbisVideoOutFlipStatus Flips(const Guest& g) {
@@ -324,9 +376,24 @@ void CheckBufferSetErrors(Guest& g, const OrbisVideoOutBufferAttribute& attr) {
     CHECK(rc(sceVideoOutRegisterBuffers(g.vo, 6, one, 1, &a)) == ORBIS_VIDEO_OUT_ERROR_INVALID_TILING_MODE,
           "register: tiling mode");
     a = attr;
-    a.reserved[0] = 1;
+    a.option = ORBIS_VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY; // what inFAMOUS sets
+    {
+        const int32_t set = sceVideoOutRegisterBuffers(g.vo, 6, one, 1, &a);
+        CHECK(set == 2, "register: option STRICT_COLORIMETRY is accepted (got 0x%08x)", (uint32_t)set);
+        if (set >= 0) CHECK(sceVideoOutUnregisterBuffers(g.vo, set) == 0, "unregister the option set");
+    }
+    a = attr;
+    a.reserved0 = 1;
     CHECK(rc(sceVideoOutRegisterBuffers(g.vo, 6, one, 1, &a)) == ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE,
-          "register: reserved field");
+          "register: reserved0");
+    a = attr;
+    a.reserved1 = 1;
+    CHECK(rc(sceVideoOutRegisterBuffers(g.vo, 6, one, 1, &a)) == ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE,
+          "register: reserved1");
+    // SetBufferAttribute clears option and the reserved words of a dirty struct
+    memset(&a, 0xff, sizeof a);
+    sceVideoOutSetBufferAttribute(&a, 0x80000000u, 1, 0, attr.width, attr.height, attr.pixelPitch);
+    CHECK(a.option == 0 && a.reserved0 == 0 && a.reserved1 == 0, "SetBufferAttribute: option and reserved are 0");
     // 4 sets at most
     CHECK(sceVideoOutRegisterBuffers(g.vo, 6, one, 1, &attr) == 2, "register: set 2");
     CHECK(sceVideoOutRegisterBuffers(g.vo, 7, one, 1, &attr) == 3, "register: set 3");
@@ -590,6 +657,124 @@ void* TestThread(void* argp) {
                   right[0], right[1], right[2]);
         }
 
+        // 7. flip labels and sceGnmInsertWaitFlipDone (the display is caught up after 5; the last
+        // flip was buffer base + 1)
+        if (!g_fail) {
+            const uint32_t bi = g.base, bj = g.base + 1;
+            uint32_t wi[7] = {}, wj[7] = {};
+            const uint64_t scratch = g.label + 0x100;
+            CHECK(WaitFlipDonePacket(g, scratch, bi, wi) == 0 && WaitFlipDonePacket(g, scratch + 0x40, bj, wj) == 0,
+                  "wait flip: sceGnmInsertWaitFlipDone failed");
+            CHECK(wi[0] == Type3(0x3C, 6), "wait flip: header 0x%08x, want WAIT_REG_MEM with 6 payload dwords", wi[0]);
+            // function 3 (equal), mem_space 1: wait until label == 0 (mask all bits)
+            CHECK((wi[1] & 0x17u) == 0x13u && wi[4] == 0 && wi[5] == 0xFFFFFFFFu,
+                  "wait flip: control 0x%x ref 0x%x mask 0x%x, want a memory wait (0x13) for 0 under 0xffffffff",
+                  wi[1], wi[4], wi[5]);
+            const uint64_t li = PollAddress(wi), lj = PollAddress(wj);
+            CHECK(li != 0 && li + 16 <= g.ctx->mem_size && lj == li + 8,
+                  "wait flip: label addresses 0x%llx and 0x%llx, want guest addresses 8 bytes apart",
+                  (unsigned long long)li, (unsigned long long)lj);
+            if (!g_fail) {
+                // SubmitAndFlip locks its buffer's label; the next flip that completes releases it
+                BuildFrame(g, ++value);
+                SubmitAndFlip(g, value, (int)bi);
+                ++flips;
+                CHECK(WaitFor(2000, [&] { return Flips(g).num == flips; }) && FlipLabel(g, li) == 1 && FlipLabel(g, lj) == 0,
+                      "wait flip: after the flip of %u labels %llu/%llu, want 1/0", bi,
+                      (unsigned long long)FlipLabel(g, li), (unsigned long long)FlipLabel(g, lj));
+                BuildFrame(g, ++value);
+                SubmitAndFlip(g, value, (int)bj);
+                ++flips;
+                CHECK(WaitFor(2000, [&] { return Flips(g).num == flips; }) && FlipLabel(g, li) == 0 && FlipLabel(g, lj) == 1,
+                      "wait flip: after the flip of %u labels %llu/%llu, want 0/1", bj,
+                      (unsigned long long)FlipLabel(g, li), (unsigned long long)FlipLabel(g, lj));
+            }
+            {
+                // the display is behind: the flip of bi is held, so bj stays on screen (runs on the
+                // runtime before the fix too, whose wait packet never waits)
+                void* held = TakeSlot();
+                CHECK(held != nullptr, "wait flip: no present slot to hold");
+                const FlipWaits w0 = FlipWaitStats();
+                BuildFrame(g, ++value);
+                SubmitAndFlip(g, value, (int)bi);
+                const uint32_t shown_value = value;
+                CHECK(WaitFor(1000, [&] { return Label(g) == shown_value && (li == 0 || FlipLabel(g, li) == 1); }),
+                      "wait flip: the held frame's command buffer did not run (EOP %u, label %llu)", Label(g),
+                      (unsigned long long)FlipLabel(g, li));
+                // a frame that renders into bj waits until bj has left the screen
+                BuildFrame(g, ++value, true, wj);
+                SubmitAndFlip(g, value, (int)bj);
+                // longer than the 50 ms after which the command processor gives up other waits
+                usleep(150 * 1000);
+                CHECK(Label(g) == shown_value,
+                      "wait flip: the frame waiting for buffer %u to leave the screen ran while it was shown (EOP %u)",
+                      bj, Label(g));
+                CHECK(Flips(g).num == flips && Flips(g).numFlipPending == 2,
+                      "wait flip: flips %llu, pending %d (want %llu, 2)", (unsigned long long)Flips(g).num,
+                      Flips(g).numFlipPending, (unsigned long long)flips);
+                GiveBack(held);
+                flips += 2;
+                CHECK(WaitFor(2000, [&] { return Label(g) == value && Flips(g).num == flips; }),
+                      "wait flip: after the display caught up EOP %u (want %u), flips %llu (want %llu)", Label(g), value,
+                      (unsigned long long)Flips(g).num, (unsigned long long)flips);
+                CHECK(li != 0 && FlipLabel(g, li) == 0 && FlipLabel(g, lj) == 1, "wait flip: labels %llu/%llu at the end, want 0/1",
+                      (unsigned long long)FlipLabel(g, li), (unsigned long long)FlipLabel(g, lj));
+                // counted as a flip-label wait, not given up, and resumed by the released label
+                const FlipWaits w1 = FlipWaitStats();
+                CHECK(w1.found, "wait flip: ps4_gnm_metal_flip_wait_stats is not exported");
+                CHECK(w1.suspends > w0.suspends && w1.timeouts == w0.timeouts && w1.wakes > w0.wakes,
+                      "wait flip: flip-label suspends +%llu, timeouts +%llu, wakes +%llu (want >= 1, 0, >= 1)",
+                      (unsigned long long)(w1.suspends - w0.suspends), (unsigned long long)(w1.timeouts - w0.timeouts),
+                      (unsigned long long)(w1.wakes - w0.wakes));
+            }
+            if (!g_fail) {
+                // a wait no queued flip can release (bj is on screen, the flip after the wait is the
+                // only one): given up after the flip-label limit (2 s), counted and logged
+                const FlipWaits w0 = FlipWaitStats();
+                BuildFrame(g, ++value, true, wj);
+                const double t0 = NowMs();
+                SubmitAndFlip(g, value, (int)bi);
+                usleep(1500 * 1000);
+                CHECK(Label(g) != value, "wait flip: a wait nothing can release was given up before 1.5 s");
+                const bool ran = WaitFor(3000, [&] { return Label(g) == value; });
+                const double after = NowMs() - t0;
+                ++flips;
+                CHECK(ran && after >= 1900.0, "wait flip: the unreleasable wait ended after %.0f ms (ran %d), want ~2000",
+                      after, ran ? 1 : 0);
+                CHECK(WaitFor(2000, [&] { return Flips(g).num == flips; }), "wait flip: the frame after the given-up wait never flipped");
+                const FlipWaits w1 = FlipWaitStats();
+                CHECK(w1.timeouts == w0.timeouts + 1, "wait flip: flip-label timeouts +%llu, want 1",
+                      (unsigned long long)(w1.timeouts - w0.timeouts));
+            }
+            if (!g_fail) {
+                // a wait on other memory that never comes (given up after 50 ms), then in the same
+                // command buffer a flip-label wait no queued flip can release (bi is on screen now):
+                // the second wait is a new suspension with its own limit (2 s), counted as a
+                // flip-label wait and given up as one
+                const uint64_t never = g.label + 0x200;
+                __atomic_store_n((uint32_t*)(g.ctx->mem_base + never), 0u, __ATOMIC_RELEASE);
+                uint32_t pre[14] = {Type3(0x3C, 6), 0x13u, (uint32_t)never, (uint32_t)(never >> 32), 1u, 0xFFFFFFFFu, 10u};
+                memcpy(pre + 7, wi, sizeof(wi));
+                const FlipWaits w0 = FlipWaitStats();
+                BuildFrame(g, ++value, true, pre, 14);
+                const double t0 = NowMs();
+                SubmitAndFlip(g, value, (int)bj);
+                usleep(1500 * 1000);
+                CHECK(Label(g) != value,
+                      "wait flip: a flip-label wait after a given-up wait was given up before 1.5 s (stale limit)");
+                const bool ran = WaitFor(3000, [&] { return Label(g) == value; });
+                const double after = NowMs() - t0;
+                ++flips;
+                CHECK(ran && after >= 1950.0, "wait flip: the two waits ended after %.0f ms (ran %d), want ~2050", after,
+                      ran ? 1 : 0);
+                CHECK(WaitFor(2000, [&] { return Flips(g).num == flips; }), "wait flip: the frame after the two waits never flipped");
+                const FlipWaits w1 = FlipWaitStats();
+                CHECK(w1.suspends == w0.suspends + 1 && w1.timeouts == w0.timeouts + 1,
+                      "wait flip: after a given-up wait, flip-label suspends +%llu, timeouts +%llu (want 1, 1)",
+                      (unsigned long long)(w1.suspends - w0.suspends), (unsigned long long)(w1.timeouts - w0.timeouts));
+            }
+        }
+
         // 6. the GPU hangs under a slot frame's and held frames' conversions (last: the renderer
         // stays given up)
         if (!g_fail) {
@@ -674,6 +859,18 @@ void* TestThread(void* argp) {
             }
         }
 
+        // No guest memory left for a new handle's flip labels (the allocator reports -1): an error,
+        // no write outside guest memory.
+        {
+            for (size_t sz : {size_t(64) << 20, size_t(4096)})
+                for (uint64_t a = 0; a != (uint64_t)-1 && a != 1;) a = recomp_vm_alloc(g.ctx, sz) ?: 1;
+            const int32_t vo2 = sceVideoOutOpen(255, 0, 0, nullptr);
+            uint64_t labels = 0;
+            const int32_t r = vo2 >= 0 ? sceVideoOutGetBufferLabelAddress(g.ctx, vo2, &labels) : -1;
+            CHECK(vo2 >= 0 && r < 0, "labels without guest memory: handle %d, result 0x%08x (want an error)", vo2, (uint32_t)r);
+            if (vo2 >= 0) sceVideoOutClose(vo2);
+        }
+
         // The performance overlay names the backend the renderer started (PS4_GNM_METAL, default 3).
         {
             const char* want_env = getenv("PS4_GNM_METAL");
@@ -684,6 +881,15 @@ void* TestThread(void* argp) {
             const char* label = get ? get() : nullptr;
             CHECK(label && !strcmp(label, want), "overlay backend label \"%s\", want \"%s\"", label ? label : "(none)",
                   want);
+        }
+
+        // The stall of scenario 6 ends here: the hung command buffers run to their end and complete,
+        // so the process exits as soon as the renderer is destroyed. Left hung, they only end when the
+        // system's GPU timeout kills them, a time the system chooses (on a busy GPU later than the
+        // 10 s the backend's destructor waits, which aborts the exit).
+        if (slot_frames > 0) {
+            auto release = (int (*)(void))dlsym(RTLD_DEFAULT, "ps4_gnm_metal_debug_release_gpu");
+            CHECK(release != nullptr && release() == 0, "hung: the GPU stall could not be ended (PS4_TEST_HOOKS=1)");
         }
 
         if (g_fail) {

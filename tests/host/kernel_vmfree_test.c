@@ -42,6 +42,10 @@ static int g_unmap_calls;
 static void (*g_unmap_hook)(GuestContext *, int call_no);
 
 void ps4_direct_mem_destroy(void) {}
+void ps4_direct_mem_configure(GuestContext *ctx, uint64_t proc_param_addr) {
+  (void)ctx;
+  (void)proc_param_addr;
+}
 void ps4_direct_mem_on_unmap(GuestContext *ctx, uint64_t addr, size_t size) {
   int n = g_unmap_calls++;
   if (n < 64) {

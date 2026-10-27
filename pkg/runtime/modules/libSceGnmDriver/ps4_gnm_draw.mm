@@ -73,6 +73,7 @@
 #include "ps4_gnm_backend.h"
 #include "ps4_gnm_backend_metal3.h"
 #include "ps4_gnm_util_passes.h"
+#include "ps4_gnm_vertex_layout.h"
 #include "ps4_metal_screen.h"
 #include "ps4_hitch.h"
 
@@ -172,6 +173,41 @@ struct RegSnap {
 // wait of the CPU for the GPU sleeps on cv, fed by the command buffer completion handlers and
 // the ticket listener (state changes are published with GmNotify).
 // =====================================================================================
+// Callbacks on Metal's completion threads (command buffer completions, shared-event listeners)
+// reach this file's static objects. After a crash the backend outlives exit(1) (BackendDelete),
+// so its command buffers keep completing while static destruction runs: a late callback locked
+// a destroyed std::mutex ("mutex lock failed: Invalid argument", CommitDoneFn). ReleaseBackend
+// closes the gate on a crash's way out and waits for the callbacks inside; later ones return at
+// once. Atomics only: the gate itself is never destroyed in a way a late callback could see.
+// Function-local statics with destructors are heap objects that are never destroyed in this file
+// and ps4_gnm_metal.mm (`static T& x = *new T;`): constructed at first use, possibly after the
+// exit handlers (ReleaseBackend, StopGfxWatchdog) were registered, they would be destroyed before
+// those handlers run, while the queue wait thread, the encoder or a completion still uses them.
+struct CompletionGate {
+    std::atomic<bool> closed{false};
+    std::atomic<int> inside{0};
+    bool Enter() {
+        inside.fetch_add(1); // seq_cst with closed: either Close sees it, or it sees closed
+        if (!closed.load()) return true;
+        inside.fetch_sub(1);
+        return false;
+    }
+    void Leave() { inside.fetch_sub(1); }
+    // bounded: a callback stuck behind a lock the crashed thread holds must not hang exit
+    void Close() {
+        closed.store(true);
+        for (int i = 0; i < 2000 && inside.load() != 0; ++i) usleep(500);
+        if (inside.load() != 0) fprintf(stderr, "[gnm-draw] exit: %d GPU completion callbacks still running\n", inside.load());
+    }
+};
+CompletionGate g_completion_gate;
+struct CompletionScope {
+    const bool in = g_completion_gate.Enter();
+    ~CompletionScope() {
+        if (in) g_completion_gate.Leave();
+    }
+};
+
 struct GmTicket;
 struct GmSync {
     id<MTLSharedEvent> ev = nil;
@@ -200,6 +236,8 @@ struct GmSync {
 GmSync g_gms;
 
 void GmNotify() {
+    const CompletionScope gate;
+    if (!gate.in) return;
     { std::lock_guard<std::mutex> lk(g_gms.mu); }
     g_gms.cv.notify_all();
 }
@@ -811,7 +849,12 @@ struct State {
     uint64_t trace_start = 0, trace_count = 0;
     std::deque<InflightLog> inflight_logs; // committed, not known complete (pruned at commits, cleared by WaitAll)
     uint64_t n_draws = 0, n_dispatches = 0, n_cmdbufs = 0;
-    std::atomic<uint64_t> n_skipped{0}; // both threads (see EncodeQueue)
+    // Draws and dispatches skipped (both threads, see EncodeQueue; relaxed), in all and by reason
+    // (NoteSkip). skipped_by[PendingCompile] is the part deferred because a shader or pipeline
+    // they need is still compiling in the background (a cold cache effect: the next frames draw
+    // them); the rest is work really lost.
+    std::atomic<uint64_t> n_skipped{0};
+    std::atomic<uint64_t> skipped_by[(size_t)SkipReason::Count] = {};
     // draws skipped by PS4_GNM_MTL4_ONLY_CLEARS after their pass began (not in n_skipped); encoder
     // thread, read by OnlyClearsSkippedCount
     std::atomic<uint64_t> n_clear_only{0};
@@ -836,6 +879,17 @@ struct State {
 };
 
 State S;
+
+// A draw or dispatch skipped: counted in all and for its reason (State::n_skipped).
+inline void NoteSkip(SkipReason r) {
+    S.n_skipped.fetch_add(1, std::memory_order_relaxed);
+    S.skipped_by[(size_t)r].fetch_add(1, std::memory_order_relaxed);
+}
+inline uint64_t SkippedFor(SkipReason r) { return S.skipped_by[(size_t)r].load(std::memory_order_relaxed); }
+// A draw deferred because a shader or pipeline it needs is still compiling (State::n_skipped).
+inline void NoteDrawPendingCompile() { NoteSkip(SkipReason::PendingCompile); }
+// True while the background translation or compile of `s` is in flight (not once it failed).
+inline bool ShaderCompiling(const Shader* s) { return s == &S.pending_shader || s->pending; }
 // S.be for the hooks that run off the encoder thread (CommitDoneFn's arena recycling on a Metal
 // completion thread, the presenter's texture hooks): set by Init, cleared by ReleaseBackend before
 // it resets S.be. A hook that loaded it before the clear still finds the backend alive: its
@@ -2197,6 +2251,8 @@ struct CommitDone {
 void NoteSeqCompleted();
 
 void CommitDoneFn(void* p, const GnmCompletion& c) {
+    const CompletionScope gate;
+    if (!gate.in) return; // a crash's exit: its CommitDone is left (its members are this file's)
     std::unique_ptr<CommitDone> d(static_cast<CommitDone*>(p));
     // first, as the present's own completed handler ran before this one: a failed command buffer
     // may not have reached its present signals, and the presenter must not wait for them forever
@@ -3052,6 +3108,21 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
          (unsigned long long)code_addr, vec.size(), s->info.num_buffers, s->info.num_images,
          s->info.num_samplers, s->info.num_vertex_attribs,
          s->info.translation_failed ? " [translation incomplete]" : "", ms);
+    if (s->info.fetch_shader_inlined) {
+        // a VS whose vertex V#s Metal's vertex fetch cannot read (stride, address or format):
+        // its fetch shader's loads run in the shader (gcn Translator::EmitFetch)
+        // (RLog counts them: "(xN)" on the powers of two)
+        const uint32_t why = s->info.fetch_inline_reason & 7;
+        // counted per reason (RLog's "(xN)"): one key per combination
+        static const char* const kKeys[8] = {"fetch-inlined", "fetch-inlined-s", "fetch-inlined-a", "fetch-inlined-sa",
+                                             "fetch-inlined-f", "fetch-inlined-sf", "fetch-inlined-af",
+                                             "fetch-inlined-saf"};
+        RLog(kKeys[why], "VS 0x%llx perm %zu reads its vertices in the shader (fetch shader inlined): attribute "
+             "%u has %s%s%s", (unsigned long long)code_addr, vec.size(), s->info.fetch_inline_attrib,
+             why & GCN_FETCH_INLINE_STRIDE ? "[stride not a multiple of 4]" : "",
+             why & GCN_FETCH_INLINE_ADDRESS ? "[address not a multiple of 4]" : "",
+             why & GCN_FETCH_INLINE_FORMAT ? "[no Metal vertex format]" : "");
+    }
     vec.push_back(s);
     return s;
 }
@@ -3110,7 +3181,7 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
             });
         }
         if (hit >= 0) return vec[order[hit]];
-        static std::set<uint64_t> explained; // once per program and count
+        static std::set<uint64_t>& explained = *new std::set<uint64_t>; // once per program and count
         if ((n == 8 || n == 16 || n == 32 || n == 47) && explained.insert(key * 64 + n).second) {
             // Many permutations of one program: say why the first and the latest do not fit.
             char why0[256], why1[256];
@@ -3464,10 +3535,14 @@ struct Binder {
 
 MTLTextureType ShaderTextureType(const gcn_image_binding& b) {
     switch (b.view_type) {
-    case 8: return MTLTextureType1D;
-    case 12: return MTLTextureType1DArray;
+    // Color1D / Color1DArray: the translator declares 1D images as 2D ones of height 1
+    // (DecodeImageUncached makes 1D T#s such textures)
+    case 8: return MTLTextureType2D;
+    case 12: return MTLTextureType2DArray;
     case 10: return MTLTextureType3D;
-    case 11: return b.post_op == GCN_POSTOP_CUBE_TO_2D_ARRAY ? MTLTextureType2DArray : MTLTextureTypeCube;
+    // Cube: the translator declares every cube image as a 2D array of its faces (a GCN cube
+    // sample names its face; spirv_emit_context ImageType), so the shader gets a 2D array view
+    case 11: return MTLTextureType2DArray;
     case 13: return MTLTextureType2DArray;
     case 14: return MTLTextureType2DMultisample;
     case 15: return MTLTextureType2DMultisampleArray;
@@ -3482,13 +3557,18 @@ id<MTLTexture> AdaptTextureUncached(id<MTLTexture> t, MTLTextureType want, const
     const bool type_ok = t.textureType == want;
     const bool level_ok = (level == 0 && (nlevels == 0 || nlevels >= t.mipmapLevelCount));
     // T# BASE_ARRAY / LAST_ARRAY select the slices of a 2D array the shader sees (e.g. one
-    // layer of a shadow map array sampled as a plain 2D texture).
-    const bool arr = t.textureType == MTLTextureType2DArray &&
-                     (want == MTLTextureType2D || want == MTLTextureType2DArray);
-    const NSUInteger first = arr ? std::min<NSUInteger>(img.base_array, t.arrayLength - 1) : 0;
-    const NSUInteger last = arr ? std::min<NSUInteger>(std::max(img.last_array, img.base_array), t.arrayLength - 1)
-                                : 0;
-    const bool slices_ok = !arr || (first == 0 && last == t.arrayLength - 1);
+    // layer of a shadow map array sampled as a plain 2D texture), and the faces of a cube (array)
+    // the shader sees as a 2D array of faces (ShaderTextureType: cubes are declared that way). A
+    // cube T#'s BASE_ARRAY / LAST_ARRAY count faces, as shadPS4's views take them: TLOU's and
+    // Uncharted 4's single cubes carry 0..5, inFAMOUS Second Son's 256-cube array 0..1535.
+    const bool cube_src = t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray;
+    const NSUInteger all_slices = cube_src ? (t.textureType == MTLTextureTypeCube ? 6 : t.arrayLength * 6) : t.arrayLength;
+    const bool arr = (t.textureType == MTLTextureType2DArray &&
+                      (want == MTLTextureType2D || want == MTLTextureType2DArray)) ||
+                     (cube_src && want == MTLTextureType2DArray);
+    const NSUInteger first = arr ? std::min<NSUInteger>(img.base_array, all_slices - 1) : 0;
+    const NSUInteger last = arr ? std::min<NSUInteger>(std::max(img.last_array, img.base_array), all_slices - 1) : 0;
+    const bool slices_ok = !arr || (first == 0 && last == all_slices - 1);
     if (type_ok && level_ok && slices_ok) return t;
     // compatible view types (Metal texture view rules)
     auto compatible = [&](MTLTextureType from, MTLTextureType to) {
@@ -3813,7 +3893,7 @@ void NoteStage(const char* stage, const Shader* s, const uint32_t ud[16]) {
     uint32_t footer_size = 0;
     uint64_t footer_hash = 0;
     gcn_find_binary_info(RecordRead, nullptr, s->code_addr, &footer_size, &footer_hash);
-    if (s->info.has_fetch_shader && s->info.fetch_shader_sgpr_base < 15) {
+    if ((s->info.has_fetch_shader || s->info.fetch_shader_inlined) && s->info.fetch_shader_sgpr_base < 15) {
         const uint64_t fs = ((uint64_t)ud[s->info.fetch_shader_sgpr_base + 1] << 32 | ud[s->info.fetch_shader_sgpr_base]) &
                             ((1ull << 40) - 1);
         g_reads.push_back({fs, 4096}); // fetch shaders are a few dozen dwords; their length is not recorded
@@ -4640,8 +4720,8 @@ bool BindGuestPageTable(Binder& b, __strong id<MTLBuffer>* out) {
             if (t.first > done) g_gmem.old_tables[k++] = t;
         g_gmem.old_tables.resize(k);
     }
-    static std::vector<std::pair<uint32_t, uint64_t>> want; // (page, entry); encoder thread only
-    static std::vector<id<MTLBuffer>> windows;
+    static std::vector<std::pair<uint32_t, uint64_t>>& want = *new std::vector<std::pair<uint32_t, uint64_t>>; // (page, entry); encoder thread only
+    static std::vector<id<MTLBuffer>>& windows = *new std::vector<id<MTLBuffer>>;
     want.clear();
     windows.clear();
     const uint64_t* cur = (const uint64_t*)g_gmem.table.contents;
@@ -5033,7 +5113,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
             }
             uint64_t base = bd.base_address;
             if (static const bool lb = getenv("PS4_GNM_LOG_BIGBUF") != nullptr; lb && bd.size_bytes > (1u << 20)) {
-                static std::set<uint64_t> seen;
+                static std::set<uint64_t>& seen = *new std::set<uint64_t>;
                 if (seen.insert(s->code_addr * 64 + i).second)
                     fprintf(stderr, "[gnm-bigbuf] shader 0x%llx buf %u: base 0x%llx size 0x%x stride %u nrec 0x%x%s\n",
                             (unsigned long long)s->code_addr, i, (unsigned long long)bd.base_address, bd.size_bytes,
@@ -5213,7 +5293,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                 tex = SampledTexture(img);
                 static const bool texdbg3d = getenv("PS4_GNM_TEXDBG3D") != nullptr;
                 if (texdbg3d && tex && tex.textureType == MTLTextureType3D && tex.storageMode == MTLStorageModeShared) {
-                    static std::unordered_set<uint64_t> seen3d;
+                    static std::unordered_set<uint64_t>& seen3d = *new std::unordered_set<uint64_t>;
                     if (seen3d.insert(img.address).second) {
                         const size_t w = tex.width, h = tex.height, d = tex.depth;
                         std::vector<uint8_t> px(w * h * d * 4);
@@ -5424,8 +5504,8 @@ void SyncDepthSibling(const DepthTarget& db, id<MTLTexture> t) {
 void SyncStorageToStencil(uint64_t z_addr, id<MTLTexture> src) {
     id<MTLTexture> dt = S.tex->FindDepthTarget(z_addr);
     if (!dt || dt.sampleCount > 1 || dt.textureType != MTLTextureType2D || !HasStencil(dt.pixelFormat)) return;
-    static std::unordered_map<uint32_t, id<MTLRenderPipelineState>> psos;
-    static id<MTLDepthStencilState> dss = nil;
+    static std::unordered_map<uint32_t, id<MTLRenderPipelineState>>& psos = *new std::unordered_map<uint32_t, id<MTLRenderPipelineState>>;
+    static __strong id<MTLDepthStencilState>& dss = *new __strong id<MTLDepthStencilState>(nil);
     __strong id<MTLRenderPipelineState>& pso = psos[(uint32_t)dt.pixelFormat];
     if (!pso && S.util_lib) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
@@ -5509,7 +5589,7 @@ void SyncStorageToDepth() {
 // R32F copy of a depth target for shaders that sample the depth surface as a color texture.
 // Encodes a conversion pass into the current command buffer when the depth changed.
 id<MTLRenderPipelineState> Depth2ColorMsPso(NSUInteger samples) {
-    static std::unordered_map<NSUInteger, id<MTLRenderPipelineState>> psos;
+    static std::unordered_map<NSUInteger, id<MTLRenderPipelineState>>& psos = *new std::unordered_map<NSUInteger, id<MTLRenderPipelineState>>;
     auto it = psos.find(samples);
     if (it != psos.end()) return it->second;
     id<MTLRenderPipelineState> pso = nil;
@@ -5649,7 +5729,7 @@ id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode) {
 // the sampled texture from guest memory is converted into a depth texture (once per frame).
 id<MTLTexture> DepthFromMemory(const ImageDesc& img, bool encode) {
     GmApplyInvalidations();
-    static std::unordered_map<uint64_t, std::pair<id<MTLTexture>, uint64_t>> cache;
+    static std::unordered_map<uint64_t, std::pair<id<MTLTexture>, uint64_t>>& cache = *new std::unordered_map<uint64_t, std::pair<id<MTLTexture>, uint64_t>>;
     const uint64_t key = img.address ^ ((uint64_t)img.width << 40) ^ ((uint64_t)img.height << 52) ^
                          ((uint64_t)img.raw_dfmt << 32);
     auto& ent = cache[key];
@@ -6403,7 +6483,7 @@ void StoreLibraries(const ps4gnm_lib_store::Key* vs, const ps4gnm_lib_store::Key
 
 // Appends a pipeline hash to the list of pipelines built so far (any thread).
 void RememberPipeline(uint64_t stable) {
-    static std::mutex mu;
+    static std::mutex& mu = *new std::mutex;
     std::lock_guard<std::mutex> lk(mu);
     if (S.pso_list_path.empty()) return;
     if (FILE* f = fopen(S.pso_list_path.c_str(), "ab")) {
@@ -6412,13 +6492,19 @@ void RememberPipeline(uint64_t stable) {
     }
 }
 
+// True if the last GetGfxPipeline call returned nil because the pipeline builds in the
+// background (a nil for a pipeline whose build failed is a lost draw). Encoder thread.
+bool g_gfx_pipe_building = false;
+bool PipelineCompiling() { return g_gfx_pipe_building; }
+
 id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, const RenderState& rs,
                                           const uint32_t color_fmt[8], const uint32_t write_mask[8],
                                           uint32_t depth_fmt, uint32_t samples,
                                           const std::vector<VertexAttr>& attrs,
                                           const std::vector<uint32_t>& attr_locs, bool alpha_to_cov) {
     // only the encoder looks pipelines up (S.gfx_pipes is not locked either)
-    static std::string key; // reused: no allocation per draw
+    g_gfx_pipe_building = false;
+    static std::string& key = *new std::string; // reused: no allocation per draw
     key.clear();
     auto put = [&](const void* p, size_t n) { key.append((const char*)p, n); };
     put(&vs->uid, 8);
@@ -6442,8 +6528,8 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
         put(&attr_locs[i], 4);
     }
     // consecutive draws mostly use the same pipeline
-    static std::string last_key;
-    static id<MTLRenderPipelineState> last_pso;
+    static std::string& last_key = *new std::string;
+    static __strong id<MTLRenderPipelineState>& last_pso = *new __strong id<MTLRenderPipelineState>(nil);
     if (last_pso && key == last_key) return last_pso;
     auto it = S.gfx_pipes.find(key);
     if (it != S.gfx_pipes.end()) {
@@ -6494,9 +6580,7 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
             vd.attributes[loc].format = (MTLVertexFormat)a.format;
             vd.attributes[loc].offset = a.offset;
             vd.attributes[loc].bufferIndex = a.buffer;
-            vd.layouts[a.buffer].stride = a.stride;
-            vd.layouts[a.buffer].stepFunction = (MTLVertexStepFunction)a.step_fn;
-            vd.layouts[a.buffer].stepRate = a.step_rate;
+            ps4gnm_vertex::SetLayout(vd.layouts[a.buffer], a.stride, (MTLVertexStepFunction)a.step_fn, a.step_rate);
         }
         d.vertexDescriptor = vd;
     }
@@ -6524,6 +6608,7 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
             g_hitch.psos++;
             g_compile.pso_async++;
         }
+        g_gfx_pipe_building = true;
         return nil;
     }
     NSError* e = nil;
@@ -7338,12 +7423,22 @@ void DebugGpuWaitImpl(id<MTLSharedEvent> ev, uint64_t value) {
 
 // Test hook (tests/host/gnm_submit_flip_nonblocking_test.mm): an event nothing signals, as with a
 // hung GPU, until the watchdog (WaitAll, PS4_GNM_GPU_TIMEOUT) gives the renderer up.
+static id<MTLSharedEvent> g_stall_event; // created by the first DebugStallGpu, signaled by DebugReleaseGpu
+
 void DebugStallGpu() {
     encq::Run([] {
         if (!S.enabled.load(std::memory_order_acquire)) return;
-        static id<MTLSharedEvent> never = [S.dev newSharedEvent];
-        DebugGpuWaitImpl(never, 1);
+        if (!g_stall_event) g_stall_event = [S.dev newSharedEvent];
+        DebugGpuWaitImpl(g_stall_event, 1);
     });
+}
+
+// Test hook: the event DebugStallGpu waits for is signaled, so the stalled command buffers run to
+// their end and complete. A test that stalled the GPU calls it when it is done: otherwise the
+// stalled work only ends when the system's GPU timeout kills it, at a time the system chooses.
+void DebugReleaseGpu() {
+    id<MTLSharedEvent> ev = g_stall_event;
+    if (ev) ev.signaledValue = 1;
 }
 
 void FlushImpl(bool wait);
@@ -7611,13 +7706,13 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
         if (args.count > (16u << 20) || args.num_instances > (1u << 20)) {
             RLog("draw-count", "%s: implausible draw (count %u instances %u); skipped", args.name, args.count,
                  args.num_instances);
-            S.n_skipped++;
+            NoteSkip(SkipReason::DrawCount);
             return true;
         }
         const uint32_t stages = regs[0xA2D5]; // VGT_SHADER_STAGES_EN
         if (stages & 0x3F) {
             RLog("stages", "%s: unsupported shader stages enabled (VGT_SHADER_STAGES_EN=0x%x)", args.name, stages);
-            S.n_skipped++;
+            NoteSkip(SkipReason::ShaderStages);
             return true;
         }
         if (rs.raster.cull_front_and_back) return true;
@@ -7634,13 +7729,13 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
         gcn_stage_from_regs(regs, 0x10000, GCN_HW_PS, &ps_addr, ps_ud);
         DrainAsyncCompiles();
         Shader* vs = GetShader(GCN_HW_VS, GCN_SW_VERTEX, vs_rt, vs_addr, vs_ud, true);
-        if (vs && !vs->fn) { // still compiling in the background
-            S.n_skipped++;
+        if (vs && !vs->fn && ShaderCompiling(vs)) { // still compiling in the background
+            NoteDrawPendingCompile();
             g_hitch.pending_draws++;
             return true;
         }
-        if (!vs) {
-            S.n_skipped++;
+        if (!vs || !vs->fn) {
+            NoteSkip(SkipReason::VsUnavailable);
             RLog("skip-vs", "%s skipped: VS 0x%llx unavailable", args.name, (unsigned long long)vs_addr);
             return true;
         }
@@ -7660,10 +7755,11 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
         if (rs.raster.prim == PrimitiveType::RectList && !indirect) {
             bool pending = false;
             if (!RectListShaders(vs, &pending)) {
-                S.n_skipped++;
                 if (pending) {
+                    NoteDrawPendingCompile();
                     g_hitch.pending_draws++;
                 } else {
+                    NoteSkip(SkipReason::RectVariant);
                     RLog("rect-skip", "%s skipped: VS 0x%llx has no RectList variant", args.name,
                          (unsigned long long)vs_addr);
                 }
@@ -7681,13 +7777,13 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
                 for (int k = 0; k < 4; ++k) ps_rt.fs.color_buffers[i].swizzle[k] = (uint8_t)ex[k];
             }
             ps = GetShader(GCN_HW_PS, GCN_SW_FRAGMENT, ps_rt, ps_addr, ps_ud, true);
-            if (ps && !ps->fn) { // still compiling in the background
-                S.n_skipped++;
+            if (ps && !ps->fn && ShaderCompiling(ps)) { // still compiling in the background
+                NoteDrawPendingCompile();
                 g_hitch.pending_draws++;
                 return true;
             }
-            if (!ps) {
-                S.n_skipped++;
+            if (!ps || !ps->fn) {
+                NoteSkip(SkipReason::PsUnavailable);
                 RLog("skip-ps", "%s skipped: PS 0x%llx unavailable", args.name, (unsigned long long)ps_addr);
                 return true;
             }
@@ -7720,15 +7816,22 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
             DecodeBuffer(v, &vi.bd);
             vi.vf = GetVertexFormat(vi.bd.raw_dfmt, vi.bd.raw_nfmt);
             const uint32_t slot = vb_first + i;
+            // (gcn IsVertexFormatFetchable mirrors the format table: such a V# is read in the shader)
             if (slot > 30 || !vi.vf.mtl_vertex_format) {
                 RLog("vtx-fmt", "%s: VS 0x%llx attribute %u unsupported (fmt %u/%u slot %u)", args.name,
                      (unsigned long long)vs->code_addr, i, vi.bd.raw_dfmt, vi.bd.raw_nfmt, slot);
-                S.n_skipped++;
+                NoteSkip(SkipReason::VertexFormat);
                 return true;
             }
-            if (vi.bd.stride & 3) {
-                RLog("vtx-stride", "%s: vertex stride %u not a multiple of 4", args.name, vi.bd.stride);
-                S.n_skipped++;
+            // Metal's vertex fetch needs dword multiples; the translator reads any other V# from
+            // the buffer in the shader (fetch_shader_inlined), and the permutation lookup never
+            // pairs such a V# with a shader that has vertex attributes. Reaching this is a bug.
+            if ((vi.bd.stride & 3) || (vi.bd.address & 3)) {
+                RLog("vtx-stride", "%s: VS 0x%llx (program 0x%llx%s) attribute %u: stride %u / address 0x%llx not a "
+                     "multiple of 4 in a shader with vertex attributes", args.name, (unsigned long long)vs->code_addr,
+                     (unsigned long long)vs->info.pgm_hash, vs->from_worker ? ", translated on the worker" : "", i,
+                     vi.bd.stride, (unsigned long long)vi.bd.address);
+                NoteSkip(SkipReason::VertexAlign);
                 return true;
             }
         }
@@ -7936,9 +8039,9 @@ void DrawEncode(DrawRec& r) {
 
         // ---- vertex inputs (shadPS4 GraphicsPipeline::GetVertexInputs / BindVertexBuffers)
         // reused from draw to draw (only the encoder runs DrawEncode)
-        static std::vector<VertexAttr> vattrs;
-        static std::vector<uint32_t> vlocs;
-        static std::vector<std::pair<id<MTLBuffer>, uint64_t>> vbufs;
+        static std::vector<VertexAttr>& vattrs = *new std::vector<VertexAttr>;
+        static std::vector<uint32_t>& vlocs = *new std::vector<uint32_t>;
+        static std::vector<std::pair<id<MTLBuffer>, uint64_t>>& vbufs = *new std::vector<std::pair<id<MTLBuffer>, uint64_t>>;
         vattrs.clear();
         vlocs.clear();
         vbufs.clear();
@@ -7988,19 +8091,27 @@ void DrawEncode(DrawRec& r) {
             rect_capture = GetGfxPipeline(rect->capture, nullptr, crs, color_fmt, write_mask, depth_fmt, samples,
                                           vattrs, vlocs, false);
             if (!rect_capture) {
-                S.n_skipped++;
-                g_hitch.pending_draws++;
+                if (PipelineCompiling()) {
+                    NoteDrawPendingCompile();
+                    g_hitch.pending_draws++;
+                } else {
+                    NoteSkip(SkipReason::PipelineFailed);
+                }
                 return;
             }
         }
-        static const std::vector<VertexAttr> no_attrs;
-        static const std::vector<uint32_t> no_locs;
+        static const std::vector<VertexAttr>& no_attrs = *new std::vector<VertexAttr>;
+        static const std::vector<uint32_t>& no_locs = *new std::vector<uint32_t>;
         id<MTLRenderPipelineState> pso =
             GetGfxPipeline(rect ? rect->expand : vs, ps, rs, color_fmt, write_mask, depth_fmt, samples,
                            rect ? no_attrs : vattrs, rect ? no_locs : vlocs, a2c);
         if (!pso) {
-            S.n_skipped++;
-            g_hitch.pending_draws++;
+            if (PipelineCompiling()) {
+                NoteDrawPendingCompile();
+                g_hitch.pending_draws++;
+            } else {
+                NoteSkip(SkipReason::PipelineFailed); // its build failed (logged)
+            }
             return;
         }
 
@@ -8031,7 +8142,7 @@ void DrawEncode(DrawRec& r) {
         if (sc.width == 0 || sc.height == 0) {
             RLog("scissor-empty", "%s: empty scissor (%u,%u %ux%u) on %ux%u target; skipped", args.name,
                  rs.scissor.x, rs.scissor.y, rs.scissor.width, rs.scissor.height, pw, ph);
-            S.n_skipped++;
+            NoteSkip(SkipReason::ScissorEmpty);
             return;
         }
 
@@ -8049,17 +8160,17 @@ void DrawEncode(DrawRec& r) {
             const uint64_t isz = args.index_type == 1 ? 4 : 2;
             if (rs.raster.needs_emulation ||
                 !GuestBuffer(args.indirect_addr, indexed ? 20 : 16, GuestAccess::Read, &arg_buf, &arg_off) || (arg_off & 3))
-                { S.n_skipped++; return; }
+                { NoteSkip(SkipReason::IndirectArgs); return; }
             if (indexed &&
                 (!args.index_base || !GuestBuffer(args.index_base, (uint64_t)args.max_index * isz, GuestAccess::Read, &ib, &ib_off) ||
                  (ib_off & 3)))
-                { S.n_skipped++; return; }
+                { NoteSkip(SkipReason::IndirectArgs); return; }
             if (indexed) ib_len = (uint64_t)args.max_index * isz;
         } else if (rs.raster.needs_emulation && !rect) {
             if (rs.raster.prim == PrimitiveType::QuadList) {
                 size_t aoff;
                 if (!BuildQuadListIndices(args, args.count, &ib, &aoff, &draw_count)) {
-                    S.n_skipped++;
+                    NoteSkip(SkipReason::QuadIndices);
                     return;
                 }
                 ib_off = aoff;
@@ -8070,7 +8181,7 @@ void DrawEncode(DrawRec& r) {
             } else {
                 RLog("prim", "%s: primitive type %s not supported yet; skipped (VS 0x%llx PS 0x%llx n=%u)", args.name,
                      NameOf(rs.raster.prim), (unsigned long long)vs_addr, (unsigned long long)ps_addr, args.count);
-                S.n_skipped++;
+                NoteSkip(SkipReason::Primitive);
                 return;
             }
         } else if (indexed) {
@@ -8079,13 +8190,16 @@ void DrawEncode(DrawRec& r) {
             const uint64_t bytes = (uint64_t)args.count * isz;
             if (!args.index_base || !GuestBuffer(addr, bytes, GuestAccess::Read, &ib, &ib_off)) {
                 RLog("ib", "%s: index buffer 0x%llx unavailable", args.name, (unsigned long long)addr);
-                S.n_skipped++;
+                NoteSkip(SkipReason::IndexBuffer);
                 return;
             }
             if (ib_off & 3) { // Metal wants 4 byte aligned index buffer offsets
                 void* ptr;
                 size_t aoff;
-                if (!S.arena.Alloc(S.dev, bytes, 16, &ib, &aoff, &ptr)) return;
+                if (!S.arena.Alloc(S.dev, bytes, 16, &ib, &aoff, &ptr)) {
+                    NoteSkip(SkipReason::Arena);
+                    return;
+                }
                 memcpy(ptr, S.ctx->mem_base + addr, bytes);
                 ib_off = aoff;
             }
@@ -8098,7 +8212,7 @@ void DrawEncode(DrawRec& r) {
             const uint32_t n = args.count;
             if (n % 3) {
                 RLog("rect-count", "%s: RectList with %u vertices (not 3 per rectangle); skipped", args.name, n);
-                S.n_skipped++;
+                NoteSkip(SkipReason::RectCount);
                 return;
             }
             const uint8_t* src = nullptr;
@@ -8112,17 +8226,22 @@ void DrawEncode(DrawRec& r) {
             size_t soff, poff, voff;
             if (!S.arena.Alloc(S.dev, (size_t)n * 4, 16, &rect_bufs.slots, &soff, &sp) ||
                 !S.arena.Alloc(S.dev, 4, 16, &rect_bufs.params, &poff, &pp)) {
-                S.n_skipped++;
+                NoteSkip(SkipReason::Arena);
                 return;
             }
             const uint32_t per_instance = ps4gnm_rect::BuildSlots(src, args.index_type == 1, n, (uint32_t*)sp);
             *(uint32_t*)pp = per_instance;
             const uint64_t bytes = (uint64_t)per_instance * inst * rect->vertex_stride;
-            if (bytes > (64u << 20) ||
-                !S.arena.Alloc(S.dev, (size_t)bytes, 16, &rect_bufs.vertices, &voff, &vp_)) {
+            if (bytes > (64u << 20)) {
                 RLog("rect-size", "%s: RectList of %u vertices x %u instances needs %llu bytes; skipped", args.name, n,
                      inst, (unsigned long long)bytes);
-                S.n_skipped++;
+                NoteSkip(SkipReason::RectSize);
+                return;
+            }
+            if (!S.arena.Alloc(S.dev, (size_t)bytes, 16, &rect_bufs.vertices, &voff, &vp_)) {
+                RLog("rect-arena", "%s: no arena memory for the %llu bytes of a RectList capture; skipped", args.name,
+                     (unsigned long long)bytes);
+                NoteSkip(SkipReason::Arena);
                 return;
             }
             rect_bufs.slots_off = soff;
@@ -8152,7 +8271,7 @@ void DrawEncode(DrawRec& r) {
                                             {ps, ps_ud, &r.ps_rt, &ps_flat, &r.ps_img}};
         if (!ResolveTableHazards(table_stages, 2, r.table_snap)) {
             cap::SetSkipped(kCapTableHazardSkip);
-            S.n_skipped++;
+            NoteSkip(SkipReason::TableHazard);
             return;
         }
         // the textures the draw samples. PS4_GNM_MTL4_ONLY_CLEARS skips them: the draw is skipped, and
@@ -8165,7 +8284,10 @@ void DrawEncode(DrawRec& r) {
             PrepareDepthCompanions(vs, vs_flat);
             if (ps) PrepareDepthCompanions(ps, ps_flat);
         }
-        if (!BeginPass(key, clr, hold)) return;
+        if (!BeginPass(key, clr, hold)) {
+            NoteSkip(SkipReason::PassBegin);
+            return;
+        }
         meta_undo.Keep(); // the pass's load actions hold the clears now
         if (g_only_clears) { // debug (Metal 4 without draws): the pass's clears happen, the draw does not
             S.n_clear_only++;
@@ -8238,21 +8360,21 @@ void DrawEncode(DrawRec& r) {
         S.buffer_stores.clear();
         if (!BindStage(vs, vs_ud, vs_flat, vb, bc, push, &why)) {
             RLog("bind", "%s: VS bind failed: %s", args.name, why.c_str());
-            S.n_skipped++;
+            NoteSkip(SkipReason::VsBind);
             return;
         }
         if (ps) {
             Binder fb{.stage = Stage::Fragment, .serial = enc_serial};
             if (!BindStage(ps, ps_ud, ps_flat, fb, bc, push, &why)) {
                 RLog("bind", "%s: PS bind failed: %s", args.name, why.c_str());
-                S.n_skipped++;
+                NoteSkip(SkipReason::PsBind);
                 return;
             }
         }
         // BindStage may have flushed (texture hazard) and closed the encoder
         if (S.be->OpenEncoder() != GnmEncoder::Render || S.be->EncoderSerial() != enc_serial) {
             RLog("reencode", "%s: encoder restarted after a hazard flush; skipped this draw", args.name);
-            S.n_skipped++;
+            NoteSkip(SkipReason::Reencode);
             return;
         }
         for (size_t i = 0; i < vbufs.size(); ++i) vb.Buffer(vbufs[i].first, vbufs[i].second, vattrs[i].buffer);
@@ -8491,7 +8613,7 @@ bool EncodeCs(DispatchRec& r, id<MTLComputePipelineState> pso, MTLSize tg, id<MT
     if (cap::g_pass) cap::ForgetBindings(Stage::Compute);
     if (!BindStage(r.cs, r.ud, r.flat, b, bc, push, &why)) {
         RLog("bind", "%s CS 0x%llx bind failed: %s", r.queue, (unsigned long long)r.addr, why.c_str());
-        S.n_skipped++;
+        NoteSkip(SkipReason::CsBind);
         return false;
     }
     if (!forced && (S.be->OpenEncoder() != GnmEncoder::Compute || S.be->EncoderSerial() != serial)) {
@@ -8506,7 +8628,7 @@ bool EncodeCs(DispatchRec& r, id<MTLComputePipelineState> pso, MTLSize tg, id<MT
         S.buffer_stores.clear();
         if (!BindStage(r.cs, r.ud, r.flat, b2, bc, push, &why)) {
             RLog("bind", "%s CS 0x%llx bind failed: %s", r.queue, (unsigned long long)r.addr, why.c_str());
-            S.n_skipped++;
+            NoteSkip(SkipReason::CsBind);
             return false;
         }
     }
@@ -8518,7 +8640,7 @@ bool EncodeCs(DispatchRec& r, id<MTLComputePipelineState> pso, MTLSize tg, id<MT
         if (!GuestBuffer(r.indirect_addr, 12, GuestAccess::Read, &ab, &off)) {
             RLog("bind", "%s CS 0x%llx skipped: no buffer for its indirect arguments at 0x%llx", r.queue,
                  (unsigned long long)r.addr, (unsigned long long)r.indirect_addr);
-            S.n_skipped++;
+            NoteSkip(SkipReason::CsIndirectArgs);
             return false;
         }
         enc.DispatchIndirect(ab, off, tg);
@@ -8699,11 +8821,11 @@ bool GmRunSync(bool second, DispatchRec& r, id<MTLComputePipelineState> pso, MTL
             if (run == kMaxRuns) {
                 RLog("guestmem", "%s CS 0x%llx skipped: guest pages still missing after %d probes", r.queue,
                      (unsigned long long)r.cs->code_addr, kMaxRuns);
-                S.n_skipped++;
+                NoteSkip(SkipReason::GmPages);
                 return false;
             }
             if (!GmMapPages(res->unmapped, r.queue, r.cs->code_addr)) {
-                S.n_skipped++;
+                NoteSkip(SkipReason::GmPages);
                 return false;
             }
         }
@@ -8731,7 +8853,7 @@ bool GmRunSync(bool second, DispatchRec& r, id<MTLComputePipelineState> pso, MTL
         if (res->status) {
             RLog("guestmem", "%s CS 0x%llx skipped: it accesses guest memory through %s", r.queue,
                  (unsigned long long)r.cs->code_addr, GuestStatusText(res->status).c_str());
-            S.n_skipped++;
+            NoteSkip(SkipReason::GmStatus);
             return false;
         }
         if (capture && res->why == kGmWhyForced) {
@@ -8760,7 +8882,7 @@ bool GmRunSync(bool second, DispatchRec& r, id<MTLComputePipelineState> pso, MTL
         }
         RLog("guestmem", "%s CS 0x%llx skipped: its indirect dispatch size cannot be read", r.queue,
              (unsigned long long)r.cs->code_addr);
-        S.n_skipped++;
+        NoteSkip(SkipReason::GmIndirectSize);
         return false;
     }
 }
@@ -8805,7 +8927,7 @@ bool GmDispatchSync(DispatchRec& r, id<MTLComputePipelineState> pso, MTLSize tg)
     if (!slot.buf) {
         g_gm_stats.no_slot++;
         RLog("guestmem", "%s CS 0x%llx skipped: no fault buffer", r.queue, (unsigned long long)r.cs->code_addr);
-        S.n_skipped++;
+        NoteSkip(SkipReason::GmNoSlot);
         return false;
     }
     GmResult res;
@@ -8828,6 +8950,8 @@ void GmListenChain(const std::shared_ptr<std::vector<std::shared_ptr<GmTicket>>>
     [g_gms.ev notifyListener:g_gms.listener
                      atValue:2 * m->back()->t - 1
                        block:^(id<MTLSharedEvent>, uint64_t) {
+                           const CompletionScope gate;
+                           if (!gate.in) return;
                            // members up to `end` (tests: a withheld one ends the chain unfinished)
                            size_t end = m->size(), miss;
                            for (size_t i = 0; i < m->size(); ++i)
@@ -8910,7 +9034,7 @@ bool GmDispatchFast(DispatchRec*& rp, id<MTLComputePipelineState> pso, MTLSize t
     if (!slot.buf) {
         g_gm_stats.no_slot++;
         RLog("guestmem", "%s CS 0x%llx skipped: no fault buffer", r.queue, (unsigned long long)r.cs->code_addr);
-        S.n_skipped++;
+        NoteSkip(SkipReason::GmNoSlot);
         return false;
     }
     GmTarget t;
@@ -8984,7 +9108,7 @@ void GmFinish(GmTicket& k) {
     if (k.slot.buf) {
         if (!k.have_res) GmReadSlot(k.slot, &k.res);
         if (k.failed) {
-            S.n_skipped++;
+            NoteSkip(SkipReason::GmCmdFailed);
             RLog("guestmem", "%s CS 0x%llx skipped: its command buffer failed", k.rec->queue,
                  (unsigned long long)k.rec->cs->code_addr);
         } else if (k.pass_failed && !k.rerun) {
@@ -8996,8 +9120,9 @@ void GmFinish(GmTicket& k) {
         } else if (!k.rerun) {
             // refused for a status (GmRunSync logs and counts its own skips)
             g_gm_stats.refused++;
-            S.n_skipped++;
-            if (k.res.gate == 2 && (k.res.why & kGmWhyStatus))
+            const bool status = k.res.gate == 2 && (k.res.why & kGmWhyStatus);
+            NoteSkip(status ? SkipReason::GmStatus : SkipReason::GmIndirectSize);
+            if (status)
                 RLog("guestmem", "%s CS 0x%llx skipped: it accesses guest memory through %s", k.rec->queue,
                      (unsigned long long)k.rec->cs->code_addr, GuestStatusText(k.res.status).c_str());
             else
@@ -9103,7 +9228,7 @@ void Dispatch(GuestContext* ctx, const uint32_t* regs, uint32_t dim_x, uint32_t 
         DrainAsyncCompiles();
         Shader* cs = GetShader(GCN_HW_CS, GCN_SW_COMPUTE, rt, addr, ud);
         if (!cs) {
-            S.n_skipped++;
+            NoteSkip(SkipReason::CsUnavailable);
             RLog("skip-cs", "%s dispatch skipped: CS 0x%llx unavailable", queue, (unsigned long long)addr);
             return;
         }
@@ -9169,7 +9294,7 @@ void DispatchEncode(DispatchRec*& rp) {
     cap::EncodeScope cap_scope;
     if (!BackendHas(kGnmCapCompute)) {
         cap::SetSkipped("backend without compute (PS4_GNM_MTL4_ONLY_CLEARS)");
-        S.n_skipped++;
+        NoteSkip(SkipReason::NoCompute);
         return;
     }
     const RegSnap& regs = r.regs;
@@ -9206,7 +9331,7 @@ void DispatchEncode(DispatchRec*& rp) {
                     RLog("msl-fail", "Metal rejected MSL of shader 0x%llx (hw %u): %s", (unsigned long long)addr,
                          cs->hw, cs->kjob->Error().c_str());
                     S.cs_pipes[cs->uid] = nil;
-                    S.n_skipped++;
+                    NoteSkip(SkipReason::CsLibrary);
                     return;
                 }
             }
@@ -9237,19 +9362,19 @@ void DispatchEncode(DispatchRec*& rp) {
             S.cs_pipes[cs->uid] = pso;
         }
         if (!pso) {
-            S.n_skipped++;
+            NoteSkip(SkipReason::CsPipeline);
             return;
         }
         const uint32_t wx = std::max(1u, rt.cs.workgroup_size[0]), wy = std::max(1u, rt.cs.workgroup_size[1]),
                        wz = std::max(1u, rt.cs.workgroup_size[2]);
-        static std::unordered_map<void*, NSUInteger> max_threads; // per pipeline (an Objective-C call)
+        static std::unordered_map<void*, NSUInteger>& max_threads = *new std::unordered_map<void*, NSUInteger>; // per pipeline (an Objective-C call)
         auto mt = max_threads.find((__bridge void*)pso);
         if (mt == max_threads.end()) mt = max_threads.emplace((__bridge void*)pso, pso.maxTotalThreadsPerThreadgroup).first;
         if ((uint64_t)wx * wy * wz > mt->second) {
             RLog("cs-wg", "%s CS 0x%llx workgroup %ux%ux%u exceeds Metal limit %lu (NUM_THREAD regs %08x %08x %08x, dims %u %u %u)",
                  queue, (unsigned long long)addr, wx, wy, wz, (unsigned long)pso.maxTotalThreadsPerThreadgroup,
                  regs[0x2E07], regs[0x2E08], regs[0x2E09], dim_x, dim_y, dim_z);
-            S.n_skipped++;
+            NoteSkip(SkipReason::CsWorkgroup);
             return;
         }
 
@@ -9330,7 +9455,7 @@ void DispatchEncode(DispatchRec*& rp) {
         const TableStage table_stage = {cs, r.ud, &r.rt, &flat, &r.img};
         if (!ResolveTableHazards(&table_stage, 1, r.table_snap)) {
             cap::SetSkipped(kCapTableHazardSkip);
-            S.n_skipped++;
+            NoteSkip(SkipReason::CsTableHazard);
             return;
         }
         ResolveTextureHazards(cs, flat);
@@ -9339,7 +9464,7 @@ void DispatchEncode(DispatchRec*& rp) {
         if (cs->info.uses_guest_memory) {
             if (!EnsureGuestMemoryState()) {
                 RLog("guestmem", "%s CS 0x%llx skipped: no guest memory state", queue, (unsigned long long)addr);
-                S.n_skipped++;
+                NoteSkip(SkipReason::GmNoState);
                 return;
             }
             if (r.gm_ticket) {
@@ -9502,18 +9627,35 @@ id<MTLTexture> GuestDisplayTexture(uint64_t addr, uint32_t width, uint32_t heigh
 // perf, backend and guest memory lines, and every 300th the "present #" totals line
 // (tools/metal4_route_report.py reads all of them). describe(buf, size) names the source of this
 // present; it is called only for that line.
+FlipWaitCounters& FlipWaits() {
+    static FlipWaitCounters c;
+    return c;
+}
+
 template <class Describe> void PresentStats(Describe&& describe) {
     static uint64_t presents = 0;
     S.be->NoteFrameEnd(); // the allocator trim's frame (Metal 4)
     static double last_t = CFAbsoluteTimeGetCurrent();
     if ((presents + 1) % 300 == 0) {
         const double now = CFAbsoluteTimeGetCurrent();
+        static uint64_t fw_s0, fw_t0, fw_w0, skip0, pend0;
+        const uint64_t skip_now = S.n_skipped.load(std::memory_order_relaxed);
+        const uint64_t pend_now = SkippedFor(SkipReason::PendingCompile);
+        const uint64_t fw_s = FlipWaits().suspends.load(std::memory_order_relaxed);
+        const uint64_t fw_t = FlipWaits().timeouts.load(std::memory_order_relaxed);
+        const uint64_t fw_w = FlipWaits().wakes.load(std::memory_order_relaxed);
         fprintf(stderr, "[gnm-draw] perf: %.1f fps over last 300 presents; per frame: %.1f commits, %.1f waits, %.1f ms waiting, %.1f ms GPU busy, %.1f ms CP (CPU), %.1f ms encoder, %.1f ms screen; "
-                        "encoder %.1f ms CPU, blocked %.1f ms throttle, %.1f ms in-flight limit, %.1f ms opening command buffers\n",
+                        "encoder %.1f ms CPU, blocked %.1f ms throttle, %.1f ms in-flight limit, %.1f ms opening command buffers; "
+                        "flip-label waits %llu (given up %llu, woken %llu; totals %llu, %llu, %llu); "
+                        "skipped %llu (pending compile %llu) in 300 presents\n",
                 300.0 / (now - last_t), S.n_commits / 300.0, S.n_waits / 300.0, S.wait_ms / 300.0,
                 S.gpu_ns.exchange(0) / 1e6 / 300.0, ps4_gnm_take_cp_ns() / 1e6 / 300.0, encq::busy_ns.exchange(0) / 1e6 / 300.0, S.screen_ms / 300.0,
                 encq::cpu_ns.exchange(0) / 1e6 / 300.0, encq::throttle_ns.exchange(0) / 1e6 / 300.0, encq::room_ns.exchange(0) / 1e6 / 300.0,
-                encq::begin_ns.exchange(0) / 1e6 / 300.0);
+                encq::begin_ns.exchange(0) / 1e6 / 300.0, (unsigned long long)(fw_s - fw_s0),
+                (unsigned long long)(fw_t - fw_t0), (unsigned long long)(fw_w - fw_w0), (unsigned long long)fw_s,
+                (unsigned long long)fw_t, (unsigned long long)fw_w, (unsigned long long)(skip_now - skip0),
+                (unsigned long long)(pend_now - pend0));
+        fw_s0 = fw_s, fw_t0 = fw_t, fw_w0 = fw_w, skip0 = skip_now, pend0 = pend_now;
         S.screen_ms = 0;
         {
             static uint64_t held0, time0, backlog0;
@@ -9579,10 +9721,23 @@ template <class Describe> void PresentStats(Describe&& describe) {
     if (++presents % 300 == 1) {
         char from[96];
         describe(from, sizeof(from));
-        fprintf(stderr, "[gnm-draw] present #%llu from %s; totals: draws %llu dispatches %llu skipped %llu shaders %zu "
-                        "pipelines %zu submit %llu\n",
+        fprintf(stderr, "[gnm-draw] present #%llu from %s; totals: draws %llu dispatches %llu skipped %llu (pending compile %llu) "
+                        "shaders %zu pipelines %zu submit %llu\n",
                 (unsigned long long)presents, from, (unsigned long long)S.n_draws, (unsigned long long)S.n_dispatches,
-                (unsigned long long)S.n_skipped, S.shaders.size(), S.gfx_pipes.size(), (unsigned long long)S.submit_idx);
+                (unsigned long long)S.n_skipped.load(std::memory_order_relaxed), (unsigned long long)SkippedFor(SkipReason::PendingCompile),
+                S.shaders.size(), S.gfx_pipes.size(), (unsigned long long)S.submit_idx);
+        // the totals' skips by reason (tools/metal4_route_report.py reads the line)
+        char line[2048];
+        int n = snprintf(line, sizeof(line), "[gnm-draw] skipped by reason:");
+        bool any = false;
+        for (size_t i = 0; i < (size_t)SkipReason::Count && n > 0 && (size_t)n < sizeof(line); ++i) {
+            const uint64_t c = SkippedFor((SkipReason)i);
+            if (!c) continue;
+            n += snprintf(line + n, sizeof(line) - n, "%s %s %llu", any ? "," : "", SkipReasonName((SkipReason)i),
+                          (unsigned long long)c);
+            any = true;
+        }
+        fprintf(stderr, "%s%s\n", line, any ? "" : " none");
     }
 }
 
@@ -9755,7 +9910,7 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
             // Frame-time distribution (present-to-present on the submitting thread) and a
             // breakdown of every hitch (> 50 ms) so stutter causes are visible in the log.
             static double last_present = 0;
-            static std::vector<float> intervals;
+            static std::vector<float>& intervals = *new std::vector<float>;
             const double now_t = CFAbsoluteTimeGetCurrent();
             if (last_present > 0) {
                 const double dt = (now_t - last_present) * 1000.0;
@@ -9856,7 +10011,18 @@ void ReplayDisarmMetaCleared(uint64_t cmask_address) {
     });
 }
 
-uint64_t SkippedCount() { return S.n_skipped.load(); }
+uint64_t SkippedCount() { return S.n_skipped.load(std::memory_order_relaxed); }
+uint64_t PendingCompileCount() { return SkippedFor(SkipReason::PendingCompile); }
+uint64_t SkippedCount(SkipReason r) { return r < SkipReason::Count ? SkippedFor(r) : 0; }
+const char* SkipReasonName(SkipReason r) {
+    static constexpr const char* kNames[] = {
+#define PS4_GNM_SKIP_NAME(e, n) n,
+        PS4_GNM_SKIP_REASONS(PS4_GNM_SKIP_NAME)
+#undef PS4_GNM_SKIP_NAME
+    };
+    static_assert(sizeof(kNames) / sizeof(kNames[0]) == (size_t)SkipReason::Count, "a name per reason");
+    return r < SkipReason::Count ? kNames[(size_t)r] : "?";
+}
 uint64_t OnlyClearsSkippedCount() { return S.n_clear_only.load(); }
 
 uint64_t BindUploadCount() { return S.n_bind_uploads.load(std::memory_order_relaxed); }
@@ -9882,11 +10048,15 @@ ImageTableStats GetImageTableStats() {
 // destructor (Metal 4 waits for the feedback of every commit) would run the remaining
 // CommitDoneFn calls against them.
 //
-// After a crash (the crash handler's exit(1) runs the exit handlers) it does nothing: committing,
-// waiting for the GPU or taking the encoder's state from a crashed thread can hang or fault again;
-// BackendDelete keeps static destruction from destroying the backend too.
+// After a crash (the crash handler's exit(1) runs the exit handlers) it only closes the completion
+// gate (CompletionGate): committing, waiting for the GPU or taking the encoder's state from a
+// crashed thread can hang or fault again; BackendDelete keeps static destruction from destroying
+// the backend too.
 void ReleaseBackend() {
-    if (ps4_host_crashing()) return;
+    if (ps4_host_crashing()) {
+        g_completion_gate.Close();
+        return;
+    }
     encq::Run([] {
         if (!S.be) return;
         if (S.enabled.load(std::memory_order_acquire)) FlushImpl(true);

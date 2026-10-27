@@ -31,8 +31,13 @@
 #include <string>
 #include <vector>
 
+// The VFS of a game whose app root is /test/LOOKUPTEST and has no param.sfo: the shader caches
+// are keyed by the root's name (ps4_current_game_key's fallback).
 extern "C" const char* ps4_vfs_get_app_root(void) {
     return "/test/LOOKUPTEST";
+}
+extern "C" int ps4_vfs_resolve(const char*, char*, size_t) {
+    return -1;
 }
 
 namespace sc = ps4gnm_shader_cache;

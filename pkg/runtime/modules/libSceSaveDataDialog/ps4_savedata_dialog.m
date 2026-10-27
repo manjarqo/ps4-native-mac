@@ -9,7 +9,9 @@
 // (PS4_RECOMP_HEADLESS, or no terminal and not launched as an app bundle)
 // answer automatically; PS4_SAVEDATA_DIALOG=ui|auto forces either behavior and
 // PS4_SAVEDATA_DIALOG_PICK=first|new|latest|<dirName> selects the automatic
-// list answer (default: see sdd_auto_pick).
+// list answer (default: see sdd_auto_pick); a comma-separated sequence answers the
+// lists in the order they open (the last choice repeats), e.g. "new,gameUser0" for a
+// game that offers a save list before its load list.
 #import <Cocoa/Cocoa.h>
 #include "ps4_savedata_dialog.h"
 #include "ps4_savedata.h"
@@ -344,15 +346,41 @@ static void sdd_answer_locked(bool affirmative, bool cancel) {
     }
 }
 
+static uint32_t g_sdd_lists_answered; // automatically answered list dialogs (index into the PICK sequence)
+
+// Copies the PICK choice for the list dialog number `index` (0-based) into out ("" = none).
+// Every automatically answered list consumes one entry, an empty list (no saves, answered
+// with a cancel) too. Entries are taken verbatim: no whitespace is trimmed, so "new, x" names
+// the directory " x"; an empty entry ("new,,x") means the default answer.
+static void sdd_pick_choice(uint32_t index, char *out, size_t out_size) {
+    out[0] = '\0';
+    const char *seq = getenv("PS4_SAVEDATA_DIALOG_PICK");
+    if (!seq) return;
+    const char *item = seq;
+    for (uint32_t i = 0; i < index; i++) {
+        const char *comma = strchr(item, ',');
+        if (!comma) break; // past the end: the last choice repeats
+        item = comma + 1;
+    }
+    size_t n = strcspn(item, ",");
+    if (n >= out_size) n = out_size - 1;
+    memcpy(out, item, n);
+    out[n] = '\0';
+}
+
 // Automatic list answer for non-interactive runs. Without PS4_SAVEDATA_DIALOG_PICK it
 // never destroys existing data: a save list takes the "new saved data" item when offered
-// (else the first save), a load list the first save, and a delete list is canceled.
+// (else the first save), a load list the save the game focused (what X confirms on the
+// console, e.g. the latest save for FOCUS_DATALATEST), and a delete list is canceled.
 static int sdd_auto_pick(const SddSpec *s) {
+    char choice[SDD_DIRNAME_SIZE + 8];
+    sdd_pick_choice(g_sdd_lists_answered++, choice, sizeof(choice));
     if (s->entry_count == 0) return -1;
-    const char *pick = getenv("PS4_SAVEDATA_DIALOG_PICK");
-    if (!pick || !*pick) {
+    const char *pick = choice;
+    if (!*pick) {
         if (s->type == ORBIS_SAVE_DATA_DIALOG_TYPE_DELETE) return -1;
         if (s->type == ORBIS_SAVE_DATA_DIALOG_TYPE_SAVE && s->entries[0].is_new) return 0;
+        if (s->type == ORBIS_SAVE_DATA_DIALOG_TYPE_LOAD && !s->entries[s->focus].is_new) return s->focus;
         return s->first_save >= 0 ? s->first_save : 0;
     }
     if (strcmp(pick, "new") == 0) {
@@ -617,6 +645,12 @@ static int32_t sdd_open(const GuestContext *ctx, const OrbisSaveDataDialogParam 
     fprintf(stderr, "[ps4-savedata-dialog] Open: mode=%d dispType=%d entries=%d focus=%d(pos %u) sys=%u user_btn=%u err=0x%x sdk=0x%x %s\n",
             (int)param->mode, (int)param->dispType, spec.entry_count, spec.focus, spec.focus_pos, spec.sys_type, spec.user_btn,
             spec.error_code, g_sdd_sdk_version, ui ? "(ui)" : until_close ? "(until close)" : "(auto)");
+    if (spec.msg) {
+        // The question an automatic answer replies to, on one line.
+        fprintf(stderr, "[ps4-savedata-dialog]   msg: \"");
+        for (const char *c = spec.msg; *c; c++) fputc(*c == '\n' || *c == '\r' ? ' ' : *c, stderr);
+        fprintf(stderr, "\"\n");
+    }
     for (int i = 0; i < spec.entry_count; i++) {
         fprintf(stderr, "[ps4-savedata-dialog]   [%d] %s '%s' | %s | %s\n", i,
                 spec.entries[i].is_new ? "new" : "dir", spec.entries[i].dir,

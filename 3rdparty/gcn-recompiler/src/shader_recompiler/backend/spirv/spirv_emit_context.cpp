@@ -247,7 +247,8 @@ void EmitContext::DefineBufferProperties() {
                                        ConstU32(buffer.binding))};
             const Id size_bytes{OpLoad(U32[1], ptr)};
             Name(size_bytes, fmt::format("buf{}_size", buffer.binding));
-            if (True(desc.used_types & IR::Type::U8)) {
+            if (True(desc.used_types & IR::Type::U8) ||
+                ((buffer.misalign & 1) != 0 && True(desc.used_types & IR::Type::U16))) {
                 buffer.Size(PointerSize::B8) = size_bytes;
             }
             if (True(desc.used_types & IR::Type::U16)) {
@@ -941,7 +942,9 @@ void EmitContext::DefineBuffers() {
             spv_buffer.Alias(PointerType::U16) =
                 DefineBuffer(desc.is_written, is_coherent, 1, desc.buffer_type, U16);
         }
-        if (True(desc.used_types & IR::Type::U8)) {
+        // (16-bit loads from an odd base address read bytes: EmitLoadBufferU16)
+        if (True(desc.used_types & IR::Type::U8) ||
+            ((spv_buffer.misalign & 1) != 0 && True(desc.used_types & IR::Type::U16))) {
             spv_buffer.Alias(PointerType::U8) =
                 DefineBuffer(desc.is_written, is_coherent, 0, desc.buffer_type, U8);
         }

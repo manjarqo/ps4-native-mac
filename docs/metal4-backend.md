@@ -158,7 +158,8 @@ last six perf lines: the route's last scene, after the earlier scenes' 14-15 ms)
 Metal 3 11.5-11.6 ms, 11.0-11.1 ms CPU, 0.3 ms opening.
 
 These lines, the `perf` and `per frame` lines before them and the `present #<n> from <source>;
-totals: …` line every 300th present are printed for every present: from a GPU target, and from
+totals: …` line every 300th present (its `skipped K (pending compile P)` counts the draws deferred
+while their shader or pipeline compiles in the background as P, part of K) are printed for every present: from a GPU target, and from
 guest memory read by the CPU (the only path while PS4_GNM_MTL4_ONLY_CLEARS skips what writes the
 display buffer).
 

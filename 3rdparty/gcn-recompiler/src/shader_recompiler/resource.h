@@ -154,26 +154,23 @@ enum class MipStorageFallbackMode : u16 {
 };
 
 // PS4Recomp: false for a T# no Metal texture can be made of (MTLTextureDescriptor validation
-// aborts the process): 1D with mips or a block-compressed format, multisampled with more than 8
-// samples, 3D past 2048 texels, a cube that is not square, more layers than an array texture
-// holds. The unused entries of T# tables hold data that is no T# (Uncharted 4's lights: floats)
-// and decode to such T#s. Mirrors the renderer's check (ps4_gnm_resources.mm
-// DecodeImageUncached); a table entry failing it counts as unbound (GetSharp: the null image).
+// aborts the process): multisampled with more than 8 samples, 3D past 2048 texels, a cube that
+// is not square, more layers than an array texture holds (2048 for a 2D array, 341 cubes = 2046
+// faces for a cube array; the layers are depth + 1, 6 per cube: POW2PAD pads only the guest
+// layout's slice count, the renderer's texture holds the real ones). (A 1D image, also with mips
+// or a block-compressed format, is made as a 2D image of height 1: Image::Is1DAs2D.) The unused
+// entries of T# tables hold data that is no T# (Uncharted 4's lights: floats) and decode to such
+// T#s.
+// Mirrors the renderer's check (ps4_gnm_resources.mm DecodeImageUncached); a table entry failing
+// it counts as unbound (GetSharp: the null image).
 inline bool IsCreatableImage(const AmdGpu::Image& image) {
     using AmdGpu::ImageType;
     const ImageType type = image.GetType();
     const u32 width = u32(image.width) + 1, height = u32(image.height) + 1;
     const u32 depth_field = u32(image.depth) + 1;
     const bool msaa = type == ImageType::Color2DMsaa || type == ImageType::Color2DMsaaArray;
-    const bool is1d = type == ImageType::Color1D || type == ImageType::Color1DArray;
     const bool cube = type == ImageType::Cube;
-    u32 layers = type == ImageType::Color3D ? 1 : depth_field * (cube ? 6 : 1);
-    if (image.pow2pad) {
-        layers = std::bit_ceil(layers);
-    }
-    if (is1d && (image.last_level > 0 || AmdGpu::IsBlockCoded(image.GetDataFmt()))) {
-        return false;
-    }
+    const u32 layers = type == ImageType::Color3D ? 1 : depth_field * (cube ? 6 : 1);
     if (msaa && image.last_level > 3) {
         return false;
     }

@@ -19,6 +19,7 @@
 
 #include "recomp_runtime.h"
 #include "ps4_metal_screen.h" // the stubs below must keep its signatures
+#include "ps4_game_key.h"
 
 static void NotInReplay(const char *what) {
     fprintf(stderr, "gnm_replay: %s was called; it is not on the draw / dispatch path a replay runs\n", what);
@@ -110,8 +111,13 @@ uint64_t ps4_gnm_take_cp_ns(void) { NotInReplay("ps4_gnm_take_cp_ns (Present per
 void ps4_gnm_print_sync_stats(void) { NotInReplay("ps4_gnm_print_sync_stats (Present perf line)"); }
 void ps4_fiber_print_stats(int frames) { (void)frames; NotInReplay("ps4_fiber_print_stats (Present perf line)"); }
 void ps4_sync_print_stats(int frames) { (void)frames; NotInReplay("ps4_sync_print_stats (Present perf line)"); }
-// ps4_direct_mem.c: recomp_runtime.c recomp_free_runtime (process teardown) and recomp_vm_free
-// (guest munmap); the replay's guest memory is its own mapping, never freed through the runtime
+// ps4_direct_mem.c: recomp_runtime.c recomp_init_process_param (process start),
+// recomp_free_runtime (process teardown) and recomp_vm_free (guest munmap); the replay's guest
+// memory is its own mapping, never set up or freed through the runtime
+void ps4_direct_mem_configure(GuestContext *ctx, uint64_t proc_param_addr) {
+    (void)ctx; (void)proc_param_addr;
+    NotInReplay("ps4_direct_mem_configure (recomp_init_process_param)");
+}
 void ps4_direct_mem_destroy(void) { NotInReplay("ps4_direct_mem_destroy (recomp_free_runtime)"); }
 void ps4_direct_mem_on_unmap(GuestContext *ctx, uint64_t addr, size_t size) {
     (void)ctx; (void)addr; (void)size;
@@ -131,8 +137,14 @@ void ps4_metal_screen_destroy(void) { NotInReplay("ps4_metal_screen_destroy (rec
 void ps4_sync_destroy(void) { NotInReplay("ps4_sync_destroy (recomp_free_runtime)"); }
 void ps4_vfs_destroy(void) { NotInReplay("ps4_vfs_destroy (recomp_free_runtime)"); }
 void ps4_videoout_destroy(void) { NotInReplay("ps4_videoout_destroy (recomp_free_runtime)"); }
-// recomp_runtime.c boot and ps4_gnm_shader_cache.mm (the shader cache, off in a replay)
-const char *ps4_vfs_get_app_root(void) { NotInReplay("ps4_vfs_get_app_root (boot, shader cache)"); return NULL; }
+// recomp_runtime.c boot
+const char *ps4_vfs_get_app_root(void) { NotInReplay("ps4_vfs_get_app_root (boot)"); return NULL; }
+// ps4_gnm_shader_cache.mm: the shader cache's directory (the shader cache is off in a replay)
+bool ps4_current_game_key(char *out, size_t out_size) {
+    (void)out; (void)out_size;
+    NotInReplay("ps4_current_game_key (shader cache)");
+    return false;
+}
 void recomp_init_main_thread(GuestContext *ctx) { (void)ctx; NotInReplay("recomp_init_main_thread (boot)"); }
 uint64_t recomp_resolve_symbol(const char *m, const char *s) {
     (void)m; (void)s;

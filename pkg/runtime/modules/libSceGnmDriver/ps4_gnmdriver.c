@@ -406,17 +406,25 @@ int32_t sceGnmInsertThreadTraceMarker(void) {
     return ORBIS_GNM_OK;
 }
 
-int32_t sceGnmInsertWaitFlipDone(uint32_t *cmdbuf, uint32_t size, int32_t vo_handle, uint32_t buf_idx) {
-    (void)vo_handle;
-    (void)buf_idx;
-    if (!cmdbuf || size < 7) return -1;
+// Waits (on the command processor) for the VideoOut flip label of display buffer buf_idx to be 0
+// (shadPS4 gnmdriver.cpp). The GPU flip of a buffer sets its label to 1; the label is cleared when
+// the flip after it completes, i.e. once another buffer has been flipped to (see ps4_videoout.c).
+int32_t sceGnmInsertWaitFlipDone(GuestContext *ctx, uint32_t *cmdbuf, uint32_t size, int32_t vo_handle,
+                                 uint32_t buf_idx) {
+    // shadPS4 returns -1 unless size is exactly 7 and asserts on a bad handle. The packet is 7
+    // dwords whatever the space, so a larger size is accepted (only the first 7 are written); a
+    // bad handle or buffer index returns -1 like a bad size instead of stopping the process.
+    if (!cmdbuf || size < 7 || buf_idx >= PS4_VIDEO_OUT_MAX_BUFFERS) return -1;
+    uint64_t labels = 0;
+    if (sceVideoOutGetBufferLabelAddress(ctx, vo_handle, &labels) < 0) return -1;
+    const uint64_t label = labels + (uint64_t)buf_idx * sizeof(uint64_t);
     cmdbuf[0] = PM4_TYPE3_HEADER(PM4_IT_WAIT_REG_MEM, 5, 0, 0);
-    cmdbuf[1] = 0x3; // MEM_SPACE_REGISTER | FUNCTION_EQUAL
-    cmdbuf[2] = 0;
-    cmdbuf[3] = 0;
-    cmdbuf[4] = 0;
-    cmdbuf[5] = 0;
-    cmdbuf[6] = 0;
+    cmdbuf[1] = 0x13; // ENGINE_ME | MEM_SPACE_MEMORY | FUNCTION_EQUAL
+    cmdbuf[2] = (uint32_t)label & ~3u;
+    cmdbuf[3] = (uint32_t)(label >> 32);
+    cmdbuf[4] = 0;          // reference
+    cmdbuf[5] = 0xFFFFFFFF; // mask
+    cmdbuf[6] = 10;         // poll interval
     return ORBIS_GNM_OK;
 }
 
@@ -1070,7 +1078,7 @@ int32_t sceGnmSubmitAndFlipCommandBuffers(GuestContext *ctx, uint32_t count,
     pthread_mutex_unlock(&g_gnm_mutex);
 
     // Present frame & signal flip event via libSceVideoOut
-    int32_t flip_res = sceVideoOutSubmitFlip(ctx, (int32_t)vo_handle, (int32_t)buf_idx, flip_mode, flip_arg);
+    int32_t flip_res = ps4_videoout_submit_flip(ctx, (int32_t)vo_handle, (int32_t)buf_idx, flip_mode, flip_arg, 1);
     if (flip_res != 0) {
         return (flip_res == -ENOSPC) ? (int32_t)0x80d11081 : flip_res;
     }
@@ -1115,7 +1123,7 @@ int32_t sceGnmRequestFlipAndSubmitDoneForWorkload(GuestContext *ctx, uint64_t wo
 
     sceGnmSubmitDone();
 
-    int32_t flip_res = sceVideoOutSubmitFlip(ctx, (int32_t)vo_handle, (int32_t)buf_idx, flip_mode, flip_arg);
+    int32_t flip_res = ps4_videoout_submit_flip(ctx, (int32_t)vo_handle, (int32_t)buf_idx, flip_mode, flip_arg, 1);
     if (flip_res != 0) {
         return (flip_res == -ENOSPC) ? (int32_t)0x80d11081 : flip_res;
     }
@@ -1313,7 +1321,8 @@ void shim_sceGnmInsertThreadTraceMarker(GuestContext *ctx) {
 
 void shim_sceGnmInsertWaitFlipDone(GuestContext *ctx) {
     uint32_t *cmdbuf = (uint32_t *)recomp_guest_to_host(ctx, ctx->rdi);
-    ctx->rax = (uint64_t)(int64_t)sceGnmInsertWaitFlipDone(cmdbuf, (uint32_t)ctx->rsi, (int32_t)ctx->rdx, (uint32_t)ctx->rcx);
+    ctx->rax = (uint64_t)(int64_t)sceGnmInsertWaitFlipDone(ctx, cmdbuf, (uint32_t)ctx->rsi, (int32_t)ctx->rdx,
+                                                           (uint32_t)ctx->rcx);
     SHIM_RETURN();
 }
 

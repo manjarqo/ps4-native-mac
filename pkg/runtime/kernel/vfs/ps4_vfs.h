@@ -23,6 +23,12 @@ int ps4_vfs_unmount(const char *guest_prefix);
 // Returns 0 on success, or negative errno on error.
 int ps4_vfs_resolve(const char *guest_path, char *host_path, size_t host_path_sz);
 
+// Returns 1 when guest_path lies on a read-only file system, 0 otherwise. /app0 is the
+// application package, a read-only PFS mount on the console: writes, creates, truncation,
+// removal, renames and attribute changes there fail with EROFS. Mounts registered with
+// ps4_vfs_mount (save data, /temp0, /download0, ...) are writable.
+int ps4_vfs_is_read_only(const char *guest_path);
+
 // Cleanup VFS state
 void ps4_vfs_destroy(void);
 

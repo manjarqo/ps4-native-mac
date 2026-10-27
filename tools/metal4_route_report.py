@@ -8,9 +8,13 @@ usage: metal4_route_report.py <run.log> [--skip N]
 
 Default: one line. fps, encoder ms, CP ms and commits are means over the [gnm-draw] perf lines
 after the first N (default 13: boot and loading); split commits are the mean of the [gnm-draw]
-backend lines (0 without any); skipped and flips come from the last "present #" line; load is the
+backend lines (0 without any); skipped, pending and flips come from the last "present #" line (pending
+is the part of skipped that waited for a background shader or pipeline compile, a cold-cache effect;
+skipped minus pending is the work really lost; 0 in logs that predate the split); load is the
 1-minute load in the stop line of <run>.mon next to the log (-1 without one); asserts counts
-[gnm-residency] ASSERT lines. Exit status 1 when the log has no perf line after the skipped ones.
+[gnm-residency] ASSERT lines; reasons are the three largest counts of the last "[gnm-draw] skipped by
+reason:" line as name:count ("none" when it says none, "-" in logs that predate it). Exit status 1
+when the log has no perf line after the skipped ones.
 
 --mem: one line with the numbers of the last "[gnm-mem] charged ..." line (the memory total the
 Phase 5 footprint gate reads) and of the last "texture cache" line (-1 when the log has none).
@@ -30,7 +34,9 @@ import sys
 
 PERF = re.compile(r"\[gnm-draw\] perf: ([\d.]+) fps .*?per frame: ([\d.]+) commits.*?([\d.]+) ms CP \(CPU\), ([\d.]+) ms encoder")
 BACKEND = re.compile(r"\[gnm-draw\] backend \w+: split commits per frame ([\d.]+)")
-PRESENT = re.compile(r"\[gnm-draw\] present #(\d+) .*totals: .* skipped (\d+)")
+PRESENT = re.compile(r"\[gnm-draw\] present #(\d+) .*totals: .* skipped (\d+)(?: \(pending compile (\d+)\))?")
+REASONS = re.compile(r"\[gnm-draw\] skipped by reason: (.*)$")
+REASON = re.compile(r"\s*([\w-]+) (\d+)\s*$")
 STOP = re.compile(r" stop .* load \{ ([\d.]+)")
 MEM = re.compile(r"\[gnm-mem\] charged (\d+)/(\d+) MiB \(device (\d+) MiB incl\. no-copy (\d+) MiB; no-copy buffers (\d+) "
                  r"covering (\d+) MiB\); wired (\d+) MiB \([+-]?\d+ since start\); footprint (\d+) MiB; "
@@ -50,8 +56,8 @@ def median(v):
 
 
 def parse(path):
-    r = {"perf": [], "split": [], "skipped": 0, "flips": 0, "fatal": 0, "gpu_err": 0, "watchdog": 0,
-         "asserts": 0, "mem": None, "tex": None}
+    r = {"perf": [], "split": [], "skipped": 0, "pending": 0, "flips": 0, "fatal": 0, "gpu_err": 0, "watchdog": 0,
+         "asserts": 0, "mem": None, "tex": None, "reasons": None}
     with open(path, errors="replace") as f:
         for line in f:
             m = PERF.search(line)
@@ -65,6 +71,17 @@ def parse(path):
             m = PRESENT.search(line)
             if m:
                 r["flips"], r["skipped"] = int(m.group(1)), int(m.group(2))
+                r["pending"] = int(m.group(3) or 0)  # logs before the split have no pending count
+                continue
+            m = REASONS.search(line)
+            if m:
+                body = m.group(1).strip()
+                r["reasons"] = []
+                if body != "none":
+                    for part in body.split(","):
+                        p = REASON.match(part)
+                        if p:
+                            r["reasons"].append((p.group(1), int(p.group(2))))
                 continue
             m = MEM.search(line)
             if m:
@@ -100,15 +117,26 @@ def run_means(r, skip):
     return mean([p[0] for p in perf]), mean([p[3] for p in perf]), mean([p[2] for p in perf]), mean([p[1] for p in perf])
 
 
+def reasons_text(reasons, top=3):
+    """The largest counts of a parsed "skipped by reason" line (stable order on ties)."""
+    if reasons is None:
+        return "-"
+    if not reasons:
+        return "none"
+    best = sorted(reasons, key=lambda x: -x[1])[:top]
+    return ",".join("%s:%d" % x for x in best)
+
+
 def cmd_report(a):
     r = parse(a.log[0])
     m = run_means(r, a.skip)
     if not m:
         print("metal4_route_report: no perf lines after the first %d" % a.skip)
         return 1
-    print("fps %.1f enc_ms %.1f cp_ms %.1f commits %.1f split %.1f skipped %d fatal %d gpu_err %d watchdog %d "
-          "flips %d load %.1f asserts %d" % (m[0], m[1], m[2], m[3], mean(r["split"]), r["skipped"], r["fatal"],
-                                              r["gpu_err"], r["watchdog"], r["flips"], load_of(a.log[0]), r["asserts"]))
+    print("fps %.1f enc_ms %.1f cp_ms %.1f commits %.1f split %.1f skipped %d pending %d fatal %d gpu_err %d watchdog %d "
+          "flips %d load %.1f asserts %d reasons %s" % (m[0], m[1], m[2], m[3], mean(r["split"]), r["skipped"], r["pending"],
+                                                        r["fatal"], r["gpu_err"], r["watchdog"], r["flips"], load_of(a.log[0]),
+                                                        r["asserts"], reasons_text(r["reasons"])))
     return 0
 
 

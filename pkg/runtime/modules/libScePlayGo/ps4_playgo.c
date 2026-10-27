@@ -92,6 +92,15 @@ int32_t scePlayGoGetToDoList(OrbisPlayGoHandle handle, OrbisPlayGoToDo *outToDoL
     return 0;
 }
 
+// Every chunk is installed, so a to-do list (the order to install chunks in) changes nothing.
+int32_t scePlayGoSetToDoList(OrbisPlayGoHandle handle, const OrbisPlayGoToDo *toDoList, uint32_t numEntries) {
+    (void)handle;
+    if (!toDoList && numEntries > 0) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
 int32_t scePlayGoGetEta(OrbisPlayGoHandle handle, const OrbisPlayGoChunkId *chunkIds, uint32_t count, OrbisPlayGoEta *outEta) {
     (void)handle;
     (void)chunkIds;
@@ -220,6 +229,16 @@ void shim_scePlayGoGetToDoList(GuestContext *ctx) {
     uint32_t *outNum = outNumGuest ? (uint32_t *)(ctx->mem_base + outNumGuest) : NULL;
 
     int32_t ret = scePlayGoGetToDoList(handle, outToDo, maxEntries, outNum);
+    ctx->rax = (uint64_t)(int64_t)ret;
+    SHIM_RETURN();
+}
+
+void shim_scePlayGoSetToDoList(GuestContext *ctx) {
+    OrbisPlayGoHandle handle = (OrbisPlayGoHandle)ctx->rdi;
+    uint64_t toDoGuest = ctx->rsi;
+    uint32_t numEntries = (uint32_t)ctx->rdx;
+    const OrbisPlayGoToDo *toDo = toDoGuest ? (const OrbisPlayGoToDo *)(ctx->mem_base + toDoGuest) : NULL;
+    int32_t ret = scePlayGoSetToDoList(handle, toDo, numEntries);
     ctx->rax = (uint64_t)(int64_t)ret;
     SHIM_RETURN();
 }
