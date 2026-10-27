@@ -1,0 +1,105 @@
+name: Bug report
+description: A game or the PS4 Native app does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do **not** attach or link game files, PKGs, dumps, built `.app`
+        bundles, `guest_image.bin` or keys: they are the game's code and cannot be shared here.
+        Retail (console-encrypted) PKGs are not supported; use a dump of a game you own.
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: Title, TITLE_ID and version, as the app's game page shows them.
+      placeholder: "The Last of Us Remastered, CUSA00557, v1.00"
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: How the game was added
+      options:
+        - Game folder, used in place
+        - Game folder, copied into the library
+        - Fake-signed PKG
+        - Command line (ps4-recomp), no app
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where it fails
+      options:
+        - Adding / import
+        - Analysis
+        - Build
+        - Game start
+        - In game (graphics)
+        - In game (audio)
+        - In game (input / controller)
+        - In game (crash or freeze)
+        - Saves
+        - DLC or updates
+        - The app itself
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Mac
+      description: Model, chip and memory (Apple menu → About This Mac).
+      placeholder: "MacBook Pro 14\", M1 Pro, 16 GB"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "26.1"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: PS4 Native version
+      description: The release you installed, or the commit if you built from source.
+      placeholder: "0.4.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: renderer
+    attributes:
+      label: Renderer
+      description: The game's Settings tab.
+      options:
+        - Automatic
+        - Metal 3
+        - Metal 4
+        - Not relevant
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead.
+      placeholder: |
+        1. Pressed PLAY
+        2. Started a new game
+        3. The screen went black after the first cutscene
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        In the app: the game page → Build log tab (pick Build, Run or Analysis), or "Show log" in
+        Builds & imports. Logs are in `~/Library/Application Support/PS4Native/games/<TITLE_ID>/logs/`.
+        Paste the end of the log, or attach the file. You may replace your user name in paths.
+      render: text
+  - type: textarea
+    id: screens
+    attributes:
+      label: Screenshots or video
+      description: Optional. A screenshot of a rendering problem helps a lot.
