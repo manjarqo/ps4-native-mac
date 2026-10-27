@@ -1,1 +1,8 @@
 blank_issues_enabled: true
+contact_links:
+  - name: Question or "does game X work?"
+    url: https://github.com/manjarqo/ps4-native-mac/discussions/categories/q-a
+    about: Ask about setup, a specific game or your Mac in Discussions (Q&A).
+  - name: Idea or game request
+    url: https://github.com/manjarqo/ps4-native-mac/discussions/categories/ideas
+    about: Suggest a feature or the next game to bring up.
