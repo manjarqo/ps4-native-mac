@@ -15,6 +15,10 @@
  */
 
 #include <dispatch/dispatch.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #include "ps4_gnm_resources.h"
 #include "ps4_hitch.h"
 
@@ -2874,6 +2878,12 @@ struct TextureCache::Entry {
     CompMapping cb_swizzle;     // color targets: CB component swap (for readback)
     id<MTLTexture> tex = nil;
     bool dirty = true;
+    uint64_t cpu_digest = 0;       // sampled: digest of guest bytes at last CPU/GPU-refresh upload
+    uint64_t cpu_check_epoch = 0;  // sampled: last cpu_submit_epoch_ verified against cpu_digest
+    uint64_t readable_bytes = 0;   // sampled: contiguous VM_PROT_READ bytes from address
+    uint32_t cpu_unchanged_streak = 0;
+    bool cpu_digest_valid = false;
+    bool readable_known = false;
     uint64_t generation = 0;    // bumped each time a render target is (re)bound
     // alias copies for sampling a render target with different dims/format
     id<MTLTexture> alias = nil;
@@ -3225,6 +3235,7 @@ TextureCache::MemStats TextureCache::GetMemStats() const {
     m.sampled_bytes = sampled_bytes_.load(std::memory_order_relaxed);
     m.gpu_count = gpu_count_.load(std::memory_order_relaxed);
     m.gpu_bytes = gpu_bytes_.load(std::memory_order_relaxed);
+    m.cpu_uploads_skipped = cpu_uploads_skipped_.load(std::memory_order_relaxed);
     return m;
 }
 
@@ -3242,10 +3253,86 @@ static MTLStorageMode SharedOrManaged(id<MTLDevice>) {
 
 extern "C" void ps4_gnm_hitch_note_upload(double ms);
 
+static uint64_t ReadablePrefixBytes(const uint8_t* p, uint64_t max_len) {
+    if (!p || !max_len) return 0;
+#if defined(__APPLE__)
+    const mach_vm_address_t start = (mach_vm_address_t)(uintptr_t)p;
+    mach_vm_address_t cur = start;
+    while (cur - start < max_len) {
+        mach_vm_address_t addr = cur;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS)
+            break;
+        if (addr > cur || !(info.protection & VM_PROT_READ) || size == 0) break;
+        cur = addr + size;
+    }
+    return std::min<uint64_t>(cur - start, max_len);
+#else
+    return max_len;
+#endif
+}
+
+bool TextureCache::ComputeGuestDigestLocked(Entry* e, uint64_t* out) {
+    if (!mem_base_ || e->address >= mem_size_ || !e->layout.total_size) return false;
+    const uint64_t max_avail = std::min<uint64_t>(mem_size_ - e->address, e->layout.total_size);
+    if (!e->readable_known) {
+        e->readable_bytes = ReadablePrefixBytes(mem_base_ + e->address, max_avail);
+        e->readable_known = (e->readable_bytes == max_avail);
+    }
+    const uint64_t n = e->readable_bytes;
+    if (!n) return false;
+    const uint8_t* p = mem_base_ + e->address;
+    auto mix64 = [](uint64_t h, uint64_t v) -> uint64_t {
+        v ^= v >> 33;
+        v *= 0xff51afd7ed558ccdULL;
+        v ^= v >> 33;
+        v *= 0xc4ceb9fe1a85ec53ULL;
+        v ^= v >> 33;
+        return (h ^ v) * 0x9e3779b97f4a7c15ULL;
+    };
+    uint64_t h = n ^ 0x517cc1b727220a95ULL;
+    if (n <= 4096) {
+        uint64_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            uint64_t w;
+            memcpy(&w, p + i, 8);
+            h = mix64(h, w);
+        }
+        if (i < n) {
+            uint64_t tail = 0;
+            memcpy(&tail, p + i, (size_t)(n - i));
+            h = mix64(h, tail);
+        }
+    } else {
+        const uint64_t probes = (!e->surf.is_block && e->levels == 1) ? 64 : 16;
+        constexpr uint64_t kBlock = 64;
+        const uint64_t span = n - kBlock;
+        for (uint64_t k = 0; k < probes; ++k) {
+            const uint64_t off = ((k * span) / (probes - 1)) & ~7ull;
+            for (uint64_t j = 0; j < kBlock; j += 8) {
+                uint64_t w;
+                memcpy(&w, p + off + j, 8);
+                h = mix64(h, w);
+            }
+        }
+        uint64_t last;
+        memcpy(&last, p + n - 8, 8);
+        h = mix64(h, last);
+    }
+    *out = h;
+    return true;
+}
+
 bool TextureCache::UploadLocked(Entry* e) {
     const double t0 = CFAbsoluteTimeGetCurrent();
+    const uint64_t before = stats.uploads;
     const bool ok = UploadLockedImpl(e);
-    ps4_gnm_hitch_note_upload((CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+    if (!ok || stats.uploads != before)
+        ps4_gnm_hitch_note_upload((CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
     return ok;
 }
 
@@ -3254,6 +3341,7 @@ bool TextureCache::UploadLockedImpl(Entry* e) {
     // MSAA / private textures cannot be written by the CPU (their contents are GPU-produced)
     if (e->tex.sampleCount > 1 || e->tex.storageMode == MTLStorageModePrivate) {
         e->dirty = false;
+        e->cpu_check_epoch = cpu_submit_epoch_.load(std::memory_order_relaxed);
         return false;
     }
     if (e->address >= mem_size_) return false;
@@ -3261,13 +3349,19 @@ bool TextureCache::UploadLockedImpl(Entry* e) {
     const uint32_t bpe = e->surf.bpp / 8;
     if (bpe == 0) return false;
     std::vector<uint8_t> lin((size_t)e->layout.total_size);
-    const uint64_t avail = mem_size_ - e->address;
+    const uint64_t max_avail = std::min<uint64_t>(mem_size_ - e->address, e->layout.total_size);
+    if (!e->readable_known) {
+        e->readable_bytes = ReadablePrefixBytes(mem_base_ + e->address, max_avail);
+        e->readable_known = (e->readable_bytes == max_avail);
+    }
+    const uint64_t avail = e->readable_bytes;
     if (!DetileSurface(e->surf, e->layout, mem_base_ + e->address,
-                       (size_t)std::min<uint64_t>(avail, e->layout.total_size), lin.data(),
+                       (size_t)avail, lin.data(),
                        lin.size(), 0, e->levels, true)) {
         return false;
     }
     const bool is3d = e->tex_type == MTLTextureType3D;
+    bool complete = true;
     for (uint32_t m = 0; m < e->levels; ++m) {
         const MipLayout& ml = e->layout.mips[m];
         const uint32_t w = std::max(1u, e->width >> m), h = std::max(1u, e->height >> m);
@@ -3287,6 +3381,7 @@ bool TextureCache::UploadLockedImpl(Entry* e) {
                                 "rows %llu slices %llu offset %u total %zu); skipped\n",
                         (unsigned long long)e->address, m, e->mtl_format, w, h, ml.pitch, ml.height, bpe,
                         (unsigned long long)rows, (unsigned long long)slices_read, ml.offset, lin.size());
+            complete = false;
             break;
         }
         static int dbg = getenv("PS4_GNM_TEXDBG") ? 1 : 0;
@@ -3322,6 +3417,13 @@ bool TextureCache::UploadLockedImpl(Entry* e) {
     stats.uploads++;
     stats.upload_bytes += e->layout.total_size;
     e->dirty = false;
+    e->cpu_unchanged_streak = 0;
+    if (e->kind == Entry::Sampled && complete) {
+        e->cpu_digest_valid = ComputeGuestDigestLocked(e, &e->cpu_digest);
+        e->cpu_check_epoch = cpu_submit_epoch_.load(std::memory_order_relaxed);
+    } else {
+        e->cpu_digest_valid = false;
+    }
     return true;
 }
 
@@ -3354,6 +3456,8 @@ void TextureCache::MarkStale(uint64_t address, id<MTLTexture> tex) {
         if (it->second->tex == tex) {
             it->second->dirty = true;
             it->second->gpu_upload_epoch = 0;
+            it->second->cpu_digest_valid = false;
+            it->second->cpu_unchanged_streak = 0;
             return;
         }
 }
@@ -3368,6 +3472,7 @@ bool TextureCache::DebugCpuUploadInto(const ImageDesc& img, id<MTLTexture> dst) 
             continue;
         Entry tmp = *e; // same surface and layout, other texture
         tmp.tex = dst;
+        tmp.cpu_digest_valid = false;
         const bool ok = UploadLockedImpl(&tmp);
         tmp.tex = nil;
         return ok;
@@ -3382,8 +3487,16 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
     if (!img.valid || img.address == 0 || img.pixel.mtl_format == 0 || !device_) return nil;
     const SurfaceDesc sd = img.ToSurfaceDesc();
     if (sd.bpp == 0) return nil;
-    SurfaceLayout image_layout;
-    if (!ComputeSurfaceLayout(sd, &image_layout)) return nil;
+    SurfaceLayout image_layout{};
+    bool have_image_layout = false;
+    bool image_layout_valid = false;
+    const auto ensure_image_layout = [&]() -> bool {
+        if (!have_image_layout) {
+            have_image_layout = true;
+            image_layout_valid = ComputeSurfaceLayout(sd, &image_layout);
+        }
+        return image_layout_valid;
+    };
     TimedLock lk(mutex_);
 
     const bool is3d = img.mtl_texture_type == MTLTextureType3D;
@@ -3414,8 +3527,8 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
         // their full extent; differently shaped volumes need an explicit conversion.
         if (is3d != (c->tex_type == MTLTextureType3D)) return false;
         if (is3d && (c->width != width || c->height != height || c->depth != depth || c->levels < levels)) return false;
-        return c->size >= image_layout.total_size &&
-               GetPixelFormat(c->dfmt, c->nfmt).bytes_per_block == img.pixel.bytes_per_block;
+        if (GetPixelFormat(c->dfmt, c->nfmt).bytes_per_block != img.pixel.bytes_per_block) return false;
+        return ensure_image_layout() && c->size >= image_layout.total_size;
     };
     Entry* rt = nullptr;
     if (!img.pixel.compressed) {
@@ -3516,6 +3629,7 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
     };
 
     // 2) cached sampled texture with identical identity
+    const uint64_t sub_epoch = cpu_submit_epoch_.load(std::memory_order_relaxed);
     for (auto it = range.first; it != range.second; ++it) {
         Entry* e = it->second;
         if (e->kind != Entry::Sampled) continue;
@@ -3523,18 +3637,47 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
             e->width == width && e->height == height && e->depth == depth && e->levels == levels &&
             e->layers == layers && e->swizzle == img.view_swizzle && e->surf.pitch == sd.pitch &&
             e->surf.tile_mode == sd.tile_mode && e->surf.is_pow2 == sd.is_pow2) {
+            const bool is_static_asset = (e->surf.is_block || e->levels > 1) && e->cpu_unchanged_streak >= 4;
+            const uint64_t poll_interval = is_static_asset ? 64 : 1;
+            const bool need_cpu_check = e->dirty || (sub_epoch - e->cpu_check_epoch) >= poll_interval;
             if (refresh_min_bytes) {
                 // stale contents: big surfaces are copied on the GPU, small ones by the CPU
                 // (MSAA entries take the CPU path, which only clears their dirty flag)
-                if (e->dirty) {
-                    if (e->samples <= 1 && e->layout.total_size >= refresh_min_bytes) gpu_upload(e);
-                    else UploadLocked(e);
+                if (need_cpu_check) {
+                    uint64_t dig = 0;
+                    const bool dig_ok = ComputeGuestDigestLocked(e, &dig);
+                    if (e->cpu_digest_valid && dig_ok && dig == e->cpu_digest) {
+                        e->dirty = false;
+                        e->cpu_check_epoch = sub_epoch;
+                        if (e->cpu_unchanged_streak < UINT32_MAX) e->cpu_unchanged_streak++;
+                        cpu_uploads_skipped_.fetch_add(1, std::memory_order_relaxed);
+                    } else if (e->samples <= 1 && e->layout.total_size >= refresh_min_bytes) {
+                        gpu_upload(e);
+                        e->cpu_digest = dig;
+                        e->cpu_digest_valid = dig_ok;
+                        e->cpu_check_epoch = sub_epoch;
+                        e->cpu_unchanged_streak = 0;
+                    } else {
+                        UploadLocked(e);
+                    }
                 }
             } else if (gpu_epochs) {
                 // stale unless already copied on the GPU after the pending writes
-                if ((e->dirty || e->gpu_upload_epoch <= gpu_epochs[0]) && e->samples <= 1) gpu_upload(e);
-            } else if (e->dirty) {
-                UploadLocked(e);
+                if ((e->dirty || e->gpu_upload_epoch <= gpu_epochs[0]) && e->samples <= 1) {
+                    gpu_upload(e);
+                    e->cpu_digest_valid = false;
+                    e->cpu_unchanged_streak = 0;
+                }
+            } else if (need_cpu_check) {
+                uint64_t dig = 0;
+                if (e->cpu_digest_valid && ComputeGuestDigestLocked(e, &dig) && dig == e->cpu_digest) {
+                    e->dirty = false;
+                    e->cpu_check_epoch = sub_epoch;
+                    if (e->cpu_unchanged_streak < UINT32_MAX) e->cpu_unchanged_streak++;
+                    cpu_uploads_skipped_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    UploadLocked(e);
+                }
             }
             TouchLocked(e);
             stats.hits++;
@@ -3543,6 +3686,7 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
     }
 
     // 3) create
+    if (!ensure_image_layout()) return nil;
     stats.misses++;
     Entry* e = new Entry();
     e->kind = Entry::Sampled;
@@ -3582,8 +3726,17 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
         return nil;
     }
     if (!msaa) {
-        if (gpu_epochs && (!refresh_min_bytes || e->layout.total_size >= refresh_min_bytes)) gpu_upload(e);
-        else UploadLocked(e);
+        if (gpu_epochs && (!refresh_min_bytes || e->layout.total_size >= refresh_min_bytes)) {
+            gpu_upload(e);
+            if (refresh_min_bytes) {
+                e->cpu_digest_valid = ComputeGuestDigestLocked(e, &e->cpu_digest);
+                e->cpu_check_epoch = sub_epoch;
+            } else {
+                e->cpu_digest_valid = false;
+            }
+        } else {
+            UploadLocked(e);
+        }
     }
     TouchLocked(e);
     e->alloc_bytes = (uint64_t)e->tex.allocatedSize;
@@ -3741,6 +3894,13 @@ id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture
 }
 
 void TextureCache::InvalidateRange(uint64_t addr, uint64_t size, bool include_rts, uint64_t write_epoch) {
+    // Whole-memory submission polling (OnSubmit): advance the submission epoch in O(1) without
+    // locking or walking every entry. Bound sampled textures lazily check their guest-memory
+    // digest once per submission epoch and re-upload only if the guest bytes actually changed.
+    if (addr == 0 && size >= mem_size_ && !include_rts && write_epoch == ~0ull) {
+        cpu_submit_epoch_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     TimedLock lk(mutex_);
     const uint64_t end = addr + size;
     for (auto& kv : entries_) {
@@ -3749,6 +3909,9 @@ void TextureCache::InvalidateRange(uint64_t addr, uint64_t size, bool include_rt
             if (e->kind == Entry::Sampled) {
                 if (e->gpu_upload_epoch > write_epoch) continue; // copied on the GPU after that write
                 e->dirty = true;
+                e->cpu_digest_valid = false;
+                e->cpu_unchanged_streak = 0;
+                e->readable_known = false;
                 stats.invalidations++;
             } else if (include_rts && e->kind == Entry::Color) {
                 UploadLocked(e);
@@ -3794,6 +3957,8 @@ void TextureCache::InvalidateWrites(std::vector<WriteRange>& w) {
             const WriteRange& r = w[--j];
             if (r.addr + r.size > a && e->gpu_upload_epoch <= r.epoch) {
                 e->dirty = true;
+                e->cpu_digest_valid = false;
+                e->cpu_unchanged_streak = 0;
                 stats.invalidations++;
                 break;
             }

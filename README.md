@@ -460,7 +460,7 @@ Saves and per-game settings are not in the library. The runtime keeps them in
 - **Signing.** The app and the built games are signed ad hoc, not notarized. On another Mac,
   Gatekeeper blocks the first launch of a downloaded copy of the app; allow it in System Settings,
   Privacy & Security, "Open Anyway".
-- **Status: preview.** Download the app as `PS4Native-0.4.2.dmg` from GitHub Releases. The app
+- **Status: preview.** Download the app as `PS4Native-0.4.3.dmg` from GitHub Releases. The app
   first shipped in v0.4.0.
   `app/PS4Native/scripts/package.sh` builds the engine kit and packages `PS4 Native.app` and a
   `.dmg`; `scripts/smoke.sh` smoke-tests that

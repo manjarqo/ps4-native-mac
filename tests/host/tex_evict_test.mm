@@ -825,6 +825,55 @@ static void test_cpu_submission(id<MTLDevice> dev, TestTextureResidency& res) {
         const uint64_t uploads = tc.stats.uploads;
         check(tc.GetTexture(Tsharp(0x10000, 64, 64)) == sampled && tc.stats.uploads == uploads,
               "CPU submission: repeated binds do not upload again");
+        tc.InvalidateRange(0, g.size, false);
+        check(tc.GetTexture(Tsharp(0x10000, 64, 64)) == sampled && tc.stats.uploads == uploads &&
+                  tc.GetMemStats().cpu_uploads_skipped == 1,
+              "CPU submission: unchanged guest bytes skip CPU upload after whole-memory invalidation");
+        tc.InvalidateRange(0, g.size, false);
+        TextureCache::GpuUpload up;
+        check(tc.GetTextureForGpuRefresh(Tsharp(0x10000, 64, 64), 5, 1024, &up) == sampled && up.tex == nil &&
+                  tc.stats.uploads == uploads && tc.GetMemStats().cpu_uploads_skipped == 2,
+              "CPU submission: unchanged guest bytes skip GPU refresh upload after whole-memory invalidation");
+        Fill(g, 0x10000, 64 * 64 * 4, 0x44);
+        tc.InvalidateRange(0, g.size, false);
+        check(tc.GetTextureForGpuRefresh(Tsharp(0x10000, 64, 64), 6, 1024, &up) == sampled && up.tex == sampled &&
+                  tc.stats.uploads == uploads + 1,
+              "CPU submission: changed guest bytes trigger GPU refresh upload");
+        tc.MarkStale(0x10000, sampled);
+        check(tc.GetTexture(Tsharp(0x10000, 64, 64)) == sampled && FirstByte(sampled) == 0x44 &&
+                  tc.stats.uploads == uploads + 2,
+              "CPU submission: MarkStale forces CPU fallback upload");
+        Fill(g, 0x10000, 64 * 64 * 4, 0x22);
+        tc.InvalidateRange(0, g.size, false);
+        tc.GetTexture(Tsharp(0x10000, 64, 64));
+        const uint64_t after_22 = tc.stats.uploads;
+        tc.GetTextureForGpuUpload(Tsharp(0x10000, 64, 64), 0, 10, &up);
+        check(up.tex == sampled, "CPU submission: GPU hazard upload hands out texture");
+        std::vector<uint8_t> gpu_pixels(64 * 64 * 4, 0x88);
+        [sampled replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0
+                     withBytes:gpu_pixels.data() bytesPerRow:64 * 4];
+        tc.InvalidateRange(0, g.size, false);
+        check(tc.GetTexture(Tsharp(0x10000, 64, 64)) == sampled && FirstByte(sampled) == 0x22 &&
+                  tc.stats.uploads == after_22 + 2,
+              "CPU submission: GPU hazard upload invalidates prior CPU digest");
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                      width:64 height:64 mipmapped:NO];
+        td.storageMode = MTLStorageModeShared;
+        id<MTLTexture> reference = [dev newTextureWithDescriptor:td];
+        check(tc.DebugCpuUploadInto(Tsharp(0x10000, 64, 64), reference) && FirstByte(reference) == 0x22,
+              "CPU submission: reference uploads are never skipped by digest equality");
+        Fill(g, 0x40000, 0x4000, 0x55);
+        check(mprotect(g.base + 0x44000, 0x4000, PROT_NONE) == 0,
+              "CPU submission: guard page marked PROT_NONE");
+        id<MTLTexture> partial = tc.GetTexture(Tsharp(0x40000, 64, 128));
+        const uint64_t uploads_after_partial = tc.stats.uploads;
+        const uint64_t skipped_before_partial = tc.GetMemStats().cpu_uploads_skipped;
+        tc.InvalidateRange(0, g.size, false);
+        check(tc.GetTexture(Tsharp(0x40000, 64, 128)) == partial && FirstByte(partial) == 0x55 &&
+                  tc.stats.uploads == uploads_after_partial &&
+                  tc.GetMemStats().cpu_uploads_skipped == skipped_before_partial + 1,
+              "CPU submission: digest clamps to readable VM prefix before PROT_NONE tail");
+        mprotect(g.base + 0x44000, 0x4000, PROT_READ | PROT_WRITE);
     }
     munmap(g.base, g.size);
 }

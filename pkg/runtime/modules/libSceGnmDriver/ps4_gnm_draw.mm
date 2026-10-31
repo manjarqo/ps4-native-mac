@@ -1502,14 +1502,16 @@ void StartGpuMemSampler(uint64_t mem_size) {
                         (unsigned long long)(g_mem.copy_bytes.load() >> 20), budget.over ? "; OVER BUDGET" : "");
                 if (tc) {
                     fprintf(stderr, "[gnm-mem] texture cache at %llu s: sampled %llu (%llu MiB, peak %llu MiB, budget %llu MiB), "
-                                    "GPU-owned %llu (%llu MiB); evicted %llu (%llu MiB), superseded GPU-owned %llu (%llu MiB)\n",
+                                    "GPU-owned %llu (%llu MiB); evicted %llu (%llu MiB), superseded GPU-owned %llu (%llu MiB), "
+                                    "unchanged uploads skipped %llu\n",
                             (unsigned long long)((s.t_ns - t_start) / 1000000000ull),
                             (unsigned long long)ts.sampled_count, (unsigned long long)(ts.sampled_bytes >> 20),
                             (unsigned long long)(peak_tex >> 20),
                             (unsigned long long)(g_mem.texpol.budget == UINT64_MAX ? 0 : g_mem.texpol.budget >> 20),
                             (unsigned long long)ts.gpu_count, (unsigned long long)(ts.gpu_bytes >> 20),
                             (unsigned long long)tc->EvictedCount(), (unsigned long long)(tc->EvictedBytes() >> 20),
-                            (unsigned long long)tc->EvictedGpuCount(), (unsigned long long)(tc->EvictedGpuBytes() >> 20));
+                            (unsigned long long)tc->EvictedGpuCount(), (unsigned long long)(tc->EvictedGpuBytes() >> 20),
+                            (unsigned long long)ts.cpu_uploads_skipped);
                 }
                 if (tc) {
                     const TextureCache::GpuOwnedStats go = tc->GetGpuOwnedStats(10000000000ull);
@@ -6566,7 +6568,7 @@ void ResolveTextureHazards(const Shader* s, const std::vector<uint32_t>& flat) {
             ImageDesc img;
             uint64_t approx = 0;
             if (!StageImage(s, flat, i, &img, &approx) || !img.valid) continue;
-            if (!S.tex->OverlapsGpuTexture(img.address, 1) && OverlapsPendingWrite(img.address, approx)) {
+            if (OverlapsPendingWrite(img.address, approx) && !S.tex->OverlapsGpuTexture(img.address, 1)) {
                 const bool can_gpu = S.detile_pso != nil && BackendHas(kGnmCapCompute | kGnmCapCopies);
                 if (id<MTLTexture> st = S.tex->GetStorageTexture(img, can_gpu))
                     RefreshGuestNewer(img.address, st, true);

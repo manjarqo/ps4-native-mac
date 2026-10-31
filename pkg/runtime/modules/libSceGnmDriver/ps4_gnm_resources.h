@@ -943,6 +943,7 @@ public:
     struct MemStats {
         uint64_t sampled_count = 0, sampled_bytes = 0; // detiled from guest memory (re-creatable)
         uint64_t gpu_count = 0, gpu_bytes = 0;         // render targets, depth, storage (GPU-owned)
+        uint64_t cpu_uploads_skipped = 0;              // unchanged sampled binds skipped after submission invalidation
     };
     MemStats GetMemStats() const;
 
@@ -1007,6 +1008,7 @@ private:
     struct Entry;
     bool UploadLocked(Entry* e);
     bool UploadLockedImpl(Entry* e);
+    bool ComputeGuestDigestLocked(Entry* e, uint64_t* out);
     id<MTLTexture> GetTextureImpl(const ImageDesc& img, const uint64_t* gpu_epochs, GpuUpload* up,
                                   uint64_t refresh_min_bytes = 0);
     // Waits for the work committed so far on the cache's queue (queue_: the backend's SideQueue).
@@ -1084,6 +1086,7 @@ private:
     uint64_t gpu_version_ = 0;
     mutable uint64_t gpu_index_version_ = ~0ull;
     std::atomic<uint64_t> sampled_count_{0}, sampled_bytes_{0}, gpu_count_{0}, gpu_bytes_{0};
+    std::atomic<uint64_t> cpu_submit_epoch_{1}, cpu_uploads_skipped_{0};
     std::atomic<uint64_t> evicted_count_{0}, evicted_bytes_{0}, evicted_gpu_count_{0}, evicted_gpu_bytes_{0};
     // GPU-owned entries sorted by address, with their superseded flags (SupersededLocked)
     void SupersededLocked(std::vector<Entry*>* v, std::vector<char>* sup) const;
