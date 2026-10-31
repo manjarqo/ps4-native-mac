@@ -190,8 +190,37 @@ static int Run(size_t keep_idle) {
     return 0;
 }
 
+// Two open command buffers (the main one and the asynchronous compute one): each write is pending
+// until its own command buffer's seq completed, whichever target commits first; the latest write of
+// a range written by both decides.
+static int TwoTargets() {
+    GnmPendingWrites w;
+    GnmPendingWrites::Range hit;
+    w.Note(0x1000, 0x100, 1, 0); // main
+    w.Note(0x2000, 0x100, 2, 1); // async
+    w.Commit(5, 1);              // async committed first: seq 5
+    CHECK(w.Overlaps(0x1000, 4, &hit) && hit.epoch == 1, "main's open write is not pending after async's commit");
+    w.Prune(5);
+    CHECK(!w.Overlaps(0x2000, 4), "async's write still pending after its seq completed");
+    CHECK(w.Overlaps(0x1000, 4), "main's open write pruned by async's completion");
+    w.Commit(6, 0);
+    CHECK(w.Overlaps(0x1000, 4), "main's write not pending after its commit");
+    w.Prune(6);
+    CHECK(!w.Overlaps(0x1000, 4), "main's write still pending after its seq completed");
+    // a range written by main, then by async while both are open: async's write is the latest
+    w.Note(0x3000, 0x100, 3, 0);
+    w.Note(0x3000, 0x100, 4, 1);
+    w.Commit(7, 0); // main's commit does not take the range async wrote last
+    w.Prune(7);
+    CHECK(w.Overlaps(0x3000, 4, &hit) && hit.epoch == 4, "the range's latest write (async, open) is not pending");
+    w.Commit(8, 1);
+    w.Prune(8);
+    CHECK(!w.Overlaps(0x3000, 4), "the range is pending after both seqs completed");
+    return fails != 0;
+}
+
 int main() {
-    if (Run(GnmPendingWrites::kKeepIdle) || Run(8)) return 1;
+    if (Run(GnmPendingWrites::kKeepIdle) || Run(8) || TwoTargets()) return 1;
     printf("gnm_pending_writes_test: PASS\n");
     return 0;
 }

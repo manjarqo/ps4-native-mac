@@ -12,6 +12,10 @@
 // and "pass <n>: UNSTABLE-FIRST" before the verdict line; range, U lines (FormatPassResult). A
 // pass writing a texture it creates is replayed once ("NOT SETTLED", S line). The exit status is
 // the judged replay's.
+// gnm_replay <frame_dir> <pass>|<a>-<b>|all --time <n>: median and min encode + GPU wall time of
+// each pass over n warmed-up replays (TimePasses), one "pass <id> <kind> <shader> median_ms <x>
+// min_ms <x> runs <n>" line per pass and, for a range, a "total median_ms" line. Not combinable
+// with --allocs, --settle or --sha.
 // Single-pass exit status: 0 every output matches, 1 a mismatch, 2 the pass could not be replayed
 // or the capture records no output of it (nothing to compare; the notes on stderr list the store
 // instructions in its shaders, whose writes the renderer may not track).
@@ -25,17 +29,18 @@
 #include <algorithm>
 
 #include "gnm_replay.h"
+#include "ps4_gnm_draw.h"
 
 int main(int argc, char** argv) {
     @autoreleasepool {
         if (argc < 3) {
-            fprintf(stderr, "usage: gnm_replay <frame_dir> <pass>|<a>-<b>|all [--out <dir>] [--sha] [--settle]\n");
+            fprintf(stderr, "usage: gnm_replay <frame_dir> <pass>|<a>-<b>|all [--out <dir>] [--sha] [--settle] [--allocs <n>] [--time <n>]\n");
             return 2;
         }
         ps4replay::Options o;
         o.frame_dir = argv[1];
         bool sha = false;
-        int allocs = 0;
+        int allocs = 0, time_runs = 0;
         for (int i = 3; i < argc; ++i) {
             if (!strcmp(argv[i], "--sha")) sha = true;
             else if (!strcmp(argv[i], "--settle")) o.settle = true;
@@ -48,6 +53,15 @@ int main(int argc, char** argv) {
                 }
                 allocs = (int)v;
             }
+            else if (!strcmp(argv[i], "--time") && i + 1 < argc) {
+                char* e = nullptr;
+                const long v = strtol(argv[++i], &e, 10);
+                if (e == argv[i] || *e || v < 1 || v > 100000) {
+                    fprintf(stderr, "--time wants a count from 1 to 100000, got '%s'\n", argv[i]);
+                    return 2;
+                }
+                time_runs = (int)v;
+            }
             else if (!strcmp(argv[i], "--out") && i + 1 < argc) o.out_dir = argv[++i];
         }
         uint32_t first = 0, last = 0;
@@ -55,6 +69,38 @@ int main(int argc, char** argv) {
         if (!ps4replay::ParsePassSpec(argv[2], &first, &last, &range)) {
             fprintf(stderr, "bad pass argument '%s': want <pass>, <a>-<b> with a <= b, or all\n", argv[2]);
             return 2;
+        }
+        if (time_runs) {
+            if (allocs || o.settle || sha) {
+                fprintf(stderr, "--time measures replays of its own: --allocs, --settle and --sha do not apply\n");
+                return 2;
+            }
+            ps4gnm_capture::FrameRec f;
+            std::string err;
+            if (!ps4gnm_capture::LoadFrame(o.frame_dir, &f, &err)) {
+                fprintf(stderr, "%s\n", err.c_str());
+                return 2;
+            }
+            std::vector<std::string> notes;
+            const std::vector<ps4replay::PassTime> times = ps4replay::TimePasses(o, first, last, time_runs, &notes);
+            for (const std::string& n : notes) fprintf(stderr, "note: %s\n", n.c_str());
+            double total = 0;
+            for (const ps4replay::PassTime& t : times) {
+                const ps4gnm_capture::PassRec& p = f.passes[t.pass];
+                // the shader a pass is known by: the pixel shader of a draw (else its first stage), the compute shader
+                const ps4gnm_capture::StageRec* st = p.stages.empty() ? nullptr : &p.stages[0];
+                for (const ps4gnm_capture::StageRec& s : p.stages)
+                    if (s.stage == "ps" || s.stage == "cs") st = &s;
+                printf("pass %u %s 0x%llx median_ms %.3f min_ms %.3f runs %d\n", t.pass, p.type.c_str(),
+                       (unsigned long long)(st ? st->code_addr : 0), t.median_ms, t.min_ms, t.runs);
+                total += t.median_ms;
+            }
+            if (range) printf("total median_ms %.3f\n", total);
+            if (times.empty()) {
+                fprintf(stderr, "no pass could be timed\n");
+                return 2;
+            }
+            return 0;
         }
         if (range) {
             if (allocs) {
@@ -70,6 +116,11 @@ int main(int argc, char** argv) {
                 for (const std::string& n : p.r.notes) fprintf(stderr, "note: pass %u: %s\n", p.pass, n.c_str());
                 fputs(ps4replay::FormatPassResult(p).c_str(), stdout);
             }
+            // PS4_GNM_ASYNC_COMPUTE=1: where the replayed compute-ring passes ran
+            const ps4draw::AsyncComputeCounts ac = ps4draw::GetAsyncComputeCounts();
+            if (ac.on)
+                fprintf(stderr, "async compute: %llu compute-ring jobs on the asynchronous compute queue, %llu on the main one\n",
+                        (unsigned long long)ac.eligible, (unsigned long long)ac.joined);
             return 0;
         }
         o.pass = first;

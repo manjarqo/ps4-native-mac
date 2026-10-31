@@ -1410,6 +1410,21 @@ static bool ProcessSurface(const SurfaceDesc& d, const SurfaceLayout& l, const u
                         const uint64_t tbase = soff + ((uint64_t)ty * tiles_per_row + tx) * mtb;
                         const uint32_t y0 = ty * 8, x0 = tx * 8;
                         const uint32_t ye = std::min(h, y0 + 8), xe = std::min(w, x0 + 8);
+                        if constexpr (kMode == 0) {
+                            // A complete single-sample 32-bit microtile needs one bounds check,
+                            // rather than a size dispatch and bounds check for every texel.
+                            // Keep edge pixels clipped to the visible extent as on the general path.
+                            if (bpe == 4 && P.samples == 1 && tbase <= tiled_size && mtb <= tiled_size - tbase) {
+                                const uint8_t* tile = tiled_src + tbase;
+                                for (uint32_t y = y0; y < ye; ++y) {
+                                    uint8_t* row = lin_dst + m.offset + s * lin_slice + uint64_t(y) * pitch * 4;
+                                    const uint32_t* offsets = &lut[zl | ((y & 7) << 3)];
+                                    for (uint32_t x = x0; x < xe; ++x)
+                                        memcpy(row + uint64_t(x) * 4, tile + offsets[x & 7], 4);
+                                }
+                                continue;
+                            }
+                        }
                         for (uint32_t y = y0; y < ye; ++y) {
                             const uint64_t lrow = m.offset + s * lin_slice + ((uint64_t)y * pitch) * bpe;
                             const uint32_t* lrowlut = &lut[zl | ((y & 7) << 3)];
@@ -1419,8 +1434,9 @@ static bool ProcessSurface(const SurfaceDesc& d, const SurfaceLayout& l, const u
                                 if constexpr (kMode == 2)
                                     map[lo / bpe] = ta + bpe <= tiled_size ? (uint32_t)ta : ~0u;
                                 else
-                                    CopyElem<kTile>(tiled_src, tiled_dst, tiled_size, ta, lin_dst + lo,
-                                                    lin_src + lo, bpe);
+                                    CopyElem<kTile>(tiled_src, tiled_dst, tiled_size, ta,
+                                                    kTile ? nullptr : lin_dst + lo,
+                                                    kTile ? lin_src + lo : nullptr, bpe);
                             }
                         }
                     }
@@ -1455,8 +1471,9 @@ static bool ProcessSurface(const SurfaceDesc& d, const SurfaceLayout& l, const u
                                 if constexpr (kMode == 2)
                                     map[lo / bpe] = ta + bpe <= tiled_size ? (uint32_t)ta : ~0u;
                                 else
-                                    CopyElem<kTile>(tiled_src, tiled_dst, tiled_size, ta, lin_dst + lo,
-                                                    lin_src + lo, bpe);
+                                    CopyElem<kTile>(tiled_src, tiled_dst, tiled_size, ta,
+                                                    kTile ? nullptr : lin_dst + lo,
+                                                    kTile ? lin_src + lo : nullptr, bpe);
                             }
                         }
                     }
@@ -2869,12 +2886,66 @@ struct TextureCache::Entry {
     // compute copy's destination): its command buffer and the range. Other writes (draws, storage
     // images) only count as uses: which bytes they touch is not known.
     mutable uint64_t last_write_seq = 0, write_lo = 0, write_hi = 0;
+    // GPU-owned: when the GPU last wrote the surface, in the cache's order of GPU writes
+    // (StampWriteLocked); 0: never written since it was made
+    mutable uint64_t write_order = 0;
     // Color: buffer writes over the surface (NoteBufferWrite). newer_epoch != 0: marked guest newer
     // (the write epoch of the write that completed the cover); newer_cover: the exactly known
     // written ranges since its last GPU write (sorted, merged, clipped to the surface).
     uint64_t newer_epoch = 0;
     mutable std::vector<std::pair<uint64_t, uint64_t>> newer_cover;
     bool newer_partial_logged = false;
+    uint64_t write_site_seq = 0; // the last GPU write site noted for it (NoteWriteSite)
+    // Immutable layout-derived footprint, computed only for a viable partial prefix.
+    uint64_t visible_prefix_end = 0;
+    bool visible_prefix_known = false;
+
+    uint64_t VisibleBytes() const {
+        if (samples != 1 || surf.is_block || !surf.bpp || (surf.bpp & 7) || !levels ||
+            levels > layout.num_mips) return 0;
+        uint64_t bytes = 0;
+        for (uint32_t m = 0; m < levels; ++m) {
+            const uint64_t w = std::max(1u, width >> m), h = std::max(1u, height >> m);
+            const uint64_t slices = (tex_type == MTLTextureType3D ? std::max(1u, depth >> m) : layers);
+            // Layout creation validated the allocation. Reject inconsistent products conservatively.
+            if (!slices || w > size / h || w * h > size / slices ||
+                w * h * slices > size / (surf.bpp / 8)) return 0;
+            const uint64_t n = w * h * slices * (surf.bpp / 8);
+            if (n > size - bytes) return 0;
+            bytes += n;
+        }
+        return bytes;
+    }
+
+    bool VisiblePrefixCovered(uint64_t bytes) {
+        if (bytes >= size) return true;
+        const uint64_t visible_bytes = VisibleBytes();
+        if (!visible_bytes || visible_bytes > bytes) return false;
+        if (!visible_prefix_known) {
+            visible_prefix_known = true;
+            visible_prefix_end = size; // unknown or inconsistent footprints require full coverage
+            SurfaceDesc d = surf;
+            d.width = width;
+            d.height = height;
+            d.depth = depth;
+            uint64_t end = 0;
+            const uint64_t bpe = d.bpp / 8;
+            for (uint32_t m = 0; m < levels; ++m) {
+                const uint32_t w = std::max(1u, width >> m), h = std::max(1u, height >> m);
+                const uint32_t slices = tex_type == MTLTextureType3D ? std::max(1u, depth >> m) : layers;
+                if (w > layout.mips[m].pitch || h > layout.mips[m].height || slices > layout.mips[m].slices) return false;
+                for (uint32_t z = 0; z < slices; ++z)
+                    for (uint32_t y = 0; y < h; ++y)
+                        for (uint32_t x = 0; x < w; ++x) {
+                            const uint64_t at = TiledElementOffset(d, layout, m, x, y, z);
+                            if (at > size || bpe > size - at) return false;
+                            end = std::max(end, at + bpe);
+                        }
+            }
+            if (end) visible_prefix_end = end;
+        }
+        return bytes >= visible_prefix_end;
+    }
 };
 
 void TextureCache::TouchLocked(const Entry* e) const {
@@ -2886,6 +2957,22 @@ void TextureCache::GpuWroteLocked(const Entry* e) const {
     e->newer_cover.clear();
 }
 
+void TextureCache::StampWriteLocked(const Entry* e) const {
+    e->write_order = ++write_order_;
+}
+
+template <class Fits>
+TextureCache::Entry* TextureCache::LastWrittenLocked(uint64_t address, int kind, Fits fits) const {
+    Entry* best = nullptr;
+    auto range = entries_.equal_range(address);
+    for (auto it = range.first; it != range.second; ++it) {
+        Entry* e = it->second;
+        if ((int)e->kind != kind || !e->tex || !fits(e)) continue;
+        if (!best || e->write_order > best->write_order) best = e;
+    }
+    return best;
+}
+
 void TextureCache::UnmarkLocked(const Entry* e) {
     if (!e->newer_epoch) return;
     const_cast<Entry*>(e)->newer_epoch = 0;
@@ -2895,6 +2982,7 @@ void TextureCache::UnmarkLocked(const Entry* e) {
 void TextureCache::ExactWriteLocked(const Entry* e, uint64_t lo, uint64_t hi, uint64_t seq) const {
     TouchLocked(e);
     GpuWroteLocked(e);
+    StampWriteLocked(e);
     lo = std::max(lo, e->address);
     hi = std::min(hi, e->address + e->size);
     if (lo >= hi) return;
@@ -2949,6 +3037,14 @@ void TextureCache::SupersededLocked(std::vector<Entry*>* v, std::vector<char>* s
             reach = std::max(reach, c.second);
         }
         (*sup)[i] = reach >= b;
+        if ((*sup)[i] && !superseded_logged_) {
+            superseded_logged_ = true;
+            fprintf(stderr,
+                    "[gnm-mem] first GPU-owned surface counted as overlapped by newer surfaces: %s at 0x%llx, %llu bytes, "
+                    "%ux%u MTLPixelFormat %u (logged once)\n",
+                    e->kind == Entry::Depth ? "depth" : "color", (unsigned long long)e->address,
+                    (unsigned long long)e->size, e->width, e->height, e->mtl_format);
+        }
     }
 }
 
@@ -3286,6 +3382,8 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
     if (!img.valid || img.address == 0 || img.pixel.mtl_format == 0 || !device_) return nil;
     const SurfaceDesc sd = img.ToSurfaceDesc();
     if (sd.bpp == 0) return nil;
+    SurfaceLayout image_layout;
+    if (!ComputeSurfaceLayout(sd, &image_layout)) return nil;
     TimedLock lk(mutex_);
 
     const bool is3d = img.mtl_texture_type == MTLTextureType3D;
@@ -3301,24 +3399,55 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
         layers = 1;
     }
 
-    // 1) GPU-written render target at this address?
+    // 1) GPU-written render target at this address? Of several, the last written of those that
+    // cover the image: its contents are what that memory holds (a half-size target written after a
+    // full-size one at the same address is what a T# of the half size reads, not the full-size
+    // target's corner). A smaller surface written later holds only part of the image, so it is taken
+    // only when no surface covers the image.
     auto range = entries_.equal_range(img.address);
-    for (auto it = range.first; it != range.second; ++it) {
-        Entry* e = it->second;
-        if (e->kind != Entry::Color || !e->tex) continue;
-        const PixelFormatInfo rtpf = GetPixelFormat(e->dfmt, e->nfmt);
-        if (rtpf.bytes_per_block != img.pixel.bytes_per_block || img.pixel.compressed) continue;
+    const auto texel_fits = [&](const Entry* c) {
+        // A cached surface owns only its recorded byte range. The same base can later be
+        // reused for a larger CPU image (for example, a framebuffer after a text target).
+        // Copying the old, shorter surface and leaving the rest blank is not an alias of
+        // that image. Partial overlaps need separate composition, not a whole-image bind.
+        // Metal cannot reinterpret a 2D surface as a volume. Volume aliases keep
+        // their full extent; differently shaped volumes need an explicit conversion.
+        if (is3d != (c->tex_type == MTLTextureType3D)) return false;
+        if (is3d && (c->width != width || c->height != height || c->depth != depth || c->levels < levels)) return false;
+        return c->size >= image_layout.total_size &&
+               GetPixelFormat(c->dfmt, c->nfmt).bytes_per_block == img.pixel.bytes_per_block;
+    };
+    Entry* rt = nullptr;
+    if (!img.pixel.compressed) {
+        rt = LastWrittenLocked(img.address, Entry::Color,
+                               [&](const Entry* c) { return texel_fits(c) && c->width >= width && c->height >= height; });
+        Entry* newest = LastWrittenLocked(img.address, Entry::Color, texel_fits);
+        if (!rt) {
+            rt = newest;
+        } else if (newest && newest->write_order > rt->write_order &&
+                   skipped_newer_logged_.insert(img.address).second) {
+            // The newer surface's bytes are part of the image, but only the covering surface is
+            // read: merging the newer one's region into the copy is not done yet.
+            fprintf(stderr,
+                    "[gnm-tex] 0x%llx: a %ux%u T# reads the older %ux%u surface; the newer %ux%u one there does not "
+                    "cover it (logged once per address)\n",
+                    (unsigned long long)img.address, width, height, rt->width, rt->height, newest->width, newest->height);
+        }
+    }
+    if (Entry* e = rt) {
         stats.rt_aliased++;
         const MTLTextureSwizzleChannels swz = ToMTLSwizzle(img.view_swizzle);
-        if (e->width == width && e->height == height && img.mtl_texture_type == MTLTextureType2D) {
+        if (e->width == width && e->height == height &&
+            (img.mtl_texture_type == MTLTextureType2D || is3d)) {
             const uint32_t key = img.pixel.mtl_format ^ ((uint32_t)img.view_swizzle.r << 16) ^
                                  ((uint32_t)img.view_swizzle.g << 20) ^ ((uint32_t)img.view_swizzle.b << 24) ^
                                  ((uint32_t)img.view_swizzle.a << 28);
-            if (!e->alias || e->alias_key != key) {
+            const uint32_t alias_levels = is3d ? levels : 1;
+            if (!e->alias || e->alias_key != key || e->alias.mipmapLevelCount != alias_levels) {
                 ReleaseTextureLocked(AliasCopy(e)); // a copy this view replaces
                 e->alias = [e->tex newTextureViewWithPixelFormat:(MTLPixelFormat)img.pixel.mtl_format
-                                                     textureType:MTLTextureType2D
-                                                          levels:NSMakeRange(0, 1)
+                                                     textureType:(MTLTextureType)img.mtl_texture_type
+                                                          levels:NSMakeRange(0, alias_levels)
                                                           slices:NSMakeRange(0, 1)
                                                          swizzle:swz];
                 e->alias_key = key;
@@ -3430,10 +3559,7 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
     e->surf = sd;
     e->dfmt = img.dfmt;
     e->nfmt = img.nfmt;
-    if (!ComputeSurfaceLayout(sd, &e->layout)) {
-        DropEntryLocked(e); // nothing created yet: reports nothing
-        return nil;
-    }
+    e->layout = image_layout;
     e->size = e->layout.total_size;
 
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
@@ -3466,7 +3592,8 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
     return e->tex;
 }
 
-id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_from_guest) {
+id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_from_guest, bool written,
+                                            bool guest_write_pending) {
     if (!cb.bound || cb.mtl_format == 0 || !device_) return nil;
     TimedLock lk(mutex_);
     const uint32_t w = (cb.extent_width && cb.extent_width <= cb.pitch) ? cb.extent_width : cb.pitch;
@@ -3480,6 +3607,7 @@ id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_fro
             e->generation++;
             stats.hits++;
             GpuWroteLocked(e); // drawn into: earlier buffer writes no longer describe it
+            if (written) StampWriteLocked(e);
             return TouchLocked(e), e->tex;
         }
     }
@@ -3522,10 +3650,17 @@ id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_fro
         // one-time initial contents; afterwards the GPU owns the texture. The Metal format has
         // the same memory layout as the guest surface (BGRA chosen for swapped 8888).
         e->levels = 1;
-        UploadLocked(e);
+        if (guest_write_pending) {
+            e->newer_epoch = 1;
+            guest_newer_n_.fetch_add(1, std::memory_order_relaxed);
+            guest_newer_marked_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            UploadLocked(e);
+        }
     }
     e->dirty = false;
     e->generation = 1;
+    if (written) StampWriteLocked(e); // bound to be written (a read-only bind leaves it oldest)
     stats.rt_created++;
     e->alloc_bytes = (uint64_t)e->tex.allocatedSize;
     TrackLocked(e, +1);
@@ -3533,7 +3668,7 @@ id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_fro
     return TouchLocked(e), e->tex;
 }
 
-id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from) {
+id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from, bool written) {
     if (grown_from) *grown_from = nil;
     if (!db.bound || db.mtl_format == 0 || !device_) return nil;
     TimedLock lk(mutex_);
@@ -3568,6 +3703,7 @@ id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture
                 TrackLocked(e, +1); // also marks the GPU range index stale
             }
             e->generation++;
+            if (written) StampWriteLocked(e); // depth or stencil written (a test alone reads it)
             return TouchLocked(e), e->tex;
         }
     }
@@ -3597,6 +3733,7 @@ id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture
         return nil;
     }
     e->dirty = false;
+    if (written) StampWriteLocked(e); // depth or stencil written (a test alone reads it)
     e->alloc_bytes = (uint64_t)e->tex.allocatedSize;
     TrackLocked(e, +1);
     entries_.emplace(addr, e);
@@ -3616,6 +3753,13 @@ void TextureCache::InvalidateRange(uint64_t addr, uint64_t size, bool include_rt
             } else if (include_rts && e->kind == Entry::Color) {
                 UploadLocked(e);
                 e->generation++;
+                // its texture now holds the guest bytes. Several targets over the same bytes are
+                // all reloaded here, stamped in the map's order: which of them a later lookup takes
+                // is arbitrary, but each holds the same guest bytes now.
+                StampWriteLocked(e);
+                // and it is used now: an exactly known write of another surface before the CPU's
+                // write no longer supersedes it (it holds the newer guest bytes)
+                TouchLocked(e);
                 stats.invalidations++;
             }
         }
@@ -3659,20 +3803,15 @@ void TextureCache::InvalidateWrites(std::vector<WriteRange>& w) {
 
 id<MTLTexture> TextureCache::FindColorTarget(uint64_t address) const {
     TimedLock lk(mutex_);
-    auto range = entries_.equal_range(address);
-    for (auto it = range.first; it != range.second; ++it)
-        if (it->second->kind == Entry::Color) return TouchLocked(it->second), it->second->tex;
-    return nil;
+    const Entry* e = LastWrittenLocked(address, Entry::Color, [](const Entry*) { return true; });
+    return e ? (TouchLocked(e), e->tex) : nil;
 }
 
 id<MTLTexture> TextureCache::FindColorTarget(uint64_t address, uint32_t width, uint32_t height) const {
     TimedLock lk(mutex_);
-    auto range = entries_.equal_range(address);
-    for (auto it = range.first; it != range.second; ++it) {
-        const Entry* e = it->second;
-        if (e->kind == Entry::Color && e->tex && e->tex.width == width && e->tex.height == height) return TouchLocked(e), e->tex;
-    }
-    return nil;
+    const Entry* e = LastWrittenLocked(address, Entry::Color,
+                                       [&](const Entry* c) { return c->tex.width == width && c->tex.height == height; });
+    return e ? (TouchLocked(e), e->tex) : nil;
 }
 
 id<MTLTexture> TextureCache::FindDepthSibling(const DepthTarget& db, id<MTLTexture> self) const {
@@ -3691,23 +3830,27 @@ id<MTLTexture> TextureCache::FindDepthSibling(const DepthTarget& db, id<MTLTextu
 
 id<MTLTexture> TextureCache::FindDepthTarget(uint64_t address) const {
     TimedLock lk(mutex_);
-    auto range = entries_.equal_range(address);
-    for (auto it = range.first; it != range.second; ++it)
-        if (it->second->kind == Entry::Depth) return TouchLocked(it->second), it->second->tex;
-    return nil;
+    const Entry* e = LastWrittenLocked(address, Entry::Depth, [](const Entry*) { return true; });
+    return e ? (TouchLocked(e), e->tex) : nil;
+}
+
+id<MTLTexture> TextureCache::FindDepthTarget(uint64_t address, uint32_t samples) const {
+    TimedLock lk(mutex_);
+    const Entry* e = LastWrittenLocked(address, Entry::Depth,
+                                       [&](const Entry* c) { return c->tex.sampleCount == std::max(1u, samples); });
+    return e ? (TouchLocked(e), e->tex) : nil;
 }
 
 bool TextureCache::CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, uint64_t written_bytes,
                                    id<MTLTexture>* src_out, id<MTLTexture>* dst_out, int* kind_out) {
     if (!device_ || src_addr == dst_addr) return false;
     TimedLock lk(mutex_);
-    Entry* s = nullptr;
-    auto range = entries_.equal_range(src_addr);
-    for (auto it = range.first; it != range.second; ++it) {
-        Entry* e = it->second;
-        if (e->kind == Entry::Sampled || !e->tex) continue;
-        if (!s || e->kind == Entry::Depth) s = e;
-    }
+    // the source: the last written of the depth and color surfaces at the address (a depth surface
+    // when both are equally old: never written since they were made)
+    const auto any = [](const Entry*) { return true; };
+    Entry* s = LastWrittenLocked(src_addr, Entry::Depth, any);
+    Entry* c = LastWrittenLocked(src_addr, Entry::Color, any);
+    if (!s || (c && c->write_order > s->write_order)) s = c;
     if (!s) return false;
     Entry* d = nullptr;
     auto drange = entries_.equal_range(dst_addr);
@@ -3730,6 +3873,7 @@ bool TextureCache::CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, uint64_
         d->newer_epoch = 0;                                // nor its buffer writes
         d->newer_cover.clear();
         d->newer_partial_logged = false;
+        d->write_site_seq = 0;
         MTLTextureDescriptor* td = [MTLTextureDescriptor new];
         td.textureType = s->tex.textureType;
         td.pixelFormat = s->tex.pixelFormat;
@@ -3852,11 +3996,14 @@ bool TextureCache::SameIdentity(const Entry& e, const ps4gnm_capture::GpuTexture
 
 void TextureCache::DescribeGpuTextures(uint64_t address, std::vector<ps4gnm_capture::GpuTextureId>* out) const {
     TimedLock lk(mutex_);
+    std::vector<const Entry*> v;
     auto range = entries_.equal_range(address);
-    for (auto it = range.first; it != range.second; ++it) {
-        if (it->second->kind == Entry::Sampled || !it->second->tex) continue;
+    for (auto it = range.first; it != range.second; ++it)
+        if (it->second->kind != Entry::Sampled && it->second->tex) v.push_back(it->second);
+    std::stable_sort(v.begin(), v.end(), [](const Entry* a, const Entry* b) { return a->write_order < b->write_order; });
+    for (const Entry* e : v) {
         out->emplace_back();
-        EntryId(*it->second, &out->back());
+        EntryId(*e, &out->back());
     }
 }
 
@@ -3878,7 +4025,11 @@ id<MTLTexture> TextureCache::FindGpuTexture(const ps4gnm_capture::GpuTextureId& 
     TimedLock lk(mutex_);
     auto range = entries_.equal_range(gid.address);
     for (auto it = range.first; it != range.second; ++it)
-        if (SameIdentity(*it->second, gid)) return TouchLocked(it->second), it->second->tex;
+        if (SameIdentity(*it->second, gid)) {
+            // a replay adopting the surface (its contents follow): the newest, as in the capture's order
+            if (create) StampWriteLocked(it->second);
+            return TouchLocked(it->second), it->second->tex;
+        }
     if (!create) return nil;
     Entry* e = new Entry();
     e->kind = (Entry::Kind)gid.kind;
@@ -3920,6 +4071,7 @@ id<MTLTexture> TextureCache::FindGpuTexture(const ps4gnm_capture::GpuTextureId& 
     }
     e->dirty = false;
     e->generation = 1;
+    StampWriteLocked(e); // a replay adopts a capture's surfaces oldest first (DescribeGpuTextures)
     TouchLocked(e);
     e->alloc_bytes = (uint64_t)e->tex.allocatedSize;
     TrackLocked(e, +1);
@@ -4037,13 +4189,17 @@ void TextureCache::GpuEntriesOverlappingLocked(uint64_t addr, uint64_t size, std
         if (gpu_ranges_[j].second > addr) out->push_back(gpu_entries_[j]);
 }
 
-void TextureCache::NoteBufferWrite(uint64_t addr, uint64_t size, uint64_t epoch) {
+void TextureCache::NoteBufferWrite(uint64_t addr, uint64_t size, uint64_t epoch, uint64_t encoded_at) {
     if (!size || addr + size < addr || !HintNear(addr, size)) return;
     TimedLock lk(mutex_);
     GpuEntriesOverlappingLocked(addr, size, &overlap_scratch_);
     const uint64_t end = addr + size;
     for (Entry* e : overlap_scratch_) {
         if (e->kind != Entry::Color || !e->tex || e->samples != 1 || !e->size) continue;
+        if (e->write_site_seq > encoded_at) { // written on the GPU after the store
+            guest_newer_superseded_.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         if (e->newer_epoch) { // already marked: its whole range is guest newer
             e->newer_epoch = std::max<uint64_t>(epoch, 1);
             continue;
@@ -4059,7 +4215,9 @@ void TextureCache::NoteBufferWrite(uint64_t addr, uint64_t size, uint64_t epoch)
             else cover[++k] = cover[i];
         }
         cover.resize(k + 1);
-        if (cover[0].first <= a && cover[0].second >= b) {
+        // Allocation padding is not copied into Metal, but every visible texel must
+        // be covered. A fixed prefix length cannot prove that for a tiled image.
+        if (cover[0].first <= a && e->VisiblePrefixCovered(cover[0].second - a)) {
             cover.clear();
             e->newer_epoch = std::max<uint64_t>(epoch, 1);
             guest_newer_n_.fetch_add(1, std::memory_order_relaxed);
@@ -4074,6 +4232,17 @@ void TextureCache::NoteBufferWrite(uint64_t addr, uint64_t size, uint64_t epoch)
             fprintf(stderr, "[gnm-draw] buffer write covers part of GPU target 0x%llx (%llu/%llu bytes); not refreshed\n",
                     (unsigned long long)a, (unsigned long long)covered, (unsigned long long)e->size);
         }
+    }
+}
+
+void TextureCache::NoteWriteSite(uint64_t address, id<MTLTexture> tex, uint64_t seq) {
+    TimedLock lk(mutex_);
+    auto range = entries_.equal_range(address);
+    for (auto it = range.first; it != range.second; ++it) {
+        Entry* e = it->second;
+        if (e->kind != Entry::Color) continue;
+        if (tex && e->tex != tex && tex.parentTexture != e->tex) continue;
+        e->write_site_seq = seq;
     }
 }
 
@@ -4117,8 +4286,16 @@ void TextureCache::FinishGuestNewer(uint64_t address, id<MTLTexture> tex, bool c
         }
         UnmarkLocked(e);
         e->generation++; // alias copies of the old contents are stale
-        // the copy writes every byte of the surface: tex-evict sees an exactly known write
-        ExactWriteLocked(e, e->address, e->address + e->size);
+        // Only an unpadded image proves a whole-allocation byte write. A visible
+        // refresh must not supersede another surface using untouched padding.
+        if (e->VisibleBytes() == e->size) {
+            ExactWriteLocked(e, e->address, e->address + e->size);
+        } else {
+            TouchLocked(e);
+            GpuWroteLocked(e);
+            StampWriteLocked(e);
+            e->last_write_seq = e->write_lo = e->write_hi = 0;
+        }
         guest_newer_refreshed_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -4130,10 +4307,11 @@ TextureCache::GuestNewerStats TextureCache::GetGuestNewerStats() const {
     g.refreshed = guest_newer_refreshed_.load(std::memory_order_relaxed);
     g.partial = guest_newer_partial_.load(std::memory_order_relaxed);
     g.failed = guest_newer_failed_.load(std::memory_order_relaxed);
+    g.superseded = guest_newer_superseded_.load(std::memory_order_relaxed);
     return g;
 }
 
-id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img) {
+id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img, bool guest_write_pending) {
     if (!img.valid || img.address == 0 || img.pixel.mtl_format == 0 || img.pixel.compressed ||
         !device_)
         return nil;
@@ -4141,22 +4319,33 @@ id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img) {
     if (sd.bpp == 0) return nil;
     TimedLock lk(mutex_);
     const uint32_t width = img.width, height = img.height;
+    const bool is3d = img.mtl_texture_type == MTLTextureType3D;
+    const uint32_t depth = is3d ? img.depth : 1;
     const bool is_array = img.mtl_texture_type == MTLTextureType2DArray ||
                           img.mtl_texture_type == MTLTextureTypeCube ||
                           img.mtl_texture_type == MTLTextureTypeCubeArray;
     const uint32_t layers = is_array ? std::max(1u, img.num_layers) : 1u;
-    auto range = entries_.equal_range(img.address);
-    for (auto it = range.first; it != range.second; ++it) {
-        Entry* e = it->second;
-        if (e->kind != Entry::Color || !e->tex || e->samples != 1) continue;
-        const PixelFormatInfo rtpf = GetPixelFormat(e->dfmt, e->nfmt);
-        if (rtpf.bytes_per_block != img.pixel.bytes_per_block) continue;
-        if (e->width < width || e->height < height || e->layers < layers) continue;
-        e->generation++;
-        GpuWroteLocked(e); // stored to: earlier buffer writes no longer describe it
-        if (e->mtl_format == img.pixel.mtl_format) return TouchLocked(e), e->tex;
+    // of several surfaces that hold the image, the last written (LastWrittenLocked)
+    const auto holds = [&](const Entry* c) {
+        if (is3d != (c->tex_type == MTLTextureType3D)) return false;
+        if (is3d && (c->width != width || c->height != height || c->depth != depth)) return false;
+        return c->samples == 1 && GetPixelFormat(c->dfmt, c->nfmt).bytes_per_block == img.pixel.bytes_per_block &&
+               c->width >= width && c->height >= height && c->layers >= layers;
+    };
+    if (Entry* e = LastWrittenLocked(img.address, Entry::Color, holds)) {
+        if (e->mtl_format == img.pixel.mtl_format) {
+            e->generation++;
+            GpuWroteLocked(e); // stored to: earlier buffer writes no longer describe it
+            StampWriteLocked(e);
+            return TouchLocked(e), e->tex;
+        }
         id<MTLTexture> v = [e->tex newTextureViewWithPixelFormat:(MTLPixelFormat)img.pixel.mtl_format];
-        if (v) return TouchLocked(e), v;
+        if (v) {
+            e->generation++;
+            GpuWroteLocked(e);
+            StampWriteLocked(e);
+            return TouchLocked(e), v;
+        }
     }
     Entry* e = new Entry();
     e->kind = Entry::Color;
@@ -4164,7 +4353,7 @@ id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img) {
     e->mtl_format = img.pixel.mtl_format;
     e->width = width;
     e->height = height;
-    e->depth = 1;
+    e->depth = depth;
     e->levels = 1;
     e->layers = layers;
     e->samples = 1;
@@ -4178,12 +4367,13 @@ id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img) {
         return nil;
     }
     e->size = e->layout.total_size;
-    e->tex_type = layers > 1 ? MTLTextureType2DArray : MTLTextureType2D;
+    e->tex_type = is3d ? MTLTextureType3D : (layers > 1 ? MTLTextureType2DArray : MTLTextureType2D);
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
     td.textureType = (MTLTextureType)e->tex_type;
     td.pixelFormat = (MTLPixelFormat)e->mtl_format;
     td.width = width;
     td.height = height;
+    td.depth = depth;
     td.arrayLength = layers;
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
                MTLTextureUsagePixelFormatView;
@@ -4193,9 +4383,16 @@ id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img) {
         DropEntryLocked(e); // nothing created yet: reports nothing
         return nil;
     }
-    UploadLocked(e);
+    if (guest_write_pending) {
+        e->newer_epoch = 1;
+        guest_newer_n_.fetch_add(1, std::memory_order_relaxed);
+        guest_newer_marked_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        UploadLocked(e);
+    }
     e->dirty = false;
     e->generation = 1;
+    StampWriteLocked(e); // bound for stores
     stats.rt_created++;
     e->alloc_bytes = (uint64_t)e->tex.allocatedSize;
     TrackLocked(e, +1);
@@ -4256,10 +4453,7 @@ bool TextureCache::ReadTextureBGRA8(id<MTLTexture> tex, DataFormat, NumberFormat
 
 bool TextureCache::WriteBackColorTarget(uint64_t address) {
     TimedLock lk(mutex_);
-    Entry* e = nullptr;
-    auto range = entries_.equal_range(address);
-    for (auto it = range.first; it != range.second; ++it)
-        if (it->second->kind == Entry::Color) e = it->second;
+    const Entry* e = LastWrittenLocked(address, Entry::Color, [](const Entry*) { return true; });
     if (!e || !mem_base_ || e->address >= mem_size_) return false;
     DrainQueueLocked();
     const uint32_t bpe = e->surf.bpp / 8;

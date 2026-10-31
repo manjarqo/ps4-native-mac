@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Host test of libSceVdecsw and libSceVideodec on the shared VideoToolbox H.264 core.
+// Host test of libSceVdecsw, libSceVideodec and libSceVideodec2 on the shared VideoToolbox H.264
+// core.
 //
 // The test makes its own H.264 streams with VideoToolbox's encoder (High profile): flat frames
 // whose luma encodes the display index (top half: index % 30, bottom half: index / 30), at a
@@ -55,6 +56,15 @@ void shim_sceVideodecDecode(GuestContext *ctx);
 void shim_sceVideodecFlush(GuestContext *ctx);
 void shim_sceVideodecReset(GuestContext *ctx);
 void shim_sceVideodecDeleteDecoder(GuestContext *ctx);
+void shim_sceVideodec2QueryComputeMemoryInfo(GuestContext *ctx);
+void shim_sceVideodec2AllocateComputeQueue(GuestContext *ctx);
+void shim_sceVideodec2ReleaseComputeQueue(GuestContext *ctx);
+void shim_sceVideodec2QueryDecoderMemoryInfo(GuestContext *ctx);
+void shim_sceVideodec2CreateDecoder(GuestContext *ctx);
+void shim_sceVideodec2DeleteDecoder(GuestContext *ctx);
+void shim_sceVideodec2Decode(GuestContext *ctx);
+void shim_sceVideodec2Flush(GuestContext *ctx);
+void shim_sceVideodec2Reset(GuestContext *ctx);
 
 #define W 352
 #define H 200
@@ -1056,6 +1066,146 @@ static void test_videodec(void) {
     fprintf(stderr, "videodec: %d pictures\n", got);
 }
 
+// libSceVideodec2 (Sonic Origins' API): synchronous Decode/Flush, one picture per call, NV12
+// and the AVC picture-info trailer in the frame buffer.
+#define V2_STRUCT_SIZE ((int32_t)0x811D0101)
+#define V2_DECODER_INSTANCE ((int32_t)0x811D0103)
+#define V2_FRAME_BUFFER_SIZE ((int32_t)0x811D0106)
+#define V2_CODEC_TYPE ((int32_t)0x811D0204)
+
+typedef struct V2 {
+    uint64_t handle, in, fb, oi, buf, au_buf;
+} V2;
+
+static void v2_create(V2 *v) {
+    uint64_t ccfg = galloc(0x10, 16), cmem = galloc(0x18, 16), q = galloc(8, 8);
+    wr64(cmem, 0x18);
+    CHECK(call(shim_sceVideodec2QueryComputeMemoryInfo, cmem, 0, 0, 0) == 0, "v2 QueryComputeMemoryInfo");
+    wr64(cmem + 0x10, galloc(rd64(cmem + 8), 0x100));
+    wr64(ccfg, 0x10);
+    wr16(ccfg + 8, 3);
+    wr16(ccfg + 10, 3);
+    CHECK(call(shim_sceVideodec2AllocateComputeQueue, ccfg, cmem, q, 0) == 0, "v2 AllocateComputeQueue");
+    CHECK(rd64(q) == rd64(cmem + 0x10), "v2 queue handle");
+
+    uint64_t cfg = galloc(0x48, 16), mem = galloc(0x48, 16), out = galloc(8, 8);
+    wr64(cfg, 0x48);
+    wr32(cfg + 0x08, 1);
+    wr32(cfg + 0x0c, 1);
+    wr32(cfg + 0x10, 100);
+    wr32(cfg + 0x14, 42);
+    wr32(cfg + 0x18, W);
+    wr32(cfg + 0x1c, H);
+    wr32(cfg + 0x20, 4);
+    wr32(cfg + 0x24, 1);
+    wr64(cfg + 0x28, rd64(q));
+    wr64(mem, 0x48);
+    CHECK(call(shim_sceVideodec2QueryDecoderMemoryInfo, cfg, mem, 0, 0) == 0, "v2 QueryDecoderMemoryInfo");
+    CHECK(rd64(mem + 0x38) >= FRAME_SIZE + 0x78, "v2 maxFrameBufferSize 0x%llx", (unsigned long long)rd64(mem + 0x38));
+    CHECK(rd32(mem + 0x40) == 0x100, "v2 frame buffer alignment");
+    // HEVC and a wrong struct size are refused.
+    wr32(cfg + 0x0c, 974921);
+    CHECK(call(shim_sceVideodec2QueryDecoderMemoryInfo, cfg, mem, 0, 0) == V2_CODEC_TYPE, "v2 HEVC refused");
+    wr32(cfg + 0x0c, 1);
+    wr64(mem, 0x40);
+    CHECK(call(shim_sceVideodec2QueryDecoderMemoryInfo, cfg, mem, 0, 0) == V2_STRUCT_SIZE, "v2 struct size");
+    wr64(mem, 0x48);
+    wr64(mem + 0x10, galloc(rd64(mem + 0x08), 16));
+    wr64(mem + 0x20, galloc(rd64(mem + 0x18), 0x100));
+    wr64(mem + 0x30, galloc(rd64(mem + 0x28), 0x100));
+    CHECK(call(shim_sceVideodec2CreateDecoder, cfg, mem, out, 0) == 0, "v2 CreateDecoder");
+    v->handle = rd64(out);
+    v->in = galloc(0x30, 16);
+    v->fb = galloc(0x20, 16);
+    v->oi = galloc(0x38, 16);
+    v->buf = galloc(rd64(mem + 0x38), 0x100);
+    v->au_buf = galloc(AU_BUF, 0x100);
+    wr64(v->fb, 0x20);
+    wr64(v->fb + 8, v->buf);
+    wr64(v->fb + 0x10, rd64(mem + 0x38));
+    wr64(v->oi, 0x38);
+}
+
+// Decode (j < count) or Flush (j >= count) once; returns the call's result.
+static int32_t v2_step(V2 *v, const Stream *st, int j) {
+    if (j >= st->count) return call(shim_sceVideodec2Flush, v->handle, v->fb, v->oi, 0);
+    memcpy(gp(v->au_buf), st->aus[j].data, st->aus[j].size);
+    wr64(v->in, 0x30);
+    wr64(v->in + 0x08, v->au_buf);
+    wr64(v->in + 0x10, st->aus[j].size);
+    wr64(v->in + 0x18, (uint64_t)st->aus[j].display * 3003);
+    wr64(v->in + 0x20, (uint64_t)j * 3003);
+    wr64(v->in + 0x28, (uint64_t)j);
+    return call(shim_sceVideodec2Decode, v->handle, v->in, v->fb, v->oi);
+}
+
+static void test_videodec2_stream(const Stream *st) {
+    V2 v;
+    v2_create(&v);
+    int got = 0, order_ok = 1;
+    for (int j = 0; j <= st->count + MAXN; j++) {
+        const int32_t rc = v2_step(&v, st, j);
+        CHECK(rc == 0, "%s v2 Decode/Flush 0x%x", st->name, rc);
+        if (!rd8(v.oi + 0x08)) {
+            CHECK(!rd8(v.fb + 0x18), "%s v2 is_accepted without a picture", st->name);
+            if (j >= st->count) break;
+            continue;
+        }
+        CHECK(rd8(v.fb + 0x18) == 1, "%s v2 is_accepted", st->name);
+        CHECK(!rd8(v.oi + 0x09) && rd8(v.oi + 0x0a) == 1, "%s v2 error frame / picture count", st->name);
+        CHECK(rd32(v.oi + 0x0c) == 1, "%s v2 codec type", st->name);
+        CHECK(rd32(v.oi + 0x10) == W && rd32(v.oi + 0x14) == PITCH && rd32(v.oi + 0x18) == AH &&
+                  rd32(v.oi + 0x34) == PITCH,
+              "%s v2 dims", st->name);
+        CHECK(rd64(v.oi + 0x20) == v.buf && rd64(v.oi + 0x28) == FRAME_SIZE, "%s v2 frame buffer", st->name);
+        const int display = display_of(v.buf);
+        if (display != got) order_ok = 0;
+        const uint64_t pic = v.buf + FRAME_SIZE; // the picture-info trailer
+        CHECK(rd64(pic) == 0x78 && rd8(pic + 0x08) == 1, "%s v2 trailer", st->name);
+        CHECK(rd64(pic + 0x10) == (uint64_t)display * 3003, "%s v2 pts %llu", st->name,
+              (unsigned long long)rd64(pic + 0x10));
+        CHECK(rd64(pic + 0x20) < (uint64_t)st->count && st->aus[rd64(pic + 0x20)].display == display,
+              "%s v2 attached data", st->name);
+        got++;
+    }
+    CHECK(got == st->count, "%s v2 decoded %d pictures, expected %d", st->name, got, st->count);
+    CHECK(order_ok, "%s v2 display order", st->name);
+    CHECK(call(shim_sceVideodec2DeleteDecoder, v.handle, 0, 0, 0) == 0, "v2 DeleteDecoder");
+    fprintf(stderr, "videodec2 %s: %d pictures\n", st->name, got);
+}
+
+// A frame buffer too small for the picture: FRAME_BUFFER_SIZE, the picture stays queued and comes
+// out with a large enough buffer. Reset drops it; a deleted decoder's handle is refused.
+static void test_videodec2_errors(void) {
+    V2 v;
+    v2_create(&v);
+    const uint64_t size = rd64(v.fb + 0x10);
+    int32_t rc = 0;
+    int j = 0;
+    wr64(v.fb + 0x10, FRAME_SIZE); // no room for the trailer
+    for (; j < S2.count && rc == 0; j++) rc = v2_step(&v, &S2, j);
+    CHECK(rc == V2_FRAME_BUFFER_SIZE, "v2 small buffer 0x%x", rc);
+    CHECK(!rd8(v.fb + 0x18) && !rd8(v.oi + 0x08), "v2 small buffer accepted");
+    wr64(v.fb + 0x10, size);
+    CHECK(call(shim_sceVideodec2Flush, v.handle, v.fb, v.oi, 0) == 0 && rd8(v.oi + 0x08), "v2 kept picture");
+    CHECK(display_of(v.buf) == 0, "v2 kept picture is the first one (%d)", display_of(v.buf));
+    CHECK(call(shim_sceVideodec2Reset, v.handle, 0, 0, 0) == 0, "v2 Reset");
+    CHECK(call(shim_sceVideodec2Flush, v.handle, v.fb, v.oi, 0) == 0 && !rd8(v.oi + 0x08), "v2 nothing after Reset");
+    wr64(v.oi, 0x20);
+    CHECK(call(shim_sceVideodec2Flush, v.handle, v.fb, v.oi, 0) == V2_STRUCT_SIZE, "v2 output info size");
+    wr64(v.oi, 0x30); // the old layout is accepted
+    CHECK(call(shim_sceVideodec2Flush, v.handle, v.fb, v.oi, 0) == 0, "v2 old output info");
+    CHECK(call(shim_sceVideodec2DeleteDecoder, v.handle, 0, 0, 0) == 0, "v2 DeleteDecoder");
+    CHECK(call(shim_sceVideodec2DeleteDecoder, v.handle, 0, 0, 0) == V2_DECODER_INSTANCE, "v2 stale handle");
+    CHECK(call(shim_sceVideodec2Decode, 0, v.in, v.fb, v.oi) == V2_DECODER_INSTANCE, "v2 null handle");
+}
+
+static void test_videodec2(void) {
+    test_videodec2_stream(&S1);
+    test_videodec2_stream(&S3);
+    test_videodec2_errors();
+}
+
 // ---------------------------------------------------------------------------------------------
 // Access-unit census, per-decoder counts (Ps4VideodecStats) and the inFAMOUS splash fixture
 // ---------------------------------------------------------------------------------------------
@@ -1847,6 +1997,7 @@ int main(int argc, char **argv) {
     test_reset_forgets_last_poc();
     test_idr_error_flush();
     test_videodec();
+    test_videodec2();
     test_au_census();
     videodec_counts(&S1, W, H);
     setenv("PS4_VIDEODEC_LOG", "1", 1); // the trace path runs too (under ASan)

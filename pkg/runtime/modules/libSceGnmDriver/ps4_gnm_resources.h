@@ -32,6 +32,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __OBJC__
@@ -796,11 +797,16 @@ public:
 
     // Render target / depth textures (created on first use, contents loaded from guest memory
     // once when load_from_guest is true; afterwards owned by the GPU and never re-uploaded).
-    id<MTLTexture> GetColorTarget(const ColorTarget& cb, bool load_from_guest = true);
+    // written: the caller writes the target (a draw with a non-zero write mask, a clear, a resolve
+    // destination); false for a bind that only reads it (a resolve source). Only a write makes the
+    // surface the last written at its address (LastWrittenLocked).
+    id<MTLTexture> GetColorTarget(const ColorTarget& cb, bool load_from_guest = true, bool written = true,
+                                  bool guest_write_pending = false);
     // One texture per depth surface: views of later slices grow it to a larger 2D array, and the
     // texture it replaced is returned in *grown_from so the caller can copy its slices over.
     // The replaced texture is also queued for TakeRetired.
-    id<MTLTexture> GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from = nullptr);
+    // written: the pass writes depth or stencil (false: a depth/stencil test only).
+    id<MTLTexture> GetDepthTarget(const DepthTarget& db, id<MTLTexture>* grown_from = nullptr, bool written = true);
     // The GPU-owned surface `tex` at `address` gets every byte of guest [lo, hi) written by the open
     // command buffer (a clear of that range). Only such exactly known writes let a surface supersede
     // older ones (EvictSuperseded); a draw's pixels, or a storage image's stores, are not known.
@@ -832,7 +838,16 @@ public:
     // once per surface). Walks only the GPU-owned entries overlapping the range; a range no GPU-owned
     // surface comes near (64 MiB granules, checked without the lock) returns at once.
     // Call it only for work that has really been encoded (or, for CPU-side DMA, done).
-    void NoteBufferWrite(uint64_t addr, uint64_t size, uint64_t epoch);
+    // encoded_at: the write-site sequence (NoteWriteSite) at the time the storing work was encoded,
+    // for a store known only later (a guest memory dispatch encoded without a CPU wait, whose pass is
+    // known to have run once its result came in). A surface a GPU write site was noted for after it
+    // (a larger sequence) is not marked: that write runs after the store on the GPU, so the texture
+    // holds the newer contents (counted as superseded). ~0: the store was encoded just now.
+    void NoteBufferWrite(uint64_t addr, uint64_t size, uint64_t epoch, uint64_t encoded_at = ~0ull);
+    // A GPU write of the color surface(s) at `address` (texture `tex` or a view of it; nil: every color
+    // surface there) is being encoded, as write-site sequence `seq` (increasing): stores encoded
+    // before it and marked only later leave it alone (NoteBufferWrite's encoded_at).
+    void NoteWriteSite(uint64_t address, id<MTLTexture> tex, uint64_t seq);
     // The marked color surface at `address` whose texture is `tex` (or a view of it; nil: any marked
     // color surface at the address): fills `up` to copy guest memory into its texture (its own
     // layout). The mark stays until FinishGuestNewer. False when nothing is marked there (up->tex nil).
@@ -849,6 +864,7 @@ public:
     // Totals since start: surfaces marked, refreshes handed out, surfaces partly covered (logged).
     struct GuestNewerStats {
         uint64_t marked = 0, refreshed = 0, partial = 0, failed = 0;
+        uint64_t superseded = 0; // marks not made: the surface was written after the store was encoded
     };
     GuestNewerStats GetGuestNewerStats() const;
 
@@ -875,6 +891,9 @@ public:
     // share an address over time); nil if none matches.
     id<MTLTexture> FindColorTarget(uint64_t address, uint32_t width, uint32_t height) const;
     id<MTLTexture> FindDepthTarget(uint64_t address) const;
+    // The depth surface at the address with `samples` samples (a 1x surface and its 2x twin of PS4
+    // Pro checkerboard rendering share the memory); nil if none.
+    id<MTLTexture> FindDepthTarget(uint64_t address, uint32_t samples) const;
     // Another depth surface of the same memory, format and size but a different sample count
     // (PS4 Pro checkerboard rendering uses one buffer as 2x and as 1x depth); nil if none.
     id<MTLTexture> FindDepthSibling(const DepthTarget& db, id<MTLTexture> self) const;
@@ -883,7 +902,7 @@ public:
     // initial contents are loaded from guest memory once, later sampling of the same address
     // aliases it, presentation finds it). Reuses a render target at the same address when the
     // texel size matches. Usage includes ShaderRead|ShaderWrite|RenderTarget|PixelFormatView.
-    id<MTLTexture> GetStorageTexture(const ImageDesc& img);
+    id<MTLTexture> GetStorageTexture(const ImageDesc& img, bool guest_write_pending = false);
 
     // GPU-side copies of whole surfaces (e.g. a compute shader copying a depth buffer through
     // buffer loads/stores, shadPS4 Rasterizer::IsComputeImageCopy): find the GPU-owned texture at
@@ -896,7 +915,9 @@ public:
     // Debugging: visit every GPU-owned texture (kind: 1 color/storage, 2 depth).
     void ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<MTLTexture> tex)) const;
     // ---- Frame capture and pass replay (ps4_gnm_capture.h) ----
-    // Identities of the GPU-owned entries (color/storage, depth) at `address`.
+    // Identities of the GPU-owned entries (color/storage, depth) at `address`, the last written
+    // last (a replay that creates them in this order with FindGpuTexture recreates which one a
+    // lookup takes).
     void DescribeGpuTextures(uint64_t address, std::vector<ps4gnm_capture::GpuTextureId>* out) const;
     // Identity of the GPU-owned entry whose texture is `tex`; false if none (views, EQAA twins).
     bool DescribeGpuTexture(id<MTLTexture> tex, ps4gnm_capture::GpuTextureId* out) const;
@@ -1005,6 +1026,20 @@ private:
     // A GPU write to the surface (render-target or storage bind, copy, clear): buffer writes
     // recorded before it no longer describe its contents.
     void GpuWroteLocked(const Entry* e) const;
+    // A write to the surface's contents (render-target, depth or storage bind that writes, clear,
+    // copy, a load of guest memory into it): it becomes the last written of the surfaces at its
+    // address (write_order).
+    void StampWriteLocked(const Entry* e) const;
+    // Several GPU-owned surfaces can share an address (the same memory used as surfaces of other
+    // sizes or formats over time); their memory holds what the last write left. The GPU-owned
+    // entry (Color or Depth, as `kind`) at `address` with the latest write among those `fits`
+    // accepts; nullptr if none does.
+    template <class Fits>
+    Entry* LastWrittenLocked(uint64_t address, int kind, Fits fits) const;
+    mutable uint64_t write_order_ = 0; // StampWriteLocked's counter
+    // addresses where a sampled image skipped a newer surface that does not cover it (logged once)
+    std::unordered_set<uint64_t> skipped_newer_logged_;
+    mutable bool superseded_logged_ = false; // SupersededLocked logged its first superseded entry
     // Drops the entry's guest-newer mark (before it is deleted).
     void UnmarkLocked(const Entry* e);
     // GPU-owned entries overlapping [addr, addr + size), from the sorted range index.
@@ -1039,7 +1074,7 @@ private:
     std::vector<Entry*> overlap_scratch_;     // NoteBufferWrite, kept to avoid allocations
     std::atomic<size_t> guest_newer_n_{0};    // entries with a guest-newer mark
     std::atomic<uint64_t> guest_newer_marked_{0}, guest_newer_refreshed_{0}, guest_newer_partial_{0},
-        guest_newer_failed_{0};
+        guest_newer_failed_{0}, guest_newer_superseded_{0};
     // GPU-owned entries by 64 MiB guest granule (a bit per granule below 256 GiB; set when an entry is
     // added, recomputed with the range index): NoteBufferWrite's check without the lock
     static constexpr uint32_t kHintShift = 26, kHintWords = 64;

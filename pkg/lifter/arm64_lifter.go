@@ -493,10 +493,11 @@ func defMemSz(inst disasm.Instruction) int {
 //     RIP-relative operand and the displacement does not fit the 32-bit path;
 //   - GS: the guest GS base is not kept anywhere.
 //
-// NOP and the prefetches do not access memory and are exempt.
+// NOP and prefetches do not access memory. LEA handles address-size truncation
+// itself and ignores segment bases.
 func unsupportedAddressing(inst x86asm.Inst) string {
 	switch inst.Op {
-	case x86asm.NOP, x86asm.PREFETCHT0, x86asm.PREFETCHNTA, x86asm.PREFETCHT1, x86asm.PREFETCHT2, x86asm.PREFETCHW:
+	case x86asm.LEA, x86asm.NOP, x86asm.PREFETCHT0, x86asm.PREFETCHNTA, x86asm.PREFETCHT1, x86asm.PREFETCHT2, x86asm.PREFETCHW:
 		return ""
 	}
 	for _, a := range inst.Args {
@@ -1016,7 +1017,15 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 			lines = append(lines, "    brk #0 // unmapped lea dst")
 			return lines, nil
 		}
+		// LEA computes an offset: FS/GS never contributes a segment base.
+		mem.Segment = 0
+		if mem.Base == x86asm.EIP {
+			mem.Base = x86asm.RIP
+		}
 		lines = append(lines, computeEffAddr(mem, nextPC, "x16")...)
+		if inst.Inst.AddrSize == 32 {
+			lines = append(lines, "    uxtw x16, w16")
+		}
 		if desc.Size == 4 {
 			lines = append(lines, fmt.Sprintf("    mov %s, w16", desc.W))
 		} else if desc.Size == 2 {

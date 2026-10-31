@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <errno.h>
 
 static int g_user_service_initialized = 0;
 static pthread_mutex_t g_user_service_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -18,7 +17,7 @@ int32_t sceUserServiceInitialize(const OrbisUserServiceInitializeParams *params)
 
 int32_t sceUserServiceGetInitialUser(int32_t *userId) {
     if (!userId) {
-        return -EINVAL;
+        return (int32_t)ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
     *userId = ORBIS_USER_SERVICE_INITIAL_USER_ID;
     return 0;
@@ -26,7 +25,7 @@ int32_t sceUserServiceGetInitialUser(int32_t *userId) {
 
 int32_t sceUserServiceGetLoginUserIdList(OrbisUserServiceLoginUserIdList *list) {
     if (!list) {
-        return -EINVAL;
+        return (int32_t)ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
     list->userId[0] = ORBIS_USER_SERVICE_INITIAL_USER_ID;
     for (int i = 1; i < ORBIS_USER_SERVICE_MAX_LOGIN_USERS; i++) {
@@ -37,7 +36,7 @@ int32_t sceUserServiceGetLoginUserIdList(OrbisUserServiceLoginUserIdList *list) 
 
 int32_t sceUserServiceGetUserName(int32_t userId, char *userName, const size_t size) {
     if (!userName || size == 0) {
-        return -EINVAL;
+        return (int32_t)ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
     (void)userId;
     const char *name = getenv("USER");
@@ -53,7 +52,7 @@ static int g_user_event_delivered = 0;
 
 int32_t sceUserServiceGetEvent(OrbisUserServiceEvent *event) {
     if (!event) {
-        return -EINVAL;
+        return (int32_t)ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
     pthread_mutex_lock(&g_user_service_mutex);
     if (!g_user_event_delivered) {
@@ -144,7 +143,7 @@ int32_t sceUserServiceUnregisterEventCallback(int32_t callbackId) {
 int32_t sceUserServiceGetUserColor(int32_t userId, int32_t *color) {
     (void)userId;
     if (!color) {
-        return (int32_t)0x80960001; // ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT
+        return (int32_t)ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
     *color = 0; // Blue (default)
     return 0;

@@ -530,7 +530,6 @@ func TestRegressAddressingForms(t *testing.T) {
 		{"mov [moffs64], rax", "48a30000001000000000"},
 		{"mov rax, gs:[0]", "65488b042500000000"},
 		{"mov eax, [edi]", "678b07"},
-		{"lea rax, [edi+eax]", "67488d0407"},
 	} {
 		requireInOrder(t, tc.name, liftBlock(t, tc.hex)[0], "b _recomp_unsupported_instruction")
 	}

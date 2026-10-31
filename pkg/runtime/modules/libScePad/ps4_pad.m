@@ -585,6 +585,12 @@ void ps4_pad_handle_key(unsigned short keyCode, int isDown) {
 // for appended lines while the game runs. Commands are executed one after another, in file
 // order (a "shot" after a "w" is taken when the wait has ended):
 //   p <hexmask> <dur_ms> [<lx> <ly> [<rx> <ry>]]  hold buttons/sticks for dur_ms
+//   t <hexmask> <dur_ms> <x0> <y0> <x1> <y1> [<x0> <y0> <x1> <y1>]
+//                                                hold buttons with one or two fingers on the touch
+//                                                pad for dur_ms, each moving in a straight line
+//                                                from (x0, y0) to (x1, y1) (0..1919 x 0..949; equal
+//                                                points = a finger held still); a finger that stays
+//                                                down into the next "t" keeps its touch id
 //   w <ms>                                       wait (neutral pad)
 //   shot                                         save a screenshot of the next frame
 //                                                (needs PS4_SCREENSHOT_DIR)
@@ -602,7 +608,42 @@ typedef enum {
   PAD_CTL_HOLD, PAD_CTL_SHOT, PAD_CTL_DUMPRT, PAD_CTL_DUMPDRAWS, PAD_CTL_TRACE, PAD_CTL_CLOSE,
   PAD_CTL_TERMINATE
 } PadCtlKind;
-typedef struct { PadCtlKind kind; long dur; uint32_t mask; int lx, ly, rx, ry; } PadCtlCmd;
+typedef struct {
+  PadCtlKind kind;
+  long dur;
+  uint32_t mask;
+  int lx, ly, rx, ry;
+  int fingers;                          // touch points of a "t" command (0 = no touch)
+  int tx0[ORBIS_PAD_MAX_TOUCH_NUM], ty0[ORBIS_PAD_MAX_TOUCH_NUM];
+  int tx1[ORBIS_PAD_MAX_TOUCH_NUM], ty1[ORBIS_PAD_MAX_TOUCH_NUM];
+} PadCtlCmd;
+
+static int pad_clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+// The touch points of the active "t" command at time now (us) in a command that runs from
+// start_us for dur_us. A finger keeps its id while it stays down from one command to the next;
+// a finger that comes down again gets a new id, as on the console (ids count 0..127).
+static void pad_ctl_touch(const PadCtlCmd *c, uint64_t start_us, uint64_t dur_us, uint64_t now,
+                          OrbisPadTouchData *out) {
+  static int down_prev;
+  static uint8_t ids[ORBIS_PAD_MAX_TOUCH_NUM];
+  static uint8_t next_id;
+  const int n = c ? c->fingers : 0;
+  for (int i = 0; i < ORBIS_PAD_MAX_TOUCH_NUM; i++) {
+    if (i < n && i >= down_prev) ids[i] = next_id++ & 0x7f;
+  }
+  down_prev = n;
+  memset(out, 0, sizeof(*out));
+  out->fingers = (uint8_t)n;
+  if (!n) return;
+  const double f = dur_us ? (double)(now > start_us ? now - start_us : 0) / (double)dur_us : 1.0;
+  const double k = f > 1.0 ? 1.0 : f;
+  for (int i = 0; i < n; i++) {
+    out->touch[i].x = (uint16_t)pad_clamp((int)lround(c->tx0[i] + (c->tx1[i] - c->tx0[i]) * k), 0, 1919);
+    out->touch[i].y = (uint16_t)pad_clamp((int)lround(c->ty0[i] + (c->ty1[i] - c->ty0[i]) * k), 0, 949);
+    out->touch[i].finger = ids[i];
+  }
+}
 
 static void ps4_pad_control_action(PadCtlKind kind) {
   switch (kind) {
@@ -624,7 +665,8 @@ static void ps4_pad_control_action(PadCtlKind kind) {
   }
 }
 
-static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, uint8_t *rx, uint8_t *ry) {
+static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, uint8_t *rx, uint8_t *ry,
+                                 OrbisPadTouchData *touch) {
   static int init;
   static FILE *f;
   static char line[256];
@@ -633,7 +675,7 @@ static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, ui
   static int q_head, q_tail;
   static int active;
   static PadCtlCmd cur;
-  static uint64_t cur_end_us;
+  static uint64_t cur_end_us, cur_start_us;
   if (!init) {
     init = 1;
     const char *path = getenv("PS4_PAD_CTL");
@@ -643,7 +685,10 @@ static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, ui
       else fprintf(stderr, "[pad] cannot open control file %s\n", path);
     }
   }
-  if (!f) return;
+  if (!f) {
+    memset(touch, 0, sizeof(*touch));
+    return;
+  }
   int c;
   clearerr(f);
   while ((c = fgetc(f)) != EOF) {
@@ -653,7 +698,7 @@ static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, ui
     }
     line[line_len] = 0;
     line_len = 0;
-    PadCtlCmd cmd = {PAD_CTL_HOLD, 0, 0, -1, -1, -1, -1};
+    PadCtlCmd cmd = {PAD_CTL_HOLD, 0, 0, -1, -1, -1, -1, 0, {0}, {0}, {0}, {0}};
     if (strncmp(line, "shot", 4) == 0) {
       cmd.kind = PAD_CTL_SHOT;
     } else if (strncmp(line, "dumprt", 6) == 0) {
@@ -681,6 +726,30 @@ static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, ui
         e = e2;
       }
       cmd.lx = v[0]; cmd.ly = v[1]; cmd.rx = v[2]; cmd.ry = v[3];
+    } else if (line[0] == 't' && (line[1] == ' ' || line[1] == '\t')) {
+      char *e = line + 1;
+      cmd.mask = (uint32_t)strtoul(e, &e, 16);
+      cmd.dur = strtol(e, &e, 10);
+      long v[4 * ORBIS_PAD_MAX_TOUCH_NUM];
+      int got = 0;
+      while (got < 4 * ORBIS_PAD_MAX_TOUCH_NUM) {
+        char *e2;
+        long x = strtol(e, &e2, 10);
+        if (e2 == e) break;
+        v[got++] = x;
+        e = e2;
+      }
+      if (got != 4 && got != 8) {
+        fprintf(stderr, "[pad] control: a touch needs 4 or 8 coordinates, ignored: %s\n", line);
+        continue;
+      }
+      cmd.fingers = got / 4;
+      for (int k = 0; k < cmd.fingers; k++) {
+        cmd.tx0[k] = (int)v[4 * k];
+        cmd.ty0[k] = (int)v[4 * k + 1];
+        cmd.tx1[k] = (int)v[4 * k + 2];
+        cmd.ty1[k] = (int)v[4 * k + 3];
+      }
     } else {
       continue;
     }
@@ -701,9 +770,11 @@ static void ps4_pad_control_file(uint32_t *buttons, uint8_t *lx, uint8_t *ly, ui
       ps4_pad_control_action(cur.kind);
       continue;
     }
+    cur_start_us = now;
     cur_end_us = now + (uint64_t)(cur.dur > 0 ? cur.dur : 0) * 1000;
     active = 1;
   }
+  pad_ctl_touch(active ? &cur : NULL, cur_start_us, cur_end_us - cur_start_us, now, touch);
   if (!active) return;
   *buttons |= cur.mask;
   if (cur.lx >= 0) *lx = (uint8_t)cur.lx;
@@ -844,7 +915,8 @@ int32_t scePadReadState(int32_t handle, OrbisPadData *data) {
   uint8_t ry = g_key_ry;
   uint8_t l2 = g_key_l2;
   uint8_t r2 = g_key_r2;
-  ps4_pad_control_file(&buttons, &lx, &ly, &rx, &ry);
+  OrbisPadTouchData touch;
+  ps4_pad_control_file(&buttons, &lx, &ly, &rx, &ry, &touch);
 
   PadMotionSample motion = virtual_sample(script_us);
   @autoreleasepool {
@@ -953,6 +1025,7 @@ int32_t scePadReadState(int32_t handle, OrbisPadData *data) {
   data->rightStick.y = ry;
   data->analogButtons.l2 = l2;
   data->analogButtons.r2 = r2;
+  data->touch = touch;
   data->connected = 1;
   data->count = 1;
   data->timestamp = get_time_micros();

@@ -15,6 +15,8 @@
 
 #include "ps4_gnm_capture.h"
 
+struct GuestContext; // recomp_context.h
+
 namespace ps4replay {
 
 struct Options {
@@ -98,6 +100,12 @@ struct Result {
 // mem_size and neo mode.
 Result ReplayPass(const Options& o);
 
+// Test-only (host tests; the command line never uses it): the guest context the replays run the
+// renderer with, null before the first ReplayPass prepared the process. A test encodes its own
+// work on the same renderer between replayed passes with it (ps4draw::Dispatch), over guest memory
+// that still holds the inputs of the pass replayed last.
+GuestContext* TestGuestContext();
+
 // The settle comparison (ReplayPass with Options::settle), exposed for tests: marks settled's
 // outputs against first's by name and SHA-256 (first_sha256, unstable_first; "ABSENT" when first
 // lacks the output), lists first's outputs settled lacks in first_only, and sets settled->settled.
@@ -116,6 +124,24 @@ struct PassResult {
 // parsed once. With base.out_dir set, pass <n>
 // writes its outputs to <out_dir>/pass_<n>/ (the names inside are per output, not per pass).
 std::vector<PassResult> ReplayPasses(const Options& base, uint32_t first, uint32_t last);
+
+struct PassTime {
+    uint32_t pass = 0;
+    double median_ms = 0, min_ms = 0; // over `runs` timed replays
+    int runs = 0;
+};
+
+// Times passes first..last (UINT32_MAX: to the frame's last) for gnm_replay --time. Per pass: one
+// warm-up replay (translation, pipelines, texture uploads), then `runs` replays, each with the
+// pass's inputs reloaded as ReplayPass does. A replay's time is the wall clock between the
+// begin and end of Options::around_render, from ps4draw::Draw / Dispatch through
+// ps4draw::Flush(true): encoding plus GPU execution to completion, not pure GPU time (the guest
+// memory reload and the output read-back are outside it). Reports the median and the minimum.
+// A pass that cannot be replayed is left out, with the reason in *notes (when given). A pass
+// that writes a texture it creates is timed, with a note: the replay does not restore that
+// texture, so its later replays start from the earlier output.
+std::vector<PassTime> TimePasses(const Options& base, uint32_t first, uint32_t last, int runs,
+                                 std::vector<std::string>* notes = nullptr);
 
 // Parses the pass argument of the command line: "<n>" (*range false), "<a>-<b>" with a <= b or
 // "all" (*range true, "all" = 0..UINT32_MAX). Anything else (empty parts, junk, a > b) is refused.

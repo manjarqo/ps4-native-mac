@@ -45,6 +45,12 @@ bool Metal3Backend::Init(id<MTLDevice> dev, std::string* why) {
         return false;
     }
     queue_.label = @"gnm";
+    async_queue_ = [dev newCommandQueueWithMaxCommandBufferCount:kGnmMaxCommandBuffers];
+    if (!async_queue_) {
+        if (why) *why = "newCommandQueueWithMaxCommandBufferCount failed (asynchronous compute queue)";
+        return false;
+    }
+    async_queue_.label = @"gnm async compute";
     return true;
 }
 
@@ -52,12 +58,13 @@ bool Metal3Backend::Init(id<MTLDevice> dev, std::string* why) {
 // MTLCommandBufferErrorOptionEncoderExecutionStatus; the upload command buffer logs its failure.
 void Metal3Backend::BeginCmd(GnmCmdTarget t, NSString* label, bool encoder_status) {
     TargetState& x = t_[(int)t];
+    id<MTLCommandQueue> q = t == GnmCmdTarget::AsyncCompute ? async_queue_ : queue_;
     if (encoder_status) {
         MTLCommandBufferDescriptor* d = [MTLCommandBufferDescriptor new];
         d.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
-        x.cmd = [queue_ commandBufferWithDescriptor:d];
+        x.cmd = [q commandBufferWithDescriptor:d];
     } else {
-        x.cmd = [queue_ commandBuffer];
+        x.cmd = [q commandBuffer];
     }
     x.cmd.label = label;
     if (t == GnmCmdTarget::Upload)
@@ -80,18 +87,30 @@ void Metal3Backend::CommitUpload() {
 // Commit: addCompletedHandler (GPU times, status) + commit; S.inflight
 void Metal3Backend::Commit(uint64_t seq, GnmCompletionFn done, void* ctx) {
     CommitUpload();
-    if (!fences_.empty()) {
-        // every fence made so far is in this seq's command buffers (or an earlier one's)
-        fences_by_seq_.push_back({seq, first_fence_ + fences_.size() - 1});
-        RetireFences();
-    }
+    StampFences(false, seq); // the fences made in this seq's main and upload command buffers
+    RetireFences();
     TargetState& m = t_[(int)GnmCmdTarget::Main];
     id<MTLCommandBuffer> cb = m.cmd;
     m.cmd = nil;
-    // CompletedSeq() reaches seq before its completion runs (the status its walk reads may not say
+    main_cbs_++;
+    CommitOn(0, cb, seq, done, ctx);
+}
+
+// The asynchronous compute command buffer, as seq, on its own queue.
+void Metal3Backend::CommitAsync(uint64_t seq, GnmCompletionFn done, void* ctx) {
+    StampFences(true, seq);
+    RetireFences();
+    TargetState& a = t_[(int)GnmCmdTarget::AsyncCompute];
+    id<MTLCommandBuffer> cb = a.cmd;
+    a.cmd = nil;
+    CommitOn(1, cb, seq, done, ctx);
+}
+
+void Metal3Backend::CommitOn(int queue, id<MTLCommandBuffer> cb, uint64_t seq, GnmCompletionFn done, void* ctx) {
+    // CompletedSeq() counts seq before its completion runs (the status its walk reads may not say
     // Completed yet inside this handler; handlers of one queue run in commit order). The handler
     // holds its own reference to the counter: it may run after the backend is gone.
-    std::shared_ptr<std::atomic<uint64_t>> handled = handled_;
+    std::shared_ptr<std::atomic<uint64_t>> handled = handled_[queue];
     std::shared_ptr<Finished> finished = finished_;
     main_commits_++;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
@@ -114,19 +133,21 @@ void Metal3Backend::Commit(uint64_t seq, GnmCompletionFn done, void* ctx) {
     [cb commit];
     commits_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(inflight_mu_);
-    inflight_.emplace_back(seq, cb);
+    inflight_.push_back({seq, cb, queue});
 }
 
-// WaitAll's status walk over S.inflight: the longest completed prefix of the committed seqs
+// WaitAll's status walk over S.inflight: the longest completed prefix of the committed seqs, of
+// both queues (a seq counts once its queue's handlers reached it, or its status says so)
 uint64_t Metal3Backend::CompletedSeq() const {
     std::lock_guard<std::mutex> lk(inflight_mu_);
-    const uint64_t h = handled_->load(std::memory_order_acquire);
-    while (!inflight_.empty() && (inflight_.front().first <= h ||
-                                  inflight_.front().second.status >= MTLCommandBufferStatusCompleted)) {
-        completed_ = std::max(completed_, inflight_.front().first);
+    const uint64_t h[2] = {handled_[0]->load(std::memory_order_acquire), handled_[1]->load(std::memory_order_acquire)};
+    while (!inflight_.empty() && (inflight_.front().seq <= h[inflight_.front().queue] ||
+                                  inflight_.front().cb.status >= MTLCommandBufferStatusCompleted)) {
+        completed_ = std::max(completed_, inflight_.front().seq);
         inflight_.pop_front();
     }
-    completed_ = std::max(completed_, h);
+    // with nothing in flight, everything a handler started is complete
+    if (inflight_.empty()) completed_ = std::max(completed_, std::max(h[0], h[1]));
     return completed_;
 }
 
@@ -174,6 +195,7 @@ bool Metal3Backend::BeginRender(const GnmPassDesc& d) {
     if (d.height) rp.renderTargetHeight = d.height;
     if (d.default_samples) rp.defaultRasterSampleCount = d.default_samples;
     if (d.num_sample_positions) [rp setSamplePositions:d.sample_positions count:d.num_sample_positions];
+    if (d.visibility) rp.visibilityResultBuffer = d.visibility; // reset when the encoder is made (the default)
     x.renc = [x.cmd renderCommandEncoderWithDescriptor:rp];
     if (!x.renc) return false;
     if (d.label) x.renc.label = d.label;
@@ -350,7 +372,7 @@ uint64_t Metal3Backend::AccessFence() {
     } else {
         f = [dev_ newFence];
     }
-    fences_.push_back({f, cur_, main_commits_});
+    fences_.push_back({f, cur_, main_cbs_, kOpenSeq});
     x.fence = first_fence_ + fences_.size() - 1;
     access_fences_++;
     return x.fence;
@@ -363,7 +385,7 @@ void Metal3Backend::WaitAccessFence(uint64_t id) {
     if (!id || id < first_fence_ || id == x.fence) return; // none, its seq completed, or this encoder's own
     if (id >= first_fence_ + fences_.size()) return;
     const LiveFence& l = fences_[id - first_fence_];
-    if (cur_ == GnmCmdTarget::Upload && l.target == GnmCmdTarget::Main && l.main_cb == main_commits_) return;
+    if (cur_ == GnmCmdTarget::Upload && l.target == GnmCmdTarget::Main && l.main_cb == main_cbs_) return;
     for (uint64_t w : x.waited)
         if (w == id) return;
     if (x.renc) [x.renc waitForFence:l.fence beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
@@ -374,17 +396,30 @@ void Metal3Backend::WaitAccessFence(uint64_t id) {
     alias_waits_++;
 }
 
-// The fences of completed seqs go back to the free list.
+// The open fences of one queue's targets get the seq of the command buffer being committed.
+// From the newest back to the first of this queue stamped already (each queue stamps in commit order).
+void Metal3Backend::StampFences(bool async, uint64_t seq) {
+    for (auto it = fences_.rbegin(); it != fences_.rend(); ++it) {
+        if ((it->target == GnmCmdTarget::AsyncCompute) != async) continue;
+        if (it->seq != kOpenSeq) break;
+        it->seq = seq;
+    }
+}
+
+bool Metal3Backend::AccessFenceOtherQueue(uint64_t id) const {
+    if (!id || id < first_fence_ || id >= first_fence_ + fences_.size()) return false;
+    const bool fence_async = fences_[id - first_fence_].target == GnmCmdTarget::AsyncCompute;
+    return fence_async != (cur_ == GnmCmdTarget::AsyncCompute);
+}
+
+// The fences whose seqs completed go back to the free list, in id order (a fence of a seq still in
+// flight keeps the later ones too).
 void Metal3Backend::RetireFences() {
     const uint64_t done = CompletedSeq();
-    while (!fences_by_seq_.empty() && fences_by_seq_.front().first <= done) {
-        const uint64_t last = fences_by_seq_.front().second;
-        while (first_fence_ <= last && !fences_.empty()) {
-            free_fences_.push_back(fences_.front().fence);
-            fences_.pop_front();
-            first_fence_++;
-        }
-        fences_by_seq_.pop_front();
+    while (!fences_.empty() && fences_.front().seq <= done) {
+        free_fences_.push_back(fences_.front().fence);
+        fences_.pop_front();
+        first_fence_++;
     }
 }
 

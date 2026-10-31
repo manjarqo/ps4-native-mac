@@ -45,7 +45,7 @@
 //   34 frame_pitch_in_bytes]} [S]. U4 passes this_size 0x30 [V] and keeps its first picture-info
 //   buffer right after it, so nothing past this_size may be written [V].
 // AvcPictureInfo 0x78, written as a trailer at frame_buffer + frame_buffer_size [S]; layout in
-//   VdecswAvcPictureInfo below. U4 asks for this_size 0x68 [V] and GetAvcPictureInfo copies
+//   H264AvcPictureInfo (ps4_h264_vt.h). U4 asks for this_size 0x68 [V] and GetAvcPictureInfo copies
 //   this_size - 8 bytes after the caller's this_size [S]. U4 player B reads pts (0x10) [V].
 //
 // Calls and return codes:
@@ -217,64 +217,7 @@ typedef struct VdecswComputeConfigInfo {
 } VdecswComputeConfigInfo;
 _Static_assert(sizeof(VdecswComputeConfigInfo) == 0x10, "ComputeConfigInfo");
 
-typedef struct VdecswAvcPictureInfo {
-    uint64_t this_size;
-    uint8_t is_valid;
-    uint64_t pts_data;
-    uint64_t dts_data;
-    uint64_t attached_data;
-    uint8_t idr_pictureflag;
-    uint8_t profile_idc;
-    uint8_t level_idc;
-    uint32_t pic_width_in_mbs_minus1;
-    uint32_t pic_height_in_map_units_minus1;
-    uint8_t frame_mbs_only_flag;
-    uint8_t frame_cropping_flag;
-    uint32_t frame_crop_left_offset;
-    uint32_t frame_crop_right_offset;
-    uint32_t frame_crop_top_offset;
-    uint32_t frame_crop_bottom_offset;
-    uint8_t aspect_ratio_info_present_flag;
-    uint8_t aspect_ratio_idc;
-    uint16_t sar_width;
-    uint16_t sar_height;
-    uint8_t video_signal_type_present_flag;
-    uint8_t video_format;
-    uint8_t video_full_range_flag;
-    uint8_t colour_description_present_flag;
-    uint8_t colour_primaries;
-    uint8_t transfer_characteristics;
-    uint8_t matrix_coefficients;
-    uint8_t timing_info_present_flag;
-    uint32_t num_units_in_tick;
-    uint32_t time_scale;
-    uint8_t fixed_frame_rate_flag;
-    uint8_t bitstream_restriction_flag;
-    uint8_t max_dec_frame_buffering;
-    uint8_t pic_struct_present_flag;
-    uint8_t pic_struct;
-    uint8_t field_pic_flag;
-    uint8_t bottom_field_flag;
-    uint8_t sequence_parameter_set_present_flag;
-    uint8_t picture_parameter_set_present_flag;
-    uint8_t au_delimiter_present_flag;
-    uint8_t end_of_sequence_present_flag;
-    uint8_t end_of_stream_present_flag;
-    uint8_t filler_data_present_flag;
-    uint8_t picture_timing_sei_present_flag;
-    uint8_t buffering_period_sei_present_flag;
-    uint8_t constraint_set0_flag;
-    uint8_t constraint_set1_flag;
-    uint8_t constraint_set2_flag;
-    uint8_t constraint_set3_flag;
-    uint8_t constraint_set4_flag;
-    uint8_t constraint_set5_flag;
-} VdecswAvcPictureInfo;
-_Static_assert(sizeof(VdecswAvcPictureInfo) == 0x78, "AvcPictureInfo");
-_Static_assert(offsetof(VdecswAvcPictureInfo, pts_data) == 0x10, "AvcPictureInfo.pts");
-_Static_assert(offsetof(VdecswAvcPictureInfo, frame_crop_left_offset) == 0x38, "AvcPictureInfo.crop");
-_Static_assert(offsetof(VdecswAvcPictureInfo, num_units_in_tick) == 0x58, "AvcPictureInfo.timing");
-_Static_assert(offsetof(VdecswAvcPictureInfo, constraint_set0_flag) == 0x6f, "AvcPictureInfo.constraints");
+typedef H264AvcPictureInfo VdecswAvcPictureInfo;
 
 #define VDECSW_DECODER_MEM_SIZE 0x10000ULL
 #define VDECSW_COMPUTE_MEM_SIZE 0x4000ULL
@@ -594,64 +537,6 @@ static int32_t vdecsw_SetDecodeOutput(GuestContext *ctx, Vdecsw *d) {
 }
 void shim_sceVdecswSetDecodeOutput(GuestContext *ctx) { VDECSW_WITH_DECODER(vdecsw_SetDecodeOutput); }
 
-static void fill_picture_info(VdecswAvcPictureInfo *p, const H264VtFrame *f) {
-    const uint32_t pitch = h264vt_pitch(f->width);
-    const uint32_t ah = h264vt_aligned_height(f->height);
-    const H264SpsInfo *s = &f->sps;
-    memset(p, 0, sizeof(*p));
-    p->this_size = sizeof(*p);
-    p->is_valid = 1;
-    p->pts_data = (uint64_t)f->pts;
-    p->dts_data = (uint64_t)f->dts;
-    p->attached_data = f->attached;
-    p->idr_pictureflag = f->au.idr;
-    p->profile_idc = s->profile_idc;
-    p->level_idc = s->level_idc;
-    p->pic_width_in_mbs_minus1 = s->pic_width_in_mbs_minus1;
-    p->pic_height_in_map_units_minus1 = s->pic_height_in_map_units_minus1;
-    p->frame_mbs_only_flag = s->frame_mbs_only_flag;
-    p->frame_crop_left_offset = 0;
-    p->frame_crop_top_offset = 0;
-    p->frame_crop_right_offset = pitch - f->width;
-    p->frame_crop_bottom_offset = ah - f->height;
-    p->frame_cropping_flag = (p->frame_crop_right_offset || p->frame_crop_bottom_offset) ? 1 : 0;
-    p->aspect_ratio_info_present_flag = s->aspect_ratio_info_present_flag;
-    p->aspect_ratio_idc = s->aspect_ratio_idc;
-    p->sar_width = s->sar_width;
-    p->sar_height = s->sar_height;
-    p->video_signal_type_present_flag = s->video_signal_type_present_flag;
-    p->video_format = s->video_format;
-    p->video_full_range_flag = s->video_full_range_flag;
-    p->colour_description_present_flag = s->colour_description_present_flag;
-    p->colour_primaries = s->colour_primaries;
-    p->transfer_characteristics = s->transfer_characteristics;
-    p->matrix_coefficients = s->matrix_coefficients;
-    p->timing_info_present_flag = s->timing_info_present_flag;
-    p->num_units_in_tick = s->num_units_in_tick;
-    p->time_scale = s->time_scale;
-    p->fixed_frame_rate_flag = s->fixed_frame_rate_flag;
-    p->bitstream_restriction_flag = s->bitstream_restriction_flag;
-    p->max_dec_frame_buffering = s->max_dec_frame_buffering;
-    p->pic_struct_present_flag = s->pic_struct_present_flag;
-    p->pic_struct = 0; // a progressive frame
-    p->field_pic_flag = 0;
-    p->bottom_field_flag = 0;
-    p->sequence_parameter_set_present_flag = f->au.sps;
-    p->picture_parameter_set_present_flag = f->au.pps;
-    p->au_delimiter_present_flag = f->au.aud;
-    p->end_of_sequence_present_flag = f->au.end_of_sequence;
-    p->end_of_stream_present_flag = f->au.end_of_stream;
-    p->filler_data_present_flag = f->au.filler;
-    p->picture_timing_sei_present_flag = f->au.sei_pic_timing;
-    p->buffering_period_sei_present_flag = f->au.sei_buffering_period;
-    p->constraint_set0_flag = (s->constraint_set_flags >> 0) & 1;
-    p->constraint_set1_flag = (s->constraint_set_flags >> 1) & 1;
-    p->constraint_set2_flag = (s->constraint_set_flags >> 2) & 1;
-    p->constraint_set3_flag = (s->constraint_set_flags >> 3) & 1;
-    p->constraint_set4_flag = (s->constraint_set_flags >> 4) & 1;
-    p->constraint_set5_flag = (s->constraint_set_flags >> 5) & 1;
-}
-
 // int sceVdecswTrySyncDecodeOutput(SceVdecswDecoder decoder, SceVdecswOutputInfo *info)
 static int32_t vdecsw_TrySyncDecodeOutput(GuestContext *ctx, Vdecsw *d) {
     VdecswOutputInfo *info = (VdecswOutputInfo *)gptr(ctx, ctx->rsi);
@@ -703,7 +588,7 @@ static int32_t vdecsw_TrySyncDecodeOutput(GuestContext *ctx, Vdecsw *d) {
     // An error picture leaves the frame buffer as it is; the trailer is still written.
     if (!f->error) h264vt_copy_nv12(f, dst);
     VdecswAvcPictureInfo pic;
-    fill_picture_info(&pic, f);
+    h264vt_fill_picture_info(&pic, f);
     memcpy(dst + frame_size, &pic, sizeof(pic));
     if (ps4_gnm_notify_cpu_write) {
         if (f->error) ps4_gnm_notify_cpu_write(fb.frame_buffer + frame_size, sizeof(pic));

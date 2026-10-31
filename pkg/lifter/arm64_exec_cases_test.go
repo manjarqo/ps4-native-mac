@@ -9,6 +9,16 @@ import (
 	"golang.org/x/arch/x86/x86asm"
 )
 
+func TestExecLeaAddr32(t *testing.T) {
+	var cases []execCase
+	for _, h := range []string{"678d81fffefefe", "67488d0447", "67668d0407", "6467488d07", "6567488d07"} {
+		cases = append(cases, execCase{name: h, code: []string{h},
+			regs: map[x86asm.Reg]uint64{x86asm.RAX: 0x1234567880000001, x86asm.RCX: 0x12345678ffffffff,
+				x86asm.RDI: 0xabcdef00ffffffff}, flags: readMask})
+	}
+	runExecCases(t, cases)
+}
+
 // Shifts and rotates by CL and by an immediate: the count is masked to 5 bits (6 for 64-bit
 // operands), a masked count of 0 leaves every flag unchanged (and still zero-extends a 32-bit
 // register), CF is the last bit shifted out, OF is defined for a count of 1. Flags x86 leaves

@@ -30,7 +30,7 @@ static pthread_mutex_t g_savedata_mutex = PTHREAD_MUTEX_INITIALIZER;
 static SaveMemorySlot g_slots[MAX_SAVE_MEMORY_SLOTS];
 
 static inline void *recomp_guest_to_host(const GuestContext *ctx, uint64_t gaddr) {
-    if (!ctx || !ctx->mem_base || gaddr == 0) {
+    if (!ctx || !ctx->mem_base || gaddr < 0x1000) {
         return NULL;
     }
     if (gaddr >= (uintptr_t)ctx->mem_base && gaddr < (uintptr_t)ctx->mem_base + ctx->mem_size) {
@@ -180,6 +180,172 @@ static SaveMemorySlot *find_slot(uint32_t slot_id) {
     return NULL;
 }
 
+static int32_t sync_slot_to_disk(SaveMemorySlot *slot, const char *caller) {
+    if (!slot || !slot->cache || slot->cache_size == 0) {
+        return ORBIS_SAVE_DATA_ERROR_MEMORY_NOT_READY;
+    }
+
+    if (mkdir_p(slot->folder_path, 0755) != 0) {
+        fprintf(stderr, "[ps4-recomp] WARN: Failed to create save directory: %s (errno=%d)\n",
+                slot->folder_path, errno);
+    }
+
+    char file_path[1024];
+    char tmp_path[1024];
+    snprintf(file_path, sizeof(file_path), "%s/%s", slot->folder_path, FILENAME_SAVE_DATA_MEMORY);
+    snprintf(tmp_path, sizeof(tmp_path), "%s/%s.tmp", slot->folder_path, FILENAME_SAVE_DATA_MEMORY);
+
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) {
+        fprintf(stderr, "[ps4-recomp] WARN: %s failed to open save file for writing: '%s' (errno=%d)\n",
+                caller, tmp_path, errno);
+        return ORBIS_SAVE_DATA_ERROR_INTERNAL;
+    }
+
+    size_t written = fwrite(slot->cache, 1, slot->cache_size, f);
+    int write_error = written != slot->cache_size ? (errno ? errno : EIO) : 0;
+    if (!write_error && fflush(f) != 0) {
+        write_error = errno ? errno : EIO;
+    }
+    if (!write_error) {
+        int fd = fileno(f);
+        if (fd < 0 || fsync(fd) != 0) {
+            write_error = errno ? errno : EIO;
+        }
+    }
+    // Always close the stream, retaining the first failure if closing also fails.
+    if (fclose(f) != 0 && !write_error) {
+        write_error = errno ? errno : EIO;
+    }
+
+    if (write_error) {
+        unlink(tmp_path);
+        fprintf(stderr, "[ps4-recomp] WARN: %s failed to persist save data (%zu / %zu bytes, errno=%d)\n",
+                caller, written, slot->cache_size, write_error);
+        return ORBIS_SAVE_DATA_ERROR_INTERNAL;
+    }
+
+    if (rename(tmp_path, file_path) != 0) {
+        unlink(tmp_path);
+        fprintf(stderr, "[ps4-recomp] WARN: %s failed to rename '%s' -> '%s' (errno=%d)\n",
+                caller, tmp_path, file_path, errno);
+        return ORBIS_SAVE_DATA_ERROR_INTERNAL;
+    }
+
+    slot->dirty = false;
+    fprintf(stderr, "[ps4-recomp] %s: Slot %u synced %zu bytes to '%s'\n",
+            caller, slot->slot_id, slot->cache_size, file_path);
+    return 0;
+}
+
+typedef struct SaveMemoryIcon {
+    uint64_t buf;
+    uint64_t bufSize;
+    uint64_t dataSize;
+    uint8_t _reserved[32];
+} SaveMemoryIcon;
+
+static int32_t persist_metadata(const char *path, const void *data, size_t size) {
+    char tmp_path[1280];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) >= (int)sizeof(tmp_path))
+        return ORBIS_SAVE_DATA_ERROR_INTERNAL;
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) return ORBIS_SAVE_DATA_ERROR_INTERNAL;
+    int error = fwrite(data, 1, size, f) != size;
+    if (!error && fflush(f) != 0) error = 1;
+    if (!error && fsync(fileno(f)) != 0) error = 1;
+    if (fclose(f) != 0) error = 1;
+    if (!error && rename(tmp_path, path) != 0) error = 1;
+    if (error) {
+        unlink(tmp_path);
+        return ORBIS_SAVE_DATA_ERROR_INTERNAL;
+    }
+    return 0;
+}
+
+static int32_t slot_store_param_and_icon(const GuestContext *ctx, const char *folder_path,
+                                      uint64_t param_gaddr, uint64_t icon_gaddr) {
+    if (!folder_path || !*folder_path) return ORBIS_SAVE_DATA_ERROR_INTERNAL;
+    if (param_gaddr) {
+        const Ps4SaveDataParam *src = (const Ps4SaveDataParam *)recomp_guest_to_host(ctx, param_gaddr);
+        if (src) {
+            Ps4SaveDataParam p;
+            memcpy(&p, src, sizeof(p));
+            p.title[sizeof(p.title) - 1] = '\0';
+            p.subTitle[sizeof(p.subTitle) - 1] = '\0';
+            p.detail[sizeof(p.detail) - 1] = '\0';
+            char sys_dir[1200];
+            snprintf(sys_dir, sizeof(sys_dir), "%s/sce_sys", folder_path);
+            if (mkdir_p(sys_dir, 0755) != 0) return ORBIS_SAVE_DATA_ERROR_INTERNAL;
+            char param_path[1200];
+            snprintf(param_path, sizeof(param_path), "%s/sce_sys/param.bin", folder_path);
+            int32_t rc = persist_metadata(param_path, &p, sizeof(p));
+            if (rc != 0) return rc;
+        } else {
+            return ORBIS_SAVE_DATA_ERROR_PARAMETER;
+        }
+    }
+    if (icon_gaddr) {
+        const SaveMemoryIcon *icon = (const SaveMemoryIcon *)recomp_guest_to_host(ctx, icon_gaddr);
+        if (icon && icon->buf) {
+            const void *data = recomp_guest_to_host(ctx, icon->buf);
+            uint64_t size = icon->dataSize ? icon->dataSize : icon->bufSize;
+            if (icon->bufSize && size > icon->bufSize) size = icon->bufSize;
+            if (data && size > 0) {
+                char sys_dir[1200];
+                snprintf(sys_dir, sizeof(sys_dir), "%s/sce_sys", folder_path);
+                if (mkdir_p(sys_dir, 0755) != 0) return ORBIS_SAVE_DATA_ERROR_INTERNAL;
+                char icon_path[1200];
+                snprintf(icon_path, sizeof(icon_path), "%s/sce_sys/icon0.png", folder_path);
+                int32_t rc = persist_metadata(icon_path, data, (size_t)size);
+                if (rc != 0) return rc;
+            } else if (!data) {
+                return ORBIS_SAVE_DATA_ERROR_PARAMETER;
+            }
+        } else {
+            return ORBIS_SAVE_DATA_ERROR_PARAMETER;
+        }
+    }
+    return 0;
+}
+
+static void slot_load_param_and_icon(const GuestContext *ctx, const char *folder_path,
+                                     uint64_t param_gaddr, uint64_t icon_gaddr) {
+    if (!folder_path || !*folder_path) return;
+    if (param_gaddr) {
+        Ps4SaveDataParam *dst = (Ps4SaveDataParam *)recomp_guest_to_host(ctx, param_gaddr);
+        if (dst) {
+            memset(dst, 0, sizeof(*dst));
+            char param_path[1200];
+            snprintf(param_path, sizeof(param_path), "%s/sce_sys/param.bin", folder_path);
+            FILE *f = fopen(param_path, "rb");
+            if (f) {
+                size_t got = fread(dst, 1, sizeof(*dst), f);
+                fclose(f);
+                if (got != sizeof(*dst)) {
+                    memset(dst, 0, sizeof(*dst));
+                }
+            }
+        }
+    }
+    if (icon_gaddr) {
+        SaveMemoryIcon *icon = (SaveMemoryIcon *)recomp_guest_to_host(ctx, icon_gaddr);
+        if (icon && icon->buf && icon->bufSize > 0) {
+            void *dst = recomp_guest_to_host(ctx, icon->buf);
+            if (dst) {
+                char icon_path[1200];
+                snprintf(icon_path, sizeof(icon_path), "%s/sce_sys/icon0.png", folder_path);
+                FILE *f = fopen(icon_path, "rb");
+                if (f) {
+                    size_t got = fread(dst, 1, (size_t)icon->bufSize, f);
+                    fclose(f);
+                    icon->dataSize = got;
+                }
+            }
+        }
+    }
+}
+
 int32_t sceSaveDataInitialize(const void *param) {
     (void)param;
     pthread_mutex_lock(&g_savedata_mutex);
@@ -205,12 +371,24 @@ int32_t sceSaveDataInitialize3(const void *param) {
 
 int32_t sceSaveDataTerminate(void) {
     pthread_mutex_lock(&g_savedata_mutex);
+    // Keep every cache and the initialized state available if persistence must be retried.
+    for (int i = 0; i < MAX_SAVE_MEMORY_SLOTS; i++) {
+        if (g_slots[i].active && g_slots[i].dirty) {
+            int32_t rc = sync_slot_to_disk(&g_slots[i], "sceSaveDataTerminate");
+            if (rc != 0) {
+                pthread_mutex_unlock(&g_savedata_mutex);
+                return rc;
+            }
+        }
+    }
     for (int i = 0; i < MAX_SAVE_MEMORY_SLOTS; i++) {
         if (g_slots[i].active) {
             if (g_slots[i].cache) {
                 free(g_slots[i].cache);
                 g_slots[i].cache = NULL;
             }
+            g_slots[i].cache_size = 0;
+            g_slots[i].dirty = false;
             g_slots[i].active = false;
         }
     }
@@ -222,7 +400,6 @@ int32_t sceSaveDataTerminate(void) {
 int32_t sceSaveDataSetupSaveDataMemory2(GuestContext *ctx,
                                        const OrbisSaveDataMemorySetup2 *setupParam,
                                        OrbisSaveDataMemorySetupResult *result) {
-    (void)ctx;
     pthread_mutex_lock(&g_savedata_mutex);
     if (!g_savedata_initialized) {
         pthread_mutex_unlock(&g_savedata_mutex);
@@ -240,16 +417,16 @@ int32_t sceSaveDataSetupSaveDataMemory2(GuestContext *ctx,
         return ORBIS_SAVE_DATA_ERROR_INTERNAL;
     }
 
-    slot->user_id = setupParam->userId;
-    get_slot_folder_path(setupParam->userId, slot_id, slot->folder_path, sizeof(slot->folder_path));
+    char folder_path[1024];
+    get_slot_folder_path(setupParam->userId, slot_id, folder_path, sizeof(folder_path));
 
-    if (mkdir_p(slot->folder_path, 0755) != 0) {
+    if (mkdir_p(folder_path, 0755) != 0) {
         fprintf(stderr, "[ps4-recomp] WARN: Failed to create save directory: %s (errno=%d)\n",
-                slot->folder_path, errno);
+                folder_path, errno);
     }
 
     char file_path[1024];
-    snprintf(file_path, sizeof(file_path), "%s/%s", slot->folder_path, FILENAME_SAVE_DATA_MEMORY);
+    snprintf(file_path, sizeof(file_path), "%s/%s", folder_path, FILENAME_SAVE_DATA_MEMORY);
 
     size_t existed_size = 0;
     struct stat st;
@@ -262,10 +439,42 @@ int32_t sceSaveDataSetupSaveDataMemory2(GuestContext *ctx,
         alloc_size = 64 * 1024; // Default minimum 64 KB
     }
 
+    // If the slot is already active in memory for the same user, preserve its in-memory
+    // buffer across repeated SetupSaveDataMemory2 calls (e.g. games that call Setup before
+    // every Get/Set operation).
+    if (slot->cache && slot->user_id == setupParam->userId &&
+        strcmp(slot->folder_path, folder_path) == 0) {
+        if (alloc_size > slot->cache_size) {
+            uint8_t *new_cache = (uint8_t *)realloc(slot->cache, alloc_size);
+            if (!new_cache) {
+                pthread_mutex_unlock(&g_savedata_mutex);
+                return ORBIS_SAVE_DATA_ERROR_INTERNAL;
+            }
+            memset(new_cache + slot->cache_size, 0, alloc_size - slot->cache_size);
+            slot->cache = new_cache;
+            slot->cache_size = alloc_size;
+        }
+        if (result) {
+            result->existedMemorySize = existed_size;
+        }
+        pthread_mutex_unlock(&g_savedata_mutex);
+        return 0;
+    }
+
     if (slot->cache) {
+        if (slot->dirty) {
+            int32_t rc = sync_slot_to_disk(slot, "sceSaveDataSetupSaveDataMemory2");
+            if (rc != 0) {
+                pthread_mutex_unlock(&g_savedata_mutex);
+                return rc;
+            }
+        }
         free(slot->cache);
         slot->cache = NULL;
     }
+
+    slot->user_id = setupParam->userId;
+    snprintf(slot->folder_path, sizeof(slot->folder_path), "%s", folder_path);
 
     slot->cache = (uint8_t *)calloc(1, alloc_size);
     if (!slot->cache) {
@@ -284,6 +493,15 @@ int32_t sceSaveDataSetupSaveDataMemory2(GuestContext *ctx,
                     slot_id, read_bytes, file_path);
         }
     } else {
+        int32_t rc = slot_store_param_and_icon(ctx, slot->folder_path, setupParam->initParam, setupParam->initIcon);
+        if (rc != 0) {
+            free(slot->cache);
+            slot->cache = NULL;
+            slot->cache_size = 0;
+            slot->active = false;
+            pthread_mutex_unlock(&g_savedata_mutex);
+            return rc;
+        }
         fprintf(stderr, "[ps4-recomp] sceSaveDataSetupSaveDataMemory2: Slot %u created fresh at '%s' (allocated: %zu bytes)\n",
                 slot_id, file_path, alloc_size);
     }
@@ -337,6 +555,8 @@ int32_t sceSaveDataGetSaveDataMemory2(GuestContext *ctx,
         }
     }
 
+    slot_load_param_and_icon(ctx, slot->folder_path, getParam->param, getParam->icon);
+
     pthread_mutex_unlock(&g_savedata_mutex);
     return 0;
 }
@@ -388,6 +608,22 @@ int32_t sceSaveDataSetSaveDataMemory2(GuestContext *ctx,
         }
     }
 
+    int32_t metadata_rc = slot_store_param_and_icon(ctx, slot->folder_path, setParam->param, setParam->icon);
+    if (metadata_rc != 0) {
+        pthread_mutex_unlock(&g_savedata_mutex);
+        return metadata_rc;
+    }
+
+    // Persist immediately so games that do not call sceSaveDataSyncSaveDataMemory
+    // (such as Sonic Origins) still commit SaveDataMemory2 writes to disk.
+    if (slot->dirty) {
+        int32_t sync_rc = sync_slot_to_disk(slot, "sceSaveDataSetSaveDataMemory2");
+        if (sync_rc != 0) {
+            pthread_mutex_unlock(&g_savedata_mutex);
+            return sync_rc;
+        }
+    }
+
     pthread_mutex_unlock(&g_savedata_mutex);
     return 0;
 }
@@ -412,42 +648,9 @@ int32_t sceSaveDataSyncSaveDataMemory(GuestContext *ctx,
         return ORBIS_SAVE_DATA_ERROR_MEMORY_NOT_READY;
     }
 
-    char file_path[1024];
-    char tmp_path[1024];
-    snprintf(file_path, sizeof(file_path), "%s/%s", slot->folder_path, FILENAME_SAVE_DATA_MEMORY);
-    snprintf(tmp_path, sizeof(tmp_path), "%s/%s.tmp", slot->folder_path, FILENAME_SAVE_DATA_MEMORY);
-
-    FILE *f = fopen(tmp_path, "wb");
-    if (!f) {
-        fprintf(stderr, "[ps4-recomp] WARN: Failed to open save file for writing: '%s' (errno=%d)\n",
-                tmp_path, errno);
-        pthread_mutex_unlock(&g_savedata_mutex);
-        return ORBIS_SAVE_DATA_ERROR_INTERNAL;
-    }
-
-    size_t written = fwrite(slot->cache, 1, slot->cache_size, f);
-    fflush(f);
-    int fd = fileno(f);
-    if (fd >= 0) {
-        fsync(fd);
-    }
-    fclose(f);
-
-    if (written == slot->cache_size) {
-        rename(tmp_path, file_path);
-        slot->dirty = false;
-        fprintf(stderr, "[ps4-recomp] sceSaveDataSyncSaveDataMemory: Slot %u synced %zu bytes to '%s'\n",
-                slot_id, slot->cache_size, file_path);
-    } else {
-        unlink(tmp_path);
-        fprintf(stderr, "[ps4-recomp] WARN: Failed to write complete save data (%zu / %zu bytes)\n",
-                written, slot->cache_size);
-        pthread_mutex_unlock(&g_savedata_mutex);
-        return ORBIS_SAVE_DATA_ERROR_INTERNAL;
-    }
-
+    int32_t rc = sync_slot_to_disk(slot, "sceSaveDataSyncSaveDataMemory");
     pthread_mutex_unlock(&g_savedata_mutex);
-    return 0;
+    return rc;
 }
 
 // Shims

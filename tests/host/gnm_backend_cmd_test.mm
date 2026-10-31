@@ -21,6 +21,12 @@
 //    alive until its seq completed and is released after, and the pass and the copy read the
 //    dropped views' texels. Metal 3's command buffer retains what is encoded; a Metal 4 command
 //    buffer retains nothing, so the backend keeps every texture an encoder used until its seq completes;
+//  - the asynchronous compute queue (kGnmCapAsyncCompute, both backends): with a main seq
+//    committed and held by an event, async seqs complete and their completions run (in seq order)
+//    while CompletedSeq stays below the held main seq; with a main seq open (not committed), async
+//    seqs that complete and recycle bytes chunks do not overwrite its setBytes, and a buffer it
+//    writes that is evicted meanwhile (after the last committed seq, as the renderer does) stays
+//    resident until it is committed and completed, and its write lands;
 //  - Metal 4 only: the feedback dispatch queue is freed with its backend (no leak); no command
 //    allocator is reset before its seq completed, one is reused once its seq completed, the
 //    allocator count stays bounded over 1000 seqs, the allocator trim (oversized allocators
@@ -37,7 +43,9 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 #include "backend_harness.h"
 #include "ps4_gnm_backend_metal4.h"
@@ -201,6 +209,9 @@ kernel void k_write_slow(device uint* out [[buffer(0)]], constant uint& n [[buff
 kernel void k_chain(device const uint* in [[buffer(0)]], device uint* out [[buffer(1)]], uint i [[thread_position_in_grid]]) {
     out[i] = in[i] * 2u;
 }
+kernel void k_const(device uint* out [[buffer(0)]], constant uint& v [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    out[i] = v;
+}
 kernel void k_tex(texture2d<float, access::read> t [[texture(0)]], texture2d<float> u [[texture(1)]],
                   sampler s [[sampler(0)]], device float* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {
     if (i == 0) out[0] = t.read(uint2(1, 0)).x;
@@ -332,6 +343,126 @@ static void TestComputeOps(id<MTLDevice> dev, GnmBackend& be) {
     CHECK(bad == 0, "DispatchIndirect at BindBufferOffset 256: %zu of 256 dwords wrong", bad);
     const float* o = (const float*)out.contents;
     CHECK(o[0] == 5.0f && o[1] == 9.0f, "compute texture read %g, sample %g (want 5, 9)", o[0], o[1]);
+}
+
+// The second queue beside the main one. See the file comment.
+struct AsyncDone {
+    std::atomic<int> n{0};
+    std::mutex mu;
+    std::vector<uint64_t> order; // under mu: the seqs of the completions, as they ran
+    static void Fn(void* p, const GnmCompletion& c) {
+        AsyncDone* d = static_cast<AsyncDone*>(p);
+        {
+            std::lock_guard<std::mutex> lk(d->mu);
+            d->order.push_back(c.seq);
+        }
+        d->n.fetch_add(1);
+    }
+};
+
+// `count` async seqs, each binding kBytesPerSeq setBytes values (enough to fill a 256 KiB chunk of
+// 256-byte slots) and writing the last into out[k]; each is waited for before the next begins (its
+// BeginCmd recycles what completed). Leaves Main current.
+static void RunAsyncSeqs(GnmBackend& be, id<MTLComputePipelineState> kc, __strong id<MTLBuffer> const* out, int count,
+                         AsyncDone& done) {
+    constexpr int kBytesPerSeq = 1200;
+    be.UseTarget(GnmCmdTarget::AsyncCompute);
+    for (int k = 0; k < count; ++k) {
+        be.BeginCmd(GnmCmdTarget::AsyncCompute, @"async test async", false);
+        be.BeginCompute(false);
+        be.SetComputePipeline(kc);
+        be.BindBuffer(GnmStage::Compute, 0, out[k], 0);
+        const uint32_t v = 0xA5000000u + (uint32_t)k;
+        for (int i = 0; i < kBytesPerSeq; ++i) be.BindBytes(GnmStage::Compute, 1, &v, sizeof(v));
+        be.Dispatch(MTLSizeMake(1, 1, 1), MTLSizeMake(64, 1, 1));
+        be.EndEncoder();
+        const int want = done.n.load() + 1;
+        be.CommitAsync(++g_seq, AsyncDone::Fn, &done);
+        for (int i = 0; i < 1000 && done.n.load() < want; ++i) usleep(1000);
+    }
+    be.UseTarget(GnmCmdTarget::Main);
+    for (int k = 0; k < count; ++k)
+        CHECK(((const uint32_t*)out[k].contents)[0] == 0xA5000000u + (uint32_t)k, "async seq %d wrote 0x%x", k,
+              ((const uint32_t*)out[k].contents)[0]);
+}
+
+static void TestAsyncQueue(id<MTLDevice> dev, GnmBackend& be) {
+    if (!(be.Caps() & kGnmCapAsyncCompute)) return;
+    NSError* err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:@(kComputeMsl) options:nil error:&err];
+    id<MTLComputePipelineState> kc =
+        lib ? [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_const"] error:&err] : nil;
+    CHECK(kc != nil, "k_const: %s", err.localizedDescription.UTF8String);
+    if (!kc) return;
+    constexpr int kSeqs = 6;
+    id<MTLBuffer> out[kSeqs];
+    for (auto& b : out) b = Zeroed(dev, be, 256);
+
+    // (1) main seq A committed and held by an event: the async seqs complete and their completions
+    // run in seq order; CompletedSeq stays below A
+    {
+        id<MTLSharedEvent> gate = [dev newSharedEvent];
+        std::atomic<int> main_done{0};
+        be.UseTarget(GnmCmdTarget::Main);
+        be.BeginCmd(GnmCmdTarget::Main, @"async test main A", false);
+        be.QueueWait(gate, 1);
+        const uint64_t seq_a = ++g_seq;
+        be.Commit(seq_a, Count, &main_done);
+        AsyncDone done;
+        RunAsyncSeqs(be, kc, out, kSeqs, done);
+        CHECK(done.n.load() == kSeqs, "%d of %d async seqs completed (their completions ran) beside held main seq %llu",
+              done.n.load(), kSeqs, (unsigned long long)seq_a);
+        {
+            std::lock_guard<std::mutex> lk(done.mu);
+            for (size_t i = 0; i < done.order.size(); ++i)
+                CHECK(done.order[i] == seq_a + 1 + i, "async completion %zu has seq %llu, want %llu", i,
+                      (unsigned long long)done.order[i], (unsigned long long)(seq_a + 1 + i));
+        }
+        CHECK(main_done.load() == 0 && be.CompletedSeq() == seq_a - 1,
+              "CompletedSeq %llu with main seq %llu held (want the prefix %llu)", (unsigned long long)be.CompletedSeq(),
+              (unsigned long long)seq_a, (unsigned long long)(seq_a - 1));
+        gate.signaledValue = 1;
+        for (int i = 0; i < 2500 && main_done.load() == 0; ++i) usleep(2000);
+        CHECK(main_done.load() == 1 && be.CompletedSeq() == g_seq, "after the gate: main seq A done %d, CompletedSeq %llu "
+              "(want %llu)", main_done.load(), (unsigned long long)be.CompletedSeq(), (unsigned long long)g_seq);
+    }
+    // (2) main seq B open: it writes 0x5EED0001 (setBytes) into `written`, which is then evicted after
+    // the last committed seq (+1, as ReleasedTexture does). Async seqs commit and complete past that
+    // seq, recycling bytes chunks: B's bytes and B's buffer stay until B is committed and completed.
+    {
+        for (auto& b : out) memset(b.contents, 0, 256);
+        id<MTLBuffer> written = Zeroed(dev, be, 256);
+        be.UseTarget(GnmCmdTarget::Main);
+        be.BeginCmd(GnmCmdTarget::Main, @"async test main B", false);
+        be.BeginCompute(false);
+        be.SetComputePipeline(kc);
+        be.BindBuffer(GnmStage::Compute, 0, written, 0);
+        const uint32_t main_v = 0x5EED0001u;
+        be.BindBytes(GnmStage::Compute, 1, &main_v, sizeof(main_v));
+        be.Dispatch(MTLSizeMake(1, 1, 1), MTLSizeMake(64, 1, 1));
+        be.EndEncoder();
+        be.Evict(written, g_seq + 1);
+        AsyncDone done;
+        RunAsyncSeqs(be, kc, out, kSeqs, done);
+        CHECK(done.n.load() == kSeqs && be.CompletedSeq() == g_seq, "%d of %d async seqs completed, CompletedSeq %llu "
+              "(want %llu)", done.n.load(), kSeqs, (unsigned long long)be.CompletedSeq(), (unsigned long long)g_seq);
+        if (be.Kind() == GnmBackendKind::Metal4)
+            CHECK(be.IsResident(written), "the buffer open main seq B writes left its residency set while async seqs "
+                                          "completed");
+        const uint64_t seq_b = ++g_seq;
+        CHECK(CommitAndWait(be, seq_b), "main seq %llu failed", (unsigned long long)seq_b);
+        CHECK(((const uint32_t*)written.contents)[0] == main_v, "main seq B wrote 0x%x into the evicted buffer, want "
+              "0x%x (its bytes overwritten, or the buffer not resident)", ((const uint32_t*)written.contents)[0], main_v);
+        // the next seq's start retires the eviction (Metal 4)
+        be.BeginCmd(GnmCmdTarget::Main, @"async test after", false);
+        const uint64_t s2 = ++g_seq;
+        CHECK(CommitAndWait(be, s2), "seq %llu failed", (unsigned long long)s2);
+        be.BeginCmd(GnmCmdTarget::Main, @"async test after 2", false);
+        const uint64_t s3 = ++g_seq;
+        CHECK(CommitAndWait(be, s3), "seq %llu failed", (unsigned long long)s3);
+        if (be.Kind() == GnmBackendKind::Metal4)
+            CHECK(!be.IsResident(written), "the evicted buffer is still resident after its main seq completed");
+    }
 }
 
 // Two backends in a row destroyed while their seqs wait on the GPU for an event a thread signals
@@ -952,6 +1083,7 @@ int main(int argc, char** argv) {
         TestSignalAfterUploads(dev, *be);
         TestComputeOps(dev, *be);
         TestDroppedViews(dev, *be);
+        TestAsyncQueue(dev, *be);
         if (be->Kind() == GnmBackendKind::Metal4) {
             Metal4Backend& m4 = static_cast<Metal4Backend&>(*be);
             CHECK(m4.Residency().Set(GnmResidencyClass::Guest) != nil, "no residency sets after Init");

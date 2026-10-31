@@ -111,8 +111,7 @@ typedef struct OrbisNetCtlNatInfo {
     uint32_t mapped_addr;
 } OrbisNetCtlNatInfo;
 
-typedef void (*OrbisNetCtlCallback)(int32_t eventType, void *arg);
-typedef void (*OrbisNetCtlCallbackForNpToolkit)(int32_t eventType, void *arg);
+// Callbacks are guest functions void (*)(int eventType, void *arg): guest addresses.
 
 // C API
 int32_t sceNetCtlInit(void);
@@ -120,10 +119,10 @@ int32_t sceNetCtlTerm(void);
 int32_t sceNetCtlGetState(int32_t *state);
 int32_t sceNetCtlGetInfo(int32_t code, OrbisNetCtlInfo *info);
 int32_t sceNetCtlGetNatInfo(OrbisNetCtlNatInfo *nat_info);
-int32_t sceNetCtlRegisterCallback(OrbisNetCtlCallback func, void *arg, int32_t *cid);
+int32_t sceNetCtlRegisterCallback(uint64_t func, uint64_t arg, int32_t *cid);
 int32_t sceNetCtlUnregisterCallback(int32_t cid);
 int32_t sceNetCtlCheckCallback(void);
-int32_t sceNetCtlRegisterCallbackForNpToolkit(OrbisNetCtlCallbackForNpToolkit func, void *arg, int32_t *cid);
+int32_t sceNetCtlRegisterCallbackForNpToolkit(uint64_t func, uint64_t arg, int32_t *cid);
 int32_t sceNetCtlUnregisterCallbackForNpToolkit(int32_t cid);
 int32_t sceNetCtlCheckCallbackForNpToolkit(void);
 

@@ -116,6 +116,8 @@ typedef struct GuestContext {
 
   // Size of the static TLS area below the TCB (recomp_init_tls_modules)
   uint64_t static_tls_size;
+  // Protected prefix of a thread's stack allocation (outside the usable stack).
+  uint64_t stack_guard_size;
 } GuestContext;
 
 // The TCB slot (guest address fs_base + RECOMP_TCB_CTX_SLOT) that holds the GuestContext

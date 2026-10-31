@@ -1437,6 +1437,11 @@ int recomp_vm_free(GuestContext *ctx, uint64_t addr, size_t size) {
 
 GuestContext *recomp_create_thread_context(GuestContext *parent,
                                            uint64_t stack_size) {
+  return recomp_create_thread_context_guarded(parent, stack_size, 0);
+}
+
+GuestContext *recomp_create_thread_context_guarded(GuestContext *parent,
+                                                  uint64_t stack_size, uint64_t guard_size) {
   if (!parent)
     return NULL;
   if (stack_size == 0)
@@ -1446,15 +1451,27 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   uint64_t tls_size = proc->static_tls_size ? proc->static_tls_size : 0x1000ULL;
   tls_size = (tls_size + 0xFFFULL) & ~0xFFFULL;
 
+  const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+  if (guard_size > UINT64_MAX - (page - 1)) return NULL;
+  guard_size = (guard_size + page - 1) & ~(page - 1);
+  if (stack_size > UINT64_MAX - tls_size - 0x10000ULL - page ||
+      guard_size > UINT64_MAX - stack_size - tls_size - 0x10000ULL - page)
+    return NULL;
+
   // Allocate stack, TLS area and TCB (64KB) via VM extent allocator
-  size_t alloc_total = stack_size + tls_size + 0x10000ULL;
-  uint64_t stack_base = recomp_vm_alloc(proc, alloc_total);
+  size_t alloc_total = guard_size + stack_size + tls_size + 0x10000ULL;
+  uint64_t stack_base = recomp_vm_alloc_named_aligned(proc, alloc_total, page,
+                                                      PROT_READ | PROT_WRITE, 0, "thread stack");
   if (stack_base == (uint64_t)-1) {
     fprintf(stderr,
             "[ps4-recomp] FATAL: out of guest memory for new thread stack\n");
     return NULL;
   }
-  uint64_t tcb_base = stack_base + stack_size + tls_size;
+  if (guard_size && mprotect(parent->mem_base + stack_base, guard_size, PROT_NONE) != 0) {
+    recomp_vm_free(proc, stack_base, alloc_total);
+    return NULL;
+  }
+  uint64_t tcb_base = stack_base + guard_size + stack_size + tls_size;
 
   // Static TLS area for the new thread [tcb_base - tls_size, tcb_base): zeroed, with every
   // module's .tdata template in its block (recomp_init_tls_modules).
@@ -1465,8 +1482,11 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   *(uint64_t *)(parent->mem_base + tcb_base + 0x28ULL) = 0x595e9fbd94fda766ULL;
 
   GuestContext *t_ctx = (GuestContext *)calloc(1, sizeof(GuestContext));
-  if (!t_ctx)
+  if (!t_ctx) {
+    if (guard_size) mprotect(parent->mem_base + stack_base, guard_size, PROT_READ | PROT_WRITE);
+    recomp_vm_free(proc, stack_base, alloc_total);
     return NULL;
+  }
 
   *(uint64_t *)(parent->mem_base + tcb_base + RECOMP_TCB_CTX_SLOT) = (uint64_t)t_ctx;
 
@@ -1477,7 +1497,8 @@ GuestContext *recomp_create_thread_context(GuestContext *parent,
   t_ctx->process_ctx = proc;
   t_ctx->stack_base = stack_base;
   t_ctx->stack_alloc_size = alloc_total;
-  t_ctx->rsp = (stack_base + stack_size - 0x100ULL) & ~0xFFULL;
+  t_ctx->stack_guard_size = guard_size;
+  t_ctx->rsp = (stack_base + guard_size + stack_size - 0x100ULL) & ~0xFFULL;
   t_ctx->rbp = t_ctx->rsp;
   // The creator's control words, as FreeBSD's cpu_copy_thread copies the user FPU state at
   // thr_new; the guest entry trampoline applies mxcsr to FPCR (RMode, FZ).
@@ -1493,6 +1514,11 @@ void recomp_free_thread_context(GuestContext *ctx) {
     return;
   GuestContext *proc = ctx->process_ctx ? ctx->process_ctx : ctx;
   if (ctx->stack_base && ctx->stack_alloc_size > 0 && ctx != proc) {
+    if (ctx->stack_guard_size &&
+        mprotect(ctx->mem_base + ctx->stack_base, ctx->stack_guard_size, PROT_READ | PROT_WRITE) != 0) {
+      fprintf(stderr, "[ps4-recomp] FATAL: cannot release thread stack guard: %s\n", strerror(errno));
+      abort();
+    }
     recomp_vm_free(proc, ctx->stack_base, ctx->stack_alloc_size);
   }
   free(ctx);

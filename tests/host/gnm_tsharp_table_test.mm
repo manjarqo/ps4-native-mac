@@ -21,6 +21,8 @@
 // Hazard: a compute shader writes a new T# into a table record and the next dispatch, in the same
 // submission, reads the table: its SRT copy was made before the GPU wrote the record, so the
 // encoder drains the GPU and copies again (the sample sees the new texture).
+// The same with the writer on the asynchronous compute queue ("async-compute"): the graphics wait
+// for its label joins the queues, and the reader still copies the table after the write.
 // Address check: a table record holding a well-formed T# of an address inside a free VM extent
 // is unbound (0 is read, not the texture in the host memory behind it) and counts as unmapped; one
 // in memory without an extent (module images) or in a PROT_NONE extent is bound; mapping the free
@@ -513,6 +515,54 @@ void TestHazard() {
         memcpy(got, At(out + 16 * w), 16);
         CHECK(memcmp(got, want, 16) == 0, "hazard: workgroup %u (record 0, rewritten blue) stored %g %g %g %g", w,
               got[0], got[1], got[2], got[3]);
+    }
+}
+
+// The hazard with asynchronous compute (mode "async-compute", PS4_GNM_ASYNC_COMPUTE=1): the copy
+// shader runs on a compute ring (its own queue: eligible, it binds no image), the CP's graphics
+// wait for its label joins the queues, and the reading dispatch on the graphics ring sees the
+// rewritten record: the table copy is made after the compute work completed (a hazard drain).
+void TestHazardCompute() {
+    constexpr uint64_t kTable3 = 0x02600000, kNewTsharp = 0x02700000;
+    const uint64_t copy_addr = kCode + 0x70000, read_addr = kCode + 0x80000, out = kOut + 0x6000;
+    memcpy(At(kTable3), At(kTable), kTableBytes);
+    PutTsharp(At(kNewTsharp), kTex[1]);
+    const std::vector<uint32_t> copy = CopyProgram(), read = Program(Form::Records, Op::Sample);
+    memcpy(g_mem + copy_addr, copy.data(), copy.size() * 4);
+    memcpy(g_mem + read_addr, read.data(), read.size() * 4);
+    for (uint32_t k = 0; k < 6 * 4; ++k) At(out)[k] = kSentinel;
+    ps4draw::NotifyGuestWrite(kTable3, 0x200000, false, 0);
+    ps4draw::NotifyGuestWrite(copy_addr, 0x20000, false, 0);
+    ps4draw::NotifyGuestWrite(out, 0x1000, false, 0);
+    std::vector<uint32_t> cregs = CsRegs(copy_addr, 8);
+    PutVsharp(&cregs[0x2E40], kNewTsharp, 32);
+    PutVsharp(&cregs[0x2E44], kTable3 + kTableFirst, 32);
+    std::vector<uint32_t> rregs = Regs(Form::Records, read_addr, out);
+    PutVsharp(&rregs[0x2E44], kTable3, kTableBytes);
+    const ps4draw::AsyncComputeCounts c0 = ps4draw::GetAsyncComputeCounts();
+    CHECK(c0.on, "asynchronous compute is not on");
+    const ps4draw::ImageTableStats s0 = ps4draw::GetImageTableStats();
+    ps4draw::Dispatch(&g_ctx, cregs.data(), 1, 1, 1, 0, "asc", ps4draw::kQueueCompute);
+    ps4draw::AfterGpu([] {}, ps4draw::kQueueCompute); // the compute label
+    ps4draw::FlushCompute();
+    // the CP at the graphics WAIT_REG_MEM met by that pending label
+    ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
+    ps4draw::JoinQueues(ps4draw::kQueueGfx);
+    ps4draw::Dispatch(&g_ctx, rregs.data(), 6, 1, 1, 0, "gfx", ps4draw::kQueueGfx);
+    ps4draw::Flush(true);
+    const ps4draw::AsyncComputeCounts c1 = ps4draw::GetAsyncComputeCounts();
+    CHECK(c1.eligible > c0.eligible, "the copy shader did not run on the compute queue");
+    const ps4draw::ImageTableStats s1 = ps4draw::GetImageTableStats();
+    CHECK(s1.hazard_drains - s0.hazard_drains == 1, "%llu table hazard drains, want 1",
+          (unsigned long long)(s1.hazard_drains - s0.hazard_drains));
+    CHECK(memcmp(At(kTable3 + kTableFirst), At(kNewTsharp), 32) == 0, "the copy shader did not write the record");
+    for (uint32_t w = 0; w < 6; ++w) {
+        if (kIndices[w] != 0) continue;
+        float want[4] = {0, 0, 0, 0}, got[4];
+        Store(want, kColor[1], 1);
+        memcpy(got, At(out + 16 * w), 16);
+        CHECK(memcmp(got, want, 16) == 0, "async compute hazard: workgroup %u (record 0, rewritten blue) stored %g %g "
+              "%g %g", w, got[0], got[1], got[2], got[3]);
     }
 }
 
@@ -1173,12 +1223,14 @@ void TestJunkDecode() {
 int main(int argc, char** argv) {
     @autoreleasepool {
         // "": every test, with PS4_GNM_SYNC_ENCODE; "capture": the DMA hazard in a captured frame
-        // (frame 0, into a temporary directory); "async": the hazard with the encoder thread
+        // (frame 0, into a temporary directory); "async": the hazard with the encoder thread;
+        // "async-compute": the hazard with the writer on the asynchronous compute queue
         const std::string mode = argc > 1 ? argv[1] : "";
-        if (mode != "" && mode != "capture" && mode != "async") {
-            fprintf(stderr, "usage: gnm_tsharp_table_test [capture|async]\n");
+        if (mode != "" && mode != "capture" && mode != "async" && mode != "async-compute") {
+            fprintf(stderr, "usage: gnm_tsharp_table_test [capture|async|async-compute]\n");
             return 2;
         }
+        if (mode == "async-compute") setenv("PS4_GNM_ASYNC_COMPUTE", "1", 1);
         char cap_dir[] = "/tmp/gnm_tsharp_capture.XXXXXX";
         if (mode == "async") {
             unsetenv("PS4_GNM_SYNC_ENCODE");
@@ -1229,11 +1281,13 @@ int main(int argc, char** argv) {
             return 1;
         }
         Setup();
-        if (mode == "capture" || mode == "async") {
+        if (mode == "capture" || mode == "async" || mode == "async-compute") {
             if (mode == "capture") {
                 TestHazardDma("capture");
-            } else {
+            } else if (mode == "async") {
                 TestHazardAsync();
+            } else {
+                TestHazardCompute();
             }
             if (mode == "capture") {
                 std::error_code ec;

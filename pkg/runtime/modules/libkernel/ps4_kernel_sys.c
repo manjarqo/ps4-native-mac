@@ -2,6 +2,8 @@
 #include "ps4_kernel_sys.h"
 #include "ps4_sysmodule.h"
 #include "ps4_fiber.h"
+#include "ps4_neo.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,27 +89,53 @@ int32_t sceKernelGetCpumode(void) {
     return 1; // 7-core high-performance gaming mode
 }
 
-// PS4 Pro (Neo) mode: 4K checkerboard targets and Neo-only shaders. Comes from the startup
-// settings (on by default; PS4_PRO=0|1 overrides; the older PS4_NEO_MODE=0|1 still works).
+// The host console (a PS4 Pro when the startup settings say so: on by default; PS4_PRO=0|1
+// overrides; the older PS4_NEO_MODE=0|1 still works) and PS4 Pro (Neo) mode for this title (4K
+// checkerboard targets, Neo-only shaders, Pro direct memory): only on a Pro host and only if the
+// title does not run in base mode there (ps4_neo.h has the console rule). Decided once, under
+// pthread_once (the queries come from guest threads and the renderer), and logged with the reason.
+static pthread_once_t g_neo_once = PTHREAD_ONCE_INIT;
+static int g_host_pro;
+static int g_neo_mode;
+
+static void ps4_neo_decide(void) {
+    const char *e = getenv("PS4_NEO_MODE");
+    g_host_pro = (e && *e) ? (e[0] == '1') : (ps4_host_setting_pro_mode() != 0);
+    Ps4SfoContext sfo;
+    memset(&sfo, 0, sizeof(sfo));
+    const int found = ps4_sfo_find_and_load(&sfo);
+    char why[160];
+    const Ps4NeoTitleSupport title = ps4_neo_title_support(found ? &sfo : NULL, why, sizeof(why));
+    if (found) ps4_sfo_free(&sfo);
+    g_neo_mode = ps4_neo_mode_rule(g_host_pro, title);
+    fprintf(stderr, "[ps4-kernel] PS4 Pro (Neo) mode %s: host %s, title %s (%s)\n", g_neo_mode ? "on" : "off",
+            g_host_pro ? "PS4 Pro" : "PS4", title == PS4_NEO_TITLE_PRO    ? "supports Pro"
+                                            : title == PS4_NEO_TITLE_BASE ? "base only"
+                                                                          : "unknown, follows the host",
+            why);
+}
+
+static int ps4_host_is_pro(void) {
+    pthread_once(&g_neo_once, ps4_neo_decide);
+    return g_host_pro;
+}
+
 static int ps4_neo_mode(void) {
-    static int mode = -1;
-    if (mode < 0) {
-        const char *e = getenv("PS4_NEO_MODE");
-        mode = (e && *e) ? (e[0] == '1') : (ps4_host_setting_pro_mode() != 0);
-    }
-    return mode;
+    pthread_once(&g_neo_once, ps4_neo_decide);
+    return g_neo_mode;
 }
 
 int32_t sceKernelIsNeoMode(void) {
     return ps4_neo_mode();
 }
 
+// The console is a Pro, whatever mode the title runs in.
 int32_t sceKernelHasNeoMode(void) {
-    return ps4_neo_mode();
+    return ps4_host_is_pro();
 }
 
 int32_t sceKernelIsAuthenticNeo(void) {
-    return ps4_neo_mode();
+    return ps4_host_is_pro();
 }
 
 int32_t sceKernelGetSystemSwVersion(OrbisKernelSwVersion *version) {

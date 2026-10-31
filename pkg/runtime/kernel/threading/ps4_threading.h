@@ -83,6 +83,8 @@ void shim_scePthreadGetaffinity(GuestContext *ctx);
 void shim_scePthreadAttrInit(GuestContext *ctx);
 void shim_scePthreadAttrDestroy(GuestContext *ctx);
 void shim_scePthreadAttrSetstacksize(GuestContext *ctx);
+void shim_scePthreadAttrSetguardsize(GuestContext *ctx);
+void shim_scePthreadAttrGetguardsize(GuestContext *ctx);
 void shim_scePthreadAttrSetdetachstate(GuestContext *ctx);
 void shim_scePthreadAttrSetschedpolicy(GuestContext *ctx);
 void shim_scePthreadAttrSetschedparam(GuestContext *ctx);

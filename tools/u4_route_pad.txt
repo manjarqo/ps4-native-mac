@@ -1,0 +1,21 @@
+# Pad script of tools/u4_route.sh ROUTE_KIND=boat. One step per line, "<time ms>:<hex button mask>:<hold ms>";
+# the lines are joined with commas into PS4_PAD_SCRIPT (format: pkg/runtime/modules/libScePad/ps4_pad.m).
+# The run sets PS4_PAD_CLOCK=frames, so the times are submitted flips at 30 per second (a step at
+# 36000 ms is flip 1080), not wall time. Masks: 4000 = Cross, 40 = Down. Lines starting with # are
+# comments. The steps are those of the earlier hand-made script; each line says only what it presses.
+36000:4000:100
+42000:4000:100
+52000:40:100
+55000:40:100
+58000:40:100
+61000:40:100
+64000:40:100
+68000:4000:100
+80000:4000:100
+90000:4000:100
+100000:4000:100
+110000:4000:100
+120000:40:100
+123000:40:100
+126000:40:100
+130000:4000:100

@@ -19,17 +19,19 @@ static inline void *guest_to_host(const GuestContext *ctx, uint64_t addr) {
     return (void *)addr;
 }
 
+// A registered callback: a guest function and its argument (guest addresses).
+//
+// The console calls a callback from sceNetCtlCheckCallback for each connection event queued since
+// the last check: a change of state. The host network is reported connected with an IP address
+// (sceNetCtlGetState: IPOBTAINED) from the start and never changes, so no event is ever queued and
+// the check calls nothing, as on a console that stays connected.
 typedef struct CallbackSlot {
-    OrbisNetCtlCallback func;
-    void *arg;
+    uint64_t func;
+    uint64_t arg;
     bool active;
 } CallbackSlot;
 
-typedef struct ToolkitCallbackSlot {
-    OrbisNetCtlCallbackForNpToolkit func;
-    void *arg;
-    bool active;
-} ToolkitCallbackSlot;
+typedef CallbackSlot ToolkitCallbackSlot;
 
 static pthread_mutex_t g_netctl_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_netctl_initialized = false;
@@ -216,7 +218,7 @@ int32_t sceNetCtlGetNatInfo(OrbisNetCtlNatInfo *nat_info) {
     return ORBIS_OK;
 }
 
-int32_t sceNetCtlRegisterCallback(OrbisNetCtlCallback func, void *arg, int32_t *cid) {
+int32_t sceNetCtlRegisterCallback(uint64_t func, uint64_t arg, int32_t *cid) {
     if (!func || !cid) {
         return (int32_t)ORBIS_NET_CTL_ERROR_INVALID_ADDR;
     }
@@ -241,8 +243,8 @@ int32_t sceNetCtlUnregisterCallback(int32_t cid) {
     int idx = cid - 1;
     if (idx >= 0 && idx < MAX_NETCTL_CALLBACKS && g_callbacks[idx].active) {
         g_callbacks[idx].active = false;
-        g_callbacks[idx].func = NULL;
-        g_callbacks[idx].arg = NULL;
+        g_callbacks[idx].func = 0;
+        g_callbacks[idx].arg = 0;
         pthread_mutex_unlock(&g_netctl_mutex);
         return ORBIS_OK;
     }
@@ -250,21 +252,12 @@ int32_t sceNetCtlUnregisterCallback(int32_t cid) {
     return (int32_t)ORBIS_NET_CTL_ERROR_INVALID_ID;
 }
 
+// No connection event is ever queued (see CallbackSlot), so there is nothing to deliver.
 int32_t sceNetCtlCheckCallback(void) {
-    CallbackSlot copy[MAX_NETCTL_CALLBACKS];
-    pthread_mutex_lock(&g_netctl_mutex);
-    memcpy(copy, g_callbacks, sizeof(copy));
-    pthread_mutex_unlock(&g_netctl_mutex);
-
-    for (int i = 0; i < MAX_NETCTL_CALLBACKS; i++) {
-        if (copy[i].active && copy[i].func) {
-            copy[i].func(ORBIS_NET_CTL_EVENT_TYPE_IPOBTAINED, copy[i].arg);
-        }
-    }
     return ORBIS_OK;
 }
 
-int32_t sceNetCtlRegisterCallbackForNpToolkit(OrbisNetCtlCallbackForNpToolkit func, void *arg, int32_t *cid) {
+int32_t sceNetCtlRegisterCallbackForNpToolkit(uint64_t func, uint64_t arg, int32_t *cid) {
     if (!func || !cid) {
         return (int32_t)ORBIS_NET_CTL_ERROR_INVALID_ADDR;
     }
@@ -289,8 +282,8 @@ int32_t sceNetCtlUnregisterCallbackForNpToolkit(int32_t cid) {
     int idx = cid - 1;
     if (idx >= 0 && idx < MAX_NETCTL_CALLBACKS && g_toolkit_callbacks[idx].active) {
         g_toolkit_callbacks[idx].active = false;
-        g_toolkit_callbacks[idx].func = NULL;
-        g_toolkit_callbacks[idx].arg = NULL;
+        g_toolkit_callbacks[idx].func = 0;
+        g_toolkit_callbacks[idx].arg = 0;
         pthread_mutex_unlock(&g_netctl_mutex);
         return ORBIS_OK;
     }
@@ -298,17 +291,8 @@ int32_t sceNetCtlUnregisterCallbackForNpToolkit(int32_t cid) {
     return (int32_t)ORBIS_NET_CTL_ERROR_INVALID_ID;
 }
 
+// As sceNetCtlCheckCallback: no event is ever queued.
 int32_t sceNetCtlCheckCallbackForNpToolkit(void) {
-    ToolkitCallbackSlot copy[MAX_NETCTL_CALLBACKS];
-    pthread_mutex_lock(&g_netctl_mutex);
-    memcpy(copy, g_toolkit_callbacks, sizeof(copy));
-    pthread_mutex_unlock(&g_netctl_mutex);
-
-    for (int i = 0; i < MAX_NETCTL_CALLBACKS; i++) {
-        if (copy[i].active && copy[i].func) {
-            copy[i].func(ORBIS_NET_CTL_EVENT_TYPE_IPOBTAINED, copy[i].arg);
-        }
-    }
     return ORBIS_OK;
 }
 
@@ -349,10 +333,8 @@ void shim_sceNetCtlGetNatInfo(GuestContext *ctx) {
 }
 
 void shim_sceNetCtlRegisterCallback(GuestContext *ctx) {
-    OrbisNetCtlCallback func = (OrbisNetCtlCallback)guest_to_host(ctx, ctx->rdi);
-    void *arg = (void *)guest_to_host(ctx, ctx->rsi);
     int32_t *cid = (int32_t *)guest_to_host(ctx, ctx->rdx);
-    ctx->rax = (uint64_t)sceNetCtlRegisterCallback(func, arg, cid);
+    ctx->rax = (uint64_t)sceNetCtlRegisterCallback(ctx->rdi, ctx->rsi, cid);
     SHIM_RETURN();
 }
 
@@ -367,10 +349,8 @@ void shim_sceNetCtlCheckCallback(GuestContext *ctx) {
 }
 
 void shim_sceNetCtlRegisterCallbackForNpToolkit(GuestContext *ctx) {
-    OrbisNetCtlCallbackForNpToolkit func = (OrbisNetCtlCallbackForNpToolkit)guest_to_host(ctx, ctx->rdi);
-    void *arg = (void *)guest_to_host(ctx, ctx->rsi);
     int32_t *cid = (int32_t *)guest_to_host(ctx, ctx->rdx);
-    ctx->rax = (uint64_t)sceNetCtlRegisterCallbackForNpToolkit(func, arg, cid);
+    ctx->rax = (uint64_t)sceNetCtlRegisterCallbackForNpToolkit(ctx->rdi, ctx->rsi, cid);
     SHIM_RETURN();
 }
 

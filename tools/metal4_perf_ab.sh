@@ -21,23 +21,66 @@
 # (medians of fps, encoder ms and CP ms per side, the B-vs-A line). Exit status: that of
 # --verdict (0: B >= A), 1 when fewer than N pairs were kept. After every run it sleeps PAUSE s
 # (default 60) outside the lock, so that other agents' jobs waiting for a slot get a window.
+# NEVER run this script under heavy_lock.sh: it takes the lock for every run itself, and an outer
+# exclusive lock blocks the inner one for ever (a deadlock that also stalls every other agent).
+# A= and B= split a trailing ":3" or ":4" off as the Metal backend (PS4_GNM_METAL); anything else
+# is the plain build directory.
+# Each side's cache directory is $OUT/cache_<TAG>_A or _B (scratch, outside ~/Library/Caches): shared
+# by that side's warm-up run and counted runs within this one invocation, and deleted when the
+# script ends, whatever the exit path.
 # usage: N=5 A=<build>:<3|4> B=<build>:<3|4> TAG=<name> [SECS=300] [PAIR_MARGIN=40] tools/metal4_perf_ab.sh [VAR=value...]
-#        (trailing arguments go to every metal4_route.sh run after its own settings, so
+#        (trailing arguments go to every route run after its own settings, so
 #        PS4_UPSCALE=metalfx overrides the route's PS4_UPSCALE=0 on both sides)
 #        SUMMARY_ONLY=1 KEPT_A="<tag>..." KEPT_B="<tag>..." TAG=<name> N=<n> tools/metal4_perf_ab.sh
 #        (no runs: the same summary over the logs of runs already made)
+# REPORT_ARGS="<options>" go to every metal4_route_report.py call, the verdict included
+# (REPORT_ARGS=--after-marker for routes whose boot has a varying number of perf lines: inFAMOUS).
+# --after-marker and --skip in REPORT_ARGS are refused (exit status 2, before any run) together with
+# ROUTE_KIND, FROM or TO, which select the perf windows by present index.
 # Tests (tools/tests/test_metal4_perf_ab.py): ROUTE=<program> replaces the heavy_lock'ed
-# metal4_route.sh (it gets BUILD, TAG, METAL, SECS, CACHE, EVERY and OUT in the environment and
-# writes $OUT/$TAG.log and $OUT/$TAG.mon); OUT= is the runs directory.
+# metal4_route.sh (it gets BUILD, TAG, METAL, SECS, CACHE, EVERY, OUT and ROUTE_KIND in the
+# environment and writes $OUT/$TAG.log and $OUT/$TAG.mon); OUT= is the runs directory.
+#
+# Uncharted 4: tools/u4_route.sh is a ROUTE program (it needs PS4_U4_APP_DIR=<game folder>):
+#   N=3 A=<build> B=<build> TAG=<name> ROUTE=tools/u4_route.sh ROUTE_KIND=title|boat \
+#     [FROM=<present>] [TO=<present>] tools/metal4_perf_ab.sh
+# A and B may be plain build directories ("<build>" without ":<3|4>": no PS4_GNM_METAL is set).
+# ROUTE_KIND is passed on to the route and makes a ROUTE run like the built-in one: under
+# HEAVY_EXCLUSIVE=1 heavy_lock (HEAVY_LOCK= names another lock program, for tests). ROUTE_KIND, FROM
+# or TO also switch the report lines and the verdict to the perf windows selected by present index
+# (tools/metal4_route_report.py --from/--to; FROM defaults to 0, TO to the end of the log) instead
+# of skipping the first 13 windows, and the verdict ends with the
+# "VERDICT: B faster|slower|within noise" line.
 set -u
 : "${TAG:?}"
 [ -n "${SUMMARY_ONLY:-}" ] || : "${A:?} ${B:?}"
 EXTRA=("$@")
+read -ra RARGS <<< "${REPORT_ARGS:-}"
 N=${N:-5}; SECS=${SECS:-300}; PAUSE=${PAUSE:-60}; PAIR_MARGIN=${PAIR_MARGIN:-40}
 R=$(cd "$(dirname "$0")/.." && pwd)
 W=$HOME/ps4recomp-work
 OUT=${OUT:-$W/metal4_research/runs}
 export OUT
+# the scratch caches of the sides (see the header); also removed on interrupt
+CACHE_A=$OUT/cache_${TAG}_A; CACHE_B=$OUT/cache_${TAG}_B
+cleanup_caches() { rm -rf "${CACHE_A:?}" "${CACHE_B:?}"; }
+if [ -z "${SUMMARY_ONLY:-}" ]; then trap cleanup_caches EXIT; trap 'exit 1' INT TERM HUP; fi
+HEAVY_LOCK=${HEAVY_LOCK:-$W/tools/heavy_lock.sh}
+RANGE=()
+if [ -n "${ROUTE_KIND:-}${FROM:-}${TO:-}" ]; then
+  RANGE=(--from "${FROM:-0}" --to "${TO:-99999999}")
+  # the report refuses to select perf lines both by position and by present index: every run's report
+  # would fail, so refuse before the first run
+  for o in ${RARGS[@]+"${RARGS[@]}"}; do
+    case $o in --after-marker | --skip | --skip=*)
+      echo "metal4_perf_ab: REPORT_ARGS $o selects perf lines by position; ROUTE_KIND, FROM and TO select them by present index: use one" >&2
+      exit 2 ;;
+    esac
+  done
+fi
+# "<build>:<3|4>", or a plain "<build>" (no Metal version)
+build_of() { case $1 in *:[34]) echo "${1%:*}" ;; *) echo "$1" ;; esac; }
+metal_of() { case $1 in *:[34]) echo "${1##*:}" ;; *) echo "" ;; esac; }
 declare -a TA TB
 dropped=()
 MED=0 # other_cpu median of the last run_side (run_side runs in this shell)
@@ -48,15 +91,17 @@ cpu_median() {
 run_side() { # side build metal index: returns 0 for a kept run; the run line goes to stderr
   local side=$1 build=$2 metal=$3 i=$4 tag="${TAG}_$1$4"
   if [ -n "${ROUTE:-}" ]; then
-    env BUILD="$build" TAG="$tag" METAL="$metal" SECS="$SECS" EVERY="${EVERY:-0}" \
-      CACHE="$W/metal4_research/cache_${TAG}_$side" "$ROUTE" ${EXTRA[@]+"${EXTRA[@]}"} > /dev/null 2>&1
+    local lock=()
+    [ -n "${ROUTE_KIND:-}" ] && lock=(env HEAVY_EXCLUSIVE=1 "$HEAVY_LOCK")
+    ${lock[@]+"${lock[@]}"} env BUILD="$build" TAG="$tag" METAL="$metal" SECS="$SECS" EVERY="${EVERY:-0}" ROUTE_KIND="${ROUTE_KIND:-}" \
+      CACHE="$OUT/cache_${TAG}_$side" "$ROUTE" ${EXTRA[@]+"${EXTRA[@]}"} > /dev/null 2>&1
   else
     HEAVY_EXCLUSIVE=1 "$W/tools/heavy_lock.sh" env BUILD="$build" TAG="$tag" METAL="$metal" SECS="$SECS" EVERY="${EVERY:-0}" \
-      OUT="$OUT" CACHE="$W/metal4_research/cache_${TAG}_$side" "$R/tools/metal4_route.sh" ${EXTRA[@]+"${EXTRA[@]}"} > /dev/null 2>&1
+      OUT="$OUT" CACHE="$OUT/cache_${TAG}_$side" "$R/tools/metal4_route.sh" ${EXTRA[@]+"${EXTRA[@]}"} > /dev/null 2>&1
   fi
   sleep "$PAUSE"
   MED=0
-  local rep; rep=$(python3 "$R/tools/metal4_route_report.py" "$OUT/$tag.log") || { echo "$tag: no report" >&2; return 1; }
+  local rep; rep=$(python3 "$R/tools/metal4_route_report.py" ${RARGS[@]+"${RARGS[@]}"} "$OUT/$tag.log" ${RANGE[@]+"${RANGE[@]}"}) || { echo "$tag: no report" >&2; return 1; }
   local load; load=$(awk '{for (i = 1; i < NF; i++) if ($i == "load") print $(i + 1)}' <<< "$rep")
   local busy; busy=$(awk -F'other_cpu=' 'NF > 1 && $2 + 0 > 350 {n++} END {print n + 0}' "$OUT/$tag.mon")
   MED=$(cpu_median "$OUT/$tag.mon")
@@ -81,19 +126,19 @@ summary() {
   for t in "${TB[@]}"; do lb+=("$OUT/$t.log"); done
   echo "A logs: ${la[*]}"
   echo "B logs: ${lb[*]}"
-  python3 "$R/tools/metal4_route_report.py" --verdict --min-runs "$N" --a "${la[@]}" --b "${lb[@]}"
+  python3 "$R/tools/metal4_route_report.py" ${RARGS[@]+"${RARGS[@]}"} --verdict ${RANGE[@]+"${RANGE[@]}"} --min-runs "$N" --a "${la[@]}" --b "${lb[@]}"
 }
 if [ -n "${SUMMARY_ONLY:-}" ]; then
   read -ra TA <<< "${KEPT_A:?}"; read -ra TB <<< "${KEPT_B:?}"
   summary; exit $?
 fi
-run_side A "${A%:*}" "${A##*:}" w; run_side B "${B%:*}" "${B##*:}" w
+run_side A "$(build_of "$A")" "$(metal_of "$A")" w; run_side B "$(build_of "$B")" "$(metal_of "$B")" w
 kept=0
 for ((p = 1; p <= 2 * N && kept < N; p++)); do
   # the pairs left cannot make up N any more: stop
   [ $((kept + 2 * N - p + 1)) -ge "$N" ] || break
-  run_side A "${A%:*}" "${A##*:}" $p; ka=$?; mA=$MED
-  run_side B "${B%:*}" "${B##*:}" $p; kb=$?; mB=$MED
+  run_side A "$(build_of "$A")" "$(metal_of "$A")" $p; ka=$?; mA=$MED
+  run_side B "$(build_of "$B")" "$(metal_of "$B")" $p; kb=$?; mB=$MED
   d=$((mA > mB ? mA - mB : mB - mA))
   if [ $ka -eq 0 ] && [ $kb -eq 0 ] && [ $d -le "$PAIR_MARGIN" ]; then
     TA+=("${TAG}_A$p"); TB+=("${TAG}_B$p"); kept=$((kept + 1))

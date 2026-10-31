@@ -13,6 +13,8 @@ func TestLookupShimByNID(t *testing.T) {
 		nid   string
 		shim  string
 	}{
+		{"scePthreadAttrSetguardsize", "El+cQ20DynU", "shim_scePthreadAttrSetguardsize"},
+		{"scePthreadAttrGetguardsize", "", "shim_scePthreadAttrGetguardsize"},
 		{"pthread_sigmask", "JZKw5+Wrnaw", "shim_pthread_sigmask"},
 		{"cpuset_getaffinity", "Pdgml4rbxYk", "shim_cpuset_getaffinity"},
 		{"getrlimit", "Wh7HbV7JFqc", "shim_getrlimit"},

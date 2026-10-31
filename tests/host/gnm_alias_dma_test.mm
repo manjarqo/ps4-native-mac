@@ -25,9 +25,17 @@
 //    bytes through the one-window buffer, then a copy of the first fill's bytes through the
 //    two-window buffer waits once (for the last fill, whose hull covers both).
 // After the flushes every copy holds what it read.
+// "async-compute" (PS4_GNM_ASYNC_COMPUTE=1) adds the windows across the two queues: with the
+// compute queue held, a compute-ring fill through the two-window buffer, then the graphics wait for
+// its label (JoinQueues) and a graphics copy of those bytes through the one-window buffer. The
+// copy's alias wait on the other queue's fill is left out (counted on Metal 3; a fence orders one
+// queue only) and the join orders it: the copy holds the fill's bytes.
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
+#include <thread>
 
 #import <Metal/Metal.h>
 
@@ -53,7 +61,13 @@ static uint64_t AliasWaits() {
     return be ? be->Stats().alias_waits : 0;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool async_compute = argc > 1 && !strcmp(argv[1], "async-compute");
+    if (argc > 2 || (argc == 2 && !async_compute)) {
+        fprintf(stderr, "usage: gnm_alias_dma_test [async-compute]\n");
+        return 2;
+    }
+    if (async_compute) setenv("PS4_GNM_ASYNC_COMPUTE", "1", 1);
     @autoreleasepool {
         setenv("PS4_GNM_SYNC_ENCODE", "1", 1);
         setenv("PS4_GNM_SYNC_COMPILE", "1", 1);
@@ -158,6 +172,34 @@ int main() {
         }
         CHECK(bad1 == 0 && bad2 == 0 && bad3 == 0 && bad4 == 0 && bad5 == 0,
               "copies: %u, %u, %u, %u and %u of %llu bytes wrong", bad1, bad2, bad3, bad4, bad5, (unsigned long long)n);
+        if (async_compute) {
+            const uint64_t out8 = W + 0xF00000;
+            const ps4draw::AsyncComputeCounts c0 = ps4draw::GetAsyncComputeCounts();
+            CHECK(c0.on, "asynchronous compute is not on");
+            id<MTLSharedEvent> gate = [be->Device() newSharedEvent];
+            ps4draw::DebugGpuWaitQueue((__bridge void*)gate, 1, ps4draw::kQueueCompute);
+            CHECK(ps4draw::GpuDma(false, true, 0, 0x2B2B2B2B, false, fill_at, (uint32_t)fill_n, ps4draw::kQueueCompute),
+                  "the compute fill was not taken");
+            ps4draw::AfterGpu([] {}, ps4draw::kQueueCompute);
+            ps4draw::FlushCompute();
+            std::thread opener([gate] {
+                usleep(100000);
+                gate.signaledValue = 1;
+            });
+            ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
+            ps4draw::JoinQueues(ps4draw::kQueueGfx);
+            CHECK(ps4draw::GpuDma(false, false, near, 0, false, out8, (uint32_t)n), "the graphics copy was not taken");
+            ps4draw::Flush(true);
+            opener.join();
+            uint32_t bad8 = 0;
+            for (uint64_t i = 0; i < n; ++i) bad8 += mem[out8 + i] != 0x2B;
+            CHECK(bad8 == 0, "across queues: %u of %llu copied bytes are not the compute fill's", bad8,
+                  (unsigned long long)n);
+            const ps4draw::AsyncComputeCounts c1 = ps4draw::GetAsyncComputeCounts();
+            CHECK(c1.eligible > c0.eligible, "the compute fill did not run on the compute queue");
+            if (metal3)
+                CHECK(c1.alias_skipped > c0.alias_skipped, "across queues: no alias wait was left out (counted)");
+        }
         if (metal3) {
             const ps4gnm::GnmBackendStats st = be->Stats();
             printf("gnm_alias_dma_test: %llu access fences, %llu alias waits\n", (unsigned long long)st.access_fences,

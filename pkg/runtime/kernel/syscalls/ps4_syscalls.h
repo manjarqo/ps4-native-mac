@@ -29,6 +29,7 @@ void shim_open(GuestContext *ctx);
 void shim_close(GuestContext *ctx);
 void shim_lseek(GuestContext *ctx);
 void shim_stat(GuestContext *ctx);
+void shim_sceKernelCheckReachability(GuestContext *ctx);
 void shim_fstat(GuestContext *ctx);
 void shim_chmod(GuestContext *ctx);
 void shim_fchmod(GuestContext *ctx);

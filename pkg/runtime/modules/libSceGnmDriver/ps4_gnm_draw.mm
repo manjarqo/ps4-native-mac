@@ -218,6 +218,7 @@ struct GmSync {
     std::atomic<bool> miss{false};  // a ticket waits for the encoder (GmService)
     std::atomic<bool> released{false}; // the GPU was given up on: every ticket is final
     std::atomic<bool> withhold_next{false}; // tests: TestWithholdNextTicket
+    std::atomic<bool> fail_next_chain{false}; // tests: TestFailNextChain
     // the CPU's last signal of ev (2t: ticket t final), stored after the signal with release:
     // what happened before a ticket was published (its queued texture invalidations) happens
     // before whatever a thread does after it saw the ticket final (GmResolved, acquire). The GPU
@@ -615,6 +616,9 @@ struct WorkRec {
     uint32_t n = 0, inst = 0;  // draw: count / instances; dispatch: groups x / y
     uint32_t extra = 0;        // dispatch: groups z
     bool dispatch = false;
+    uint64_t pgm = 0;          // dispatch: program hash (gcn_shader_info::pgm_hash, as in captures)
+    uint64_t ticket = 0;       // dispatch: guest memory ticket (fast path), 0 if none
+    uint8_t gm = 0;            // dispatch: 0 plain, 1 guest memory waited for, 2 guest memory fast
 };
 struct WorkLog {
     // The most recent records are kept: 64, or 512 with the debug options that print whole
@@ -633,9 +637,14 @@ struct WorkLog {
         const uint64_t first = count > std::min<uint64_t>(last, kCap) ? count - std::min<uint64_t>(last, kCap) : 0;
         for (uint64_t i = first; i < count; ++i) {
             const WorkRec& r = rec[i % kCap];
-            if (r.dispatch)
-                fprintf(stderr, "[gnm-draw]   %s[%llu]: %s dispatch CS=0x%llx groups=%ux%ux%u\n", prefix,
-                        (unsigned long long)i, r.what, (unsigned long long)r.a, r.n, r.inst, r.extra);
+            if (r.dispatch && r.gm == 2)
+                fprintf(stderr, "[gnm-draw]   %s[%llu]: %s dispatch CS=0x%llx groups=%ux%ux%u pgm 0x%llx, guest memory ticket %llu\n",
+                        prefix, (unsigned long long)i, r.what, (unsigned long long)r.a, r.n, r.inst, r.extra,
+                        (unsigned long long)r.pgm, (unsigned long long)r.ticket);
+            else if (r.dispatch)
+                fprintf(stderr, "[gnm-draw]   %s[%llu]: %s dispatch CS=0x%llx groups=%ux%ux%u pgm 0x%llx%s\n", prefix,
+                        (unsigned long long)i, r.what, (unsigned long long)r.a, r.n, r.inst, r.extra,
+                        (unsigned long long)r.pgm, r.gm == 1 ? ", guest memory (waited for)" : "");
             else if (r.a)
                 fprintf(stderr, "[gnm-draw]   %s[%llu]: %s VS=0x%llx PS=0x%llx n=%u inst=%u\n", prefix,
                         (unsigned long long)i, r.what, (unsigned long long)r.a, (unsigned long long)r.b, r.n, r.inst);
@@ -670,6 +679,10 @@ struct BackendDelete {
     }
 };
 
+// The targets whose command buffers hold guest work, by index: the main command buffer and the
+// asynchronous compute one (GnmCmdTarget::Main / AsyncCompute).
+enum { kTgtMain = 0, kTgtAsync = 1 };
+
 struct State {
     std::unique_ptr<GnmBackend, BackendDelete> be; // the backend chosen by Init (ps4_gnm_backend.h)
     uint64_t cmd_index = 0;         // label number of the open main command buffer ("gnm-<n>")
@@ -701,6 +714,29 @@ struct State {
     UploadArena arena;
     std::vector<GpuWrite> gpu_written; // guest ranges written by work in `cmd`
     uint32_t gpu_written_slot[64] = {}; // NoteGpuWrite: index of a range in gpu_written, by hash
+    // Asynchronous compute (g_async_compute): the AsyncCompute target's command buffer, and what
+    // belongs to it: arena chunks, written ranges, work log and label number, swapped with the
+    // fields above while it is the current target (AsyncScope). Encoder thread.
+    struct AsyncTarget {
+        bool open = false;     // its command buffer is open
+        bool in_scope = false; // it is the current target (its fields are swapped in)
+        uint64_t cmd_index = 0;
+        std::vector<UploadArena::Chunk> arena_cur;
+        std::vector<GpuWrite> gpu_written;
+        uint32_t gpu_written_slot[64] = {};
+        std::shared_ptr<WorkLog> cmd_log;
+        // the compute rings' work goes to Main until the end of the submission (JoinQueues: a wait
+        // met by graphics work), for this reason (AsyncJoin)
+        bool compute_joined = false;
+        uint8_t joined_reason = 0;
+        uint64_t main_compute_gen = 0; // the Main generation that holds the latest compute-ring work on Main
+        uint64_t main_waited = 0;      // the AsyncCompute generation Main waits for already (main_ev)
+        uint64_t waited_main = 0;      // the Main generation AsyncCompute waits for already
+        uint64_t ring_main_until[64] = {}; // per compute ring: on Main until this present (gfx-consumed)
+        bool marked_surfaces = false;  // AsyncCompute buffer stores marked GPU surfaces guest newer
+        // signalled with each target's generation at its commit (cross-queue waits)
+        id<MTLSharedEvent> main_ev = nil, async_ev = nil;
+    } async;
     // ranges written by committed command buffers, by sequence number (dropped once completed)
     std::deque<std::pair<uint64_t, std::vector<GpuWrite>>> inflight_written;
     // gpu_written and inflight_written by range, latest write only: what OverlapsPendingWrite asks
@@ -715,6 +751,12 @@ struct State {
     // exactly known buffer stores of the draw or dispatch being bound (NoteBufferStore), handed to
     // the texture cache once its work is really encoded (FlushBufferStores)
     std::vector<std::pair<uint64_t, uint64_t>> buffer_stores;
+    // GPU write sites of color surfaces (RefreshGuestNewer with write_site) noted for the texture cache
+    // while fast guest memory dispatches with buffer stores are unfinished (store_tickets): the
+    // stores of such a dispatch are known only once its result is in, and must not mark a surface
+    // written after the dispatch was encoded (TextureCache::NoteWriteSite)
+    uint64_t write_site_seq = 0;
+    uint32_t store_tickets = 0;
     // first write epoch of the work recorded since the last Commit (the main command buffer): copies in the upload one
     // run before all of it, so they are current only for writes with smaller epochs
     uint64_t cmd_start_epoch = 1;
@@ -722,6 +764,23 @@ struct State {
     id<MTLComputePipelineState> detile_pso = nil;
     std::unordered_map<uint64_t, id<MTLBuffer>> detile_maps;
     std::unordered_map<uint32_t, id<MTLBuffer>> detile_staging; // by size class (log2 of the length)
+    // indirect quad-list draws (EncodeQuadListIndirect): the conversion kernel; the shared quad
+    // pattern of the non-indexed ones (quad_pattern_quads quads) and the largest quad count a
+    // draw asked of it (written by the kernel, read by the encoder to grow the pattern)
+    // quad_prep_pso: arguments and the indexed conversion's dispatch size from the record;
+    // quad_indices_pso: the indexed conversion, dispatched from that size; args_patch_pso: the
+    // corrected offsets of an indirect triangle-list record (IndirectRecordOffsets)
+    id<MTLComputePipelineState> quad_prep_pso = nil, quad_indices_pso = nil, args_patch_pso = nil;
+    id<MTLBuffer> quad_pattern = nil, quad_need = nil;
+    uint32_t quad_pattern_quads = 0;
+    // the open seq's current pool of converted quad indices (QuadRegion): a region of each draw's
+    // worst case is reserved on the CPU, so a draw never finds it full
+    id<MTLBuffer> quad_pool = nil;
+    size_t quad_pool_off = 0;
+    uint64_t quad_pool_seq = 0, quad_pool_used = 0, quad_pool_bytes = 0;
+    uint64_t quad_seq_demand = 0; // the regions reserved in the open seq
+    uint64_t quad_pool_hint = 0;  // the size of the next first pool of a seq (grows, and decays)
+    uint32_t quad_hint_idle = 0;  // seqs since the hint last grew
 
     // caches
     std::unordered_map<uint64_t, std::vector<Shader*>> shaders;
@@ -862,23 +921,103 @@ struct State {
     double gpu_timeout_ms = 4000;
     uint64_t n_waits = 0, n_commits = 0;
     std::atomic<uint64_t> n_waits_total{0}; // CPU waits for the GPU (never reset; read by any thread)
-    // GPU-timeline fence actions
+    // GPU-timeline fence actions. Each command buffer that holds guest work is committed with the
+    // next seq (one numbering for every target) and the next generation of its target (Main,
+    // AsyncCompute: kTgtMain, kTgtAsync). completed_seq is the longest completed prefix of the
+    // seqs, whatever their targets; completed_gen the generations completed per target, in its
+    // queue's order. A fence action belongs to the GNM queue that issued it (fence_q[kQueueGfx /
+    // kQueueCompute]) and needs a generation of each target (Fence::need); RunFences runs the ready
+    // action issued first.
     std::mutex fence_mu;
     std::recursive_mutex fence_run_mu;
-    std::deque<std::pair<uint64_t, std::function<void()>>> fence_q;
+    struct Fence {
+        uint64_t issue = 0;
+        uint64_t need[2] = {}; // generations of kTgtMain, kTgtAsync
+        std::function<void()> fn;
+    };
+    std::deque<Fence> fence_q[2]; // by GNM queue, in issue order
+    uint64_t fence_issued = 0;
     uint64_t committed_seq = 0;            // guarded by fence_mu
     uint64_t completed_seq = 0;            // guarded by fence_mu
+    std::vector<uint64_t> completed_ahead; // completed seqs past completed_seq + 1, sorted (fence_mu)
+    uint64_t committed_gen[2] = {}, completed_gen[2] = {}; // per target (fence_mu)
     std::atomic<uint64_t> completed_pub{0}; // completed_seq, for readers without fence_mu (TableReadBegin)
     double wait_ms = 0;
     std::atomic<uint64_t> gpu_ns{0}; // GPU busy time (union of command buffer execution intervals)
+    std::atomic<uint64_t> gpu_ns_tgt[2] = {}; // the same per target (kTgtMain, kTgtAsync)
     std::mutex gpu_time_mu;
-    double gpu_last_end = 0;
+    double gpu_last_end = 0, gpu_last_end_tgt[2] = {};
     uint64_t n_passes = 0, n_depth_loads = 0, n_cencs = 0, n_cbarriers = 0, n_cdisp = 0; // per stats period
+    uint64_t n_occl_splits = 0; // render passes ended by an occlusion query event (per stats period)
+    uint64_t n_occl_events = 0, n_occl_draws = 0; // ZPASS_DONE events; draws counted for a query (per period)
+    uint64_t n_occl_missed = 0; // draws while a query is open in a pass without a visibility buffer (per period)
     uint64_t cencs_total = 0, cbarriers_total = 0; // since Init (GetEncodeCounts)
+    uint64_t passes_total = 0, occl_splits_total = 0; // since Init (GetEncodeCounts)
     double screen_ms = 0; // time spent handing frames to the window (drawable acquisition)
 };
 
 State S;
+// The latest seq a command buffer being recorded will get (asynchronous compute: either target).
+uint64_t OpenSeqMax();
+
+// Asynchronous compute (Task 10.2.1): compute-ring work that is eligible runs on its own command
+// queue (GnmCmdTarget::AsyncCompute), beside graphics as on GCN; the rest joins Main. Off: every
+// GNM queue on the main command queue. Encoder state after Init.
+bool g_async_compute = false;
+// Why a compute-ring job ran on Main with asynchronous compute on (the counters' line).
+enum class AsyncJoin : uint8_t { GuestMemory, Images, Preparation, WaitOther, WaitUnknown, MainHeld, GfxConsumed, Count };
+const char* AsyncJoinName(AsyncJoin j) {
+    switch (j) {
+    case AsyncJoin::GuestMemory: return "guest-memory";
+    case AsyncJoin::Images: return "images";
+    case AsyncJoin::Preparation: return "preparation";
+    case AsyncJoin::WaitOther: return "wait-other-queue";
+    case AsyncJoin::WaitUnknown: return "wait-unknown";
+    case AsyncJoin::MainHeld: return "main-held";
+    case AsyncJoin::GfxConsumed: return "gfx-consumed";
+    default: return "?";
+    }
+}
+struct AsyncComputeStats {
+    std::atomic<uint64_t> eligible{0}, cross_waits{0};
+    std::atomic<uint64_t> alias_skipped{0}; // alias-window waits left out: the access is on the other queue
+    std::atomic<uint64_t> joined[(size_t)AsyncJoin::Count] = {};
+} g_async_stats;
+
+// The counters' line with the perf line (asynchronous compute on): since the last one.
+std::string TakeAsyncComputeLine() {
+    static uint64_t last_e = 0, last_x = 0, last_a = 0, last_j[(size_t)AsyncJoin::Count] = {}, last_ns[2] = {};
+    char b[224];
+    const uint64_t e = g_async_stats.eligible.load(std::memory_order_relaxed);
+    const uint64_t x = g_async_stats.cross_waits.load(std::memory_order_relaxed);
+    const uint64_t al = g_async_stats.alias_skipped.load(std::memory_order_relaxed);
+    std::string joins;
+    for (size_t i = 0; i < (size_t)AsyncJoin::Count; ++i) {
+        const uint64_t j = g_async_stats.joined[i].load(std::memory_order_relaxed);
+        if (j != last_j[i]) {
+            snprintf(b, sizeof(b), "%s%s %llu", joins.empty() ? "" : ", ", AsyncJoinName((AsyncJoin)i),
+                     (unsigned long long)(j - last_j[i]));
+            joins += b;
+        }
+        last_j[i] = j;
+    }
+    uint64_t ns[2];
+    for (int t = 0; t < 2; ++t) ns[t] = S.gpu_ns_tgt[t].load(std::memory_order_relaxed);
+    snprintf(b, sizeof(b),
+             "eligible %llu, joined %s, cross waits %llu, alias waits across queues left out %llu; GPU busy main %.1f ms, "
+             "async %.1f ms per frame",
+             (unsigned long long)(e - last_e), joins.empty() ? "0" : joins.c_str(), (unsigned long long)(x - last_x),
+             (unsigned long long)(al - last_a), (ns[0] - last_ns[0]) / 1e6 / 300.0, (ns[1] - last_ns[1]) / 1e6 / 300.0);
+    last_e = e, last_x = x, last_a = al, last_ns[0] = ns[0], last_ns[1] = ns[1];
+    return b;
+}
+void CommitAsync();
+void JoinMainAfterAsync();
+// The compute ring the CP thread processes (SetCpComputeRing); -1: the graphics ring.
+thread_local int g_cp_ring = -1;
+constexpr uint64_t kGfxConsumedPresents = 120;
+// A compute ring whose results the graphics ring waited for lately runs on Main (JoinQueues).
+bool RingGfxConsumed(int ring) { return ring >= 0 && ring < 64 && S.async.ring_main_until[ring] > S.present_idx; }
 
 // A draw or dispatch skipped: counted in all and for its reason (State::n_skipped).
 inline void NoteSkip(SkipReason r) {
@@ -1033,10 +1172,16 @@ struct GmStats {
 // The exact buffer stores of a fast dispatch's pass (NoteBufferStore) are queued the same way once
 // the pass is known to have run, and handed to the texture cache there (NoteBufferWrite): the
 // cache's guest-newer marks then come from work that really ran, as on the sync path.
+// Stores carry the write-site sequence their dispatch was encoded at (TextureCache::NoteBufferWrite's
+// encoded_at): a surface the GPU writes later in stream order keeps its texture, whatever the order
+// in which the store becomes known.
+struct GmStore {
+    uint64_t addr, size, encoded_at;
+};
 struct GmInvalidations {
     std::mutex mu; // held only to append or take the lists
     std::vector<GpuWrite> ranges;
-    std::vector<std::pair<uint64_t, uint64_t>> stores;
+    std::vector<GmStore> stores;
     std::atomic<bool> any{false};
 } g_gm_inval;
 
@@ -1051,7 +1196,7 @@ void GmInvalidateOutside(const GmResult& res, const GmPages* pred);
 void GmApplyInvalidations() {
     if (!g_gm_inval.any.load(std::memory_order_acquire) || !S.tex) return;
     thread_local std::vector<GpuWrite> w;
-    thread_local std::vector<std::pair<uint64_t, uint64_t>> st;
+    thread_local std::vector<GmStore> st;
     {
         std::lock_guard<std::mutex> lk(g_gm_inval.mu);
         w.swap(g_gm_inval.ranges);
@@ -1059,17 +1204,18 @@ void GmApplyInvalidations() {
         g_gm_inval.any.store(false, std::memory_order_relaxed);
     }
     if (!w.empty()) S.tex->InvalidateWrites(w);
-    for (const auto& [a, n] : st) S.tex->NoteBufferWrite(a, n, S.write_epoch);
+    for (const GmStore& x : st) S.tex->NoteBufferWrite(x.addr, x.size, S.write_epoch, x.encoded_at);
     w.clear();
     st.clear();
 }
 
 // Queues the exact buffer stores of a fast dispatch's pass that ran (any thread; never blocks on
-// the texture cache), before its result is published.
-void GmQueueStores(const std::vector<std::pair<uint64_t, uint64_t>>& stores) {
+// the texture cache), before its result is published. encoded_at: S.write_site_seq when the
+// dispatch was encoded.
+void GmQueueStores(const std::vector<std::pair<uint64_t, uint64_t>>& stores, uint64_t encoded_at) {
     if (stores.empty()) return;
     std::lock_guard<std::mutex> lk(g_gm_inval.mu);
-    g_gm_inval.stores.insert(g_gm_inval.stores.end(), stores.begin(), stores.end());
+    for (const auto& [a, n] : stores) g_gm_inval.stores.push_back({a, n, encoded_at});
     g_gm_inval.any.store(true, std::memory_order_release);
 }
 
@@ -1388,9 +1534,9 @@ void AliasPruneReleased();
 
 // Drops a window from guest_bufs; its accounting goes when the GPU can no longer use it.
 std::unordered_map<uint64_t, GuestWin>::iterator ReleaseWindow(std::unordered_map<uint64_t, GuestWin>::iterator it) {
-    S.be->Evict(it->second.buf, S.committed_seq + 1); // the open command buffer may still use it
+    S.be->Evict(it->second.buf, OpenSeqMax()); // the open command buffer may still use it
     AliasWindowReleased(it->second, it->first);
-    if (g_mem.on) g_mem.pending.push_back({it->first, (uint64_t)it->second.buf.length, S.committed_seq + 1});
+    if (g_mem.on) g_mem.pending.push_back({it->first, (uint64_t)it->second.buf.length, OpenSeqMax()});
     return S.guest_bufs.erase(it);
 }
 
@@ -1439,8 +1585,8 @@ void DropRemappedWindows() {
 // completes; the next use re-creates it.
 // Drops the detile map and staging caches (SweepGuestWindows' purge); the open seq may still use them.
 void EvictDetileCaches() {
-    for (auto& [k, b] : S.detile_maps) S.be->Evict(b, S.committed_seq + 1);
-    for (auto& [k, b] : S.detile_staging) S.be->Evict(b, S.committed_seq + 1);
+    for (auto& [k, b] : S.detile_maps) S.be->Evict(b, OpenSeqMax());
+    for (auto& [k, b] : S.detile_staging) S.be->Evict(b, OpenSeqMax());
     S.detile_maps.clear();
     S.detile_staging.clear();
 }
@@ -1507,7 +1653,7 @@ void OwnTextureMade(id<MTLTexture> t) {
     if (t && S.be) S.be->MakeResident(t, GnmResidencyClass::Texture);
 }
 void OwnTextureDropped(id<MTLTexture> t) {
-    if (t && S.be) S.be->Evict(t, S.committed_seq + 1);
+    if (t && S.be) S.be->Evict(t, OpenSeqMax());
 }
 
 void ForgetTexture(void* key) {
@@ -1650,6 +1796,7 @@ struct AliasState {
     uint64_t job = 0;                                     // uses[idx] is its use while job is the current one
     uint32_t idx = 0;
     uint64_t stamp = 0; // visited by the use being ordered (FlushAliasOrders)
+    bool listed[2] = {}; // in AliasOrder::open[target]: accesses of that target's open command buffer
     void Prune(uint64_t done) {
         if (w_seq && w_seq <= done) w_seq = 0;
         while (!readers.empty() && readers.front().seq <= done) readers.pop_front();
@@ -1658,6 +1805,7 @@ struct AliasState {
 };
 struct AliasUse {
     AliasState* st; // alive for the job: its window's, or kept in its slots while the job uses it
+    std::shared_ptr<AliasState> keep; // st, for the open command buffer's list (AliasOrder::open)
     uint64_t lo, hi;
     bool written;
     uint64_t serial; // the encoder that last ordered it (EncoderSerial << 1 | Upload), 0: none yet
@@ -1671,8 +1819,24 @@ struct AliasOrder {
     std::vector<std::vector<std::shared_ptr<AliasState>>> cover;
     std::vector<std::pair<std::shared_ptr<AliasState>, uint64_t>> released; // with their window base | windows << 48
     uint64_t waits = 0; // waits asked for (the backend counts those it encodes)
+    // Asynchronous compute: the states with accesses recorded in each target's open command buffer
+    // (seq kOpen[target] until its commit gives them the seq: StampAliasAccesses). The waits left out
+    // because the access is on the other command queue: g_async_stats.alias_skipped (FlushAliasOrders).
+    static constexpr uint64_t kOpen[2] = {UINT64_MAX, UINT64_MAX - 1};
+    std::vector<std::shared_ptr<AliasState>> open[2];
 };
 AliasOrder g_alias;
+
+// The accesses target tgt recorded in its open command buffer belong to `seq`, now committed.
+void StampAliasAccesses(int tgt, uint64_t seq) {
+    for (const std::shared_ptr<AliasState>& a : g_alias.open[tgt]) {
+        if (a->w_seq == AliasOrder::kOpen[tgt]) a->w_seq = seq;
+        for (AliasReader& r : a->readers)
+            if (r.seq == AliasOrder::kOpen[tgt]) r.seq = seq;
+        a->listed[tgt] = false;
+    }
+    g_alias.open[tgt].clear();
+}
 
 // A window was created: its state joins the slots it covers.
 void AliasWindowCreated(GuestWin& w, uint64_t key) {
@@ -1739,15 +1903,29 @@ void NoteWindowUse(GuestWin& w, uint64_t addr, uint64_t size, GuestAccess access
     }
     a.job = g_alias.job;
     a.idx = (uint32_t)g_alias.uses.size();
-    g_alias.uses.push_back({&a, addr, addr + size, written, 0});
+    g_alias.uses.push_back({&a, w.alias, addr, addr + size, written, 0});
 }
 
+// Asynchronous compute: the accesses of each target are recorded with their command buffer's seq
+// (given at its commit). An access recorded by the other command queue is not waited for: a fence
+// orders one queue only, and GCN orders accesses of two GNM queues only where the guest waits for
+// the other queue, which JoinQueues orders (and the two targets of one compute ring are ordered by
+// the events between them, ComputeOnMain / AsyncAfterMainCompute); counted (cross_skipped).
 void FlushAliasOrders(void*) {
     if (g_alias.uses.empty()) return;
-    // serials count per target
+    // serials are unique across targets; the Upload bit as before
     const uint64_t serial = S.be->EncoderSerial() << 1 | (S.be->Target() == GnmCmdTarget::Upload);
     const uint64_t done = CompletedSeq();
-    const uint64_t seq = S.committed_seq + 1;
+    const int tgt = S.be->Target() == GnmCmdTarget::AsyncCompute ? kTgtAsync : kTgtMain; // Upload: Main's seq
+    const uint64_t seq = AliasOrder::kOpen[tgt];
+    const auto wait = [](uint64_t f) {
+        if (S.be->AccessFenceOtherQueue(f)) {
+            g_async_stats.alias_skipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        S.be->WaitAccessFence(f);
+        g_alias.waits++;
+    };
     uint64_t fence = 0;
     for (AliasUse& u : g_alias.uses) {
         if (u.serial == serial) continue; // this encoder ordered it already
@@ -1760,20 +1938,18 @@ void FlushAliasOrders(void*) {
                 if (x.stamp == a.stamp) continue; // this window, or one seen in an earlier slot
                 x.stamp = a.stamp;
                 x.Prune(done);
-                if (x.w_seq && x.w_lo < u.hi && u.lo < x.w_hi) {
-                    S.be->WaitAccessFence(x.w_fence);
-                    g_alias.waits++;
-                }
+                if (x.w_seq && x.w_lo < u.hi && u.lo < x.w_hi) wait(x.w_fence);
                 if (u.written)
                     for (const AliasReader& r : x.readers)
-                        if (r.lo < u.hi && u.lo < r.hi) {
-                            S.be->WaitAccessFence(r.fence);
-                            g_alias.waits++;
-                        }
+                        if (r.lo < u.hi && u.lo < r.hi) wait(r.fence);
             }
         }
         if (!fence) fence = S.be->AccessFence();
         a.Prune(done);
+        if (!a.listed[tgt]) {
+            a.listed[tgt] = true;
+            g_alias.open[tgt].push_back(u.keep);
+        }
         if (u.written) {
             uint64_t lo = a.w_seq ? std::min(a.w_lo, u.lo) : u.lo, hi = a.w_seq ? std::max(a.w_hi, u.hi) : u.hi;
             // the readers still in flight end before this write does (Metal orders it after them: the
@@ -1882,7 +2058,22 @@ void BuildFlat(const struct Shader* s, const uint32_t ud[16], std::vector<uint32
 id<MTLTexture> DepthCompanion(id<MTLTexture> dt, bool encode);
 bool HasStencil(MTLPixelFormat f);
 id<MTLTexture> DepthFromMemory(const ImageDesc& img, bool encode);
+// Occlusion queries (ZpassDone): the visibility buffer for a pass about to begin (nil: not a game
+// pass, or no ZPASS_DONE seen yet), the pass begun, and the visibility mode before each game draw
+// (DB_COUNT_CONTROL, the draw's context register 0xA001).
+id<MTLBuffer> OcclPassBuffer(bool game_draw);
+void OcclPassBegun();
+void OcclBeforeDraw(uint32_t count_control);
+// The GPU depth surface a T# at `address` reads: the last written one with the T#'s sample count
+// (a 1x surface and its 2x checkerboard twin share the memory), else the last written one.
+id<MTLTexture> DepthTargetFor(uint64_t address, const ImageDesc& img);
 id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode);
+// The color target at `address` for a level of `w` x `h`: the last written one of that size, else
+// the last written one.
+id<MTLTexture> ColorTargetFor(uint64_t address, uint32_t w, uint32_t h);
+// The Depth32Float_Stencil8 depth target whose stencil plane `img` (an 8-bit image at the stencil
+// address of a known depth surface, stencil_to_z) reads; nil if none.
+id<MTLTexture> StencilPlaneDepth(const ImageDesc& img);
 uint32_t MipChainSources(const ImageDesc& img, id<MTLTexture> base, __strong id<MTLTexture> (&srcs)[kMaxMips],
                          uint64_t* addrs = nullptr);
 void ComputeEncoder();
@@ -1900,8 +2091,13 @@ void NoteBufferStore(uint64_t addr, uint64_t size) {
 }
 
 void FlushBufferStores() {
-    if (S.tex)
+    if (S.tex) {
+        const size_t marked = S.async.in_scope ? S.tex->GuestNewerCount() : 0;
         for (const auto& [a, n] : S.buffer_stores) S.tex->NoteBufferWrite(a, n, S.write_epoch);
+        // GPU surfaces marked guest newer by AsyncCompute work: their refresh (RefreshGuestNewer, on
+        // Main) waits for it
+        if (S.async.in_scope && S.tex->GuestNewerCount() > marked) S.async.marked_surfaces = true;
+    }
     S.buffer_stores.clear();
 }
 
@@ -1915,7 +2111,16 @@ bool EncodeGpuUploadAt(uint64_t address, const SurfaceDesc& sd, const TextureCac
 // copy destination); a copy that cannot be encoded then drops the mark (FinishGuestNewer).
 void RefreshGuestNewer(uint64_t address, id<MTLTexture> tex, bool write_site) {
     GmApplyInvalidations(); // marks from fast guest memory dispatches that ran (GmQueueStores)
+    // a GPU write encoded while stores of unfinished fast dispatches may still come in: those were
+    // encoded before it, run before it on the GPU, and must not mark the surface once they are known
+    if (write_site && S.store_tickets && S.tex) S.tex->NoteWriteSite(address, tex, ++S.write_site_seq);
     if (!S.tex || !S.tex->GuestNewerCount()) return;
+    // surfaces marked by AsyncCompute work: its writes land in guest memory before the copy reads it
+    // (the copy runs on Main, which Metal does not order after the other queue)
+    if (S.async.marked_surfaces && !S.async.in_scope) {
+        JoinMainAfterAsync(); // the copy below is encoded into the main command buffer, behind the wait
+        S.async.marked_surfaces = false;
+    }
     TextureCache::GpuUpload up;
     // tex nil: every marked surface at the address (several surfaces can share it)
     while (S.tex->TakeGuestNewer(address, tex, &up)) {
@@ -1936,7 +2141,8 @@ void NoteGpuWrite(uint64_t addr, uint64_t size) {
     // the same range written again by this command buffer: only its latest write matters (the
     // hazard check and the texture invalidation both take the latest epoch of a range)
     uint32_t& slot = S.gpu_written_slot[((addr >> 8) ^ size) & 63];
-    S.pending_writes.Note(addr, size, S.write_epoch + 1);
+    S.pending_writes.Note(addr, size, S.write_epoch + 1,
+                          S.be->Target() == GnmCmdTarget::AsyncCompute ? kTgtAsync : kTgtMain);
     if (slot < S.gpu_written.size() && S.gpu_written[slot].addr == addr && S.gpu_written[slot].size == size) {
         S.gpu_written[slot].epoch = ++S.write_epoch;
         return;
@@ -2046,9 +2252,14 @@ void EndEncoders() {
 }
 
 std::atomic<bool> g_cmd_open{false}; // S.be->CmdOpen(Main), readable from the CP thread
+std::atomic<bool> g_async_open{false}; // S.be->CmdOpen(AsyncCompute), readable from the CP thread
 // S.be->CmdOpen(GnmCmdTarget::Main) without a virtual call, for the per-dispatch and per-fence
 // paths of the encoder thread (which writes g_cmd_open itself).
 inline bool MainCmdOpen() { return g_cmd_open.load(std::memory_order_relaxed); }
+// PS4_GNM_LABEL_TRACE's records of each seq (AfterGpuLabel)
+void LabelSeqOpened(int tgt, uint64_t gen);
+void LabelSeqCommitted(int tgt, uint64_t gen);
+void LabelSeqDone(int tgt, uint64_t gen, double gpu_start, double gpu_end);
 
 // PS4_GNM_ENCODER_STATUS=1 (debug): command buffers report per-encoder execution status, and
 // every encoder is labelled with the index of its first work record, so a failed command buffer
@@ -2198,6 +2409,7 @@ void EnsureCmd() {
                        EncoderStatusEnabled());
     }
     g_cmd_open.store(true, std::memory_order_release);
+    LabelSeqOpened(kTgtMain, S.committed_gen[kTgtMain] + 1);
     S.cmd_log = std::make_shared<WorkLog>();
     // the wait goes into the new main command buffer: Main must be the current target here
     RequireMainTarget("EnsureCmd");
@@ -2213,20 +2425,52 @@ void LogWork(const char* what) {
     LogWork(r);
 }
 
-// Runs queued fence actions whose command buffers completed (in order).
-void RunFences(uint64_t upto) {
+// fence_mu held: a fence action's needs are met.
+bool FenceReady(const State::Fence& f) {
+    return f.need[kTgtMain] <= S.completed_gen[kTgtMain] && f.need[kTgtAsync] <= S.completed_gen[kTgtAsync];
+}
+
+// Completion of the seq `seq`, generation `gen` of target `tgt` (fence_mu held).
+void NoteSeqDoneLocked(uint64_t seq, int tgt, uint64_t gen) {
+    S.completed_gen[tgt] = std::max(S.completed_gen[tgt], gen);
+    if (seq <= S.completed_seq) return;
+    if (seq != S.completed_seq + 1) {
+        S.completed_ahead.insert(std::upper_bound(S.completed_ahead.begin(), S.completed_ahead.end(), seq), seq);
+        return;
+    }
+    S.completed_seq = seq;
+    size_t n = 0;
+    while (n < S.completed_ahead.size() && S.completed_ahead[n] == S.completed_seq + 1) S.completed_seq = S.completed_ahead[n++];
+    S.completed_ahead.erase(S.completed_ahead.begin(), S.completed_ahead.begin() + n);
+    S.completed_pub.store(S.completed_seq);
+}
+
+// Everything committed has completed (WaitAll; a hung GPU: fences keep being signalled).
+void NoteAllDone() {
+    std::lock_guard<std::mutex> lk(S.fence_mu);
+    S.completed_seq = std::max(S.completed_seq, S.committed_seq);
+    S.completed_ahead.clear();
+    for (int t = 0; t < 2; ++t) S.completed_gen[t] = std::max(S.completed_gen[t], S.committed_gen[t]);
+    S.completed_pub.store(S.completed_seq);
+}
+
+// Runs the queued fence actions whose needs are met: of the ready heads of the GNM queues, the one
+// issued first, until none is ready (so actions of one queue run in their order, and with every
+// action on Main they run in issue order).
+void RunFences() {
     std::lock_guard<std::recursive_mutex> run(S.fence_run_mu);
     for (;;) {
         std::function<void()> fn;
         {
             std::lock_guard<std::mutex> lk(S.fence_mu);
-            if (upto > S.completed_seq) {
-                S.completed_seq = upto;
-                S.completed_pub.store(upto);
-            }
-            if (S.fence_q.empty() || S.fence_q.front().first > S.completed_seq) return;
-            fn = std::move(S.fence_q.front().second);
-            S.fence_q.pop_front();
+            int pick = -1;
+            for (int q = 0; q < 2; ++q)
+                if (!S.fence_q[q].empty() && FenceReady(S.fence_q[q].front()) &&
+                    (pick < 0 || S.fence_q[q].front().issue < S.fence_q[pick].front().issue))
+                    pick = q;
+            if (pick < 0) return;
+            fn = std::move(S.fence_q[pick].front().fn);
+            S.fence_q[pick].pop_front();
         }
         if (fn) fn();
     }
@@ -2237,6 +2481,8 @@ void GmCommandBufferFailed(const std::vector<std::shared_ptr<GmTicket>>& tickets
 // What the completion of one seq needs (the former addCompletedHandler block's captures).
 struct CommitDone {
     uint64_t seq = 0, cmd_index = 0;
+    int tgt = kTgtMain;
+    uint64_t gen = 0; // the target's generation
     std::shared_ptr<std::vector<GpuWrite>> written;
     TextureCache* tex_cache = nullptr;
     std::shared_ptr<WorkLog> log;
@@ -2261,13 +2507,23 @@ void CommitDoneFn(void* p, const GnmCompletion& c) {
     if (d->completed) d->completed->store(true, std::memory_order_release);
     if (d->written && d->tex_cache) d->tex_cache->InvalidateWrites(*d->written);
     {
-        // GPU busy time: union of the command buffers' execution intervals (they may overlap)
+        // GPU busy time: union of the command buffers' execution intervals (they may overlap), in all
+        // and per target
         std::lock_guard<std::mutex> lk(S.gpu_time_mu);
         const double from = std::max(c.gpu_start, S.gpu_last_end);
         if (c.gpu_end > from) S.gpu_ns.fetch_add((uint64_t)((c.gpu_end - from) * 1e9), std::memory_order_relaxed);
         S.gpu_last_end = std::max(S.gpu_last_end, c.gpu_end);
+        const double from_t = std::max(c.gpu_start, S.gpu_last_end_tgt[d->tgt]);
+        if (c.gpu_end > from_t)
+            S.gpu_ns_tgt[d->tgt].fetch_add((uint64_t)((c.gpu_end - from_t) * 1e9), std::memory_order_relaxed);
+        S.gpu_last_end_tgt[d->tgt] = std::max(S.gpu_last_end_tgt[d->tgt], c.gpu_end);
     }
-    RunFences(d->seq);
+    LabelSeqDone(d->tgt, d->gen, c.gpu_start, c.gpu_end);
+    {
+        std::lock_guard<std::mutex> lk(S.fence_mu);
+        NoteSeqDoneLocked(d->seq, d->tgt, d->gen);
+    }
+    RunFences();
     NoteSeqCompleted();
     if (c.failed) {
         // how long the seq ran on the GPU tells a hang (about the system's time limit) from a fault
@@ -2302,6 +2558,7 @@ constexpr uint64_t kHoldBacklog = 2, kHoldNs = 500000; // kHoldNs: the bound (De
 // PS4_GNM_COMPUTE_BATCH=0 (read in Init): no hold, every compute submission is committed at its end
 // (the behaviour before batching, docs/compute-batching.md)
 bool g_compute_batch = true;
+
 struct ComputeHold {
     std::mutex mu;
     std::condition_variable cv;
@@ -2381,6 +2638,12 @@ void NoteSeqCompleted() {
 
 void FlushComputeImpl() {
     if (!S.enabled.load(std::memory_order_acquire)) return;
+    // the end of a compute submission: its AsyncCompute work is committed at once (its labels wait
+    // for nothing else), and a join of its compute work to Main ends
+    if (g_async_compute) {
+        CommitAsync();
+        S.async.compute_joined = false;
+    }
     if (!g_compute_batch || !MainCmdOpen() || SeqsInFlight() < kHoldBacklog) {
         Commit();
         return;
@@ -2426,12 +2689,16 @@ void Commit() {
     S.arena.cur.clear();
     done->log = std::move(S.cmd_log);
     S.cmd_log.reset();
-    uint64_t seq;
+    uint64_t seq, gen;
     {
         std::lock_guard<std::mutex> lk(S.fence_mu);
         seq = ++S.committed_seq;
+        gen = ++S.committed_gen[kTgtMain];
     }
+    LabelSeqCommitted(kTgtMain, gen);
+    StampAliasAccesses(kTgtMain, seq);
     done->seq = seq;
+    done->gen = gen;
     // textures looked up from now on are used by the next command buffer
     if (S.tex) S.tex->SetUse(seq + 1, g_mem.tick);
     // Guest memory written by this command buffer: sampled textures created from it are stale
@@ -2458,6 +2725,8 @@ void Commit() {
     static const long hang_ms = getenv("PS4_GNM_HANG_REPORT_MS") ? atol(getenv("PS4_GNM_HANG_REPORT_MS")) : 0;
     std::shared_ptr<std::atomic<bool>> completed;
     if (hang_ms > 0) done->completed = completed = std::make_shared<std::atomic<bool>>(false);
+    // asynchronous compute work may wait for this generation (AsyncAfterMainCompute)
+    if (g_async_compute) S.be->QueueSignal(S.async.main_ev, gen);
     // the upload command buffer (texture copies used by this work) is committed first: same queue
     S.be->Commit(seq, CommitDoneFn, done); // done is deleted by CommitDoneFn
     g_gms.committed = g_gms.encoded;
@@ -2479,11 +2748,178 @@ void Commit() {
     S.inflight_logs.push_back({seq, cmd_index, log});
 }
 
+// ---- Asynchronous compute (g_async_compute, Task 10.2.1; docs/gnm-ordering.md). Compute-ring
+// work that is eligible (DispatchEncode, GpuDmaImpl) is encoded into the AsyncCompute target's
+// command buffer, on its own command queue, beside the main one; its generations are committed
+// with seqs of the same numbering (CommitAsync). Metal orders nothing between the two queues: what
+// the guest orders between its queues (a WAIT_REG_MEM on the other queue's label) is ordered by
+// JoinQueues, and the compute rings' own order across the targets by the waits below on each
+// target's event (main_ev, async_ev: signalled with the generation at each commit). The signalling
+// target is always committed before a wait for it is encoded, so a wait never waits for a command
+// buffer still being recorded. Encoder thread.
+
+// The fields of the target being recorded and of the AsyncCompute one trade places (AsyncScope).
+void SwapAsyncFields() {
+    std::swap(S.arena.cur, S.async.arena_cur);
+    std::swap(S.gpu_written, S.async.gpu_written);
+    std::swap(S.gpu_written_slot, S.async.gpu_written_slot);
+    std::swap(S.cmd_log, S.async.cmd_log);
+    std::swap(S.cmd_index, S.async.cmd_index);
+}
+
+void EnsureAsyncCmd() {
+    if (S.async.open) return;
+    S.cmd_index = S.n_cmdbufs++; // the AsyncCompute fields are swapped in
+    S.be->BeginCmd(GnmCmdTarget::AsyncCompute,
+                   [NSString stringWithFormat:@"gnm-async-%llu", (unsigned long long)S.cmd_index], EncoderStatusEnabled());
+    S.async.open = true;
+    g_async_open.store(true, std::memory_order_release);
+    S.cmd_log = std::make_shared<WorkLog>();
+    LabelSeqOpened(kTgtAsync, S.committed_gen[kTgtAsync] + 1);
+}
+
+// AsyncCompute as the current target, its fields swapped in, for the scope. open: its command
+// buffer is opened if it is not. Main's open encoder (a render pass) stays open meanwhile: the
+// two command buffers are recorded independently. A guest memory chain is Main's: closed first.
+struct AsyncScope {
+    GnmCmdTarget prev;
+    bool entered = false;
+    explicit AsyncScope(bool open = true) : prev(S.be->Target()) {
+        if (S.async.in_scope) return;
+        if (g_gms.chain_open && !g_gms.chain_closing) GmCloseChain();
+        prev = S.be->Target();
+        SwapAsyncFields();
+        S.async.in_scope = entered = true;
+        S.be->UseTarget(GnmCmdTarget::AsyncCompute);
+        if (open) EnsureAsyncCmd();
+    }
+    ~AsyncScope() {
+        if (!entered) return;
+        S.be->UseTarget(prev);
+        SwapAsyncFields();
+        S.async.in_scope = false;
+    }
+    AsyncScope(const AsyncScope&) = delete;
+    AsyncScope& operator=(const AsyncScope&) = delete;
+};
+
+// Commits the AsyncCompute command buffer, if open, as the next seq and generation.
+void CommitAsync() {
+    if (!S.async.open) return;
+    AsyncScope scope(false);
+    if (S.be->OpenEncoder() != GnmEncoder::None) S.be->EndEncoder();
+    auto* done = new CommitDone;
+    done->cmd_index = S.cmd_index;
+    done->tgt = kTgtAsync;
+    done->arena = &S.arena;
+    done->chunks.reserve(S.arena.cur.size());
+    for (auto& c : S.arena.cur) done->chunks.push_back(c.buf);
+    S.arena.cur.clear();
+    done->log = std::move(S.cmd_log);
+    S.cmd_log.reset();
+    uint64_t seq, gen;
+    {
+        std::lock_guard<std::mutex> lk(S.fence_mu);
+        seq = ++S.committed_seq;
+        gen = ++S.committed_gen[kTgtAsync];
+    }
+    LabelSeqCommitted(kTgtAsync, gen);
+    StampAliasAccesses(kTgtAsync, seq);
+    done->seq = seq;
+    done->gen = gen;
+    if (!S.gpu_written.empty()) {
+        done->written = std::make_shared<std::vector<GpuWrite>>(S.gpu_written);
+        S.inflight_written.push_back({seq, std::move(S.gpu_written)});
+        S.gpu_written.clear();
+        S.table_written.push_back({seq, done->written});
+    }
+    S.pending_writes.Commit(seq, kTgtAsync);
+    PruneTableWrites();
+    done->tex_cache = S.tex;
+    std::shared_ptr<WorkLog> log = done->log;
+    const uint64_t cmd_index = S.cmd_index;
+    S.be->QueueSignal(S.async.async_ev, gen);
+    S.be->CommitAsync(seq, CommitDoneFn, done); // done is deleted by CommitDoneFn
+    S.async.open = false;
+    g_async_open.store(false, std::memory_order_release);
+    S.n_commits++;
+    S.inflight_logs.push_back({seq, cmd_index, log});
+}
+
+// The AsyncCompute generations committed and not complete (any thread may complete them).
+bool AsyncPending() {
+    if (S.async.open) return true;
+    std::lock_guard<std::mutex> lk(S.fence_mu);
+    return S.completed_gen[kTgtAsync] < S.committed_gen[kTgtAsync];
+}
+
+// Main's work from here on runs after all AsyncCompute work so far (on the GPU: an event wait in
+// the main command buffer; its open encoder is ended).
+// The upload command buffer (committed right before Main's) needs no wait: its bind-time uploads
+// skip guest memory with GPU writes pending on either queue (SampledTexture: OverlapsPendingWrite;
+// those go through GpuUploadTexture on Main), and its alias copies read textures, which
+// AsyncCompute work does not write (Images makes a job join Main).
+void JoinMainAfterAsync() {
+    if (!AsyncPending()) return;
+    CommitAsync();
+    const uint64_t gen = S.committed_gen[kTgtAsync];
+    if (gen <= S.async.main_waited) return;
+    EndEncoders();
+    EnsureCmd();
+    S.be->QueueWait(S.async.async_ev, gen);
+    S.async.main_waited = gen;
+    g_async_stats.cross_waits.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Before an AsyncCompute job (current target AsyncCompute, nothing open on it but its command
+// buffer): it runs after the compute rings' work that went to Main. That generation is committed
+// first (the caller, before the scope: Commit is Main's) and waited for here.
+void AsyncAfterMainCompute() {
+    const uint64_t gen = S.async.main_compute_gen;
+    if (!gen || gen <= S.async.waited_main) return;
+    {
+        std::lock_guard<std::mutex> lk(S.fence_mu);
+        if (gen <= S.completed_gen[kTgtMain]) return;
+    }
+    if (S.be->OpenEncoder() != GnmEncoder::None) S.be->EndEncoder();
+    S.be->QueueWait(S.async.main_ev, gen);
+    S.async.waited_main = gen;
+    g_async_stats.cross_waits.fetch_add(1, std::memory_order_relaxed);
+}
+
+// A compute-ring job encoded on Main with asynchronous compute on: after the AsyncCompute work so far
+// (the compute rings run in order), and fence actions of the compute rings wait for this Main
+// generation too (FenceNeeds). Counted under `why`.
+void ComputeOnMain(AsyncJoin why) {
+    JoinMainAfterAsync();
+    EnsureCmd();
+    S.async.main_compute_gen = S.committed_gen[kTgtMain] + 1;
+    g_async_stats.joined[(size_t)why].fetch_add(1, std::memory_order_relaxed);
+}
+
+// The open main command buffer holds compute-ring work: the compute rings' next jobs stay on Main
+// until it is committed in its own time (an AsyncCompute job would have to wait for it, and
+// committing it for that splits graphics work).
+bool MainHoldsCompute() { return S.async.main_compute_gen > S.committed_gen[kTgtMain]; }
+
+// Commit() if the open main command buffer holds compute-ring work that an AsyncCompute job must
+// wait for (outside AsyncScope). (Routing sends such jobs to Main instead: MainHoldsCompute.)
+void CommitMainComputeForAsync() {
+    if (MainHoldsCompute()) Commit();
+}
+
+// The latest seq a command buffer being recorded will get: what is used now is released only after
+// it (Evict, the memory budget), whichever target uses it.
+uint64_t OpenSeqMax() {
+    return S.committed_seq + std::max<uint64_t>(1, (MainCmdOpen() ? 1 : 0) + (S.async.open ? 1 : 0));
+}
+
 // Waits until every committed command buffer has completed and the guest memory dispatches in
 // them have final results (re-running missed ones meanwhile). Sleeps on g_gms.cv, which the
 // completion handlers and the ticket listener notify. Watchdog: S.gpu_timeout_ms without any
 // command buffer completing (a GPU hang can never block the guest forever).
 void WaitAll() {
+    CommitAsync(); // everything encoded, on both queues
     const double t0 = CFAbsoluteTimeGetCurrent();
     if (!S.inflight_logs.empty()) S.n_waits++, S.n_waits_total++;
     const auto committed = [] {
@@ -2518,14 +2954,8 @@ void WaitAll() {
         GiveUpGpu(label, stuck ? stuck->log.get() : nullptr);
     }
     S.inflight_logs.clear();
-    {
-        uint64_t upto;
-        {
-            std::lock_guard<std::mutex> lk(S.fence_mu);
-            upto = S.committed_seq;
-        }
-        RunFences(upto);
-    }
+    NoteAllDone();
+    RunFences();
     // everything committed has completed; its completion handlers may still be pending, so
     // drop stale sampled textures here as well
     if (S.tex && !S.inflight_written.empty()) {
@@ -4096,7 +4526,7 @@ void NoteImage(Stage st, uint32_t index, const ImageDesc& img, bool storage, boo
     // a mip chain assembled from render targets (MipChainFor) also reads the targets of its levels
     id<MTLTexture> mips[kMaxMips];
     const uint32_t nmips = !storage && !depth_image && !ids.empty() && !S.tex->FindDepthTarget(img.address)
-                               ? MipChainSources(img, S.tex->FindColorTarget(img.address), mips)
+                               ? MipChainSources(img, ColorTargetFor(img.address, img.width, img.height), mips)
                                : 0;
     for (uint32_t m = 1; m < nmips; ++m) {
         GpuTextureId gid;
@@ -4751,7 +5181,7 @@ bool BindGuestPageTable(Binder& b, __strong id<MTLBuffer>* out) {
             memcpy(t.contents, g_gmem.table.contents, g_gmem.table.length);
             S.be->MakeResident(t, GnmResidencyClass::Builtin);
             // passes encoded so far (up to the open seq) keep reading the old table
-            S.be->Evict(g_gmem.table, S.committed_seq + 1);
+            S.be->Evict(g_gmem.table, OpenSeqMax());
             g_gmem.old_tables.push_back({S.committed_seq + 1, g_gmem.table});
             g_gmem.table = t;
             g_gmem.table_bound = false;
@@ -4846,6 +5276,8 @@ GuestMemoryStats GetGuestMemoryStats() {
 bool Hung() { return S.hung; }
 
 void TestWithholdNextTicket() { g_gms.withhold_next.store(true); }
+
+void TestFailNextChain() { g_gms.fail_next_chain.store(true); }
 
 void TestHoldTextureCacheLock(bool hold) {
     if (!S.tex) return;
@@ -5258,7 +5690,7 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                            ib.table == UINT32_MAX ? -1 : (int32_t)ib.table_entry);
         if (have) {
             if (ib.is_depth) {
-                tex = S.tex->FindDepthTarget(img.address);
+                tex = DepthTargetFor(img.address, img);
                 if (!tex) tex = DepthFromMemory(img, false);
                 if (!tex) RLog("depth-tex", "depth texture at 0x%llx (fmt %u/%u %ux%u tile %u) not a known depth target",
                                (unsigned long long)img.address, img.raw_dfmt, img.raw_nfmt, img.width, img.height,
@@ -5273,13 +5705,10 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                     RLog("storage-tex", "storage image unsupported (fmt %u/%u %ux%u type %u)",
                          img.raw_dfmt, img.raw_nfmt, img.width, img.height, (uint32_t)img.type);
                 }
-            } else if (auto sz = S.stencil_to_z.find(img.address);
-                       sz != S.stencil_to_z.end() && S.tex->FindDepthTarget(sz->second) &&
-                       S.tex->FindDepthTarget(sz->second).pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+            } else if (id<MTLTexture> dt = StencilPlaneDepth(img)) {
                 // the stencil plane of a depth target, read as an 8-bit integer image
-                id<MTLTexture> dt = S.tex->FindDepthTarget(sz->second);
                 tex = [dt newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
-            } else if (id<MTLTexture> dt = S.tex->FindDepthTarget(img.address)) {
+            } else if (id<MTLTexture> dt = DepthTargetFor(img.address, img)) {
                 tex = DepthCompanion(dt, false);
                 if (!tex) RLog("depth-as-color", "depth surface 0x%llx sampled as color: no companion",
                                (unsigned long long)img.address);
@@ -5502,7 +5931,8 @@ void SyncDepthSibling(const DepthTarget& db, id<MTLTexture> t) {
 // PS4 Pro resolve of the 2x checkerboard depth into a 1x depth buffer): move the values into the
 // depth target used for rendering.
 void SyncStorageToStencil(uint64_t z_addr, id<MTLTexture> src) {
-    id<MTLTexture> dt = S.tex->FindDepthTarget(z_addr);
+    // the 1x surface (not a 2x twin bound later: SyncDepthSibling copies from the 1x one)
+    id<MTLTexture> dt = S.tex->FindDepthTarget(z_addr, 1);
     if (!dt || dt.sampleCount > 1 || dt.textureType != MTLTextureType2D || !HasStencil(dt.pixelFormat)) return;
     static std::unordered_map<uint32_t, id<MTLRenderPipelineState>>& psos = *new std::unordered_map<uint32_t, id<MTLRenderPipelineState>>;
     static __strong id<MTLDepthStencilState>& dss = *new __strong id<MTLDepthStencilState>(nil);
@@ -5551,8 +5981,8 @@ void SyncStorageToDepth() {
             continue;
         }
         if (src.pixelFormat != MTLPixelFormatR32Float || src.sampleCount > 1) continue;
-        id<MTLTexture> dt = S.tex->FindDepthTarget(addr);
-        if (!dt || dt.sampleCount > 1 || dt.textureType != MTLTextureType2D) continue;
+        id<MTLTexture> dt = S.tex->FindDepthTarget(addr, 1); // the 1x surface, as above
+        if (!dt || dt.textureType != MTLTextureType2D) continue;
         __strong id<MTLRenderPipelineState>& pso = S.depth_from_color_psos[(uint32_t)dt.pixelFormat];
         if (!pso && S.util_lib) {
             MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
@@ -5656,6 +6086,23 @@ uint64_t MipChainKey(const ImageDesc& img) {
     return Fnv(k, sizeof(k));
 }
 
+id<MTLTexture> DepthTargetFor(uint64_t address, const ImageDesc& img) {
+    id<MTLTexture> t = S.tex->FindDepthTarget(address, img.num_samples);
+    return t ? t : S.tex->FindDepthTarget(address);
+}
+
+id<MTLTexture> StencilPlaneDepth(const ImageDesc& img) {
+    auto sz = S.stencil_to_z.find(img.address);
+    if (sz == S.stencil_to_z.end()) return nil;
+    id<MTLTexture> dt = DepthTargetFor(sz->second, img);
+    return dt && dt.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? dt : nil;
+}
+
+id<MTLTexture> ColorTargetFor(uint64_t address, uint32_t w, uint32_t h) {
+    id<MTLTexture> t = S.tex->FindColorTarget(address, w, h);
+    return t ? t : S.tex->FindColorTarget(address);
+}
+
 // The render targets a mip chain of `img` is assembled from (MipChainFor), given `base`, the
 // color target at img.address (FindColorTarget): srcs[m] is the one at level m's address (nil:
 // none; srcs[0] = base). Returns the number of levels, 0 if `img` is not a mipmapped 2D texture
@@ -5668,7 +6115,9 @@ uint32_t MipChainSources(const ImageDesc& img, id<MTLTexture> base, __strong id<
     if (!ComputeSurfaceLayout(img.ToSurfaceDesc(), &layout)) return 0;
     const uint32_t levels = std::min<uint32_t>(std::min<uint32_t>(img.NumViewLevels(), layout.num_mips), kMaxMips);
     srcs[0] = base;
-    for (uint32_t m = 1; m < levels; ++m) srcs[m] = S.tex->FindColorTarget(img.address + layout.mips[m].offset);
+    for (uint32_t m = 1; m < levels; ++m)
+        srcs[m] = ColorTargetFor(img.address + layout.mips[m].offset, std::max(1u, img.width >> m),
+                                 std::max(1u, img.height >> m));
     if (addrs)
         for (uint32_t m = 0; m < levels; ++m) addrs[m] = img.address + layout.mips[m].offset;
     return levels;
@@ -5679,7 +6128,7 @@ uint32_t MipChainSources(const ImageDesc& img, id<MTLTexture> base, __strong id<
 // render targets found at the mip addresses (blits encoded into the current command buffer).
 id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode) {
     if (img.mtl_texture_type != MTLTextureType2D || img.NumViewLevels() < 2 || img.pixel.compressed) return nil;
-    id<MTLTexture> base = S.tex->FindColorTarget(img.address);
+    id<MTLTexture> base = ColorTargetFor(img.address, img.width, img.height);
     if (!base || base.sampleCount > 1 || base.width != img.width || base.height != img.height) return nil;
     const uint64_t key = MipChainKey(img);
     auto it = S.mip_chains.find(key);
@@ -5791,7 +6240,7 @@ void PrepareDepthCompanions(const Shader* s, const std::vector<uint32_t>& flat) 
             if (!S.tex->FindDepthTarget(img.address)) DepthFromMemory(img, true);
             continue;
         }
-        if (id<MTLTexture> dt = S.tex->FindDepthTarget(img.address)) DepthCompanion(dt, true);
+        if (id<MTLTexture> dt = DepthTargetFor(img.address, img)) DepthCompanion(dt, true);
         else MipChainFor(img, true);
     }
 }
@@ -5889,7 +6338,7 @@ bool EncodeGpuUploadAt(uint64_t address, const SurfaceDesc& sd, const TextureCac
             std::vector<uint32_t> m;
             if (!BuildDetileMap(up.surf, up.layout, avail, 0, up.levels, &m) || m.empty()) return false;
             if (S.detile_maps.size() >= 64) {
-                for (auto& [k, b] : S.detile_maps) S.be->Evict(b, S.committed_seq + 1);
+                for (auto& [k, b] : S.detile_maps) S.be->Evict(b, OpenSeqMax());
                 S.detile_maps.clear();
             }
             map = [S.dev newBufferWithBytes:m.data() length:m.size() * 4 options:MTLResourceStorageModeShared];
@@ -6099,8 +6548,10 @@ id<MTLTexture> SampledTexture(const ImageDesc& img) {
 void ResolveTextureHazards(const Shader* s, const std::vector<uint32_t>& flat) {
     if (s->imgs.empty()) return;
     GmApplyInvalidations();
-    if (S.tex->GuestNewerCount()) {
-        // sampled and storage images of a GPU-owned surface that buffer stores overwrote
+    // sampled and storage images of a GPU-owned surface that buffer stores overwrote; and, while
+    // stores of fast guest memory dispatches may still come in, the storage images as GPU write
+    // sites (RefreshGuestNewer)
+    if (S.tex->GuestNewerCount() || S.store_tickets) {
         for (uint32_t i = 0; i < s->imgs.size(); ++i) {
             if (s->imgs[i].is_depth) continue;
             ImageDesc img;
@@ -6110,7 +6561,18 @@ void ResolveTextureHazards(const Shader* s, const std::vector<uint32_t>& flat) {
     PruneCompletedWrites();
     if (S.pending_writes.Empty()) return;
     for (uint32_t i = 0; i < s->imgs.size(); ++i) {
-        if (s->imgs[i].is_storage || s->imgs[i].is_depth) continue;
+        if (s->imgs[i].is_depth) continue;
+        if (s->imgs[i].is_storage) {
+            ImageDesc img;
+            uint64_t approx = 0;
+            if (!StageImage(s, flat, i, &img, &approx) || !img.valid) continue;
+            if (!S.tex->OverlapsGpuTexture(img.address, 1) && OverlapsPendingWrite(img.address, approx)) {
+                const bool can_gpu = S.detile_pso != nil && BackendHas(kGnmCapCompute | kGnmCapCopies);
+                if (id<MTLTexture> st = S.tex->GetStorageTexture(img, can_gpu))
+                    RefreshGuestNewer(img.address, st, true);
+            }
+            continue;
+        }
         ImageDesc img;
         uint64_t approx = 0;
         if (!StageImage(s, flat, i, &img, &approx) || !img.valid) continue;
@@ -6281,7 +6743,9 @@ void ResolveEqaaPass() {
     LogWork("EQAA write-back");
 }
 
-bool BeginPass(const PassKey& key, const ClearReq& clr, id<MTLTexture> const* hold) {
+// game_draw: the pass is begun for a game draw (it may count for an occlusion query), not for a
+// clear alone.
+bool BeginPass(const PassKey& key, const ClearReq& clr, id<MTLTexture> const* hold, bool game_draw) {
     if (g_gms.chain_open) GmCloseChain();
     const GnmEncoder open = S.be->OpenEncoder();
     if (open == GnmEncoder::Compute) S.be->EndEncoder();
@@ -6362,9 +6826,12 @@ bool BeginPass(const PassKey& key, const ClearReq& clr, id<MTLTexture> const* ho
         label = WorkLabel("render");
     }
     pd.label = label;
+    pd.visibility = OcclPassBuffer(game_draw); // held by the occlusion state while the pass is open
     if (!S.be->BeginRender(pd)) return false;
+    OcclPassBegun();
     g_rstate.Reset(S.be->EncoderSerial());
     S.n_passes++;
+    S.passes_total++;
     if (key.depth && !clr.depth) S.n_depth_loads++;
     S.pass = key;
     for (int i = 0; i < 9; ++i) S.pass_hold[i] = hold ? hold[i] : nil;
@@ -6372,6 +6839,20 @@ bool BeginPass(const PassKey& key, const ClearReq& clr, id<MTLTexture> const* ho
 }
 
 void ComputeEncoder() {
+    if (S.async.in_scope) {
+        // AsyncCompute: its own command buffer and compute encoder; Main's encoders stay as they are
+        EnsureAsyncCmd();
+        if (S.be->OpenEncoder() != GnmEncoder::Compute) {
+            if (S.be->OpenEncoder() != GnmEncoder::None) S.be->EndEncoder();
+            static const bool serial = getenv("PS4_GNM_SERIAL_COMPUTE") != nullptr;
+            S.be->BeginCompute(serial);
+            if (EncoderStatusEnabled()) S.be->SetEncoderLabel(WorkLabel("async compute"));
+            g_cstate.Reset(S.be->EncoderSerial());
+            S.n_cencs++;
+            S.cencs_total++;
+        }
+        return;
+    }
     if (g_gms.chain_open && !g_gms.chain_member) GmCloseChain();
     if (S.be->OpenEncoder() == GnmEncoder::Render) {
         S.be->EndEncoder();
@@ -6662,9 +7143,377 @@ id<MTLDepthStencilState> GetDepthStencil(const DepthStencilState& ds, bool has_d
 // =====================================================================================
 // Primitive emulation (quad lists -> triangle lists), cf. shadPS4 liverpool_to_vk.cpp
 // =====================================================================================
+// ---- Indirect draws the CP cannot hand to the GPU path (it then drains the GPU, reads the
+// arguments on the CPU and draws directly), by reason: counted on the CP thread, printed with the
+// perf line ("[gnm-draw] indirect fallbacks:").
+std::atomic<uint64_t> g_indirect_fallbacks[(size_t)IndirectFallback::Count];
+std::atomic<uint64_t> g_indirect_emulation[32]; // IndirectFallback::Emulation by primitive type
+std::atomic<uint64_t> g_record_unchecked{0};     // IndirectRecordOffsets: GPU-written records used as they are
+std::atomic<uint64_t> g_quad_pool_reserved{0};   // quad index pool bytes allocated so far (QuadRegion)
+std::atomic<uint64_t> g_quad_region_max{0};      // the largest region in the current perf window
+std::atomic<uint64_t> g_args_patched{0}, g_args_copied{0}; // IndirectRecordOffsets: on the GPU, on the CPU
+const volatile uint32_t* QuadNeed();             // the kernel's records of non-indexed draws that did not fit
+
+const char* IndirectFallbackName(IndirectFallback r) {
+    switch (r) {
+    case IndirectFallback::UserSgpr: return "user-sgpr";
+    case IndirectFallback::IndxOffset: return "indx-offset";
+    case IndirectFallback::NoMaxIndex: return "no-max-index";
+    case IndirectFallback::Emulation: return "needs-emulation";
+    case IndirectFallback::Range: return "range";
+    case IndirectFallback::QuadSize: return "quad-size";
+    case IndirectFallback::Count: break;
+    }
+    return "?";
+}
+
+void NoteIndirectFallback(IndirectFallback r, PrimitiveType prim) {
+    g_indirect_fallbacks[(size_t)r].fetch_add(1, std::memory_order_relaxed);
+    if (r == IndirectFallback::Emulation) g_indirect_emulation[(uint32_t)prim & 31].fetch_add(1, std::memory_order_relaxed);
+}
+
+// The counts since the previous call, as "<reason> <n>, needs-emulation:<prim> <n>, ..." ("none").
+std::string TakeIndirectFallbacks() {
+    static uint64_t last[(size_t)IndirectFallback::Count], last_emu[32];
+    std::string out;
+    char item[96];
+    for (size_t i = 0; i < (size_t)IndirectFallback::Count; ++i) {
+        if ((IndirectFallback)i == IndirectFallback::Emulation) {
+            for (uint32_t p = 0; p < 32; ++p) {
+                const uint64_t v = g_indirect_emulation[p].load(std::memory_order_relaxed);
+                if (v == last_emu[p]) continue;
+                snprintf(item, sizeof(item), "%sneeds-emulation:%s %llu", out.empty() ? "" : ", ",
+                         NameOf((PrimitiveType)p), (unsigned long long)(v - last_emu[p]));
+                out += item;
+                last_emu[p] = v;
+            }
+            continue;
+        }
+        const uint64_t v = g_indirect_fallbacks[i].load(std::memory_order_relaxed);
+        if (v == last[i]) continue;
+        snprintf(item, sizeof(item), "%s%s %llu", out.empty() ? "" : ", ", IndirectFallbackName((IndirectFallback)i),
+                 (unsigned long long)(v - last[i]));
+        out += item;
+        last[i] = v;
+    }
+    static uint64_t last_reserved = 0, last_patched = 0, last_copied = 0;
+    const uint64_t reserved = g_quad_pool_reserved.load(std::memory_order_relaxed);
+    const uint64_t region_max = g_quad_region_max.exchange(0, std::memory_order_relaxed);
+    if (reserved != last_reserved) {
+        snprintf(item, sizeof(item), "%squad index pools %llu KiB (largest draw region %llu bytes)", out.empty() ? "" : "; ",
+                 (unsigned long long)((reserved - last_reserved) >> 10), (unsigned long long)region_max);
+        out += item;
+        last_reserved = reserved;
+    }
+    const uint64_t patched = g_args_patched.load(std::memory_order_relaxed), copied = g_args_copied.load(std::memory_order_relaxed);
+    if (patched != last_patched || copied != last_copied) {
+        snprintf(item, sizeof(item), "%sargs-patched %llu (on the CPU %llu)", out.empty() ? "" : "; ",
+                 (unsigned long long)(patched - last_patched), (unsigned long long)(copied - last_copied));
+        out += item;
+        last_patched = patched, last_copied = copied;
+    }
+    static uint64_t last_unchecked = 0;
+    const uint64_t unchecked = g_record_unchecked.load(std::memory_order_relaxed);
+    if (unchecked != last_unchecked) {
+        snprintf(item, sizeof(item), "%srecord offsets unchecked (GPU-written) %llu", out.empty() ? "" : "; ",
+                 (unsigned long long)(unchecked - last_unchecked));
+        out += item;
+        last_unchecked = unchecked;
+    }
+    return out.empty() ? "none" : out;
+}
+
+// ---- Indirect quad-list draws on the GPU. Kernels (ps4_gnm_util_passes) on the GPU timeline,
+// after the work that wrote the guest's argument record, in one compute pass:
+//   quad_list_prep (one thread) writes the MTLDrawIndexedPrimitivesIndirectArguments of the
+//   triangle-list draw: indexCount = count / 4 * 6, and base vertex / base instance from the
+//   record only where the CP writes them to the fetch shader's SGPRs (as on GCN, whose index
+//   generator starts at 0), the direct path's offsets otherwise. For an indexed draw, indexStart
+//   is its region of the seq's quad index pool, and it writes the threadgroup count of the
+//   conversion;
+//   quad_list_indices, dispatched from that count, converts quad q of the record's range, indices
+//   start + 4q .. start + 4q + 3, as triangles 0 1 2 and 0 2 3 (BuildQuadListIndices's order); an
+//   index at or past max_index (INDEX_BUFFER_SIZE) reads 0, so a quad wholly past it is degenerate
+//   and the count stops there.
+// The GPU work follows the record's count. The region is the draw's worst case,
+// QuadListIndexBytes(max_index), reserved on the CPU (QuadRegion): no draw can find it full. A
+// pool is at most one upload arena chunk, so an index buffer whose quads could exceed that keeps
+// the CP fallback (quad-size). A non-indexed draw indexes the shared quad pattern (its start vertex
+// is a base vertex, under the same rule); one that finds the pattern too small draws nothing: the
+// kernel records it, the encoder counts it as skipped (quad-indices, at its next quad-list draw and
+// at each perf line) and grows the pattern for the next draws.
+constexpr uint64_t kQuadIndirectMaxBytes = UploadArena::kChunk;
+// The most quad index pool memory one command buffer may reserve (the sum of its draws' worst
+// cases). Draw counts the worst cases on the CP thread since its last Flush call and refuses a draw
+// past this (quad-size): the fallback's drain flushes, so the draws after it start a new count.
+// A Flush from another thread can reset the count while the CP thread's draw is still being
+// queued; QuadRegion enforces the same bound on the encoder's own per-seq sum, so such a draw is
+// skipped and counted (indirect-args) rather than exceeding it.
+constexpr uint64_t kQuadSeqMaxBytes = 64ull << 20;
+std::atomic<uint64_t> g_quad_cp_demand{0}; // worst cases Draw accepted since the last Flush call
+constexpr uint64_t kQuadPoolFirstBytes = 64u << 10;
+constexpr uint32_t kQuadHintDecaySeqs = 256; // seqs with quad draws and no larger demand before the hint halves
+constexpr uint32_t kQuadPatternMaxQuads = 2u << 20;     // BuildQuadListIndices's 8M vertices
+constexpr uint32_t kQuadPatternFirstQuads = 64u << 10;
+// quad_need: [0] the largest quad count a non-indexed draw asked of the pattern, [1] such draws
+// that found it too small. Written by quad_list_prep.
+constexpr uint32_t kQuadNeedWords = 4;
+
+// The GPU path's kernels exist (compiled, compute on this backend) and are not turned off by the
+// test hook. Any thread (S.be and the pipelines are fixed after Init).
+std::atomic<bool> g_indirect_kernels_off{false};
+bool QuadIndirectAvailable() {
+    return S.quad_prep_pso && S.quad_indices_pso && BackendHas(kGnmCapCompute) &&
+           !g_indirect_kernels_off.load(std::memory_order_relaxed);
+}
+bool ArgsPatchAvailable() {
+    return S.args_patch_pso && BackendHas(kGnmCapCompute) && !g_indirect_kernels_off.load(std::memory_order_relaxed);
+}
+
+uint64_t QuadListIndexBytes(uint32_t max_index) { return ((uint64_t)max_index + 3) / 4 * 6 * 4; }
+
+// The smallest power of two >= n (n >= 1, at most 2^63).
+uint64_t PowerOfTwoAtLeast(uint64_t n) { return n <= 1 ? 1 : 1ull << (64 - __builtin_clzll(n - 1)); }
+
+const volatile uint32_t* QuadNeed() { return S.quad_need ? (const volatile uint32_t*)S.quad_need.contents : nullptr; }
+
+// ---- The base vertex and start instance of an indirect triangle-list draw. Metal applies the
+// record's (indexed: baseVertex, baseInstance; non-indexed: vertexStart, baseInstance) to the
+// draw, GCN only through the user SGPRs the CP writes them to (base_vertex_ud / start_instance_ud):
+// without one, the index generator starts at 0 and the draw has the direct path's offsets. A
+// record no pending GPU work writes is final on the CPU: when a field without an SGPR differs from
+// the direct path's offset there, args_patch (a compute pass, so a render pass split, only for
+// such draws; counted as args-patched) copies the live record on the GPU with those two fields
+// replaced, and the draw uses the copy; the other fields are the record's own, as the GPU reads it.
+// Without the kernel the copy is made on the CPU from the final record (counted as on the CPU). A
+// record that pending GPU work writes, or one that cannot be copied (no arena memory), is used as
+// it is and counted ("record offsets unchecked"): such a draw is never skipped for this.
+void IndirectRecordOffsets(const DrawArgs& a, uint32_t vertex_offset, uint32_t instance_offset, __strong id<MTLBuffer>* buf,
+                           uint64_t* off) {
+    const uint32_t n = a.indexed ? 5 : 4;
+    if (OverlapsPendingWrite(a.indirect_addr, n * 4)) {
+        g_record_unchecked.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    uint32_t rec[5] = {};
+    if (!ReadGuest(S.ctx, a.indirect_addr, rec, n * 4)) return; // GuestBuffer found it: the window reads it
+    const uint32_t bv = a.indexed ? 3 : 2, si = a.indexed ? 4 : 3;
+    const bool fix_bv = a.base_vertex_ud < 0 && rec[bv] != vertex_offset;
+    const bool fix_si = a.start_instance_ud < 0 && rec[si] != instance_offset;
+    if (!fix_bv && !fix_si) return;
+    void* p;
+    size_t aoff;
+    id<MTLBuffer> b = nil;
+    if (!S.arena.Alloc(S.dev, 20, 16, &b, &aoff, &p)) {
+        g_record_unchecked.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!ArgsPatchAvailable()) {
+        if (fix_bv) rec[bv] = vertex_offset;
+        if (fix_si) rec[si] = instance_offset;
+        memcpy(p, rec, n * 4);
+        g_args_copied.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        struct {
+            uint32_t words, mask, index[2], value[2], pad[2];
+        } params = {n, (fix_bv ? 1u : 0u) | (fix_si ? 2u : 0u), {bv, si}, {vertex_offset, instance_offset}, {}};
+        ComputeEncoder();
+        S.be->Barrier(kGnmStageDispatch, kGnmStageDispatch, kGnmScopeBuffers); // after the dispatches before it
+        S.be->SetComputePipeline(S.args_patch_pso);
+        S.be->BindBuffer(GnmStage::Compute, 0, *buf, *off);
+        S.be->BindBuffer(GnmStage::Compute, 1, b, aoff);
+        S.be->BindBytes(GnmStage::Compute, 2, &params, sizeof(params));
+        S.be->DispatchThreads(MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+        g_cstate.Reset(S.be->EncoderSerial());
+        S.be->EndEncoder();
+        g_args_patched.fetch_add(1, std::memory_order_relaxed);
+        LogWork("args-patch");
+    }
+    *buf = b;
+    *off = aoff;
+}
+
+// Non-indexed draws the kernel found too large for the pattern since the last call: counted as
+// skipped (they drew nothing). Called before each quad-list conversion and with each perf line.
+// Encoder thread only (as QuadRegion and EncodeQuadListIndirect): its static needs no lock.
+void TakeQuadOverflows() {
+    const volatile uint32_t* need = QuadNeed();
+    if (!need) return;
+    static uint32_t taken = 0; // encoder thread only
+    for (const uint32_t n = need[1]; taken != n; ++taken) NoteSkip(SkipReason::QuadIndices);
+}
+
+// The shared pattern covering at least `quads` quads (up to kQuadPatternMaxQuads). Encoder thread.
+bool QuadPattern(uint32_t quads) {
+    quads = std::min(std::max(quads, kQuadPatternFirstQuads), kQuadPatternMaxQuads);
+    if (S.quad_pattern && S.quad_pattern_quads >= quads) return true;
+    uint32_t n = S.quad_pattern_quads ? S.quad_pattern_quads : kQuadPatternFirstQuads;
+    while (n < quads) n *= 2;
+    id<MTLBuffer> b = [S.dev newBufferWithLength:(NSUInteger)n * 6 * 4 options:MTLResourceStorageModeShared];
+    if (!b) return false;
+    uint32_t* d = (uint32_t*)b.contents;
+    for (uint32_t q = 0; q < n; ++q) {
+        const uint32_t v = 4 * q;
+        d[6 * q + 0] = v, d[6 * q + 1] = v + 1, d[6 * q + 2] = v + 2;
+        d[6 * q + 3] = v, d[6 * q + 4] = v + 2, d[6 * q + 5] = v + 3;
+    }
+    S.be->MakeResident(b, GnmResidencyClass::Builtin);
+    if (S.quad_pattern) S.be->Evict(S.quad_pattern, OpenSeqMax()); // drawn by the open seq at most
+    S.quad_pattern = b;
+    S.quad_pattern_quads = n;
+    return true;
+}
+
+// A region of `bytes` (a draw's worst case, at most one arena chunk) in the open seq's quad index
+// pool: the current pool when it has room, else a new pool (an upload arena allocation, recycled
+// with the seq's command buffer). The first pool of a seq is sized by the hint: the largest seq
+// demand seen (up to one chunk), halved after kQuadHintDecaySeqs seqs that convert quad lists
+// without a larger one, never below 64 KiB. Encoder thread.
+bool QuadRegion(uint64_t bytes, __strong id<MTLBuffer>* pool, uint64_t* pool_off, uint64_t* region_off) {
+    bytes = (bytes + 15) & ~15ull;
+    if (bytes > kQuadIndirectMaxBytes) return false; // Draw refuses these (quad-size)
+    const uint64_t seq = S.committed_seq + 1;
+    if (S.quad_pool_seq != seq) {
+        // a new seq: the previous one's demand moves the hint
+        if (S.quad_seq_demand > S.quad_pool_hint) {
+            S.quad_pool_hint = std::min<uint64_t>(PowerOfTwoAtLeast(S.quad_seq_demand), kQuadIndirectMaxBytes);
+            S.quad_hint_idle = 0;
+        } else if (S.quad_pool_hint > kQuadPoolFirstBytes && ++S.quad_hint_idle >= kQuadHintDecaySeqs) {
+            S.quad_pool_hint /= 2;
+            S.quad_hint_idle = 0;
+        }
+        S.quad_seq_demand = 0;
+        S.quad_pool = nil;
+    }
+    if (S.quad_seq_demand + bytes > kQuadSeqMaxBytes) {
+        RLog("quad-seq-cap", "indirect quad list skipped: the command buffer's quad index pools would pass %llu MiB",
+             (unsigned long long)(kQuadSeqMaxBytes >> 20));
+        return false;
+    }
+    if (!S.quad_pool || S.quad_pool_used + bytes > S.quad_pool_bytes) {
+        uint64_t size = std::max<uint64_t>(S.quad_pool_hint, kQuadPoolFirstBytes);
+        if (S.quad_pool) size = kQuadPoolFirstBytes; // a further pool of the seq: what this draw needs
+        size = std::min<uint64_t>(std::max<uint64_t>(size, PowerOfTwoAtLeast(bytes)), kQuadIndirectMaxBytes);
+        if (size < bytes) return false; // not reached: bytes <= kQuadIndirectMaxBytes above
+        void* p;
+        id<MTLBuffer> b = nil;
+        size_t boff;
+        if (!S.arena.Alloc(S.dev, size, 16, &b, &boff, &p)) return false;
+        S.quad_pool = b, S.quad_pool_off = boff, S.quad_pool_used = 0, S.quad_pool_bytes = size, S.quad_pool_seq = seq;
+        g_quad_pool_reserved.fetch_add(size, std::memory_order_relaxed);
+    }
+    *pool = S.quad_pool;
+    *pool_off = S.quad_pool_off;
+    *region_off = S.quad_pool_used;
+    S.quad_pool_used += bytes;
+    S.quad_seq_demand += bytes;
+    uint64_t m = g_quad_region_max.load(std::memory_order_relaxed);
+    while (bytes > m && !g_quad_region_max.compare_exchange_weak(m, bytes, std::memory_order_relaxed)) {}
+    return true;
+}
+
+// Encodes the conversion of the indirect quad-list draw `a` (CP checks passed: aligned record and
+// index buffer in guest memory, max_index for indexed draws, its worst case within one chunk) and
+// sets *ib / *args to the draw's index buffer and argument record. Ends the open render pass (the
+// kernels are a compute pass). False: nothing encoded (no pipeline, no memory). Encoder thread.
+bool EncodeQuadListIndirect(const DrawArgs& a, uint32_t vertex_offset, uint32_t instance_offset, __strong id<MTLBuffer>* ib,
+                            uint64_t* ib_off, uint64_t* ib_len, __strong id<MTLBuffer>* args, uint64_t* args_off) {
+    if (!S.quad_prep_pso || !S.quad_indices_pso || !BackendHas(kGnmCapCompute)) return false;
+    id<MTLBuffer> rec = nil, src = nil;
+    uint64_t rec_off = 0, src_off = 0;
+    if (!GuestBuffer(a.indirect_addr, a.indexed ? 20 : 16, GuestAccess::Read, &rec, &rec_off) || (rec_off & 3)) return false;
+    const uint64_t isz = a.index_type == 1 ? 4 : 2;
+    if (a.indexed && (!GuestBuffer(a.index_base, (uint64_t)a.max_index * isz, GuestAccess::Read, &src, &src_off) ||
+                      (src_off & 3)))
+        return false;
+    if (!S.quad_need) {
+        S.quad_need = [S.dev newBufferWithLength:kQuadNeedWords * 4 options:MTLResourceStorageModeShared];
+        if (!S.quad_need) return false;
+        memset(S.quad_need.contents, 0, kQuadNeedWords * 4);
+        S.be->MakeResident(S.quad_need, GnmResidencyClass::Builtin);
+    }
+    TakeQuadOverflows();
+    id<MTLBuffer> pool = nil;
+    uint64_t pool_off = 0, region = 0;
+    const uint64_t worst = QuadListIndexBytes(a.max_index);
+    if (a.indexed) {
+        static uint32_t max_seen = 0; // encoder thread only; logged at each new power of two
+        if (a.max_index > max_seen) {
+            if (!max_seen || __builtin_clz(a.max_index) < __builtin_clz(max_seen))
+                fprintf(stderr, "[gnm-draw] indirect quad list: largest INDEX_BUFFER_SIZE so far %u\n", a.max_index);
+            max_seen = a.max_index;
+        }
+        if (!QuadRegion(worst, &pool, &pool_off, &region)) return false;
+    } else {
+        const uint32_t need = QuadNeed()[0]; // a count an earlier draw asked for
+        if (need > S.quad_pattern_quads && S.quad_pattern_quads)
+            RLog("quad-pattern", "indirect quad list of %u quads: pattern grown from %u quads", need, S.quad_pattern_quads);
+        if (!QuadPattern(need)) return false;
+    }
+    // per draw: the draw's arguments (20 bytes), the conversion's threadgroup count and its
+    // parameters (region start, quads, first index: 32 bytes)
+    void* p;
+    size_t aoff, coff = 0;
+    id<MTLBuffer> abuf = nil, cbuf = nil;
+    if (!S.arena.Alloc(S.dev, 20, 16, &abuf, &aoff, &p)) return false;
+    if (a.indexed && !S.arena.Alloc(S.dev, 32, 16, &cbuf, &coff, &p)) return false;
+    // The record's base vertex and start instance reach the shader only through the user SGPRs the
+    // CP writes them to (base_vertex_ud / start_instance_ud, which Draw checked are the fetch
+    // shader's offsets); without one, the draw has the direct path's offsets, as on the CPU path.
+    struct {
+        uint32_t flags, max_index, cap_quads, base_vertex, base_instance, region, pad[2];
+    } params = {(a.indexed ? 1u : 0u) | (a.index_type == 1 ? 2u : 0u) | (a.base_vertex_ud >= 0 ? 4u : 0u) |
+                    (a.start_instance_ud >= 0 ? 8u : 0u),
+                a.max_index, S.quad_pattern_quads, vertex_offset, instance_offset, (uint32_t)(region / 4), {}};
+    ComputeEncoder();
+    S.be->Barrier(kGnmStageDispatch, kGnmStageDispatch, kGnmScopeBuffers); // after the dispatches that wrote the record
+    S.be->SetComputePipeline(S.quad_prep_pso);
+    S.be->BindBuffer(GnmStage::Compute, 0, rec, rec_off);
+    S.be->BindBuffer(GnmStage::Compute, 1, abuf, aoff);
+    S.be->BindBuffer(GnmStage::Compute, 2, a.indexed ? cbuf : abuf, a.indexed ? coff : aoff);
+    S.be->BindBuffer(GnmStage::Compute, 3, S.quad_need, 0);
+    S.be->BindBytes(GnmStage::Compute, 4, &params, sizeof(params));
+    S.be->DispatchThreads(MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+    if (a.indexed) {
+        S.be->Barrier(kGnmStageDispatch, kGnmStageDispatch, kGnmScopeBuffers); // the size and parameters written
+        S.be->SetComputePipeline(S.quad_indices_pso);
+        S.be->BindBuffer(GnmStage::Compute, 0, cbuf, coff);
+        S.be->BindBuffer(GnmStage::Compute, 1, src, src_off);
+        S.be->BindBuffer(GnmStage::Compute, 2, pool, pool_off);
+        S.be->BindBytes(GnmStage::Compute, 3, &params, sizeof(params));
+        S.be->DispatchIndirect(cbuf, coff, MTLSizeMake(64, 1, 1));
+    }
+    g_cstate.Reset(S.be->EncoderSerial()); // state set behind the dispatches' back
+    S.be->EndEncoder();
+    S.pass = PassKey{};
+    for (auto& t : S.pass_hold) t = nil;
+    if (a.indexed) {
+        *ib = pool;
+        *ib_off = pool_off;
+        *ib_len = S.quad_pool_bytes; // the pool holding the region (indexStart is the region)
+    } else {
+        *ib = S.quad_pattern;
+        *ib_off = 0;
+        *ib_len = (uint64_t)S.quad_pattern_quads * 6 * 4;
+    }
+    *args = abuf;
+    *args_off = aoff;
+    LogWork("quad-indirect");
+    return true;
+}
+
+// Indexed draws with a known max_index (INDEX_BUFFER_SIZE) read the indices at or past it as 0,
+// as the GPU path's kernel does (quad_list_indices): a quad wholly past it is degenerate, so the
+// quads stop at the first one that is.
 bool BuildQuadListIndices(const DrawArgs& a, uint32_t count, __strong id<MTLBuffer>* out, size_t* off,
                           uint32_t* out_count) {
-    const uint32_t quads = count / 4;
+    uint32_t quads = count / 4;
+    // indices from index_offset that lie before max_index (all of them when max_index is unknown)
+    uint32_t avail = count;
+    if (a.indexed && a.max_index) {
+        avail = a.max_index > a.index_offset ? std::min(count, a.max_index - a.index_offset) : 0;
+        quads = std::min(quads, (uint32_t)(((uint64_t)avail + 3) / 4));
+    }
     if (quads == 0) return false;
     if (count > (8u << 20)) {
         RLog("quad-count", "quad list with %u vertices rejected", count);
@@ -6679,12 +7528,13 @@ bool BuildQuadListIndices(const DrawArgs& a, uint32_t count, __strong id<MTLBuff
     if (a.indexed) {
         const uint64_t isz = i32 ? 4 : 2;
         const uint64_t addr = a.index_base + (uint64_t)a.index_offset * isz;
-        if (!a.index_base || addr >= S.ctx->mem_size || (uint64_t)count * isz > S.ctx->mem_size - addr)
+        if (!a.index_base || addr >= S.ctx->mem_size || (uint64_t)avail * isz > S.ctx->mem_size - addr)
             return false;
         src = S.ctx->mem_base + addr;
     }
     auto idx = [&](uint32_t i) -> uint32_t {
         if (!src) return i;
+        if (i >= avail) return 0;
         return i32 ? ((const uint32_t*)src)[i] : ((const uint16_t*)src)[i];
     };
     for (uint32_t q = 0; q < quads; ++q) {
@@ -6731,7 +7581,7 @@ void EliminateFastClear(const RenderState& rs) {
     PassKey k;
     k.color[0] = t;
     id<MTLTexture> hold[9] = {t};
-    BeginPass(k, clr, hold);
+    BeginPass(k, clr, hold, false);
     EndEncoders();
     S.pending = true;
     LogWork("fast-clear-elim");
@@ -6741,7 +7591,7 @@ void ResolvePass(const RenderState& rs) {
     const ColorTarget& src = rs.color[0];
     const ColorTarget& dst = rs.color[1];
     if (!src.bound || !dst.bound) return;
-    id<MTLTexture> s = S.tex->GetColorTarget(src);
+    id<MTLTexture> s = S.tex->GetColorTarget(src, true, false); // read by the resolve
     id<MTLTexture> d = S.tex->GetColorTarget(dst);
     if (!s || !d) return;
     RefreshGuestNewer(src.address, s, false);
@@ -6765,6 +7615,23 @@ void ResolvePass(const RenderState& rs) {
     }
     S.pending = true;
     LogWork("resolve");
+}
+
+void DepthDecompressCopy(const DepthTarget& db) {
+    if (!db.bound || !db.z_read_address || !db.z_write_address || db.z_read_address == db.z_write_address) return;
+    if (!BackendHas(kGnmCapCopies, "DB depth decompress copy")) return;
+    id<MTLTexture> src = nil, dst = nil;
+    int kind = 0;
+    if (!S.tex->CloneGpuTexture(db.z_read_address, db.z_write_address, db.slice_bytes, &src, &dst, &kind)) return;
+    EndEncoders();
+    EnsureCmd();
+    S.be->BeginCopies();
+    S.be->CopyTexture(src, dst);
+    S.be->EndEncoder();
+    S.pending = true;
+    if (kind == 2) BumpDepthVersion(dst);
+    if (db.stencil_write_address) S.stencil_to_z[db.stencil_write_address] = db.z_write_address;
+    LogWork("db-decompress-copy");
 }
 
 bool WriteTexturePng(id<MTLTexture> t, const char* path) {
@@ -7021,7 +7888,7 @@ void ResidentTexture(void*, id<MTLTexture> t) {
 }
 void ReleasedTexture(void*, id<MTLTexture> t) {
     RequireEncoderState("released");
-    if (S.be) S.be->Evict(t, S.committed_seq + 1);
+    if (S.be) S.be->Evict(t, OpenSeqMax());
 }
 void ScreenTextureCreated(void*, void* t) {
     if (GnmBackend* be = g_hook_be.load(std::memory_order_acquire))
@@ -7067,6 +7934,14 @@ bool Init(GuestContext* ctx) {
         }
         g_compute_batch = b[0] == '1';
         if (!g_compute_batch) fprintf(stderr, "[gnm-draw] batched compute commits off (PS4_GNM_COMPUTE_BATCH=0)\n");
+    }
+    if (const char* a = getenv("PS4_GNM_ASYNC_COMPUTE")) {
+        if (strcmp(a, "0") && strcmp(a, "1")) {
+            fprintf(stderr, "[gnm-draw] FATAL: PS4_GNM_ASYNC_COMPUTE=%s (1: eligible compute-ring work on its own "
+                            "command queue, 0 or unset: one queue)\n", a);
+            abort();
+        }
+        g_async_compute = a[0] == '1';
     }
     GuestContext* proc = ctx->process_ctx ? ctx->process_ctx : ctx;
     S.ctx = proc;
@@ -7121,12 +7996,25 @@ bool Init(GuestContext* ctx) {
             }
             fprintf(stderr, "[gnm-draw] backend %s (%s)\n", BackendName(S.be->Kind()), ch.why.c_str());
             g_alias.on = S.be->Kind() == GnmBackendKind::Metal3;
+            if (g_async_compute && !BackendHas(kGnmCapAsyncCompute)) {
+                fprintf(stderr, "[gnm-draw] asynchronous compute requested (PS4_GNM_ASYNC_COMPUTE=1); the %s backend has "
+                                "no second queue: every queue on the main one\n", BackendName(S.be->Kind()));
+                g_async_compute = false;
+            }
+            if (g_async_compute) {
+                S.async.main_ev = [S.dev newSharedEvent];
+                S.async.async_ev = [S.dev newSharedEvent];
+                S.async.main_ev.label = @"gnm main generations";
+                S.async.async_ev.label = @"gnm async compute generations";
+                fprintf(stderr, "[gnm-draw] asynchronous compute on (PS4_GNM_ASYNC_COMPUTE=1): eligible compute-ring "
+                                "work on its own command queue\n");
+            }
             if (g_alias.on) S.be->SetBeforeCommand(FlushAliasOrders, nullptr);
             // before S and this file's globals are destroyed (see ReleaseBackend)
             atexit(ReleaseBackend);
             // the upload arena's chunks are resident from creation until their release
             S.arena.on_new = [](id<MTLBuffer> b) { if (S.be) S.be->MakeResident(b, GnmResidencyClass::Guest); };
-            S.arena.on_drop = [](id<MTLBuffer> b) { if (S.be) S.be->Evict(b, S.committed_seq + 1); };
+            S.arena.on_drop = [](id<MTLBuffer> b) { if (S.be) S.be->Evict(b, OpenSeqMax()); };
             // from CommitDoneFn (a Metal completion thread): through g_hook_be, not S.be
             S.arena.on_retired = [](id<MTLBuffer> b, uint64_t seq) {
                 if (GnmBackend* be = g_hook_be.load(std::memory_order_acquire)) be->Evict(b, seq);
@@ -7217,6 +8105,9 @@ bool Init(GuestContext* ctx) {
             S.present_pso = util.present;
             S.depth2color_pso = util.depth2color;
             S.detile_pso = util.detile;
+            S.quad_prep_pso = util.quad_prep;
+            S.quad_indices_pso = util.quad_indices;
+            S.args_patch_pso = util.args_patch;
         }
         if (!S.present_pso) fprintf(stderr, "[gnm-draw] present pipeline failed: %s\n", uwhy.c_str());
     }
@@ -7236,9 +8127,13 @@ uint8_t* Gds() {
     return S.gds ? S.gds : fallback;
 }
 
-void ComputeBarrierImpl() {
+void ComputeBarrierImpl(int queue) {
     // also reached before Init (the CP's first command buffers): no backend yet, nothing open
-    if (!S.enabled.load(std::memory_order_acquire) || S.be->OpenEncoder() != GnmEncoder::Compute) return;
+    if (!S.enabled.load(std::memory_order_acquire)) return;
+    // a compute ring's barrier goes where its work goes: AsyncCompute's open compute encoder
+    std::optional<AsyncScope> scope;
+    if (g_async_compute && queue == kQueueCompute && !S.async.compute_joined && S.async.open) scope.emplace(false);
+    if (S.be->OpenEncoder() != GnmEncoder::Compute) return;
     S.be->Barrier(kGnmStageDispatch | kGnmStageBlit, kGnmStageDispatch | kGnmStageBlit,
                   kGnmScopeBuffers | kGnmScopeTextures);
     S.n_cbarriers++;
@@ -7247,10 +8142,19 @@ void ComputeBarrierImpl() {
 
 void ComputeBarrier(int queue) {
     GmCpSync(queue);
-    encq::Defer([] { ComputeBarrierImpl(); });
+    encq::Defer([queue] { ComputeBarrierImpl(queue); });
 }
 
-bool GpuDmaImpl(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, bool dst_gds, uint64_t dst, uint32_t n) {
+// GPU surfaces marked guest newer by AsyncCompute work's write of [addr, addr + n) (FlushBufferStores)
+void NoteBufferWriteMarking(uint64_t addr, uint64_t n) {
+    if (!S.tex) return;
+    const size_t marked = S.async.in_scope ? S.tex->GuestNewerCount() : 0;
+    S.tex->NoteBufferWrite(addr, n, S.write_epoch);
+    if (S.async.in_scope && S.tex->GuestNewerCount() > marked) S.async.marked_surfaces = true;
+}
+
+bool GpuDmaImpl(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, bool dst_gds, uint64_t dst, uint32_t n,
+                int queue, int ring) {
     const AliasJob alias_job;
     if (!S.enabled.load(std::memory_order_acquire) || S.hung || !S.gds || n == 0 || (n & 3) || (dst & 3) || (!src_fill && (src & 3))) return false;
     // Metal blits on macOS need 4-byte aligned offsets and sizes
@@ -7280,13 +8184,39 @@ bool GpuDmaImpl(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, 
     } else if (!GuestBuffer(src, n, GuestAccess::Read, &sb, &soff)) {
         return false;
     }
+    // a compute ring's DMA goes where its work goes (asynchronous compute)
+    if (g_async_compute && queue == kQueueCompute) {
+        const AsyncJoin why = S.async.compute_joined ? (AsyncJoin)S.async.joined_reason
+                              : RingGfxConsumed(ring) ? AsyncJoin::GfxConsumed
+                              : MainHoldsCompute()   ? AsyncJoin::MainHeld
+                                                     : AsyncJoin::Count;
+        if (why == AsyncJoin::Count) {
+            CommitMainComputeForAsync();
+            AsyncScope scope;
+            AsyncAfterMainCompute();
+            if (S.be->OpenEncoder() != GnmEncoder::None) S.be->EndEncoder();
+            S.be->BeginCopies();
+            if (src_fill && !sb) S.be->FillBuffer(db, doff, n, (uint8_t)(fill_value & 0xFF));
+            else S.be->CopyBuffer(sb, soff, db, doff, n);
+            S.be->EndEncoder();
+            if (src_fill && sb) S.be->Evict(sb, OpenSeqMax());
+            LogWork("dma");
+            if (!dst_gds) {
+                NoteGpuWrite(dst, n);
+                NoteBufferWriteMarking(dst, n);
+            }
+            g_async_stats.eligible.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        ComputeOnMain(why);
+    }
     EndEncoders();
     EnsureCmd();
     S.be->BeginCopies();
     if (src_fill && !sb) S.be->FillBuffer(db, doff, n, (uint8_t)(fill_value & 0xFF));
     else S.be->CopyBuffer(sb, soff, db, doff, n);
     S.be->EndEncoder();
-    if (src_fill && sb) S.be->Evict(sb, S.committed_seq + 1); // the pattern: used by the open seq only
+    if (src_fill && sb) S.be->Evict(sb, OpenSeqMax()); // the pattern: used by the open seq only
     LogWork("dma");
     if (!dst_gds) {
         NoteGpuWrite(dst, n);
@@ -7298,7 +8228,8 @@ bool GpuDmaImpl(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, 
 bool GuestRangeOk(uint64_t addr, uint64_t size);
 
 // Decides on the CP thread (the caller falls back to a CPU copy) whether GpuDmaImpl can do it.
-bool GpuDma(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, bool dst_gds, uint64_t dst, uint32_t n) {
+bool GpuDma(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, bool dst_gds, uint64_t dst, uint32_t n,
+            int queue) {
     if (!S.enabled.load(std::memory_order_acquire) || S.hung || !S.gds || n == 0 || (n & 3) || (dst & 3) || (!src_fill && (src & 3))) return false;
     if (!BackendHas(kGnmCapCopies)) return false; // the CP copies on the CPU (CP thread: S.be is fixed after Init)
     if (dst_gds ? (uint64_t)dst + n > 0x10000 : !GuestRangeOk(dst, n)) return false;
@@ -7307,8 +8238,9 @@ bool GpuDma(bool src_gds, bool src_fill, uint64_t src, uint32_t fill_value, bool
     } else if (src_gds ? (uint64_t)src + n > 0x10000 : !GuestRangeOk(src, n)) {
         return false;
     }
+    const int ring = queue == kQueueCompute ? g_cp_ring : -1;
     encq::Defer([=] {
-        if (!GpuDmaImpl(src_gds, src_fill, src, fill_value, dst_gds, dst, n))
+        if (!GpuDmaImpl(src_gds, src_fill, src, fill_value, dst_gds, dst, n, queue, ring))
             RLog("dma-fail", "GPU DMA 0x%llx -> 0x%llx (%u bytes) failed on the encoder", (unsigned long long)src,
                  (unsigned long long)dst, n);
     });
@@ -7354,52 +8286,460 @@ void SetRegDefaults(uint32_t* regs) {
     regs[0xA000 + 0x0317] = 0x00000010u;
 }
 
-void AfterGpuImpl(std::function<void()> fn) {
+// ---- PS4_GNM_LABEL_TRACE=<guest address> (diagnostics): the label writes (EOP / RELEASE_MEM /
+// EOS) to that qword are logged with where their time goes: CP -> encoder, encoder -> commit of the
+// command buffer the write waits for (and the work encoded into it after the label), commit -> GPU
+// start, the command buffer's GPU time, and GPU end -> the write. Nothing is recorded without it.
+namespace {
+struct LabelSeq {
+    uint64_t gen = 0, works_open = 0, works_commit = 0;
+    double t_commit = 0, gpu_start = 0, gpu_end = 0;
+};
+const uint64_t g_label_trace_addr = [] {
+    const char* e = getenv("PS4_GNM_LABEL_TRACE");
+    return e && *e ? (strtoull(e, nullptr, 0) & ~7ull) : 0ull;
+}();
+std::mutex g_label_mu;
+LabelSeq g_label_seqs[2][64]; // by target and generation % 64, under g_label_mu
+uint64_t EncodedWorks() { return S.n_draws + S.n_dispatches; } // encoder thread
+// host seconds in MTLCommandBuffer GPUStartTime's base (mach_absolute_time)
+double HostSeconds() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9; }
+void LabelSeqOpened(int tgt, uint64_t gen) {
+    if (!g_label_trace_addr) return;
+    std::lock_guard<std::mutex> lk(g_label_mu);
+    g_label_seqs[tgt][gen % 64] = LabelSeq{gen, EncodedWorks()};
+}
+void LabelSeqCommitted(int tgt, uint64_t gen) {
+    if (!g_label_trace_addr) return;
+    std::lock_guard<std::mutex> lk(g_label_mu);
+    LabelSeq& l = g_label_seqs[tgt][gen % 64];
+    if (l.gen != gen) l = LabelSeq{gen};
+    l.works_commit = EncodedWorks();
+    l.t_commit = HostSeconds();
+}
+void LabelSeqDone(int tgt, uint64_t gen, double gpu_start, double gpu_end) {
+    if (!g_label_trace_addr) return;
+    std::lock_guard<std::mutex> lk(g_label_mu);
+    LabelSeq& l = g_label_seqs[tgt][gen % 64];
+    if (l.gen != gen) return;
+    l.gpu_start = gpu_start;
+    l.gpu_end = gpu_end;
+}
+} // namespace
+
+// What a fence action issued now by GNM queue `queue` waits for (encoder thread): the generation of
+// each target that holds that queue's work encoded so far (the open command buffer's: the next
+// one). *tgt: the target whose generation decides (the trace's).
+// With asynchronous compute, a compute ring's action waits for its work on both targets: the
+// AsyncCompute generation being recorded (or the last one), and the Main generation that holds its
+// latest work there (main_compute_gen); a graphics action for Main's work only.
+void FenceNeeds(int queue, uint64_t need[2], int* tgt = nullptr) {
+    need[kTgtMain] = S.committed_gen[kTgtMain] + (MainCmdOpen() ? 1 : 0);
+    need[kTgtAsync] = 0;
+    if (tgt) *tgt = kTgtMain;
+    if (!g_async_compute || queue != kQueueCompute) return;
+    need[kTgtMain] = std::min(need[kTgtMain], S.async.main_compute_gen);
+    need[kTgtAsync] = S.committed_gen[kTgtAsync] + (S.async.open ? 1 : 0);
+    if (tgt && need[kTgtAsync]) *tgt = kTgtAsync; // the trace's: the AsyncCompute generation
+}
+
+void AfterGpuImpl(std::function<void()> fn, int queue) {
     if (!S.enabled.load(std::memory_order_acquire) || S.hung) {
-        if (S.hung) RunFences(~0ull >> 1);
+        if (S.hung) {
+            NoteAllDone();
+            RunFences();
+        }
         fn();
         return;
     }
-    // The action belongs to the end of everything encoded so far. Work still being recorded
-    // goes into the open command buffer, which gets sequence number committed_seq + 1 when it
-    // is committed; tag the action with that number instead of committing right away, so a
-    // stream with many fences (one per compute dispatch, occlusion query, ...) still ends up in
-    // a few command buffers. Every CP entry point commits the open buffer before returning
-    // (ps4_gnm_metal.mm), or, at the end of a compute submission, holds it for 0.5 ms at most
+    // The action belongs to the end of everything its queue encoded so far. Work still being
+    // recorded goes into an open command buffer, which gets its target's next generation when it
+    // is committed; the action is tagged with that instead of committing right away, so a stream
+    // with many fences (one per compute dispatch, occlusion query, ...) still ends up in a few
+    // command buffers. Every CP entry point commits the open buffers before returning
+    // (ps4_gnm_metal.mm), or, at the end of a compute submission, holds Main's for 0.5 ms at most
     // plus the encoder jobs queued before the release (FlushCompute), so the action cannot be
     // stranded.
     bool now = false;
     {
         std::lock_guard<std::mutex> lk(S.fence_mu);
-        const bool open = MainCmdOpen();
-        const uint64_t seq = S.committed_seq + (open ? 1 : 0);
-        if (!open && S.fence_q.empty() && S.completed_seq >= S.committed_seq) now = true;
-        else S.fence_q.push_back({seq, std::move(fn)});
+        State::Fence f;
+        f.issue = ++S.fence_issued;
+        FenceNeeds(queue, f.need);
+        // in issue order with every queued action (an earlier one of either queue runs first)
+        if (S.fence_q[0].empty() && S.fence_q[1].empty() && FenceReady(f)) {
+            now = true;
+        } else {
+            f.fn = std::move(fn);
+            S.fence_q[queue].push_back(std::move(f));
+        }
     }
     if (now) {
         std::lock_guard<std::recursive_mutex> run(S.fence_run_mu);
         fn();
-    } else if (!MainCmdOpen()) {
-        // the command buffers may already have completed before the push (otherwise the
-        // completion handler of the last one runs the action)
-        uint64_t done;
-        bool ready;
-        {
-            std::lock_guard<std::mutex> lk(S.fence_mu);
-            done = S.completed_seq;
-            ready = !S.fence_q.empty() && S.fence_q.front().first <= done;
-        }
-        if (ready) RunFences(done);
+        return;
     }
+    // the command buffers may already have completed before the push (otherwise the completion
+    // handler of the last one runs the action)
+    RunFences();
 }
 
 // Fence actions belong behind the work handed to the encoder before them.
-void AfterGpu(std::function<void()> fn) {
+void AfterGpu(std::function<void()> fn, int queue) {
     if (encq::Inline()) {
-        AfterGpuImpl(std::move(fn));
+        AfterGpuImpl(std::move(fn), queue);
         return;
     }
-    encq::Defer([f = std::move(fn)]() mutable { AfterGpuImpl(std::move(f)); });
+    encq::Defer([f = std::move(fn), queue]() mutable { AfterGpuImpl(std::move(f), queue); });
+}
+void AfterGpu(std::function<void()> fn) { AfterGpu(std::move(fn), kQueueGfx); }
+
+bool LabelTraced(uint64_t addr) { return g_label_trace_addr && (addr & ~7ull) == g_label_trace_addr; }
+
+void AfterGpuLabel(uint64_t addr, uint64_t value, const char* packet, int queue, std::function<void()> fn) {
+    if (!LabelTraced(addr)) {
+        AfterGpu(std::move(fn), queue);
+        return;
+    }
+    const double t_cp = HostSeconds();
+    auto at_encoder = [=, fn = std::move(fn)]() mutable {
+        // the command buffer the action waits for (FenceNeeds), and the work encoded before the label
+        uint64_t need[2];
+        int tgt;
+        FenceNeeds(queue, need, &tgt);
+        const uint64_t gen = need[tgt];
+        const uint64_t works = EncodedWorks();
+        const double t_enc = HostSeconds();
+        AfterGpuImpl([=, fn = std::move(fn)]() {
+            fn();
+            const double t_write = HostSeconds();
+            LabelSeq l;
+            {
+                std::lock_guard<std::mutex> lk(g_label_mu);
+                l = g_label_seqs[tgt][gen % 64];
+            }
+            if (l.gen != gen || !l.t_commit) {
+                fprintf(stderr, "[gnm-label] 0x%llx = 0x%llx (%s): cp->write %.2f ms (%s generation %llu, no record)\n",
+                        (unsigned long long)addr, (unsigned long long)value, packet, (t_write - t_cp) * 1e3,
+                        tgt == kTgtMain ? "main" : "async", (unsigned long long)gen);
+                return;
+            }
+            fprintf(stderr,
+                    "[gnm-label] 0x%llx = 0x%llx (%s): cp->encoder %.2f ms, encoder->commit %.2f ms (works after it %llu of "
+                    "%llu), commit->gpu start %.2f ms, gpu %.2f ms, gpu end->write %.2f ms; cp->write %.2f ms\n",
+                    (unsigned long long)addr, (unsigned long long)value, packet, (t_enc - t_cp) * 1e3,
+                    (l.t_commit - t_enc) * 1e3, (unsigned long long)(l.works_commit - works),
+                    (unsigned long long)(l.works_commit - l.works_open), (l.gpu_start - l.t_commit) * 1e3,
+                    (l.gpu_end - l.gpu_start) * 1e3, (t_write - l.gpu_end) * 1e3, (t_write - t_cp) * 1e3);
+        }, queue);
+    };
+    if (encq::Inline()) at_encoder();
+    else encq::Defer(std::move(at_encoder));
+}
+
+// ---- occlusion queries (ZpassDone, ps4_gnm_draw.h)
+// The guest layout, per shadPS4 src/video_core/amdgpu/liverpool.cpp (EventWrite, PixelPipeStatDump
+// with EventIndex::ZpassDone: one u64 per counter pair, `results += 2`, num_counter_pairs 8, 16 in
+// Neo mode, valid bit 0x8000000000000000) and the SDK's Gnm::OcclusionQueryResults (per render
+// backend a begin and an end u64, the end written by the event at the begin field + 8).
+// Counting: between two ZPASS_DONE events every game draw of a pass, while a query is open, counts
+// into one 8-byte slot of that pass's visibility buffer (an interval); each event closes the
+// interval, and after the GPU its slots are added to the running count it writes. Once the process
+// has seen a ZPASS_DONE, every game pass gets a visibility buffer (its draws in Disabled mode while
+// no query is open), so a query beginning inside a pass does not end it. Clear-only passes get none.
+// Nothing here allocates per event or per pass once the pools are warm: buffers and event records
+// are pooled for the process lifetime, the fence actions capture one pointer (std::function's small
+// buffer), and the open queries are a fixed array.
+namespace {
+constexpr uint32_t kOcclSlots = 4096; // 8-byte slots per visibility buffer (32 KiB)
+struct OcclBuf {
+    id<MTLBuffer> buf = nil;
+    uint32_t used = 0;              // slots handed out in its pass (encoder side, while the pass is open)
+    std::atomic<uint32_t> refs{0}; // its pass while open, and every interval slot in it not yet read
+};
+struct OcclSlotRef {
+    OcclBuf* buf;
+    uint32_t slot;
+};
+// One ZPASS_DONE event: the slots of the interval it closes (chained when there are more) and the
+// guest counters it writes after the GPU.
+struct OcclEvent {
+    static constexpr uint32_t kSlots = 30;
+    GuestContext* ctx = nullptr;
+    uint64_t addr = 0;
+    uint32_t backends = 0;
+    uint32_t n = 0;
+    OcclSlotRef slots[kSlots];
+    OcclEvent* next = nullptr;
+};
+struct OcclPool {
+    std::mutex mu;
+    std::vector<OcclBuf*> bufs;
+    OcclEvent* events = nullptr; // free list through next
+};
+OcclPool& Pool() {
+    static OcclPool* p = [] {
+        OcclPool* q = new OcclPool;
+        q->bufs.reserve(256);
+        return q;
+    }();
+    return *p;
+}
+// A buffer for a new pass (refs 1: the pass), resident once.
+OcclBuf* OcclTake() {
+    OcclBuf* b = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(Pool().mu);
+        if (!Pool().bufs.empty()) {
+            b = Pool().bufs.back();
+            Pool().bufs.pop_back();
+        }
+    }
+    if (!b) {
+        id<MTLBuffer> m = [S.dev newBufferWithLength:kOcclSlots * 8 options:MTLResourceStorageModeShared];
+        if (!m) return nullptr;
+        memset(m.contents, 0, kOcclSlots * 8);
+        S.be->MakeResident(m, GnmResidencyClass::Builtin);
+        b = new OcclBuf;
+        b->buf = m;
+    }
+    b->used = 0;
+    b->refs.store(1, std::memory_order_relaxed);
+    return b;
+}
+// Back to the pool, its used slots zeroed, once its pass and every slot read let it go. Only ever
+// after the GPU (fence actions), so a later pass cannot reuse it while one still writes it.
+void OcclRelease(OcclBuf* b) {
+    if (b->refs.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    memset(b->buf.contents, 0, (size_t)b->used * 8);
+    std::lock_guard<std::mutex> lk(Pool().mu);
+    Pool().bufs.push_back(b);
+}
+OcclEvent* OcclEventTake() {
+    OcclEvent* e = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(Pool().mu);
+        if ((e = Pool().events)) Pool().events = e->next;
+    }
+    if (!e) e = new OcclEvent;
+    e->n = 0;
+    e->next = nullptr;
+    return e;
+}
+void OcclEventFree(OcclEvent* e) {
+    std::lock_guard<std::mutex> lk(Pool().mu);
+    OcclEvent* last = e;
+    while (last->next) last = last->next;
+    last->next = Pool().events;
+    Pool().events = e;
+}
+
+constexpr uint32_t kOcclOpen = 256;        // queries open at once (more: logged, not counted)
+constexpr uint64_t kOcclOpenPresents = 2; // a query not ended within this many presents is dropped
+struct OcclOpenQuery {
+    uint64_t addr;    // its begin address
+    uint64_t present; // S.present_idx at its begin
+};
+struct OcclState {
+    bool seen = false;     // a ZPASS_DONE has been seen: every game pass gets a visibility buffer
+    bool counting = false; // a query is open
+    OcclOpenQuery open[kOcclOpen];
+    uint32_t n_open = 0;
+    OcclBuf* pass = nullptr; // the visibility buffer of the last game pass (null: none)
+    uint64_t pass_serial = 0; // the encoder serial of that pass
+    int64_t slot = -1;        // the current interval's slot in `pass` (-1: none yet)
+    OcclEvent* interval = nullptr; // the slots counted since the last event (head, tail)
+    OcclEvent* tail = nullptr;
+    uint64_t mode_serial = 0; // the encoder and offset the mode was last set for
+    int64_t mode_offset = -1; // (-1: disabled, the mode a render pass begins with)
+    uint32_t cc_logged[4] = {};
+    uint32_t n_cc_logged = 0;
+};
+OcclState g_occl; // encoder side
+
+// The last game pass has ended (or is ending): its buffer goes back after the GPU.
+void OcclPassEnded() {
+    OcclState& o = g_occl;
+    if (!o.pass) return;
+    OcclBuf* b = o.pass;
+    o.pass = nullptr;
+    o.slot = -1;
+    AfterGpuImpl([b] { OcclRelease(b); }, kQueueGfx);
+}
+
+id<MTLBuffer> OcclPassBuffer(bool game_draw) {
+    OcclState& o = g_occl;
+    OcclPassEnded(); // BeginPass has ended the previous pass
+    if (!game_draw || !o.seen) return nil;
+    o.pass = OcclTake();
+    return o.pass ? o.pass->buf : nil;
+}
+
+void OcclPassBegun() {
+    if (g_occl.pass) g_occl.pass_serial = S.be->EncoderSerial();
+}
+
+// DB_COUNT_CONTROL (GFX7: ZPASS_INCREMENT_DISABLE bit 0, PERFECT_ZPASS_COUNTS bit 1, SAMPLE_RATE
+// bits 4-6 = log2 of the samples counted per pixel, as radeonsi programs it from the framebuffer's
+// sample count). Metal counts every sample that passes, which is what the DB counts when
+// SAMPLE_RATE matches the target's sample count; the first distinct values are logged so a
+// mismatch shows.
+void OcclNoteCountControl(uint32_t cc) {
+    OcclState& o = g_occl;
+    for (uint32_t i = 0; i < o.n_cc_logged; ++i)
+        if (o.cc_logged[i] == cc) return;
+    if (o.n_cc_logged == 4) return;
+    o.cc_logged[o.n_cc_logged++] = cc;
+    unsigned long samples = 1;
+    for (int i = 0; i < 9; ++i) {
+        id<MTLTexture> t = i < 8 ? S.pass.color[i] : S.pass.depth;
+        if (t) {
+            samples = (unsigned long)t.sampleCount;
+            break;
+        }
+    }
+    fprintf(stderr,
+            "[gnm-draw] occlusion queries: DB_COUNT_CONTROL 0x%x (increment disable %u, perfect counts %u, "
+            "sample rate %u = %ux) on a %lux pass (first 4 values logged)\n",
+            cc, cc & 1, (cc >> 1) & 1, (cc >> 4) & 7, 1u << ((cc >> 4) & 7),
+            samples);
+}
+
+void OcclBeforeDraw(uint32_t count_control) {
+    OcclState& o = g_occl;
+    if (o.pass && o.pass_serial != S.be->EncoderSerial()) OcclPassEnded(); // that pass ended
+    if (!o.pass) { // a pass without a visibility buffer: the draw cannot count
+        S.n_occl_missed += o.counting && !(count_control & 1);
+        return;
+    }
+    const uint64_t serial = o.pass_serial;
+    if (o.mode_serial != serial) { // a new pass begins with visibility results disabled
+        o.mode_serial = serial;
+        o.mode_offset = -1;
+    }
+    int64_t off = -1;
+    if (o.counting) {
+        OcclNoteCountControl(count_control);
+        if (!(count_control & 1)) { // ZPASS_INCREMENT_DISABLE: the draw does not count
+            if (o.slot < 0) {
+                // ZpassDoneImpl ends a pass whose slots are used up, so one is free here
+                o.slot = o.pass->used++;
+                if (!o.tail || o.tail->n == OcclEvent::kSlots) {
+                    OcclEvent* e = OcclEventTake();
+                    (o.tail ? o.tail->next : o.interval) = e;
+                    o.tail = e;
+                }
+                o.tail->slots[o.tail->n++] = {o.pass, (uint32_t)o.slot};
+                o.pass->refs.fetch_add(1, std::memory_order_relaxed);
+            }
+            off = o.slot * 8;
+            S.n_occl_draws++;
+        }
+    }
+    if (o.mode_offset == off) return;
+    S.be->SetVisibilityResultMode(off < 0 ? MTLVisibilityResultModeDisabled : MTLVisibilityResultModeCounting,
+                                  off < 0 ? 0 : (uint64_t)off);
+    o.mode_offset = off;
+}
+
+// After the GPU: the interval's slots added to the running count, the guest counters written.
+void OcclEventDone(OcclEvent* ev) {
+    static uint64_t total = 0; // the DB's running ZPASS count (backend 0); fence actions run in order
+    for (OcclEvent* e = ev; e; e = e->next) {
+        for (uint32_t i = 0; i < e->n; ++i) {
+            total += ((const uint64_t*)e->slots[i].buf->buf.contents)[e->slots[i].slot];
+            OcclRelease(e->slots[i].buf);
+        }
+    }
+    GuestContext* ctx = ev->ctx;
+    const uint64_t addr = ev->addr, bytes = (uint64_t)ev->backends * 16;
+    if (ctx && ctx->mem_base && addr != 0 && addr < ctx->mem_size && bytes <= ctx->mem_size - addr) {
+        uint64_t* r = (uint64_t*)(ctx->mem_base + addr);
+        constexpr uint64_t kValid = 0x8000000000000000ull;
+        r[0] = (total & ~kValid) | kValid;
+        for (uint32_t i = 1; i < ev->backends; ++i) r[i * 2] = kValid;
+    }
+    OcclEventFree(ev);
+}
+
+void ZpassDoneImpl(uint64_t addr, uint32_t backends) {
+    OcclState& o = g_occl;
+    o.seen = true;
+    S.n_occl_events++;
+    // queries never ended stop counting after kOcclOpenPresents presents
+    const uint64_t now = S.present_idx;
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < o.n_open; ++i)
+        if (now <= o.open[i].present + kOcclOpenPresents) o.open[kept++] = o.open[i];
+    if (kept != o.n_open) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "[gnm-draw] occlusion queries: %u never ended within %llu presents, dropped (logged once)\n",
+                    o.n_open - kept, (unsigned long long)kOcclOpenPresents);
+        }
+        o.n_open = kept;
+    }
+    // an end (the begin address + 8 of an open query), or a begin
+    bool ended = false;
+    for (uint32_t i = o.n_open; i-- > 0;) {
+        if (o.open[i].addr == addr - 8) {
+            o.open[i] = o.open[--o.n_open];
+            ended = true;
+            break;
+        }
+    }
+    if (!ended) {
+        if (o.n_open < kOcclOpen) {
+            o.open[o.n_open++] = {addr, now};
+        } else {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "[gnm-draw] occlusion queries: more than %u open at once; the query at 0x%llx does "
+                                "not count (logged once)\n", kOcclOpen, (unsigned long long)addr);
+            }
+        }
+    }
+    OcclEvent* ev = o.interval ? o.interval : OcclEventTake();
+    o.interval = o.tail = nullptr;
+    o.slot = -1;
+    ev->ctx = S.ctx;
+    ev->addr = addr;
+    ev->backends = backends;
+    const bool counting = o.n_open != 0;
+    if (o.pass && o.pass_serial != S.be->EncoderSerial()) OcclPassEnded();
+    // a render pass open without a buffer when counting starts (one begun before the first
+    // ZPASS_DONE), or one whose slots are used up, ends here: the next draw begins a pass with one
+    if (counting && S.be->OpenEncoder() == GnmEncoder::Render && (!o.pass || o.pass->used >= kOcclSlots)) {
+        EndEncoders();
+        OcclPassEnded();
+        S.n_occl_splits++;
+        S.occl_splits_total++;
+    }
+    o.counting = counting;
+    AfterGpuImpl([ev] { OcclEventDone(ev); }, kQueueGfx);
+}
+
+} // namespace
+
+void ZpassDone(uint64_t addr, uint32_t backends) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        fprintf(stderr, "[gnm-draw] occlusion queries: first ZPASS_DONE at 0x%llx, %u backends (logged once)\n",
+                (unsigned long long)addr, backends);
+    if (!S.enabled.load(std::memory_order_acquire)) {
+        // no renderer: the event's counts are 0 (valid), as for a query over nothing
+        AfterGpu([addr, backends] {
+            GuestContext* ctx = S.ctx;
+            if (!ctx || !ctx->mem_base || addr == 0 || addr >= ctx->mem_size || (uint64_t)backends * 16 > ctx->mem_size - addr)
+                return;
+            uint64_t* r = (uint64_t*)(ctx->mem_base + addr);
+            for (uint32_t i = 0; i < backends; ++i) r[i * 2] = 0x8000000000000000ull;
+        });
+        return;
+    }
+    encq::Defer([=] { ZpassDoneImpl(addr, backends); });
 }
 
 void SetExtentHints(const uint32_t cb[8], uint32_t db) {
@@ -7409,6 +8749,13 @@ void SetExtentHints(const uint32_t cb[8], uint32_t db) {
 
 void OnSubmit() {
     S.submit_idx++;
+    // CPU stores into guest memory bypass the renderer's GPU write tracking. Copies of
+    // CPU-backed images must therefore be refreshed for the next submission. Keep GPU-owned
+    // targets intact: their guest bytes can be stale. This is queued after this submission's
+    // work so it cannot invalidate an upload before the draws that consume it.
+    encq::Defer([] {
+        if (S.tex && S.ctx) S.tex->InvalidateRange(0, S.ctx->mem_size, false);
+    });
 }
 
 // The test hooks' wait: the open command buffer waits on the GPU until ev reaches value, and
@@ -7501,14 +8848,69 @@ void DebugGpuWait(void* shared_event, uint64_t value) {
 }
 
 bool HasPendingWork() {
-    if (encq::Pending() || g_cmd_open.load(std::memory_order_acquire)) return true;
+    if (encq::Pending() || g_cmd_open.load(std::memory_order_acquire) || g_async_open.load(std::memory_order_acquire))
+        return true;
     std::lock_guard<std::mutex> lk(S.fence_mu);
     return S.completed_seq < S.committed_seq;
+}
+
+bool AsyncComputeOn() { return g_async_compute; }
+
+void JoinQueuesImpl(int waiting_queue, bool unknown_producer, int other_ring) {
+    if (!g_async_compute || !S.enabled.load(std::memory_order_acquire) || S.hung) return;
+    if (waiting_queue == kQueueGfx) {
+        if (other_ring >= 0 && other_ring < 64) S.async.ring_main_until[other_ring] = S.present_idx + kGfxConsumedPresents;
+        // graphics after the compute rings' work so far: Main (and its uploads) wait for it on the
+        // GPU. Its writes are pending writes until it completed, so what Main copies from that
+        // memory meanwhile (texture refreshes) is encoded behind the wait.
+        if (!AsyncPending()) return;
+        JoinMainAfterAsync();
+        return;
+    }
+    // a compute ring after graphics: the rest of its submission runs on Main (ComputeOnMain)
+    S.async.compute_joined = true;
+    S.async.joined_reason = (uint8_t)(unknown_producer ? AsyncJoin::WaitUnknown : AsyncJoin::WaitOther);
+}
+
+void JoinQueues(int waiting_queue, bool unknown_producer, int other_ring) {
+    if (!g_async_compute) return;
+    if (encq::Inline()) {
+        JoinQueuesImpl(waiting_queue, unknown_producer, other_ring);
+        return;
+    }
+    encq::Defer([=] { JoinQueuesImpl(waiting_queue, unknown_producer, other_ring); });
+}
+
+void SetCpComputeRing(int ring) { g_cp_ring = ring; }
+
+AsyncComputeCounts GetAsyncComputeCounts() {
+    AsyncComputeCounts c;
+    c.on = g_async_compute;
+    c.eligible = g_async_stats.eligible.load(std::memory_order_relaxed);
+    for (const auto& j : g_async_stats.joined) c.joined += j.load(std::memory_order_relaxed);
+    c.cross_waits = g_async_stats.cross_waits.load(std::memory_order_relaxed);
+    c.alias_skipped = g_async_stats.alias_skipped.load(std::memory_order_relaxed);
+    return c;
+}
+
+void DebugGpuWaitQueue(void* shared_event, uint64_t value, int queue) {
+    if (queue != kQueueCompute || !g_async_compute) {
+        DebugGpuWait(shared_event, value);
+        return;
+    }
+    id<MTLSharedEvent> ev = (__bridge id<MTLSharedEvent>)shared_event;
+    encq::Run([=] {
+        if (!S.enabled.load(std::memory_order_acquire)) return;
+        AsyncScope scope;
+        if (S.be->OpenEncoder() != GnmEncoder::None) S.be->EndEncoder();
+        S.be->QueueWait(ev, value);
+    });
 }
 
 void FlushImpl(bool wait) {
     if (!S.enabled.load(std::memory_order_acquire)) return;
     @autoreleasepool {
+        CommitAsync();
         Commit();
         if (wait) {
             WaitAll();
@@ -7518,6 +8920,7 @@ void FlushImpl(bool wait) {
 
 // Flush(true) returns once the GPU finished everything submitted so far (CPU reads follow).
 void Flush(bool wait) {
+    g_quad_cp_demand.store(0, std::memory_order_relaxed); // the draws before this end their command buffer
     if (wait) encq::Run([] { FlushImpl(true); });
     else encq::Defer([] { FlushImpl(false); });
 }
@@ -7546,6 +8949,8 @@ EncodeCounts GetEncodeCounts() {
         c.committed = S.committed_seq;
         c.compute_encoders = S.cencs_total;
         c.compute_barriers = S.cbarriers_total;
+        c.render_passes = S.passes_total;
+        c.occlusion_splits = S.occl_splits_total;
     });
     return c;
 }
@@ -7701,6 +9106,18 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
             });
             return true;
         }
+        if (rs.color_mode == 0 && (regs[0xA000] & 0x60) != 0 && !rs.ds.depth_test && !rs.ds.stencil_test &&
+            rs.depth.bound && regs[0x2C08] == 0 && (regs[0x2C09] & 0xFF) == 0) {
+            cap::SetSkipped("DB depth/stencil decompress (renderer operation, not a shader pass)");
+            if (rs.depth.z_read_address && rs.depth.z_write_address &&
+                rs.depth.z_read_address != rs.depth.z_write_address) {
+                encq::Defer([rec = rp.release()] {
+                    DepthDecompressCopy(rec->rs.depth);
+                    g_draw_recs.Put(rec);
+                });
+            }
+            return true;
+        }
         const bool indirect = args.indirect_addr != 0;
         if (rs.raster.prim == PrimitiveType::None || (!indirect && args.count == 0)) return true;
         if (args.count > (16u << 20) || args.num_instances > (1u << 20)) {
@@ -7744,10 +9161,17 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
             // when those SGPRs only feed the fetch shader's index offsets, which the recompiled
             // shader takes from Metal's base vertex / base instance instead.
             const auto& in = vs->info;
+            IndirectFallback why = IndirectFallback::Count;
             if ((args.base_vertex_ud >= 0 && (!in.has_fetch_shader || args.base_vertex_ud != in.vertex_offset_sgpr)) ||
                 (args.start_instance_ud >= 0 &&
-                 (!in.has_fetch_shader || args.start_instance_ud != in.instance_offset_sgpr)) ||
-                regs[0xA102] != 0 || (args.indexed && !args.max_index)) {
+                 (!in.has_fetch_shader || args.start_instance_ud != in.instance_offset_sgpr)))
+                why = IndirectFallback::UserSgpr;
+            else if (regs[0xA102] != 0)
+                why = IndirectFallback::IndxOffset;
+            else if (args.indexed && !args.max_index)
+                why = IndirectFallback::NoMaxIndex;
+            if (why != IndirectFallback::Count) {
+                NoteIndirectFallback(why, rs.raster.prim);
                 cap::SetSkipped(kCapIndirectFallback);
                 return false;
             }
@@ -7791,14 +9215,31 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
 
         if (indirect) {
             // what the encoder's GuestBuffer calls need (CPU fallback otherwise)
+            // Quad lists are drawn on the GPU path too: a kernel converts their arguments and indices
+            // behind the work that wrote them (EncodeQuadListIndirect); other emulated primitives
+            // need the CPU's conversion of a known count.
             const uint64_t isz = args.index_type == 1 ? 4 : 2;
-            if (rs.raster.needs_emulation || !GuestRangeOk(args.indirect_addr, args.indexed ? 20 : 16) ||
-                (args.indirect_addr & 3)) {
-                cap::SetSkipped(kCapIndirectFallback);
-                return false;
+            const bool quads = rs.raster.prim == PrimitiveType::QuadList;
+            IndirectFallback why = IndirectFallback::Count;
+            if (rs.raster.needs_emulation && (!quads || !QuadIndirectAvailable()))
+                why = IndirectFallback::Emulation;
+            else if (!GuestRangeOk(args.indirect_addr, args.indexed ? 20 : 16) || (args.indirect_addr & 3))
+                why = IndirectFallback::Range;
+            else if (args.indexed && (!args.index_base || !GuestRangeOk(args.index_base, (uint64_t)args.max_index * isz) ||
+                                      (args.index_base & 3)))
+                why = IndirectFallback::Range;
+            else if (quads && args.indexed && QuadListIndexBytes(args.max_index) > kQuadIndirectMaxBytes)
+                why = IndirectFallback::QuadSize;
+            else if (quads && args.indexed) {
+                // the command buffer's pools (kQuadSeqMaxBytes); CP thread only adds
+                const uint64_t worst = (QuadListIndexBytes(args.max_index) + 15) & ~15ull;
+                if (g_quad_cp_demand.load(std::memory_order_relaxed) + worst > kQuadSeqMaxBytes)
+                    why = IndirectFallback::QuadSize;
+                else
+                    g_quad_cp_demand.fetch_add(worst, std::memory_order_relaxed);
             }
-            if (args.indexed && (!args.index_base || !GuestRangeOk(args.index_base, (uint64_t)args.max_index * isz) ||
-                                 (args.index_base & 3))) {
+            if (why != IndirectFallback::Count) {
+                NoteIndirectFallback(why, rs.raster.prim);
                 cap::SetSkipped(kCapIndirectFallback);
                 return false;
             }
@@ -7907,7 +9348,10 @@ void DrawEncode(DrawRec& r) {
                 continue;
             }
             if (c.fast_clear || c.compression) RegisterMeta(c.cmask_address);
-            id<MTLTexture> t = S.tex->GetColorTarget(c);
+            const bool pending_write = c.num_samples == 1 && S.detile_pso != nil &&
+                                       BackendHas(kGnmCapCompute | kGnmCapCopies) &&
+                                       OverlapsPendingWrite(c.address, std::max<uint64_t>(c.slice_bytes, 1));
+            id<MTLTexture> t = S.tex->GetColorTarget(c, true, c.mtl_write_mask != 0, pending_write);
             if (!t) continue;
             if (samples && t.sampleCount != samples) {
                 RLog("rt-samples", "%s: mixed sample counts", args.name);
@@ -7944,7 +9388,14 @@ void DrawEncode(DrawRec& r) {
         if (want_depth && db.bound && db.mtl_format) {
             if (db.htile_enable) RegisterMeta(db.htile_address);
             id<MTLTexture> grown_from = nil;
-            id<MTLTexture> t = S.tex->GetDepthTarget(db, &grown_from);
+            // a pass that only tests depth/stencil reads the surface: not a write (LastWrittenLocked)
+            const auto stencil_writes = [](const StencilFace& f) {
+                return f.write_mask != 0 && (f.fail != MTLStencilOperationKeep || f.depth_fail != MTLStencilOperationKeep ||
+                                             f.pass != MTLStencilOperationKeep);
+            };
+            const bool ds_written = rs.ds.depth_write || db.depth_clear_enable || db.stencil_clear_enable ||
+                                    (rs.ds.stencil_test && (stencil_writes(rs.ds.front) || stencil_writes(rs.ds.back)));
+            id<MTLTexture> t = S.tex->GetDepthTarget(db, &grown_from, ds_written);
             if (t && grown_from && BackendHas(kGnmCapCopies, "copy of a grown depth array's slices")) {
                 // The array grew (a view selected a later slice): keep the slices written so far.
                 EndEncoders();
@@ -8146,6 +9597,16 @@ void DrawEncode(DrawRec& r) {
             return;
         }
 
+        // ---- vertex / instance offsets (shadPS4 GetDrawOffsets)
+        uint32_t vertex_offset = regs[0xA102]; // VGT_INDX_OFFSET
+        uint32_t instance_offset = 0;
+        if (vs->info.has_fetch_shader) {
+            if (vertex_offset == 0 && vs->info.vertex_offset_sgpr >= 0 && vs->info.vertex_offset_sgpr < 16)
+                vertex_offset = vs_ud[vs->info.vertex_offset_sgpr];
+            if (vs->info.instance_offset_sgpr >= 0 && vs->info.instance_offset_sgpr < 16)
+                instance_offset = vs_ud[vs->info.instance_offset_sgpr];
+        }
+
         // ---- index data / primitive emulation
         MTLPrimitiveType prim = (MTLPrimitiveType)rs.raster.mtl_primitive;
         id<MTLBuffer> ib = nil;
@@ -8156,7 +9617,15 @@ void DrawEncode(DrawRec& r) {
         bool indexed = args.indexed;
         id<MTLBuffer> arg_buf = nil;
         uint64_t arg_off = 0;
-        if (indirect) {
+        if (indirect && rs.raster.prim == PrimitiveType::QuadList) {
+            if (!EncodeQuadListIndirect(args, vertex_offset, instance_offset, &ib, &ib_off, &ib_len, &arg_buf, &arg_off)) {
+                NoteSkip(SkipReason::IndirectArgs);
+                return;
+            }
+            itype = MTLIndexTypeUInt32;
+            indexed = true;
+            prim = MTLPrimitiveTypeTriangle;
+        } else if (indirect) {
             const uint64_t isz = args.index_type == 1 ? 4 : 2;
             if (rs.raster.needs_emulation ||
                 !GuestBuffer(args.indirect_addr, indexed ? 20 : 16, GuestAccess::Read, &arg_buf, &arg_off) || (arg_off & 3))
@@ -8166,6 +9635,8 @@ void DrawEncode(DrawRec& r) {
                  (ib_off & 3)))
                 { NoteSkip(SkipReason::IndirectArgs); return; }
             if (indexed) ib_len = (uint64_t)args.max_index * isz;
+            if (args.base_vertex_ud < 0 || args.start_instance_ud < 0)
+                IndirectRecordOffsets(args, vertex_offset, instance_offset, &arg_buf, &arg_off);
         } else if (rs.raster.needs_emulation && !rect) {
             if (rs.raster.prim == PrimitiveType::QuadList) {
                 size_t aoff;
@@ -8251,16 +9722,6 @@ void DrawEncode(DrawRec& r) {
             rect_bufs.params_slot = rect->params_slot;
         }
 
-        // ---- vertex / instance offsets (shadPS4 GetDrawOffsets)
-        uint32_t vertex_offset = regs[0xA102]; // VGT_INDX_OFFSET
-        uint32_t instance_offset = 0;
-        if (vs->info.has_fetch_shader) {
-            if (vertex_offset == 0 && vs->info.vertex_offset_sgpr >= 0 && vs->info.vertex_offset_sgpr < 16)
-                vertex_offset = vs_ud[vs->info.vertex_offset_sgpr];
-            if (vs->info.instance_offset_sgpr >= 0 && vs->info.instance_offset_sgpr < 16)
-                instance_offset = vs_ud[vs->info.instance_offset_sgpr];
-        }
-
         // ---- encode
         std::vector<uint32_t>& vs_flat = r.vs_flat;
         std::vector<uint32_t>& ps_flat = r.ps_flat;
@@ -8284,7 +9745,7 @@ void DrawEncode(DrawRec& r) {
             PrepareDepthCompanions(vs, vs_flat);
             if (ps) PrepareDepthCompanions(ps, ps_flat);
         }
-        if (!BeginPass(key, clr, hold)) {
+        if (!BeginPass(key, clr, hold, true)) {
             NoteSkip(SkipReason::PassBegin);
             return;
         }
@@ -8379,6 +9840,7 @@ void DrawEncode(DrawRec& r) {
         }
         for (size_t i = 0; i < vbufs.size(); ++i) vb.Buffer(vbufs[i].first, vbufs[i].second, vattrs[i].buffer);
 
+        OcclBeforeDraw(regs[0xA001]); // the draw's visibility mode (an open occlusion query counts it)
         GnmDraw d;
         d.prim = prim;
         d.index_type = itype;
@@ -8485,6 +9947,8 @@ struct DispatchRec {
     uint32_t dim_x = 0, dim_y = 0, dim_z = 0;
     uint64_t indirect_addr = 0;
     const char* queue = "";
+    int queue_kind = kQueueGfx; // the GNM queue: kQueueGfx, or kQueueCompute (a compute ring)
+    int ring = -1;              // the compute ring (CP slot), -1: graphics
     std::vector<uint32_t> flat;
     StageImages img;
     // guest memory fast path (GmPlan): the ticket and the shader's predicted written pages
@@ -8520,6 +9984,8 @@ struct GmTicket {
     std::shared_ptr<const GmPages> pred;
     GmTextures textures; // what the dispatch bound (a re-run binds the same)
     std::vector<std::pair<uint64_t, uint64_t>> stores; // its pass's exact buffer stores (GmQueueStores once it ran)
+    uint64_t encoded_at = 0;      // S.write_site_seq when it was encoded (its stores' encoded_at)
+    bool counts_stores = false;   // counted in S.store_tickets until GmFinish
     std::atomic<int> state{kGmEncoded};
     std::atomic<bool> failed{false}; // its command buffer failed or the GPU hung: counts as skipped
     bool rerun = false;       // re-run after a miss (res holds the re-run's result)
@@ -8974,7 +10440,11 @@ void GmListenChain(const std::shared_ptr<std::vector<std::shared_ptr<GmTicket>>>
                                    k.have_res = true;
                                    if (k.res.gate == 1) {
                                        GmInvalidateOutside(k.res, k.pred.get());
-                                       GmQueueStores(k.stores);
+                                       // a failed command buffer (GmCommandBufferFailed marks its
+                                       // tickets before it signals, which may be what fired this):
+                                       // the pass may have stopped anywhere, it counts as skipped
+                                       // (GmFinish), so its stores mark nothing
+                                       if (!k.failed.load(std::memory_order_acquire)) GmQueueStores(k.stores, k.encoded_at);
                                    }
                                }
                                if (i >= miss) k.miss_at = now;
@@ -9001,6 +10471,21 @@ void GmEncodeTicket(const std::shared_ptr<GmTicket>& k) {
     S.pending = true;
 }
 
+// Tests (TestFailNextChain): the GPU runs the chain and then faults, before the chain's signal: the
+// failure is reported (GmCommandBufferFailed, as the completion handler of a failed command buffer
+// does) once the GPU is past the chain, instead of the GPU's 2t - 1.
+void GmTestFailChain(const std::shared_ptr<std::vector<std::shared_ptr<GmTicket>>>& members) {
+    static id<MTLSharedEvent> past = [S.dev newSharedEvent];
+    static uint64_t n = 0;
+    S.be->QueueSignal(past, ++n);
+    std::shared_ptr<std::vector<std::shared_ptr<GmTicket>>> m = members;
+    [past notifyListener:g_gms.listener
+                 atValue:n
+                   block:^(id<MTLSharedEvent>, uint64_t) {
+                       GmCommandBufferFailed(*m);
+                   }];
+}
+
 void GmCloseChain() {
     if (!g_gms.chain_open || g_gms.chain_closing) return;
     g_gms.chain_closing = true;
@@ -9010,7 +10495,8 @@ void GmCloseChain() {
     g_gmem.chain_prev = nil;
     const uint64_t t = members->back()->t;
     RequireMainTarget("GmCloseChain");
-    S.be->QueueSignal(g_gms.ev, 2 * t - 1);
+    if (g_gms.fail_next_chain.exchange(false)) GmTestFailChain(members);
+    else S.be->QueueSignal(g_gms.ev, 2 * t - 1);
     S.be->QueueWait(g_gms.ev, 2 * t);
     GmListenChain(members);
     g_gm_stats.chains++;
@@ -9064,6 +10550,8 @@ bool GmDispatchFast(DispatchRec*& rp, id<MTLComputePipelineState> pso, MTLSize t
     k->pso = pso;
     k->tg = tg;
     k->pred = r.gm_pred;
+    k->encoded_at = S.write_site_seq;
+    if (!k->stores.empty()) k->counts_stores = true, S.store_tickets++;
     GmEncodeTicket(k);
     rp = nullptr;
     g_gm_stats.fast++;
@@ -9094,7 +10582,7 @@ void GmRerun(GmTicket& k) {
         k.ran = GmRunSync(true, *k.rec, k.pso, k.tg, k.slot, &k.res, &k.textures, &stores);
         if (k.ran) {
             GmInvalidateOutside(k.res, k.pred.get());
-            GmQueueStores(stores);
+            GmQueueStores(stores, k.encoded_at); // it runs in the original's place (before 2t)
         }
     }
     if (k.miss_at > 0)
@@ -9105,6 +10593,7 @@ void GmRerun(GmTicket& k) {
 }
 
 void GmFinish(GmTicket& k) {
+    if (k.counts_stores) k.counts_stores = false, S.store_tickets--;
     if (k.slot.buf) {
         if (!k.have_res) GmReadSlot(k.slot, &k.res);
         if (k.failed) {
@@ -9242,6 +10731,8 @@ void Dispatch(GuestContext* ctx, const uint32_t* regs, uint32_t dim_x, uint32_t 
         r.dim_z = dim_z;
         r.indirect_addr = indirect_addr;
         r.queue = queue;
+        r.queue_kind = queue_kind;
+        r.ring = queue_kind == kQueueCompute ? g_cp_ring : -1;
         r.regs.Capture(regs);
         if (cs->kjob && !cs->kjob->Done()) S.kernels_open.push_back(cs->kjob);
         const bool guest_memory = cs->info.uses_guest_memory;
@@ -9285,6 +10776,17 @@ void WaitKernelCompiles() {
     }
 }
 
+// Where encoded work stands on Main and Upload (serials and command counts): preparation for an
+// asynchronous compute job that encoded something there sends the job to Main.
+struct MainMark {
+    uint64_t v[4];
+    static MainMark Now() {
+        return {{S.be->EncoderSerialOf(GnmCmdTarget::Main), S.be->EncoderSerialOf(GnmCmdTarget::Upload),
+                 S.be->CommandsOf(GnmCmdTarget::Main), S.be->CommandsOf(GnmCmdTarget::Upload)}};
+    }
+    bool operator!=(const MainMark& o) const { return memcmp(v, o.v, sizeof(v)) != 0; }
+};
+
 void DispatchEncode(DispatchRec*& rp) {
     const AliasJob alias_job;
     DispatchRec& r = *rp;
@@ -9305,6 +10807,9 @@ void DispatchEncode(DispatchRec*& rp) {
     const uint64_t indirect_addr = r.indirect_addr;
     const char* const queue = r.queue;
     StageImagesScope images(nullptr, nullptr, &r.img);
+    // asynchronous compute: a compute-ring job, and what Main and Upload held before its preparation
+    const bool async_route = g_async_compute && r.queue_kind == kQueueCompute;
+    const MainMark mark = async_route ? MainMark::Now() : MainMark{};
     {
         id<MTLComputePipelineState> pso = nil;
         auto it = S.cs_pipes.find(cs->uid);
@@ -9415,6 +10920,7 @@ void DispatchEncode(DispatchRec*& rp) {
                     RefreshGuestNewer(rd.base_address, nil, false); // the copy reads the source surface
                     RefreshGuestNewer(wr.base_address, nil, true);
                     if (S.tex->CloneGpuTexture(rd.base_address, wr.base_address, wr.size_bytes, &src, &dst, &kind)) {
+                        if (async_route) ComputeOnMain(AsyncJoin::Preparation); // a blit of GPU surfaces: Main
                         EndEncoders();
                         EnsureCmd();
                         S.be->BeginCopies();
@@ -9461,7 +10967,33 @@ void DispatchEncode(DispatchRec*& rp) {
         ResolveTextureHazards(cs, flat);
         PrepareDepthCompanions(cs, flat);
         const MTLSize tg = MTLSizeMake(wx, wy, wz);
-        if (cs->info.uses_guest_memory) {
+        const uint64_t ticket = r.gm_ticket; // (GmDispatchFast takes the record)
+        bool encoded = false;
+        if (async_route) {
+            AsyncJoin why = AsyncJoin::Count;
+            if (S.async.compute_joined) why = (AsyncJoin)S.async.joined_reason;
+            else if (RingGfxConsumed(r.ring)) why = AsyncJoin::GfxConsumed;
+            else if (MainHoldsCompute()) why = AsyncJoin::MainHeld;
+            else if (cs->info.uses_guest_memory) why = AsyncJoin::GuestMemory;
+            else if (!cs->imgs.empty()) why = AsyncJoin::Images;
+            else if (MainMark::Now() != mark) why = AsyncJoin::Preparation;
+            if (why == AsyncJoin::Count) {
+                CommitMainComputeForAsync();
+                bool ok;
+                {
+                    AsyncScope scope;
+                    AsyncAfterMainCompute();
+                    ok = EncodeCs(r, pso, tg, nil, nil, 0);
+                }
+                if (!ok) return; // skipped (EncodeCs counted it)
+                g_async_stats.eligible.fetch_add(1, std::memory_order_relaxed);
+                encoded = true;
+            } else {
+                ComputeOnMain(why);
+            }
+        }
+        if (encoded) {
+        } else if (cs->info.uses_guest_memory) {
             if (!EnsureGuestMemoryState()) {
                 RLog("guestmem", "%s CS 0x%llx skipped: no guest memory state", queue, (unsigned long long)addr);
                 NoteSkip(SkipReason::GmNoState);
@@ -9485,6 +11017,9 @@ void DispatchEncode(DispatchRec*& rp) {
         wr.inst = dim_y;
         wr.extra = dim_z;
         wr.dispatch = true;
+        wr.pgm = cs->info.pgm_hash;
+        wr.gm = cs->info.uses_guest_memory ? (ticket ? 2 : 1) : 0;
+        wr.ticket = ticket;
         LogWork(wr);
         if (!S.storage_bound.empty()) SyncStorageToDepth();
         if (ShouldTrace()) {
@@ -9639,6 +11174,7 @@ template <class Describe> void PresentStats(Describe&& describe) {
     if ((presents + 1) % 300 == 0) {
         const double now = CFAbsoluteTimeGetCurrent();
         static uint64_t fw_s0, fw_t0, fw_w0, skip0, pend0;
+        TakeQuadOverflows(); // the pattern overflows of completed command buffers, in this window's skips
         const uint64_t skip_now = S.n_skipped.load(std::memory_order_relaxed);
         const uint64_t pend_now = SkippedFor(SkipReason::PendingCompile);
         const uint64_t fw_s = FlipWaits().suspends.load(std::memory_order_relaxed);
@@ -9656,17 +11192,23 @@ template <class Describe> void PresentStats(Describe&& describe) {
                 (unsigned long long)fw_t, (unsigned long long)fw_w, (unsigned long long)(skip_now - skip0),
                 (unsigned long long)(pend_now - pend0));
         fw_s0 = fw_s, fw_t0 = fw_t, fw_w0 = fw_w, skip0 = skip_now, pend0 = pend_now;
+        fprintf(stderr, "[gnm-draw] indirect fallbacks: %s in 300 presents\n", TakeIndirectFallbacks().c_str());
+        if (g_async_compute)
+            fprintf(stderr, "[gnm-draw] async compute: %s in 300 presents\n", TakeAsyncComputeLine().c_str());
         S.screen_ms = 0;
         {
             static uint64_t held0, time0, backlog0;
             const uint64_t held = g_hold.held.load(), by_time = g_hold.by_time.load(), by_backlog = g_hold.by_backlog.load();
-            fprintf(stderr, "[gnm-draw] per frame: %.1f render passes (%.1f loading depth), %.1f compute encoders, %.1f dispatches, "
+            fprintf(stderr, "[gnm-draw] per frame: %.1f render passes (%.1f loading depth, %.2f split by occlusion queries), "
+                            "%.1f ZPASS_DONE events, %.1f draws counted for queries (%.1f missed), %.1f compute encoders, %.1f dispatches, "
                             "%.1f compute barriers; compute commits held %.1f (released by the bound %.1f, the backlog %.1f)\n",
-                    S.n_passes / 300.0, S.n_depth_loads / 300.0, S.n_cencs / 300.0, S.n_cdisp / 300.0, S.n_cbarriers / 300.0,
+                    S.n_passes / 300.0, S.n_depth_loads / 300.0, S.n_occl_splits / 300.0, S.n_occl_events / 300.0,
+                    S.n_occl_draws / 300.0, S.n_occl_missed / 300.0, S.n_cencs / 300.0, S.n_cdisp / 300.0, S.n_cbarriers / 300.0,
                     (held - held0) / 300.0, (by_time - time0) / 300.0, (by_backlog - backlog0) / 300.0);
             held0 = held, time0 = by_time, backlog0 = by_backlog;
         }
-        S.n_passes = S.n_depth_loads = S.n_cencs = S.n_cbarriers = S.n_cdisp = 0;
+        S.n_passes = S.n_depth_loads = S.n_cencs = S.n_cbarriers = S.n_cdisp = S.n_occl_splits = 0;
+        S.n_occl_events = S.n_occl_draws = S.n_occl_missed = 0;
         {
             static GnmBackendStats last{};
             const GnmBackendStats b = S.be->Stats();
@@ -9689,10 +11231,11 @@ template <class Describe> void PresentStats(Describe&& describe) {
             static TextureCache::GuestNewerStats last;
             const TextureCache::GuestNewerStats g = S.tex->GetGuestNewerStats();
             fprintf(stderr, "[gnm-draw] buffer writes over GPU targets in 300 presents: %llu marked, %llu refreshed, "
-                            "%llu partial (not refreshed), %llu refreshes not encoded; %zu marked now\n",
+                            "%llu partial (not refreshed), %llu refreshes not encoded, %llu superseded by a later GPU "
+                            "write; %zu marked now\n",
                     (unsigned long long)(g.marked - last.marked), (unsigned long long)(g.refreshed - last.refreshed),
                     (unsigned long long)(g.partial - last.partial), (unsigned long long)(g.failed - last.failed),
-                    S.tex->GuestNewerCount());
+                    (unsigned long long)(g.superseded - last.superseded), S.tex->GuestNewerCount());
             last = g;
         }
         {
@@ -9802,26 +11345,14 @@ bool PresentImpl(GuestContext* ctx, uint64_t addr, uint32_t width, uint32_t heig
                 return false;
             }
         } else {
-            // read the raw (non-sRGB) values: the display buffer holds encoded pixels
-            MTLPixelFormat f = src.pixelFormat;
-            MTLPixelFormat lin = f == MTLPixelFormatBGRA8Unorm_sRGB ? MTLPixelFormatBGRA8Unorm
-                                 : f == MTLPixelFormatRGBA8Unorm_sRGB ? MTLPixelFormatRGBA8Unorm
-                                                                      : f;
-            view = src;
-            // VideoOut A2R10G10B10 formats (0x88xxxxxx) keep R in the high bits, i.e. Metal's
-            // RGB10A2 blue channel: swap R/B when sampling (8-bit A8R8G8B8 targets are already
-            // stored as BGRA8, see GetColorTargetPixelFormat).
-            const bool rgb10 = f == MTLPixelFormatRGB10A2Unorm;
-            const bool swap_rb = rgb10 && (pixel_format & 0xFF000000u) == 0x88000000u;
-            if (swap_rb) {
-                const MTLTextureSwizzleChannels sw =
-                    MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen, MTLTextureSwizzleRed,
-                                                  MTLTextureSwizzleAlpha);
-                view = [src newTextureViewWithPixelFormat:lin textureType:MTLTextureType2D
-                                                   levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1) swizzle:sw];
-            } else if (lin != f || src.textureType != MTLTextureType2D)
-                view = [src newTextureViewWithPixelFormat:lin textureType:MTLTextureType2D
-                                                   levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+            view = PresentTextureView(src, pixel_format);
+            if (!view) {
+                RLog("present-view", "cannot view display texture format %lu as VideoOut format 0x%x",
+                     (unsigned long)src.pixelFormat, pixel_format);
+                Commit();
+                WaitAll();
+                return false;
+            }
         }
         // Convert into a present slot of the window's presenter and queue it behind the frame's
         // work: the CPU does not wait for the GPU, so the next frame's command processing
@@ -10009,6 +11540,20 @@ void ReplayDisarmMetaCleared(uint64_t cmask_address) {
         auto it = S.meta.find(cmask_address);
         if (it != S.meta.end()) it->second.cleared = false;
     });
+}
+
+uint64_t QuadIndexPoolBytes() { return g_quad_pool_reserved.load(std::memory_order_relaxed); }
+
+uint64_t IndirectRecordOffsetsUnchecked() { return g_record_unchecked.load(std::memory_order_relaxed); }
+
+void TestSetIndirectKernels(bool available) { g_indirect_kernels_off.store(!available, std::memory_order_relaxed); }
+
+uint64_t ArgsPatched(bool on_cpu) { return (on_cpu ? g_args_copied : g_args_patched).load(std::memory_order_relaxed); }
+
+uint64_t IndirectFallbacks(IndirectFallback reason, uint32_t prim) {
+    if (reason >= IndirectFallback::Count) return 0;
+    if (reason == IndirectFallback::Emulation) return g_indirect_emulation[prim & 31].load(std::memory_order_relaxed);
+    return g_indirect_fallbacks[(size_t)reason].load(std::memory_order_relaxed);
 }
 
 uint64_t SkippedCount() { return S.n_skipped.load(std::memory_order_relaxed); }

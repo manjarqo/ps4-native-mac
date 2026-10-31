@@ -163,6 +163,12 @@ int32_t sceKernelPollEventFlag(OrbisKernelEventFlag id, uint64_t bitPattern, uin
         pthread_mutex_unlock(&f->mutex);
         return 0;
     }
+    // A poll that fails still reports the pattern, as the console's (a timed-out wait does the
+    // same). Games read it after EBUSY: Sonic Origins' job groups keep bit 1 set for a flag that
+    // waits must not clear, and with 0 here every waiter cleared the group's "done" bit.
+    if (resultPattern) {
+        *resultPattern = f->pattern;
+    }
     pthread_mutex_unlock(&f->mutex);
     return (int32_t)SCE_KERNEL_ERROR_EBUSY;
 }

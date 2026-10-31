@@ -142,6 +142,72 @@ static inline uint64_t h264vt_nv12_size(uint32_t width, uint32_t height) {
 // Copies the picture to dst as linear NV12 (see above); dst must hold h264vt_nv12_size() bytes.
 void h264vt_copy_nv12(const H264VtFrame *f, uint8_t *dst);
 
+// The AVC picture information libSceVdecsw and libSceVideodec2 write as a trailer after the
+// NV12 picture in the guest frame buffer (layout from shadPS4 vdecsw.h / videodec2.h).
+typedef struct H264AvcPictureInfo {
+    uint64_t this_size;
+    uint8_t is_valid;
+    uint64_t pts_data;
+    uint64_t dts_data;
+    uint64_t attached_data;
+    uint8_t idr_pictureflag;
+    uint8_t profile_idc;
+    uint8_t level_idc;
+    uint32_t pic_width_in_mbs_minus1;
+    uint32_t pic_height_in_map_units_minus1;
+    uint8_t frame_mbs_only_flag;
+    uint8_t frame_cropping_flag;
+    uint32_t frame_crop_left_offset;
+    uint32_t frame_crop_right_offset;
+    uint32_t frame_crop_top_offset;
+    uint32_t frame_crop_bottom_offset;
+    uint8_t aspect_ratio_info_present_flag;
+    uint8_t aspect_ratio_idc;
+    uint16_t sar_width;
+    uint16_t sar_height;
+    uint8_t video_signal_type_present_flag;
+    uint8_t video_format;
+    uint8_t video_full_range_flag;
+    uint8_t colour_description_present_flag;
+    uint8_t colour_primaries;
+    uint8_t transfer_characteristics;
+    uint8_t matrix_coefficients;
+    uint8_t timing_info_present_flag;
+    uint32_t num_units_in_tick;
+    uint32_t time_scale;
+    uint8_t fixed_frame_rate_flag;
+    uint8_t bitstream_restriction_flag;
+    uint8_t max_dec_frame_buffering;
+    uint8_t pic_struct_present_flag;
+    uint8_t pic_struct;
+    uint8_t field_pic_flag;
+    uint8_t bottom_field_flag;
+    uint8_t sequence_parameter_set_present_flag;
+    uint8_t picture_parameter_set_present_flag;
+    uint8_t au_delimiter_present_flag;
+    uint8_t end_of_sequence_present_flag;
+    uint8_t end_of_stream_present_flag;
+    uint8_t filler_data_present_flag;
+    uint8_t picture_timing_sei_present_flag;
+    uint8_t buffering_period_sei_present_flag;
+    uint8_t constraint_set0_flag;
+    uint8_t constraint_set1_flag;
+    uint8_t constraint_set2_flag;
+    uint8_t constraint_set3_flag;
+    uint8_t constraint_set4_flag;
+    uint8_t constraint_set5_flag;
+} H264AvcPictureInfo;
+_Static_assert(sizeof(H264AvcPictureInfo) == 0x78, "AvcPictureInfo");
+_Static_assert(offsetof(H264AvcPictureInfo, pts_data) == 0x10, "AvcPictureInfo.pts");
+_Static_assert(offsetof(H264AvcPictureInfo, frame_crop_left_offset) == 0x38, "AvcPictureInfo.crop");
+_Static_assert(offsetof(H264AvcPictureInfo, num_units_in_tick) == 0x58, "AvcPictureInfo.timing");
+_Static_assert(offsetof(H264AvcPictureInfo, constraint_set0_flag) == 0x6f, "AvcPictureInfo.constraints");
+
+// Fills the picture information of a decoded picture: pts/dts/attached data of its access unit,
+// the SPS/VUI fields in force, the NAL-unit flags of its access unit, and crop offsets as
+// shadPS4 gives them (left/top 0, right = pitch - width, bottom = align(height, 16) - height).
+void h264vt_fill_picture_info(H264AvcPictureInfo *p, const H264VtFrame *f);
+
 // Parses an SPS NAL unit (starting with the NAL header byte). Returns false on a malformed SPS.
 bool h264_parse_sps(const uint8_t *nal, size_t size, H264SpsInfo *out);
 

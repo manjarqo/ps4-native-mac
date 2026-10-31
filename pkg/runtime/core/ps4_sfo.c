@@ -30,7 +30,7 @@ static uint16_t read_le16(const void *p) {
 
 static uint32_t read_le32(const void *p) {
     const uint8_t *b = (const uint8_t *)p;
-    return (uint32_t)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
 }
 
 bool ps4_sfo_load_memory(Ps4SfoContext *sfo, const uint8_t *buf, size_t size) {
@@ -130,7 +130,7 @@ static const PsfRawEntry *find_entry(const Ps4SfoContext *sfo, const char *key) 
     for (uint32_t i = 0; i < sfo->entries_count; i++) {
         const PsfRawEntry *e = (const PsfRawEntry *)(entries_base + i * sizeof(PsfRawEntry));
         uint16_t key_off = read_le16(&e->key_offset);
-        if (sfo->key_table_offset + key_off >= sfo->size) {
+        if ((uint64_t)sfo->key_table_offset + key_off >= sfo->size) {
             continue;
         }
 
@@ -157,7 +157,8 @@ bool ps4_sfo_get_int(const Ps4SfoContext *sfo, const char *key, int32_t *out_val
     uint32_t param_len = read_le32(&e->param_len);
 
     if (param_len != 4) return false;
-    if (sfo->data_table_offset + data_off + 4 > sfo->size) return false;
+    // In 64 bits: a crafted data offset must not wrap past the end of the buffer.
+    if ((uint64_t)sfo->data_table_offset + data_off + 4 > sfo->size) return false;
 
     *out_val = (int32_t)read_le32(sfo->data + sfo->data_table_offset + data_off);
     return true;
@@ -171,7 +172,7 @@ bool ps4_sfo_get_string(const Ps4SfoContext *sfo, const char *key, char *out_buf
     uint32_t data_off = read_le32(&e->data_offset);
     uint32_t param_len = read_le32(&e->param_len);
 
-    if (sfo->data_table_offset + data_off + param_len > sfo->size) return false;
+    if ((uint64_t)sfo->data_table_offset + data_off + param_len > sfo->size) return false;
 
     const char *src = (const char *)(sfo->data + sfo->data_table_offset + data_off);
     size_t copy_len = param_len < out_buf_sz ? param_len : out_buf_sz - 1;

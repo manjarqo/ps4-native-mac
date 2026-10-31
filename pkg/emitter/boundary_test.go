@@ -58,6 +58,8 @@ func boundaryStubAddr(i int) uint64 { return 0x7f0000000 + uint64(i)*0x10 }
 // the flags of the game build (pkg/cli: -O2 -ffp-contract=off).
 var boundaryRuntimeSources = []string{
 	"core/recomp_runtime.c",
+	"core/ps4_neo.c",
+	"core/ps4_sfo.c",
 	"kernel/threading/ps4_threading.c",
 	"kernel/threading/ps4_stall_profile.c",
 	"modules/libSceFiber/ps4_fiber.c",

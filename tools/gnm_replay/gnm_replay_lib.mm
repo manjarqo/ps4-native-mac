@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <CommonCrypto/CommonDigest.h>
 
 #include <algorithm>
@@ -344,6 +345,14 @@ Result ReplayLoaded(const Options& o, const FrameRec& f) {
     return r;
 }
 
+// The first texture the pass writes and creates itself (no contents before the pass in the
+// capture), or null: the replay does not restore renderer textures it did not seed.
+const TextureRec* CreatedWrittenTexture(const PassRec& p) {
+    for (const TextureRec& t : p.textures)
+        if (t.written && t.pre_file.empty()) return &t;
+    return nullptr;
+}
+
 // Options::settle: the pass twice, inputs restored by each ReplayLoaded; the second is returned,
 // each output compared by name and hash with the first (MarkUnstableFirst). The first replay writes
 // no --out files, keeps no bytes and runs without around_render: only the judged replay is observed.
@@ -352,12 +361,11 @@ Result ReplayLoaded(const Options& o, const FrameRec& f) {
 // replay would start from the first one's output. It is replayed once and says why (not_settled).
 Result ReplaySettled(const Options& o, const FrameRec& f) {
     if (o.pass < f.passes.size() && f.passes[o.pass].index == o.pass) {
-        for (const TextureRec& t : f.passes[o.pass].textures)
-            if (t.written && t.pre_file.empty()) {
-                Result r = ReplayLoaded(o, f);
-                r.not_settled = "writes " + t.role + ", a texture the pass creates (not restored between replays)";
-                return r;
-            }
+        if (const TextureRec* t = CreatedWrittenTexture(f.passes[o.pass])) {
+            Result r = ReplayLoaded(o, f);
+            r.not_settled = "writes " + t->role + ", a texture the pass creates (not restored between replays)";
+            return r;
+        }
     }
     Options first = o;
     first.sha256 = true;
@@ -404,6 +412,8 @@ void MarkUnstableFirst(const Result& first, Result* settled) {
     settled->unstable_first |= !settled->first_only.empty();
 }
 
+GuestContext* TestGuestContext() { return g_mem ? &g_ctx : nullptr; }
+
 Result ReplayPass(const Options& o) {
     Result r;
     FrameRec f;
@@ -435,6 +445,86 @@ std::vector<PassResult> ReplayPasses(const Options& base, uint32_t first, uint32
         p.r = ReplayOne(o, f);
         out.push_back(std::move(p));
         if (i >= f.passes.size() || i == UINT32_MAX) break; // the frame ends here: one report, not one per number
+    }
+    return out;
+}
+
+namespace {
+// Wall time between the begin and end of Options::around_render, one replay.
+struct RenderClock {
+    uint64_t t0 = 0, t1 = 0;
+    bool began = false, ended = false;
+    static void Hook(void* p, bool begin) {
+        RenderClock* c = static_cast<RenderClock*>(p);
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (begin) c->t0 = now, c->began = true;
+        else c->t1 = now, c->ended = true;
+    }
+};
+} // namespace
+
+std::vector<PassTime> TimePasses(const Options& base, uint32_t first, uint32_t last, int runs,
+                                 std::vector<std::string>* notes) {
+    std::vector<PassTime> out;
+    auto note = [&](uint32_t pass, const std::string& why) {
+        if (notes) notes->push_back("pass " + std::to_string(pass) + " not timed: " + why);
+    };
+    FrameRec f;
+    std::string err;
+    if (runs < 1) {
+        note(first, "runs must be at least 1");
+        return out;
+    }
+    if (!LoadFrame(base.frame_dir, &f, &err)) {
+        note(first, err);
+        return out;
+    }
+    if (last == UINT32_MAX) last = f.passes.empty() ? 0 : (uint32_t)f.passes.size() - 1;
+    std::vector<double> ms;
+    ms.reserve((size_t)runs);
+    for (uint32_t i = first; i <= last; ++i) {
+        if (i >= f.passes.size()) {
+            note(i, "the frame has no such pass");
+            break;
+        }
+        RenderClock clock;
+        Options o = base;
+        o.pass = i;
+        o.settle = false;
+        o.sha256 = false;
+        o.keep_outputs = false;
+        o.out_dir.clear();
+        o.around_render = RenderClock::Hook;
+        o.around_ctx = &clock;
+        // warm-up: shader translation, pipelines, texture uploads
+        const Result warm = ReplayLoaded(o, f);
+        if (!warm.ran) {
+            note(i, warm.error);
+            continue;
+        }
+        if (const TextureRec* t = CreatedWrittenTexture(f.passes[i]))
+            note(i, "timed anyway; it writes " + t->role + ", a texture it creates (not restored between replays)");
+        ms.clear();
+        std::string fail;
+        for (int k = 0; k < runs && fail.empty(); ++k) {
+            clock = RenderClock();
+            const Result r = ReplayLoaded(o, f); // restores the pass's inputs, as every settled replay does
+            if (!r.ran) fail = r.error;
+            else if (!clock.began || !clock.ended || clock.t1 < clock.t0) fail = "the renderer was not called";
+            else ms.push_back((double)(clock.t1 - clock.t0) / 1e6);
+        }
+        if (!fail.empty()) {
+            note(i, "timed replay failed: " + fail);
+            continue;
+        }
+        std::sort(ms.begin(), ms.end());
+        const size_t n = ms.size();
+        PassTime t;
+        t.pass = i;
+        t.min_ms = ms[0];
+        t.median_ms = n % 2 ? ms[n / 2] : (ms[n / 2 - 1] + ms[n / 2]) / 2;
+        t.runs = runs;
+        out.push_back(t);
     }
     return out;
 }

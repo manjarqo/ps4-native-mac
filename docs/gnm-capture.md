@@ -96,7 +96,7 @@ Addresses and hashes are hex strings (`"0x13100b0000"`), other numbers are JSON 
 - Buffer: `stage`, `index`, `addr` (bound base), `size` (bound bytes), `stride`, `written`, `vsharp[4]`.
 - Image: `stage`, `index`, `addr`, `tsharp[8]`, `dfmt`, `nfmt`, `width`, `height`, `depth`, `levels`,
   `layers`, `type`, `tile_mode`, `storage`, `depth_image`, `table` and `entry` (optional),
-  `textures` (indices of the GPU-owned textures at `addr`; empty: read from guest memory), `guest_bytes`.
+  `textures` (indices of the GPU-owned textures at `addr`, the last written last; empty: read from guest memory), `guest_bytes`.
   `table` / `entry`: the image is entry `entry` of T# table `table` of its stage (a table the shader
   indexes at run time, `gcn_image_table`; its T# is the one the CP copied from the table for this
   pass). Absent: not a table entry (a T# from user data or a fixed SRT location). A hand-written
@@ -205,7 +205,26 @@ One- and two-channel formats show R (and G). Multisampled textures have no view.
     the outputs that differ between two plain sweeps of the same build.
   - `tools/metal4_replay_cmp.py --fail-new-unstable` fails on a U line of the new list that the
     base lists do not have.
-  - A sweep takes twice as long with `--settle`. `--allocs` does not combine with it.
+  - A sweep takes twice as long with `--settle`. `--allocs` and `--time` do not combine with it.
+- `--time <n>` (single pass, range or `all`) times passes: `<out>/gnm_replay <frame_dir>
+  <pass>|<a>-<b>|all --time <n>`.
+  - Each pass gets one warm-up replay (shader translation, pipelines, texture uploads), then `n`
+    timed replays. Every replay reloads the pass's inputs the way a settled replay does, so each
+    does the same work.
+  - Output, one line per pass, and for a range a last line with the sum of the medians:
+    `pass <id> <kind> <shader addr> median_ms <x.xxx> min_ms <x.xxx> runs <n>` and
+    `total median_ms <x.xxx>`. The shader is the compute shader of a dispatch, the pixel shader of a
+    draw (its first stage when it has none).
+  - **What the number includes:** the wall time from just before `ps4draw::Draw` / `Dispatch` to
+    the return of `ps4draw::Flush(true)`, so encoding plus GPU execution until completion, measured
+    with `CLOCK_UPTIME_RAW`. It is **not** pure GPU time. The guest memory reload and the output
+    read-back are outside it. A fixed cost per pass (a command buffer, one wait) is inside it: a
+    pass of a fraction of a millisecond is that cost, not work.
+  - A pass that cannot be replayed is left out and named in a `note:` on stderr. A pass that
+    writes a texture it creates is timed with a note: the replay does not restore that texture, so
+    later replays start from the earlier output (as for `--settle`). Exit status 0 when at least
+    one pass was timed, 2 otherwise.
+  - `--time` does not combine with `--allocs`, `--settle` or `--sha` (exit 2).
 - `tools/gnm_capture_extract.py <frame_dir> <pass> <out> [--max-bytes N] [--drop-input 0xADDR]
   [--dim X,Y,Z] [--keep-outputs]`: one replayable pass, renumbered 0, as a minimal frame for a
   host test. A pass extracted from a game's capture holds that game's shaders and data: it is a

@@ -37,6 +37,7 @@ int32_t sceRtcParseRFC3339(OrbisRtcTick *pTickUtc, const char *pszDateTime);
 int32_t sceRtcGetCurrentNetworkTick(OrbisRtcTick *tick);
 int32_t sceRtcSetTime_t(OrbisDateTime *out, int64_t time, uint32_t sdk_version);
 int32_t sceRtcFormatRFC3339LocalTime(char *out, const OrbisRtcTick *tick_utc);
+int32_t sceRtcCheckValid(const OrbisDateTime *time);
 // Ticks in this module count microseconds since the Unix epoch; real PS4 ticks (since year 1)
 // are accepted as well.
 int64_t ps4_rtc_tick_to_unix_us(uint64_t tick);

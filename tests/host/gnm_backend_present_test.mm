@@ -27,6 +27,41 @@
 
 using namespace ps4gnm;
 
+namespace ps4gnm {
+id<MTLTexture> PresentTextureView(id<MTLTexture> src, uint32_t pixel_format);
+}
+
+// A compute shader may write display bytes through a uint storage image. VideoOut
+// interprets those bytes as BGRA UNORM, regardless of the shader's image type.
+static void TestUintDisplay(id<MTLDevice> dev, GnmBackend& be) {
+    const uint8_t bytes[] = {192, 128, 64, 255, 8, 32, 240, 255};
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Uint
+                                                                               width:2 height:1 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> src = [dev newTextureWithDescriptor:td];
+    [src replaceRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0 withBytes:bytes bytesPerRow:8];
+    id<MTLTexture> view = PresentTextureView(src, 0x80000000);
+    CHECK(view && view.pixelFormat == MTLPixelFormatBGRA8Unorm, "uint display must be viewed as normalized BGRA");
+    td.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:td];
+    be.MakeResident(src, GnmResidencyClass::Texture);
+    be.MakeResident(dst, GnmResidencyClass::Texture);
+    GnmUtil util;
+    std::string why;
+    CHECK(MakeGnmUtil(dev, &util, &why), "present utility: %s", why.c_str());
+    be.BeginCmd(GnmCmdTarget::Main, @"uint display", false);
+    GnmPassDesc pd;
+    pd.color[0] = {dst, nil, 0, GnmLoad::DontCare, GnmStore::Store};
+    CHECK(FullscreenPass(be, pd, util.present, nil, view), "uint display pass");
+    CHECK(CommitAndWait(be, 100), "uint display GPU completion");
+    uint8_t got[8] = {};
+    [dst getBytes:got bytesPerRow:8 fromRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0];
+    CHECK(memcmp(bytes, got, 8) == 0, "uint display must preserve encoded BGRA bytes (got %u %u %u %u)",
+          got[0], got[1], got[2], got[3]);
+}
+
 static const char* kShaders = R"(
 #include <metal_stdlib>
 using namespace metal;
@@ -285,6 +320,7 @@ int main() {
         TestPresent(dev, *be, lib);
         TestBindings(dev, *be, lib);
         TestArenaReuse(dev, *be, lib, 3);
+        TestUintDisplay(dev, *be);
     }
     printf("gnm_backend_present_test: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

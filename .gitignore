@@ -9,10 +9,14 @@ tools/
 !/tools/metal4_route_report.py
 !/tools/metal4_route.sh
 !/tools/make_engine_kit.sh
+!/tools/route_guard.sh
+!/tools/u4_route.sh
+!/tools/u4_route_pad.txt
 !/tools/metal4_perf_ab.sh
 !/tools/metal4_shot_diff.py
 !/tools/wav_activity.py
 !/tools/tests/
+!/tools/tests/data/perf_two_windows.log
 !/tools/gnm_replay/
 !/tools/gmfixtures/
 !/3rdparty/gcn-recompiler/tools/
@@ -26,3 +30,7 @@ tools/
 
 # Host test fixtures dumped from a game (game data, never committed; see tests/host/README.md)
 /tests/host/data/game/
+
+# Python test caches
+__pycache__/
+*.py[cod]

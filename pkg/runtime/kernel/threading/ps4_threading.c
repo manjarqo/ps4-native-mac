@@ -263,7 +263,7 @@ void shim_pthread_create(GuestContext *ctx) {
     stack_size = attr->stacksize_attr;
   }
 
-  GuestContext *child_ctx = recomp_create_thread_context(ctx, stack_size);
+  GuestContext *child_ctx = recomp_create_thread_context_guarded(ctx, stack_size, attr ? attr->guardsize_attr : 0);
   if (!child_ctx) {
     free(t);
     set_guest_errno(ctx, ENOMEM);
@@ -273,7 +273,7 @@ void shim_pthread_create(GuestContext *ctx) {
   child_ctx->thread_id = t->thread_id;
 
   t->ctx = child_ctx;
-  t->stack_base = child_ctx->stack_base;
+  t->stack_base = child_ctx->stack_base + child_ctx->stack_guard_size;
   t->stack_size = stack_size;
   t->start_routine = start_routine;
   t->arg = arg;
@@ -680,7 +680,7 @@ void shim_scePthreadCreate(GuestContext *ctx) {
     stack_size = attr->stacksize_attr;
   }
 
-  GuestContext *child_ctx = recomp_create_thread_context(ctx, stack_size);
+  GuestContext *child_ctx = recomp_create_thread_context_guarded(ctx, stack_size, attr ? attr->guardsize_attr : 0);
   if (!child_ctx) {
     free(t);
     set_guest_errno(ctx, ENOMEM);
@@ -690,7 +690,7 @@ void shim_scePthreadCreate(GuestContext *ctx) {
   child_ctx->thread_id = t->thread_id;
 
   t->ctx = child_ctx;
-  t->stack_base = child_ctx->stack_base;
+  t->stack_base = child_ctx->stack_base + child_ctx->stack_guard_size;
   t->stack_size = stack_size;
   t->start_routine = start_routine;
   t->arg = arg;
@@ -817,6 +817,28 @@ void shim_scePthreadAttrSetstacksize(GuestContext *ctx) {
   SCE_PTHREAD_ERR(ctx);
 }
 
+void shim_scePthreadAttrSetguardsize(GuestContext *ctx) {
+  RecompPthreadAttr *attr = get_pthread_attr(ctx, ctx->rdi);
+  if (!attr) {
+    ctx->rax = 0x80020016;
+    SHIM_RETURN();
+  }
+  attr->guardsize_attr = ctx->rsi;
+  ctx->rax = 0;
+  SHIM_RETURN();
+}
+
+void shim_scePthreadAttrGetguardsize(GuestContext *ctx) {
+  RecompPthreadAttr *attr = get_pthread_attr(ctx, ctx->rdi);
+  if (!attr || !ctx->rsi) {
+    ctx->rax = 0x80020016;
+    SHIM_RETURN();
+  }
+  *(uint64_t *)(ctx->mem_base + ctx->rsi) = attr->guardsize_attr;
+  ctx->rax = 0;
+  SHIM_RETURN();
+}
+
 void shim_scePthreadAttrSetdetachstate(GuestContext *ctx) {
   shim_pthread_attr_setdetachstate(ctx);
   SCE_PTHREAD_ERR(ctx);
@@ -928,6 +950,7 @@ void shim_scePthreadAttrGet(GuestContext *ctx) {
   pattr->cpuset = 0x7f;
 
   if (t) {
+    pattr->guardsize_attr = t->ctx ? t->ctx->stack_guard_size : 0;
     pattr->stackaddr_attr = t->stack_base ? t->stack_base : (t->ctx ? t->ctx->stack_base : 0);
     pattr->stacksize_attr = t->stack_size ? t->stack_size : (t->ctx ? t->ctx->stack_alloc_size : 2 * 1024 * 1024);
     if (t->detached) {

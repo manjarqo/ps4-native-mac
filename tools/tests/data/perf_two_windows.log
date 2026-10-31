@@ -1,0 +1,21 @@
+[gnm-draw] perf: 35.6 fps over last 300 presents; per frame: 8.0 commits, 1.0 waits, 4.6 ms waiting, 22.2 ms GPU busy, 11.4 ms CP (CPU), 8.8 ms encoder, 0.0 ms screen
+[gnm-draw] per frame: 26.6 render passes (3.0 loading depth), 25.6 compute encoders, 123.9 dispatches, 408.3 compute barriers
+[gnm-draw] buffer writes over GPU targets in 300 presents: 1484 marked, 1484 refreshed, 2361 partial (not refreshed), 0 refreshes not encoded; 0 marked now
+[gnm-draw] guest memory per frame: 1.0 dispatches (0.0 without a CPU wait, 0.0 GPU waits for the CPU), 0.00 re-runs (longest wait for one 0.00 ms, longest until a chain's re-runs ended 0.00 ms), 0.00 refused, 0.00 mispredicted, 0.00 CP waits (0.00 ms), 0.00 skipped (no buffer, binding)
+[ps4-gnm] GPU syncs by reason: eop=0 release_mem=0 eos=0 write_data=0 dma=0 ce_dump=0 cond_exec=0 other=0
+[ps4-fiber] per frame: 116 transfers (0 run, 115 switch, 0 return), coroutines
+[ps4-mutex] per frame: 4772 locks, 1001 contended (977 spun, 27 sleeps, 8 futile wakes), 20 trylocks, 22 cond waits; contended wait total 2.30 ms, avg 2.3 us p50 0 p95 5 p99 30 us; wake avg 4.6 us; host-lock contention 0.11 ms in 7
+[ps4-mutex] waiting threads (ms/contended per frame): NdJobWorkerThread 2 0.39 ms/164, NdJobWorkerThread 1 0.38 ms/164, NdJobWorkerThread 4 0.38 ms/162, NdJobWorkerThread 5 0.36 ms/161, NdJobWorkerThread 0 0.35 ms/163, NdJobWorkerThread 3 0.35 ms/163
+[ps4-mutex] top mutexes per frame: 0x14026e74b0 1212 locks 783 contended 1.68 ms wait; 0x14026e7200 526 locks 120 contended 0.30 ms wait; 0x21904a8 64 locks 8 contended 0.12 ms wait; 0x21904c8 559 locks 28 contended 0.07 ms wait
+[gnm-draw] present #301 from GPU target 0x1302c58000 (1920x1080 fmt 90); totals: draws 8007 dispatches 37304 skipped 351 shaders 95 pipelines 13 submit 2281
+[gnm-draw] perf: 35.9 fps over last 300 presents; per frame: 8.0 commits, 1.0 waits, 4.5 ms waiting, 22.0 ms GPU busy, 7.6 ms CP (CPU), 8.1 ms encoder, 0.0 ms screen
+[gnm-draw] per frame: 27.2 render passes (3.0 loading depth), 26.0 compute encoders, 125.0 dispatches, 411.0 compute barriers
+[gnm-draw] buffer writes over GPU targets in 300 presents: 1500 marked, 1500 refreshed, 2400 partial (not refreshed), 0 refreshes not encoded; 0 marked now
+[gnm-draw] guest memory per frame: 1.0 dispatches (0.0 without a CPU wait, 0.0 GPU waits for the CPU), 0.00 re-runs (longest wait for one 0.00 ms, longest until a chain's re-runs ended 0.00 ms), 0.00 refused, 0.00 mispredicted, 0.00 CP waits (0.00 ms), 0.00 skipped (no buffer, binding)
+[ps4-gnm] GPU syncs by reason: eop=0 release_mem=0 eos=0 write_data=0 dma=0 ce_dump=0 cond_exec=0 other=0
+[ps4-fiber] per frame: 83 transfers (0 run, 83 switch, 0 return), coroutines
+[ps4-mutex] per frame: 3267 locks, 825 contended (805 spun, 21 sleeps, 6 futile wakes), 14 trylocks, 1 cond waits; contended wait total 2.01 ms, avg 2.4 us p50 0 p95 5 p99 30 us; wake avg 5.8 us; host-lock contention 0.13 ms in 6
+[ps4-mutex] waiting threads (ms/contended per frame): NdJobWorkerThread 3 0.35 ms/134, NdJobWorkerThread 2 0.35 ms/140, NdJobWorkerThread 1 0.33 ms/139, NdJobWorkerThread 5 0.33 ms/135, NdJobWorkerThread 4 0.33 ms/135, NdJobWorkerThread 0 0.32 ms/140
+[ps4-mutex] top mutexes per frame: 0x14026e74b0 1063 locks 667 contended 1.60 ms wait; 0x14026e7200 498 locks 117 contended 0.36 ms wait; 0x14026e7480 398 locks 15 contended 0.02 ms wait; 0x14026e7000 538 locks 15 contended 0.02 ms wait
+[gnm-draw] frame times over 600 frames: p50 27.8 p95 32.8 p99 33.7 max 100.8 ms; >33ms 11, >50ms 2, >100ms 1
+[gnm-draw] present #601 from GPU target 0x1302c58000 (1920x1080 fmt 90); totals: draws 16179 dispatches 74805 skipped 651 shaders 95 pipelines 13 submit 4554

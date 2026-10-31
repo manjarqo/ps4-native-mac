@@ -48,3 +48,14 @@ NOOP_SHIM(sceNpSnsFacebookAbortRequest)
 NOOP_SHIM(sceHttpAbortWaitRequest)
 NOOP_SHIM(sceHttpUnsetEpoll)
 NOOP_SHIM(sceNetSocketAbort)
+
+// Sonic Origins (CUSA30448). Console services the host has no counterpart for, each answering
+// SCE_OK: the system screenshot's parameters (overlay, title), live broadcasting, and the share
+// menu's upload content.
+NOOP_SHIM(sceScreenShotSetParam)
+NOOP_SHIM(sceGameLiveStreamingInitialize)
+NOOP_SHIM(sceGameLiveStreamingEnableLiveStreaming)
+NOOP_SHIM(sceGameLiveStreamingTerminate)
+NOOP_SHIM(sceShareUtilityAdvanceInitialize)
+NOOP_SHIM(sceShareUtilityAdvanceSetUploadContentData)
+NOOP_SHIM(sceShareUtilityAdvanceTerminate)

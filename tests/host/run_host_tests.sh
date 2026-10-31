@@ -10,7 +10,7 @@ set -euo pipefail
 R=$(cd "$(dirname "$0")/../.." && pwd)
 T=$(mktemp -d)
 FIX="${PS4_HOST_GAME_FIXTURES:-$R/tests/host/data/game}"
-# output of the tests with fixture cases, for the SKIP count at the end
+# Output of the tests with fixture cases, for the SKIP count at the end.
 : > "$T/fixture_cases.txt"
 # Every test that runs Metal work runs under a hard timeout: a kernel that never ends (a GPU
 # hang) fails the run instead of holding the GPU for other work. A stopped test exits with 124
@@ -158,6 +158,15 @@ clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/kernel_batchmap_test
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/kernel_vmfree_test.c" "$R/pkg/runtime/core/recomp_runtime.c" \
   -o "$T/kernel_vmfree_test"
 "$T/kernel_vmfree_test" | grep -v '^\[ps4'
+# Sonic Origins' HLE calls: libSceLoginDialog's state machine, sceRtcCheckValid,
+# sceKernelCheckReachability through the /app0 mount, sceUserServiceGetEvent's NO_EVENT code and
+# libSceNpWebApi2 without a PSN sign-in.
+clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/sonic_hle_test.c" "$R/pkg/runtime/core/recomp_runtime.c" \
+  "$R/pkg/runtime/kernel/memory/ps4_direct_mem.c" "$R/pkg/runtime/kernel/syscalls/ps4_syscalls.c" \
+  "$R/pkg/runtime/kernel/vfs/ps4_vfs.c" "$M/libSceRtc/ps4_rtc.c" "$M/libSceRtc/ps4_rtc_extras.c" \
+  "$M/libSceLoginDialog/ps4_login_dialog.c" "$M/libSceUserService/ps4_user_service.c" \
+  "$M/libSceNpWebApi2/ps4_np_webapi2.c" -o "$T/sonic_hle_test"
+"$T/sonic_hle_test" | grep -v '^\[ps4\|^\[libSceLoginDialog'
 # New thread contexts inherit the creator's MXCSR and x87 control word (FreeBSD cpu_copy_thread).
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/thread_fpstate_test.c" "$R/pkg/runtime/core/recomp_runtime.c" \
   -o "$T/thread_fpstate_test"
@@ -167,6 +176,11 @@ clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/thread_fpstate_test.
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/crash_source_test.c" "$R/pkg/runtime/core/recomp_runtime.c" \
   -o "$T/crash_source_test"
 "$T/crash_source_test"
+# Guard-size attributes protect guest stacks and release the protection before reuse.
+clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/pthread_guard_test.c" \
+  "$R/pkg/runtime/kernel/threading/ps4_threading.c" "$R/pkg/runtime/kernel/threading/ps4_stall_profile.c" \
+  "$R/pkg/runtime/core/recomp_runtime.c" -o "$T/pthread_guard_test"
+"$T/pthread_guard_test" | grep -v '^\[ps4'
 # Static TLS per module (eboot, libSceFios2, libc): blocks laid out as FreeBSD's rtld does, .tdata
 # copied for the main thread and new threads, __tls_get_addr by module index.
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/tls_modules_test.c" \
@@ -180,6 +194,22 @@ clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/stall_watchdog_test.
 "$T/stall_watchdog_test"
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/sem_timedwait_test.c" "$R/pkg/runtime/kernel/sync/ps4_semaphore.c" \
   -o "$T/sem_timedwait_test"
+# libkernel semaphores: SignalSema hands tokens to the waiters at once (two signals to a
+# max_count 1 semaphore with a waiter both succeed), need_count order, timeout, Delete, Cancel.
+clang -std=gnu11 -Wall -Werror -g -fsanitize=thread "${RT[@]}" "$R/tests/host/kernel_sema_test.c" \
+  "$R/pkg/runtime/kernel/sync/ps4_semaphore.c" -o "$T/kernel_sema_test"
+"$T/kernel_sema_test"
+# libkernel event flags: PollEventFlag reports the pattern on EBUSY (Sonic Origins' job-group
+# wait reads it), AND / OR, CLEAR_PAT / CLEAR_ALL, timeout, wake-up from another thread.
+clang -std=gnu11 -Wall -Werror -g -fsanitize=thread "${RT[@]}" "$R/tests/host/kernel_evf_test.c" \
+  "$R/pkg/runtime/kernel/sync/ps4_event_flag.c" -o "$T/kernel_evf_test"
+"$T/kernel_evf_test"
+
+# libSceJson2 on guest memory from the runtime's VM: parse, accessors, building, serialize,
+# deep copies, malformed documents, and no node leak over 20000 parse / destroy rounds.
+clang -std=gnu11 -Wall -Werror -g -fsanitize=address,undefined "${RT[@]}" "$R/tests/host/json2_test.c" \
+  "$M/libSceJson2/ps4_json2.c" "$R/pkg/runtime/core/recomp_runtime.c" -o "$T/json2_test"
+"$T/json2_test" | grep -v '^\[ps4'
 
 # Sync objects in guest memory (ps4_sync_objects.c) under the mutex, cond and rwlock shims.
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/sync_objects_test.c" "$R/pkg/runtime/kernel/sync/ps4_sync.c" \
@@ -202,6 +232,14 @@ clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined "${RT[@]}" "$
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/playgo_sigset_test.c" "$M/libScePlayGo/ps4_playgo.c" \
   "$R/pkg/runtime/kernel/syscalls/ps4_sigset.c" -o "$T/playgo_sigset_test"
 "$T/playgo_sigset_test"
+# The DLC scan of libSceAppContent: <app>/addcont, then PS4_ADDCONT_DIR (games/<TITLE_ID>/addcont of
+# a game used in place), one entry per label, mounted at the scanned directory; and without the
+# variable only <app>/addcont.
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined "${RT[@]}" "$R/tests/host/app_content_addcont_test.c" \
+  "$M/libSceAppContent/ps4_app_content.c" "$R/pkg/runtime/core/ps4_sfo.c" "$R/pkg/runtime/kernel/vfs/ps4_vfs.c" \
+  -o "$T/app_content_addcont_test"
+"$T/app_content_addcont_test" "$T" 2>/dev/null | grep -v '^\[ps4-vfs\]'
+"$T/app_content_addcont_test" "$T" noenv 2>/dev/null | grep -v '^\[ps4-vfs\]'
 # Save directories (Mount2 / SetParam / Umount) and the save data dialog's automatic list answers
 # (PS4_SAVEDATA_DIALOG=auto) through the guest ABI: a load list loads the save the game focused, and
 # a PS4_SAVEDATA_DIALOG_PICK sequence answers successive lists (its own process).
@@ -210,6 +248,13 @@ clang -std=gnu11 -fobjc-arc -Wall -Werror -g -O1 -fsanitize=address,undefined "$
   "$R/pkg/runtime/kernel/vfs/ps4_vfs.c" -framework Cocoa -o "$T/savedata_dialog_test"
 "$T/savedata_dialog_test" 2>/dev/null
 "$T/savedata_dialog_test" sequence 2>/dev/null
+# SaveDataMemory2 persistence: in-session repeated SetupSaveDataMemory2 and cross-restart
+# persistence both with and without sceSaveDataSyncSaveDataMemory (Sonic Origins pattern),
+# immediate disk contents, child exit without Terminate, and failed buffered flush recovery.
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined "${RT[@]}" "$R/tests/savedata_test/main.c" \
+  "$M/libSceSaveData/ps4_savedata.c" "$R/pkg/runtime/core/ps4_sfo.c" "$R/pkg/runtime/core/ps4_game_key.c" \
+  "$R/pkg/runtime/kernel/vfs/ps4_vfs.c" -o "$T/savedata_test"
+"$T/savedata_test"
 # /app0 is read-only (EROFS for writes, creates, truncation, removal, renames, attribute changes)
 # through the file shims; /temp0 stays writable.
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/vfs_readonly_test.c" \
@@ -221,20 +266,25 @@ clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/vfs_readonly_test.c"
 clang -std=gnu11 -Wall -Werror -g "${RT[@]}" "$R/tests/host/direct_mem_size_test.c" \
   "$R/pkg/runtime/kernel/memory/ps4_direct_mem.c" "$R/pkg/runtime/core/recomp_runtime.c" -o "$T/direct_mem_size_test"
 "$T/direct_mem_size_test" | grep -v '^\[ps4'
+# PS4 Pro (Neo) mode only for titles that declare Pro support in their application param.sfo
+# (ATTRIBUTE bit 23); an add-on's param.sfo or none leaves the host setting in charge.
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined "${RT[@]}" "$R/tests/host/neo_mode_test.c" \
+  "$R/pkg/runtime/core/ps4_neo.c" "$R/pkg/runtime/core/ps4_sfo.c" "$R/pkg/runtime/kernel/vfs/ps4_vfs.c" -o "$T/neo_mode_test"
+"$T/neo_mode_test"
 # libScePad: controller information as Uncharted 4 reads it, and PS4_PAD_CTL command order.
 clang -std=gnu11 -fobjc-arc -Wall -Werror -g "${RT[@]}" "$R/tests/host/pad_test.m" "$M/libScePad/ps4_pad.m" \
   -framework Foundation -framework GameController -framework Cocoa -o "$T/pad_test"
 "$T/pad_test"
 "$T/pad_test" clock
 
-# H.264 through libSceVdecsw and libSceVideodec on the shared VideoToolbox core: a stream made
+# H.264 through libSceVdecsw, libSceVideodec and libSceVideodec2 on the shared VideoToolbox core: a stream made
 # by VideoToolbox's encoder (with B-frames) must come out complete, in display order, with the
 # right OutputInfo / picture-info fields. Also the access-unit census, libSceVideodec's
 # per-decoder counts, and, when the local game-data fixture is present (git-ignored, not
 # distributed), inFAMOUS's splash movie through libSceVideodec.
 V="$R/pkg/runtime/modules/libSceVideodec"
 clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address -I "$R/pkg/runtime/core" -I "$V" "$R/tests/host/vdecsw_test.c" \
-  "$R/pkg/runtime/modules/libSceVdecsw/ps4_vdecsw.c" "$V/ps4_videodec.c" "$V/ps4_h264_vt.c" -framework VideoToolbox \
+  "$R/pkg/runtime/modules/libSceVdecsw/ps4_vdecsw.c" "$V/ps4_videodec.c" "$V/ps4_videodec2.c" "$V/ps4_h264_vt.c" -framework VideoToolbox \
   -framework CoreMedia -framework CoreVideo -framework CoreFoundation -o "$T/vdecsw_test"
 "$T/vdecsw_test" "$R/tests/host/data/game/infamous/splash_europe.bsf"
 # AAC through libSceAudiodec on AudioToolbox: streams made by AudioToolbox's encoder and a stored
@@ -298,8 +348,7 @@ clang++ -std=c++17 -fobjc-arc -Wall -Werror -I "$G" -I "$R/tests/host" "$R/tests
   "$G/ps4_gnm_util_passes.mm" -framework Metal -framework Foundation -o "$T/guest_window_test"
 for m in 3 4; do btest $m 0 "$T/guest_window_test"; done
 # Shader translator (3rdparty/gcn-recompiler) scalar reads on Metal: SRT reads at offsets only the
-# shader knows, s_buffer_load past num_records, and compute shaders dumped from Uncharted 4 (local
-# fixtures: a blur, the tiled lighting and the reflection-probe culling T# tables).
+# shader knows, s_buffer_load past num_records, and a compute shader dumped from Uncharted 4.
 GR="$R/3rdparty/gcn-recompiler"
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_scalar_reads_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
@@ -325,6 +374,19 @@ for m in 3 4; do
   ( export PS4_GNM_METAL=$m; gpu "$T/tex_evict_test" ) > "$T/tex_evict.txt" 2>&1 || { cat "$T/tex_evict.txt"; exit 1; }
   tail -1 "$T/tex_evict.txt"
 done
+# CPU microtile detiling against the per-element address oracle, including clipped edges.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 -fsanitize=address,undefined \
+  -I "$G" -I "$R/pkg/runtime/core" "$R/tests/host/gnm_cpu_detile_test.mm" "$G/ps4_gnm_resources.mm" \
+  "$G/ps4_gnm_capture.cpp" "$T/membudget.o" "${BE[@]}" -framework Metal -framework Foundation -lz -o "$T/gnm_cpu_detile_test"
+"$T/gnm_cpu_detile_test"
+# Storage volumes retain their depth through GPU writes and sampled aliases.
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 -fsanitize=address,undefined \
+  -I "$G" -I "$R/pkg/runtime/core" -I "$R/tests/host" "$R/tests/host/gnm_storage_3d_test.mm" "$G/ps4_gnm_resources.mm" \
+  "$G/ps4_gnm_capture.cpp" "$T/membudget.o" "${BE[@]}" -framework Metal -framework Foundation -lz -o "$T/gnm_storage_3d_test"
+for m in 3 4; do
+  ( export PS4_GNM_METAL=$m; gpu "$T/gnm_storage_3d_test" ) > "$T/storage_3d.txt" 2>&1 || { cat "$T/storage_3d.txt"; exit 1; }
+  tail -1 "$T/storage_3d.txt"
+done
 # Array slices of POW2PAD T#s: the texture holds the image's slices (depth + 1, 6 per cube), the
 # guest layout keeps the padded count (inFAMOUS Second Son's 256-cube BC6 cube array, laid out as
 # 2048 faces, is a 256-cube Metal cube array; level 1 read after the padded slices of level 0).
@@ -334,6 +396,16 @@ clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 
 for m in 3 4; do
   ( export PS4_GNM_METAL=$m; gpu "$T/gnm_tex_layers_test" ) > "$T/tex_layers.txt" 2>&1 || { cat "$T/tex_layers.txt"; exit 1; }
   tail -1 "$T/tex_layers.txt"
+done
+# Several GPU-owned surfaces at one address: sampling, storage binds and lookups take the last
+# written surface of those that cover the image (inFAMOUS Second Son's half-resolution motion blur
+# sampled the corner of the full-resolution target at the same address: a ghost image).
+clang++ -std=c++17 -fobjc-arc -Wall -Werror -Wno-deprecated-declarations -g -O1 -fsanitize=address,undefined \
+  -I "$G" -I "$R/pkg/runtime/core" -I "$R/tests/host" "$R/tests/host/gnm_rt_last_written_test.mm" "$G/ps4_gnm_resources.mm" \
+  "$G/ps4_gnm_capture.cpp" "$T/membudget.o" "${BE[@]}" -framework Metal -framework Foundation -lz -o "$T/gnm_rt_last_written_test"
+for m in 3 4; do
+  ( export PS4_GNM_METAL=$m; gpu "$T/gnm_rt_last_written_test" ) > "$T/rt_last_written.txt" 2>&1 || { cat "$T/rt_last_written.txt"; exit 1; }
+  tail -1 "$T/rt_last_written.txt"
 done
 # Every texture the cache makes goes through TextureCache::NewTextureLocked, which reports it to the
 # residency hooks (Metal 4): no other texture creation (newTexture..., except views, which count as
@@ -359,16 +431,24 @@ done
   "$R/tests/host/gnm_exit_test.mm" "$R/tests/host/gnm_crash_exit_test.mm" "$R/tests/host/gnm_alias_dma_test.mm" \
   "$R/tests/host/gnm_compute_batch_test.mm" "$R/tests/host/gnm_detile_order_test.mm" \
   "$R/tests/host/gnm_addr64_test.mm" "$R/tests/host/gnm_htile_slices_test.mm" \
-  "$R/tests/host/gnm_tex1d_test.mm" "$R/tests/host/gnm_cube_view_test.mm" > "$T/replay_build.txt" 2>&1 ||
-  { cat "$T/replay_build.txt"; exit 1; }
+  "$R/tests/host/gnm_tex1d_test.mm" "$R/tests/host/gnm_cube_view_test.mm" \
+  "$R/tests/host/gnm_indirect_quad_test.mm" "$R/tests/host/gnm_occlusion_query_test.mm" \
+  "$R/tests/host/gnm_async_compute_test.mm" "$R/tests/host/gnm_replay_time_test.mm" \
+  > "$T/replay_build.txt" 2>&1 || { cat "$T/replay_build.txt"; exit 1; }
 # Each case on both backends, Metal 4 with the residency check.
 for m in 3 4; do rtest $m "$T/replay/gnm_replay_test"; done
+for m in 3 4; do rtest $m "$T/replay/gnm_replay_test" cpu-texture; done
 # Guest windows that alias, through the renderer: GPU DMAs through a two-window and a one-window
 # buffer over the same memory; on Metal 3 a copy of bytes written through the other window waits
 # for that write once (not for other bytes, not after its seq completed) and reads what it wrote;
 # a fill after a copy of its bytes through the other window waits for the copy (write after
 # read); a job with two encoders orders its uses in each.
-for m in 3 4; do rtest $m "$T/replay/gnm_alias_dma_test"; done
+# "async-compute": the windows across the two queues (a compute-ring fill, the graphics join and
+# copy: the copy's alias wait is left out and the join orders it).
+for m in 3 4; do
+  rtest $m "$T/replay/gnm_alias_dma_test"
+  rtest $m "$T/replay/gnm_alias_dma_test" async-compute
+done
 # MUBUF ADDR64 loads (TLOU's hair and foliage shadow cascades): the address is the V# base plus
 # the 64-bit VGPR pointer (with carry past 4 GiB) plus soffset and inst_offset, not range checked.
 # Also in a pixel shader: the draw path binds the page table and the draws' fault slot; a page a
@@ -387,6 +467,20 @@ for m in 3 4; do rtest $m "$T/replay/gnm_htile_slices_test"; done
 # PS4_GNM_SYNC_ENCODE, both backends; "off": PS4_GNM_COMPUTE_BATCH=0 commits every submission at once.
 for m in 3 4; do
   for mode in sync async off; do rtest $m "$T/replay/gnm_compute_batch_test" $mode; done
+done
+# Asynchronous compute (PS4_GNM_ASYNC_COMPUTE=1): with the main queue held at a gate, an eligible
+# compute-ring copy, its DMA and their labels complete, the labels in order; a graphics wait met by
+# a pending compute label (JoinQueues) sees the compute results, and a compute wait met by a
+# pending graphics label runs the rest of its submission behind graphics; a texture sampled over
+# memory a compute copy rewrites reads the new texels after the join (also with every bind-time
+# upload on the GPU: gpu-upload); a ring whose label graphics consumed runs on Main while another
+# ring runs beside it; Flush(true) after both queues. Both backends ("off": every queue on the
+# main one).
+for m in 3 4; do
+  for mode in sync async off; do
+    rtest $m "$T/replay/gnm_async_compute_test" $mode
+    rtest $m "$T/replay/gnm_async_compute_test" $mode gpu-upload
+  done
 done
 # PS4_GNM_MTL4_ONLY_CLEARS=1 (debug): a draw is skipped once its render pass began, the pass's
 # clear happens, and the draw is counted as skipped by the mode.
@@ -413,6 +507,25 @@ for m in 3 4; do
   [ $rc -eq 0 ] && grep -q "^pass 0: BYTE-EXACT" "$T/settle_$m.txt" && ! grep -q "UNSTABLE-FIRST" "$T/settle_$m.txt" &&
     grep -q "^O 0 buffer_0x" "$T/settle_r$m.txt" && ! grep -q "^U " "$T/settle_r$m.txt" ||
     { echo "gnm_replay --settle (Metal $m, rc=$rc)"; cat "$T/settle_$m.txt" "$T/settle_r$m.txt"; exit 1; }
+done
+# gnm_replay --time: TimePasses times a 1-group and a 256-group dispatch (the larger one takes
+# longer), and the command line prints one line per timed pass, the total for a range, and refuses
+# to combine with --allocs, --settle and --sha (exit 2).
+for m in 3 4; do rtest $m "$T/replay/gnm_replay_time_test"; done
+"$T/replay/gnm_replay_time_test" write-capture "$T/timecap" > "$T/timecap.txt" 2>&1 || { cat "$T/timecap.txt"; exit 1; }
+rc=0; ( export PS4_GNM_METAL=3; gpu "$T/replay/gnm_replay" "$T/timecap/frame_1" all --time 3 ) > "$T/time_cli.txt" 2>"$T/time_cli_err.txt" || rc=$?
+line='median_ms [0-9]+\.[0-9]{3} min_ms [0-9]+\.[0-9]{3} runs 3$'
+[ $rc -eq 0 ] && grep -Eq "^pass 0 dispatch 0x100000 $line" "$T/time_cli.txt" &&
+  grep -Eq "^pass 1 dispatch 0x100000 $line" "$T/time_cli.txt" && grep -Eq '^total median_ms [0-9]+\.[0-9]{3}$' "$T/time_cli.txt" &&
+  [ "$(wc -l < "$T/time_cli.txt")" -eq 3 ] && grep -q "pass 2 not timed: .*meta clear" "$T/time_cli_err.txt" ||
+  { echo "gnm_replay --time output (rc=$rc)"; cat "$T/time_cli.txt" "$T/time_cli_err.txt"; exit 1; }
+rc=0; ( export PS4_GNM_METAL=3; gpu "$T/replay/gnm_replay" "$T/timecap/frame_1" 1 --time 3 ) > "$T/time_one.txt" 2>&1 || rc=$?
+[ $rc -eq 0 ] && grep -Eq "^pass 1 dispatch 0x100000 $line" "$T/time_one.txt" && ! grep -q "^total" "$T/time_one.txt" ||
+  { echo "gnm_replay --time, one pass (rc=$rc)"; cat "$T/time_one.txt"; exit 1; }
+for bad in "--allocs 2" "--settle" "--sha"; do
+  rc=0; "$T/replay/gnm_replay" "$T/timecap/frame_1" 0 --time 3 $bad > "$T/time_bad.txt" 2>&1 || rc=$?
+  [ $rc -eq 2 ] && grep -q "do not apply" "$T/time_bad.txt" ||
+    { echo "gnm_replay --time $bad was not refused with exit 2 (rc=$rc)"; cat "$T/time_bad.txt"; exit 1; }
 done
 # The renderer's exit order: a program returning from main with GPU work in flight completes it
 # and destroys the backend before the renderer's static objects (gnm_exit_test.mm).
@@ -453,6 +566,13 @@ for m in 3 4; do rtest $m "$T/replay/gnm_buffer_over_target_test"; done
 # A texture uploaded on the GPU while a draw is being bound (upload command buffer): the draw's
 # encoder serial is unchanged (it is per target), so it is drawn, not skipped.
 for m in 3 4; do rtest $m "$T/replay/gnm_upload_bind_test"; done
+# Indirect quad-list draws on the GPU path (no CPU drain to read their arguments): indexed with a
+# record a dispatch writes just before, non-indexed from a start vertex, the last quad of
+# max_index, a count past max_index (indices past it read 0); the pixels of the direct draws, no
+# CPU wait while they are drawn; an indirect fan is still refused and counted by reason.
+for m in 3 4; do
+  for mode in "" async; do rtest $m "$T/replay/gnm_indirect_quad_test" $mode; done
+done
 # The guest detile dispatch of a texture copied on the GPU behind pending writes (GpuUploadTexture),
 # in one seq: after the dispatch that wrote the tiled source (its barrier in that encoder), and two
 # detiles reusing the staging buffer of one size class, each after the earlier copy from it read it;
@@ -464,8 +584,7 @@ for m in 3 4; do rtest $m "$T/replay/gnm_detile_order_test"; done
 # flushes, fence actions) do nothing and do not reach for the backend.
 gpu "$T/replay/gnm_before_init_test"
 # Buffer loads and stores through V#s a compute shader loads at run time (Uncharted 4's GPU copy
-# shader, capture r13c pass 21; local fixture; hand-assembled shaders cover the same paths
-# without it) through the renderer: probe, guest page table, dispatch; each
+# shader, capture r13c pass 21) through the renderer: probe, guest page table, dispatch; each
 # destination gets its source's dwords, GCN's range check on loads and stores, an unimplemented
 # V# format skips the dispatch. The fast path (no CPU wait) gives the same results; a probe that
 # meets a new page re-runs the dispatch without a second effect; after a barrier the CP waits for
@@ -490,9 +609,10 @@ done
 # a table record written by a pending dispatch is copied after draining the GPU. Pending is judged
 # at the CP's copy of the tables, not at encoding: a draw's VS and PS both read again after one
 # drain; a CP DMA pending at the copy in a captured frame (whose passes start encoding with the
-# GPU drained); with the encoder thread, a second reader encoded after the first one's drain.
+# GPU drained); with the encoder thread, a second reader encoded after the first one's drain; with
+# the writer on the asynchronous compute queue, the reader after the join.
 for m in 3 4; do
-  for mode in "" capture async; do rtest $m "$T/replay/gnm_tsharp_table_test" $mode; done
+  for mode in "" capture async async-compute; do rtest $m "$T/replay/gnm_tsharp_table_test" $mode; done
 done
 # Every 1D texture is a 2D texture of height 1 (a 2D array for Color1DArray): BC1, mipmapped,
 # plain RGBA8 and BC1 array Color1D T#s read through image_load_mip, image_sample_lz/_lz_o/_l/_d
@@ -505,6 +625,11 @@ done
 # Cube T#s are bound as the 2D arrays of faces the translator declares: image_sample_lz of faces
 # of a cube (and of a POW2PAD cube) gives their texels, with Metal API validation on.
 for m in 3 4; do ( export MTL_DEBUG_LAYER=1; rtest $m "$T/replay/gnm_cube_view_test" ) || exit 1; done
+# Occlusion queries (ZPASS_DONE): the samples that pass the depth/stencil tests between a query's
+# begin and end events, from Metal visibility results, in the guest's per-backend counter pairs
+# (bit 63 valid); a draw behind the depth counts 0, a 16x16 one in front 256, one with the depth
+# test off all its samples, and a query over two render passes both. Metal API validation on.
+for m in 3 4; do ( export MTL_DEBUG_LAYER=1; rtest $m "$T/replay/gnm_occlusion_query_test" ) || exit 1; done
 # RectList draws: a translated vertex shader drawn as rectangles (capture, barrier, expansion);
 # the colours at all 4 corners of each rectangle, with Metal API validation on, on each backend.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" -I "$G" -I "$R/tests/host" "$R/tests/host/gnm_rectlist_test.mm" \
@@ -532,8 +657,7 @@ clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_
   -o "$T/gcn_caller_fpenv_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }
 gpu "$T/gcn_caller_fpenv_test"
 # Uncharted 4 chapter 1 compute shaders the translator rejected (EXEC half writes, sharps
-# spilled to VGPR lanes, wave64 ballots through workgroup memory): translated and Metal-accepted
-# (local fixtures).
+# spilled to VGPR lanes, wave64 ballots through workgroup memory): translated and Metal-accepted.
 clang++ -std=c++20 -fobjc-arc -Wall -Werror -I "$GR/include" "$R/tests/host/gcn_u4_cs_test.mm" \
   "$GR/libgcn_recompiler.a" "$R/3rdparty/spirv-cross/libspirv-cross.a" -framework Metal -framework Foundation \
   -o "$T/gcn_u4_cs_test" 2>&1 | { grep -v "ignoring duplicate libraries" || true; }

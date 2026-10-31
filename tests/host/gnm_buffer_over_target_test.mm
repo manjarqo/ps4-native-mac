@@ -32,7 +32,10 @@
 //   H (GW, S, GW again on the fast path, L): x / 255. The second GW has a prediction (the first
 //      GW, and G's, ran the same shader) and PS4_GNM_GUEST_MEMORY_FAST=1 is set, so it is encoded
 //      without a CPU wait: its store marks the surface once its result is known, before L samples
-//      it (S's write in between consumed the first GW's mark: without the second mark L reads 1.0).
+//      it (S's write in between consumed the first GW's mark: without the second mark L reads 1.0);
+//   J (GW on the fast path whose command buffer is reported failed after the GPU ran its gate,
+//      TestFailNextChain; L): 10 / 255, the dispatch counts as skipped, so its store marks nothing
+//      (the ticket listener, fired by the failure's signal, must not queue the stores).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -48,11 +51,14 @@
 
 #include "gcn_recompiler.h"
 #include "gnm_replay.h"
+#include "ps4_gnm_backend.h"
 #include "ps4_gnm_capture.h"
 #include "ps4_gnm_draw.h"
 #include "ps4_gnm_resources.h"
 
 using namespace ps4gnm_capture;
+
+extern "C" void* ps4_gnm_debug_backend(void);
 
 namespace {
 
@@ -71,6 +77,7 @@ constexpr uint64_t kMemSize = 1ull << 32;
 constexpr uint64_t kCodeW = 0x100000, kCodeS = 0x110000, kCodeL = 0x120000, kCodeE = 0x130000;
 constexpr uint64_t kVs = 0x140000, kPs = 0x150000, kVb = 0x160000, kOut = 0x200000;
 constexpr uint64_t kCodeGW = 0x170000, kTableGW = 0x180000, kSrcGW = 0x190000;
+constexpr uint64_t kSrcMiss = 0x0C000000; // guest page 3 (64 MiB pages): used by no other pass
 constexpr uint32_t kW = 64, kH = 8, kTexBytes = kW * kH * 4;
 constexpr uint32_t kEnd = 0xBF810000;
 
@@ -257,22 +264,27 @@ PassRec NewPass(Frame& f, const std::vector<uint32_t>& regs, uint64_t code, cons
     return p;
 }
 
-enum class Mode { Sample, Storage, Draw, BindFails, CpuDma, GuestMem, GuestMemFast };
+enum class Mode { Sample, Storage, Draw, BindFails, CpuDma, GuestMem, GuestMemFast, GuestMemMiss, GuestMemFailed };
 
-// GW over the surface at `tex` storing `bytes`: its table (user data 0-1) holds a V# of 2048
-// bytes at kSrcGW.
-PassRec GuestMemoryPass(Frame& f, uint64_t tex, uint32_t bytes) {
+// GW's registers over the surface at `tex` storing `bytes` (its table at kTableGW, user data 0-1).
+std::vector<uint32_t> GuestMemoryRegs(uint64_t tex, uint32_t bytes) {
     std::vector<uint32_t> regs = DispatchRegs(kCodeGW, tex, bytes, tex);
     regs[0x2E12] = 2 | (3 << 6);       // 12 VGPRs, 32 SGPRs
     regs[0x2E13] = 16 << 1 | 1 << 7;   // 16 user SGPRs, s16 = workgroup id x
     uint32_t* ud = &regs[0x2E40];
     ud[0] = uint32_t(kTableGW);
     ud[1] = uint32_t(kTableGW >> 32);
-    const uint32_t vsharp[4] = {uint32_t(kSrcGW), 0, kTexBytes, ud[7]};
+    return regs;
+}
+
+// GW over the surface at `tex` storing `bytes`: its table holds a V# of 2048 bytes at `src`.
+PassRec GuestMemoryPass(Frame& f, uint64_t tex, uint32_t bytes, uint64_t src = kSrcGW) {
+    const std::vector<uint32_t> regs = GuestMemoryRegs(tex, bytes);
+    const uint32_t vsharp[4] = {uint32_t(src), uint32_t(src >> 32), kTexBytes, regs[0x2E40 + 7]};
     memcpy(f.mem + kTableGW, vsharp, sizeof(vsharp));
     PassRec p = NewPass(f, regs, kCodeGW, kProgGW);
     p.inputs.push_back(f.w->Snapshot(f.mem, kTableGW, kPage));
-    p.inputs.push_back(f.w->Snapshot(f.mem, kSrcGW, kPage));
+    p.inputs.push_back(f.w->Snapshot(f.mem, src, kPage));
     BufferRec b;
     b.stage = "cs";
     b.addr = tex;
@@ -295,7 +307,8 @@ std::string WriteCase(const std::string& root, uint64_t tex, uint32_t w_bytes, M
     std::string err;
     CHECK(w.Begin(&err), "%s", err.c_str());
     const GpuTextureId tid = mode == Mode::Draw ? ColorId(tex) : StorageId(tex);
-    const bool gm = mode == Mode::GuestMem || mode == Mode::GuestMemFast;
+    const bool gm = mode == Mode::GuestMem || mode == Mode::GuestMemFast || mode == Mode::GuestMemMiss ||
+                    mode == Mode::GuestMemFailed;
     {
         const bool lds = mode == Mode::BindFails;
         const uint32_t bytes = mode == Mode::CpuDma ? 0 : w_bytes;
@@ -327,11 +340,13 @@ std::string WriteCase(const std::string& root, uint64_t tex, uint32_t w_bytes, M
         p.inputs.push_back(w.Snapshot(f.mem, tex, kPage));
         w.AddPass(std::move(p));
     }
-    if (mode == Mode::Storage || mode == Mode::GuestMemFast) {
+    if (mode == Mode::Storage || mode == Mode::GuestMemFast || mode == Mode::GuestMemMiss) {
         PassRec p = NewPass(f, DispatchRegs(kCodeS, kOut, 256, tex), kCodeS, kProgS);
         w.AddPass(std::move(p));
     }
     if (mode == Mode::GuestMemFast) w.AddPass(GuestMemoryPass(f, tex, w_bytes));
+    // the second GW's source in a 64 MiB page no dispatch has used: its probe meets it unmapped
+    if (mode == Mode::GuestMemMiss) w.AddPass(GuestMemoryPass(f, tex, w_bytes, kSrcMiss));
     // guest memory at the surface from here on holds B (what the full-cover store left there)
     for (uint32_t y = 0; y < kH; ++y)
         for (uint32_t x = 0; x < kW; ++x) {
@@ -479,8 +494,65 @@ int main() {
         else
             CHECK(false, "case H did not run");
         ps4draw::GuestMemoryStats g2 = ps4draw::GetGuestMemoryStats();
-        CHECK(g2.fast > g1.fast, "case H: no GW took the fast path (fast %llu, sync %llu)",
-              (unsigned long long)(g2.fast - g1.fast), (unsigned long long)(g2.sync - g1.sync));
+        // both GWs on the fast path, neither re-run: the second one's mark came through the ticket
+        // listener (a re-run queues its stores itself, case H2)
+        CHECK(g2.fast - g1.fast == 2 && g2.sync == g1.sync && g2.reruns == g1.reruns,
+              "case H: fast %llu sync %llu re-runs %llu, want 2 0 0", (unsigned long long)(g2.fast - g1.fast),
+              (unsigned long long)(g2.sync - g1.sync), (unsigned long long)(g2.reruns - g1.reruns));
+        // H2: H with the second GW's source in an unmapped page: its gate refuses the pass, the
+        // dispatch is re-run before anything after it, and the re-run's store marks the surface
+        if (RunCase(WriteCase(r + "/h2", 0x540000, kTexBytes, Mode::GuestMemMiss), 4, &red))
+            CheckRed("H2 (as H, the second GW re-run after a miss)", red, ramp);
+        else
+            CHECK(false, "case H2 did not run");
+        const ps4draw::GuestMemoryStats g2m = ps4draw::GetGuestMemoryStats();
+        CHECK(g2m.fast - g2.fast == 2 && g2m.sync == g2.sync && g2m.reruns - g2.reruns == 1,
+              "case H2: fast %llu sync %llu re-runs %llu, want 2 0 1", (unsigned long long)(g2m.fast - g2.fast),
+              (unsigned long long)(g2m.sync - g2.sync), (unsigned long long)(g2m.reruns - g2.reruns));
+        // I: the late mark. GW (fast) is encoded while the GPU is held (DebugGpuWait), then S writes
+        // row 0 of the surface (1.0) without a CPU wait: S waits for GW's result on the GPU, so S
+        // runs after GW and its write is the newer one. GW's store becomes known only when the GPU
+        // goes on, after S was encoded: its mark must not replace S's write with guest memory.
+        const ps4draw::GuestMemoryStats g2i = ps4draw::GetGuestMemoryStats();
+        constexpr uint64_t tex_i = 0x580000;
+        const auto late = [] {
+            GuestContext* ctx = ps4replay::TestGuestContext();
+            auto* be = static_cast<ps4gnm::GnmBackend*>(ps4_gnm_debug_backend());
+            CHECK(ctx && be, "no replay context or backend");
+            if (!ctx || !be) return;
+            // pass 0 (GW) left its code, table and source in guest memory; S's code goes next to them
+            memcpy(ctx->mem_base + kCodeS, kProgS.data(), kProgS.size() * 4);
+            ps4draw::NotifyGuestWrite(kCodeS, kProgS.size() * 4, false, 0);
+            id<MTLSharedEvent> gate = [be->Device() newSharedEvent];
+            ps4draw::DebugGpuWait((__bridge void*)gate, 1); // the GPU work encoded from now on waits
+            const std::vector<uint32_t> gw = GuestMemoryRegs(tex_i, kTexBytes);
+            ps4draw::Dispatch(ctx, gw.data(), 1, 1, 1, 0, "gfx", ps4draw::kQueueGfx);
+            const std::vector<uint32_t> st = DispatchRegs(kCodeS, kOut, 256, tex_i);
+            ps4draw::Dispatch(ctx, st.data(), 1, 1, 1, 0, "gfx", ps4draw::kQueueGfx);
+            gate.signaledValue = 1;
+            ps4draw::Flush(true);
+        };
+        if (RunCase(WriteCase(r + "/i", tex_i, kTexBytes, Mode::GuestMem), 2, &red, -1, late))
+            CheckRed("I (a fast GW's mark known only after a later storage write, then sample)", red,
+                     [](uint32_t) { return 1.0f; });
+        else
+            CHECK(false, "case I did not run");
+        const ps4draw::GuestMemoryStats g2j = ps4draw::GetGuestMemoryStats();
+        CHECK(g2j.fast - g2i.fast == 2 && g2j.sync == g2i.sync && g2j.reruns == g2i.reruns,
+              "case I: fast %llu sync %llu re-runs %llu, want 2 0 0", (unsigned long long)(g2j.fast - g2i.fast),
+              (unsigned long long)(g2j.sync - g2i.sync), (unsigned long long)(g2j.reruns - g2i.reruns));
+        g2 = g2j;
+        // J: GW on the fast path, its command buffer reported failed after the GPU ran its gate
+        // (TestFailNextChain): the dispatch counts as skipped, so its store marks nothing and L
+        // samples the surface's own contents A
+        ps4draw::TestFailNextChain();
+        if (RunCase(WriteCase(r + "/j", 0x500000, kTexBytes, Mode::GuestMemFailed), 2, &red, 0))
+            CheckRed("J (a fast guest memory dispatch whose command buffer failed, then sample)", red, old);
+        else
+            CHECK(false, "case J did not run");
+        ps4draw::GuestMemoryStats g3 = ps4draw::GetGuestMemoryStats();
+        CHECK(g3.fast == g2.fast + 1, "case J: GW did not take the fast path (fast %llu, sync %llu)",
+              (unsigned long long)(g3.fast - g2.fast), (unsigned long long)(g3.sync - g2.sync));
         const std::string cmd = std::string("rm -rf '") + root + "'";
         if (system(cmd.c_str()) != 0) g_fail++;
         if (g_fail) {

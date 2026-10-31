@@ -3,6 +3,9 @@
 //    exactly the 28-byte ScePadControllerInformation (one connected local pad, connectedCount
 //    equal to the pad data's), writes nothing past it, and rejects unknown handles.
 //  - PS4_PAD_CTL: actions such as "shot" run in file order, after the waits and holds before them.
+//  - PS4_PAD_CTL "t": touch points in the pad data (ScePadTouchData at 0x34), a finger sliding in a
+//    straight line, two fingers with buttons, ids kept while a finger stays down and new after a
+//    release, a malformed touch line ignored, no touch after the commands.
 //  - Motion sensors: the four motion state calls keep per-handle state; the sensor is on after
 //    scePadOpen; a pad with no motion device reads as a DualShock 4 at rest (unit quaternion, +1 g on y); a scripted
 //    PS4_PAD_SCRIPT tilt turns the virtual pad (orientation, gravity and angular velocity follow);
@@ -130,6 +133,62 @@ static void test_control_file(int32_t handle, const char *path) {
   CHECK(g_close_requests == 1, "close ran %d times after the hold", g_close_requests);
   scePadReadState(handle, &d);
   CHECK(d.buttons == 0, "buttons 0x%x after the script", d.buttons);
+}
+
+static void test_touch(int32_t handle, const char *path) {
+  CHECK(offsetof(OrbisPadData, touch) == 0x34, "touch data at 0x%zx", offsetof(OrbisPadData, touch));
+  OrbisPadData d;
+  scePadReadState(handle, &d);
+  CHECK(d.touch.fingers == 0, "%u fingers before any touch command", d.touch.fingers);
+  FILE *f = fopen(path, "a");
+  // One finger slides from (100, 200) to (300, 400) over 200 ms; then it stays at (10, 20) with a
+  // second finger at (1900, 900) and R2 held; a malformed line; a wait; a new touch.
+  fprintf(f, "t 0 200 100 200 300 400\nt 200 150 10 20 10 20 1900 900 1900 900\nt 0 100 5 5\nw 50\nt 0 100 7 8 7 8\n");
+  fclose(f);
+  const double t0 = now_ms();
+  int slide_reads = 0, mono = 1, two = 0, r2_with_two = 1;
+  int last_x = -1;
+  uint8_t id_slide = 0xff, id_a = 0xff, id_b = 0xff, id_new = 0xff;
+  int bad_point = 0, gap_touch = 0, late_new = 0;
+  while (now_ms() - t0 < 600) {
+    scePadReadState(handle, &d);
+    const double t = now_ms() - t0;
+    if (d.touch.fingers == 1 && t < 190) {
+      const int x = d.touch.touch[0].x, y = d.touch.touch[0].y;
+      if (x < 100 || x > 300 || y - x != 100) bad_point++;
+      if (x < last_x) mono = 0;
+      last_x = x;
+      slide_reads++;
+      id_slide = d.touch.touch[0].finger;
+    } else if (d.touch.fingers == 2) {
+      two++;
+      id_a = d.touch.touch[0].finger;
+      id_b = d.touch.touch[1].finger;
+      if (d.touch.touch[0].x != 10 || d.touch.touch[0].y != 20 || d.touch.touch[1].x != 1900 ||
+          d.touch.touch[1].y != 900)
+        bad_point++;
+      if (!(d.buttons & ORBIS_PAD_BUTTON_R2) || d.analogButtons.r2 != 255) r2_with_two = 0;
+    } else if (d.touch.fingers == 0 && two && id_new == 0xff) {
+      gap_touch++;
+    } else if (d.touch.fingers == 1 && two) {
+      if (d.touch.touch[0].x != 7 || d.touch.touch[0].y != 8) bad_point++;
+      id_new = d.touch.touch[0].finger;
+      if (t > 560) late_new++;
+    }
+    usleep(1000);
+  }
+  CHECK(slide_reads > 20, "%d reads of the sliding finger", slide_reads);
+  CHECK(mono && last_x >= 250, "the finger did not slide right (last x %d)", last_x);
+  CHECK(bad_point == 0, "%d reads with a point off its line", bad_point);
+  CHECK(two > 20, "%d reads with two fingers", two);
+  CHECK(r2_with_two, "R2 not held with the two fingers");
+  CHECK(id_a == id_slide, "the finger that stayed down changed its id (%u -> %u)", id_slide, id_a);
+  CHECK(id_b != id_a, "both fingers have id %u", id_a);
+  CHECK(gap_touch > 10, "no release during the wait (%d reads)", gap_touch);
+  CHECK(id_new != 0xff && id_new != id_a && id_new != id_b, "the new touch has id %u (old %u, %u)", id_new, id_a, id_b);
+  CHECK(late_new == 0, "the last touch lasted past its 100 ms");
+  scePadReadState(handle, &d);
+  CHECK(d.touch.fingers == 0, "%u fingers after the commands", d.touch.fingers);
 }
 
 // Motion sensors. The script clock is PS4_PAD_CLOCK=frames: flip count f is f*1000/30 ms, so the
@@ -352,6 +411,7 @@ int main(int argc, char **argv) {
   CHECK(handle > 0, "open %d", handle);
   test_controller_information(handle);
   test_control_file(handle, path);
+  test_touch(handle, path);
   unlink(path);
   if (g_failures) {
     printf("pad_test: %d FAILED\n", g_failures);

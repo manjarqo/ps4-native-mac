@@ -572,6 +572,90 @@ static void test_guest_newer(id<MTLDevice> dev, TestTextureResidency& res) {
     munmap(base, size);
 }
 
+// A leading 8 KiB is not proof that a large tiled GPU image is guest newer. Conversely,
+// a prefix covering every visible texel need not include the unused allocation padding.
+static void test_visible_write_coverage(id<MTLDevice> dev, TestTextureResidency& res) {
+    Guest g;
+    g.size = 16 * MiB;
+    g.base = (uint8_t*)mmap(nullptr, g.size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    TextureCache tc(dev, res.be->SideQueue(), g.base, g.size);
+    Attach(tc, res);
+    for (TileMode mode : {TileMode::Thin1DThin, TileMode::Thin2DThin}) {
+        SurfaceDesc sd;
+        sd.tile_mode = mode;
+        sd.bpp = 32;
+        sd.width = 65;
+        sd.height = 9;
+        sd.pitch = 65;
+        sd.layers = 2;
+        SurfaceLayout layout;
+        check(ComputeSurfaceLayout(sd, &layout), "visible coverage: layout");
+        ColorTarget cb = Rt(mode == TileMode::Thin1DThin ? 0x100000 : 0x400000);
+        cb.tile_mode = mode;
+        cb.tiled = true;
+        cb.pitch = layout.mips[0].pitch;
+        cb.height = layout.mips[0].height;
+        cb.slice_bytes = layout.mips[0].size / layout.mips[0].slices;
+        cb.num_slices = sd.layers;
+        cb.extent_width = sd.width;
+        cb.extent_height = sd.height;
+        id<MTLTexture> tex = tc.GetColorTarget(cb, false);
+        check(tex != nil, "visible coverage: real tiled color target");
+        TextureCache::GpuUpload up;
+        SurfaceDesc actual = cb.ToSurfaceDesc();
+        actual.width = sd.width;
+        actual.height = sd.height;
+        cb.GetLayout(&layout);
+        uint64_t visible_end = 0;
+        for (uint32_t sl = 0; sl < sd.layers; ++sl)
+            for (uint32_t y = 0; y < sd.height; ++y)
+                for (uint32_t x = 0; x < sd.width; ++x)
+                    visible_end = std::max(visible_end, TiledElementOffset(actual, layout, 0, x, y, sl) + 4);
+        check(visible_end < layout.total_size && visible_end > 8192,
+              "visible coverage: oracle includes both layers and excludes padding");
+        std::vector<uint8_t> pixels(sd.width * sd.height * 4, 0x77);
+        for (uint32_t sl = 0; sl < sd.layers; ++sl)
+            [tex replaceRegion:MTLRegionMake2D(0, 0, sd.width, sd.height) mipmapLevel:0 slice:sl
+                     withBytes:pixels.data() bytesPerRow:sd.width * 4 bytesPerImage:pixels.size()];
+        tc.NoteBufferWrite(cb.address, 8192, 1);
+        check(!tc.TakeGuestNewer(cb.address, tex, &up), "visible coverage: 8 KiB cannot refresh untouched GPU texels");
+        uint8_t pixel[4] = {};
+        [tex getBytes:pixel bytesPerRow:4 bytesPerImage:4 fromRegion:MTLRegionMake2D(64, 8, 1, 1)
+          mipmapLevel:0 slice:1];
+        check(pixel[0] == 0x77, "visible coverage: untouched last-layer GPU pixel retained");
+        tc.NoteBufferWrite(cb.address + 8192, visible_end - 8192 - 4, 2);
+        check(!tc.TakeGuestNewer(cb.address, tex, &up), "visible coverage: missing last visible element stays partial");
+        tc.NoteBufferWrite(cb.address + visible_end - 4, 4, 3);
+        check(tc.TakeGuestNewer(cb.address, tex, &up), "visible coverage: all visible elements promote without padding");
+        tc.FinishGuestNewer(cb.address, tex, true, false);
+    }
+    // A thick volume has padded depth as well as padded rows; all visible z slices count.
+    uint32_t dw[8] = {0x800000u >> 8, 10u << 20, 64u | (8u << 14),
+                      4u | (5u << 3) | (6u << 6) | (7u << 9) | (19u << 20) | (10u << 28),
+                      4u | (71u << 13), 0, 0, 0};
+    ImageDesc volume;
+    check(DecodeImage(dw, 8, &volume), "visible volume: descriptor");
+    SurfaceDesc vs = volume.ToSurfaceDesc();
+    SurfaceLayout vl;
+    check(ComputeSurfaceLayout(vs, &vl), "visible volume: layout");
+    id<MTLTexture> vt = tc.GetStorageTexture(volume);
+    check(vt && vt.textureType == MTLTextureType3D && vt.depth == 5, "visible volume: real storage image");
+    uint64_t volume_end = 0;
+    for (uint32_t z = 0; z < 5; ++z)
+        for (uint32_t y = 0; y < 9; ++y)
+            for (uint32_t x = 0; x < 65; ++x)
+                volume_end = std::max(volume_end, TiledElementOffset(vs, vl, 0, x, y, z) + 4);
+    check(volume_end > 8192 && volume_end < vl.total_size, "visible volume: padded footprint");
+    TextureCache::GpuUpload vu;
+    tc.NoteBufferWrite(volume.address, volume_end - 4, 4);
+    check(!tc.TakeGuestNewer(volume.address, vt, &vu), "visible volume: last element required");
+    tc.NoteBufferWrite(volume.address + volume_end - 4, 4, 5);
+    check(tc.TakeGuestNewer(volume.address, vt, &vu), "visible volume: all z slices covered");
+    tc.FinishGuestNewer(volume.address, vt, true, false);
+    tc.Clear();
+    munmap(g.base, g.size);
+}
+
 // The texture hooks the Metal 4 backend's residency rests on: every texture the cache creates is
 // reported once, and reported released when the cache drops it (eviction, replacement, the cache's
 // destruction), so created - released is always the number of live cache textures. Views are not
@@ -713,6 +797,66 @@ static void test_gpu_copy_hook(id<MTLDevice> dev, TestTextureResidency& res) {
     munmap(g.base, g.size);
 }
 
+// A CPU-rendered framebuffer changes between submissions without a GPU buffer write.
+// Submission invalidation refreshes sampled copies, but must not upload stale guest bytes
+// over GPU-owned render targets. Repeated binds in the submission reuse the refreshed copy.
+static void test_cpu_submission(id<MTLDevice> dev, TestTextureResidency& res) {
+    Guest g;
+    g.size = 4 * MiB;
+    g.base = (uint8_t*)mmap(nullptr, g.size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    check(g.base != MAP_FAILED, "CPU submission: guest memory mapped");
+    if (g.base == MAP_FAILED) return;
+    {
+        TextureCache tc(dev, res.be->SideQueue(), g.base, g.size);
+        Attach(tc, res);
+        Fill(g, 0x10000, 64 * 64 * 4, 0x11);
+        Fill(g, 0x20000, 64 * 64 * 4, 0x77);
+        id<MTLTexture> sampled = tc.GetTexture(Tsharp(0x10000, 64, 64));
+        id<MTLTexture> target = tc.GetColorTarget(Rt(0x20000), true);
+        check(FirstByte(sampled) == 0x11 && FirstByte(target) == 0x77,
+              "CPU submission: initial sampled and target pixels");
+        Fill(g, 0x10000, 64 * 64 * 4, 0x22);
+        Fill(g, 0x20000, 64 * 64 * 4, 0x33);
+        tc.InvalidateRange(0, g.size, false);
+        check(tc.GetTexture(Tsharp(0x10000, 64, 64)) == sampled && FirstByte(sampled) == 0x22,
+              "CPU submission: CPU framebuffer changes reach the cached texture");
+        check(tc.FindColorTarget(0x20000) == target && FirstByte(target) == 0x77,
+              "CPU submission: GPU-owned pixels survive stale guest bytes");
+        const uint64_t uploads = tc.stats.uploads;
+        check(tc.GetTexture(Tsharp(0x10000, 64, 64)) == sampled && tc.stats.uploads == uploads,
+              "CPU submission: repeated binds do not upload again");
+    }
+    munmap(g.base, g.size);
+}
+
+// An old render target at the same base does not own bytes beyond its surface. A CPU image
+// spanning a larger range must not become a zero-padded copy of that smaller target.
+static void test_larger_cpu_image(id<MTLDevice> dev, TestTextureResidency& res) {
+    Guest g;
+    g.size = 4 * MiB;
+    g.base = (uint8_t*)mmap(nullptr, g.size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    check(g.base != MAP_FAILED, "larger CPU image: guest memory mapped");
+    if (g.base == MAP_FAILED) return;
+    {
+        TextureCache tc(dev, res.be->SideQueue(), g.base, g.size);
+        Attach(tc, res);
+        Fill(g, 0x10000, 64 * 64 * 4, 0x11);
+        id<MTLTexture> old = tc.GetColorTarget(Rt(0x10000, 16), true);
+        check(old && FirstByte(old) == 0x11, "larger CPU image: old short target initialized");
+        Fill(g, 0x10000, 64 * 64 * 4, 0x66);
+        id<MTLTexture> image = tc.GetTexture(Tsharp(0x10000, 64, 64));
+        std::vector<uint8_t> raw;
+        const bool read = tc.ReadRaw(image, &raw) && raw.size() == 64 * 64 * 4;
+        check(read && raw[0] == 0x66,
+              "larger CPU image: an undersized GPU target does not replace the CPU image");
+        check(read && raw[63 * 64 * 4] == 0x66,
+              "larger CPU image: last row comes from the complete CPU image");
+        check(tc.FindColorTarget(0x10000) == old && FirstByte(old) == 0x11,
+              "larger CPU image: old GPU contents remain available under their own identity");
+    }
+    munmap(g.base, g.size);
+}
+
 int main() {
     const char* backend = "none";
     test_policy_init();
@@ -737,8 +881,11 @@ int main() {
         test_cache(dev, res);
         test_superseded(dev, res);
         test_guest_newer(dev, res);
+        test_visible_write_coverage(dev, res);
         test_texture_hooks(dev, res);
         test_gpu_copy_hook(dev, res);
+        test_cpu_submission(dev, res);
+        test_larger_cpu_image(dev, res);
         const size_t leaked = res.Leaked();
         if (leaked) printf("%zu cache textures left resident\n", leaked);
         check(leaked == 0, "no texture of a destroyed cache left in the backend's residency");

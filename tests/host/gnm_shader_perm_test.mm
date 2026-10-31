@@ -11,11 +11,19 @@
 //  3. gcn_shader_explain_mismatch names why a permutation does not fit a draw (debug log).
 //  4. A VS permutation that reads its vertices through Metal's vertex fetch does not serve a
 //     draw whose V# Metal cannot fetch, even when the V#s changed while it was translated.
-//  5. The push constants: the MSL struct the translated shaders declare must be exactly
+//  5. The renderer looks a VS up on every draw (gcn_shader_find_compatible_flat), and the lookup
+//     parses the draw's fetch shader from guest memory. It used to copy 4096 dwords (16 KiB, in
+//     64 reads of 256 bytes) per lookup for a fetch shader of a few dwords: about a third of the
+//     CP thread in inFAMOUS's cannery (Task 10.4 profile). 100 lookups with unchanged user data
+//     must keep finding the same permutation while reading at most 1 KiB of fetch shader code
+//     each; with one user-data dword changed (the V# table pointer, to a V# 2 bytes off a dword)
+//     the lookup must find the inlined permutation instead.
+//  6. The push constants: the MSL struct the translated shaders declare must be exactly
 //     ps4gnm_push::kBindBytes long, with gcn_push_data's member offsets (Metal reflection).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -290,6 +298,98 @@ void TestVertexFetchDecisionKept() {
     }
 }
 
+// Counts the bytes read from the fetch shader's code region [kFetch, kFetch + 64 KiB).
+struct CountingGuest : Guest {
+    uint64_t fetch_bytes = 0, reads = 0;
+    static bool Read(void* ctx, uint64_t addr, void* dst, uint64_t size) {
+        auto* g = static_cast<CountingGuest*>(ctx);
+        constexpr uint64_t lo = FetchVs::kFetch, hi = FetchVs::kFetch + 0x10000;
+        if (addr < hi && addr + size > lo) {
+            g->fetch_bytes += std::min(addr + size, hi) - std::max(addr, lo);
+            g->reads++;
+        }
+        return Guest::Read(ctx, addr, dst, size);
+    }
+};
+
+gcn_shader* CompileVs(Guest& g, const FetchVs& v, const gcn_profile& prof) {
+    gcn_compile_desc d{};
+    d.hw_stage = GCN_HW_VS;
+    d.sw_stage = GCN_SW_VERTEX;
+    d.code_addr = FetchVs::kVs;
+    std::memcpy(d.user_data, v.ud, 64);
+    d.runtime = &v.rt;
+    d.profile = &prof;
+    d.read_guest = Guest::Read;
+    d.read_ctx = &g;
+    d.flags = GCN_COMPILE_EMIT_MSL;
+    gcn_shader* sh = nullptr;
+    char err[512] = {};
+    const gcn_status st = gcn_compile(&d, &sh, err, sizeof(err));
+    CHECK(st == GCN_OK && sh, "fetch VS does not compile: %s", err);
+    return st == GCN_OK ? sh : nullptr;
+}
+
+void TestRepeatedLookupReadsLittle() {
+    gcn_profile prof;
+    gcn_profile_default_metal(&prof);
+    CountingGuest g;
+    FetchVs v(g);
+    constexpr uint64_t kTable2 = FetchVs::kTable + 0x100; // a second V# table, position 2 bytes off a dword
+    FetchVs::Table(g.p(FetchVs::kTable), 0);
+    FetchVs::Table(g.p(kTable2), 2);
+    gcn_shader* aligned = CompileVs(g, v, prof);
+    FetchVs v2(g);
+    v2.ud[2] = uint32_t(kTable2);
+    gcn_shader* inlined = CompileVs(g, v2, prof);
+    if (!aligned || !inlined) return;
+    const gcn_shader* list[2] = {aligned, inlined};
+    gcn_shader_info info;
+    gcn_shader_get_info(aligned, &info);
+    std::vector<uint32_t> flat(std::max<uint32_t>(info.flatbuf_size_dw, 16));
+    gcn_shader_build_flatbuf(aligned, v.ud, Guest::Read, &g, flat.data(), flat.size());
+    g.fetch_bytes = g.reads = 0;
+    int same = 0;
+    for (int i = 0; i < 100; ++i)
+        same += gcn_shader_find_compatible_flat(list, 2, v.ud, flat.data(), flat.size(), &v.rt, CountingGuest::Read,
+                                                &g) == 0;
+    std::printf("gnm_shader_perm_test: 100 lookups read %llu bytes of fetch shader code in %llu reads\n",
+                (unsigned long long)g.fetch_bytes, (unsigned long long)g.reads);
+    CHECK(same == 100, "%d of 100 identical lookups found the aligned permutation", same);
+    CHECK(g.reads == 100, "100 lookups read the fetch shader in %llu reads, want one each", (unsigned long long)g.reads);
+    CHECK(g.fetch_bytes <= 100 * 1024, "100 lookups read %llu bytes of fetch shader code, want at most 1 KiB each",
+          (unsigned long long)g.fetch_bytes);
+    // one user-data dword changed: the V# table with the position 2 bytes off a dword
+    gcn_shader_build_flatbuf(aligned, v2.ud, Guest::Read, &g, flat.data(), flat.size());
+    const int hit = gcn_shader_find_compatible_flat(list, 2, v2.ud, flat.data(), flat.size(), &v2.rt,
+                                                    CountingGuest::Read, &g);
+    CHECK(hit == 1, "the lookup after the table pointer changed returned %d, want 1 (the inlined permutation)", hit);
+    gcn_shader_destroy(aligned);
+    gcn_shader_destroy(inlined);
+
+    // A fetch shader in the last 256 bytes of guest memory: the 1 KiB read fails, the reads in
+    // chunks and dwords up to the end of the mapping get it, and it still parses (translation
+    // and lookup).
+    Guest e;
+    FetchVs ve(e);
+    FetchVs::Table(e.p(FetchVs::kTable), 0);
+    constexpr uint64_t kLastFetch = kGuestBase + kGuestSize - 0x100;
+    std::memcpy(e.p(kLastFetch), e.p(FetchVs::kFetch), 11 * 4);
+    ve.ud[0] = uint32_t(kLastFetch);
+    ve.ud[1] = uint32_t(kLastFetch >> 32);
+    gcn_shader* last = CompileVs(e, ve, prof);
+    if (!last) return;
+    gcn_shader_info li;
+    gcn_shader_get_info(last, &li);
+    CHECK(!li.fetch_shader_inlined, "the fetch VS at the end of memory was translated with its fetch shader inlined");
+    std::vector<uint32_t> lf(std::max<uint32_t>(li.flatbuf_size_dw, 16));
+    gcn_shader_build_flatbuf(last, ve.ud, Guest::Read, &e, lf.data(), lf.size());
+    const gcn_shader* one[1] = {last};
+    const int lh = gcn_shader_find_compatible_flat(one, 1, ve.ud, lf.data(), lf.size(), &ve.rt, Guest::Read, &e);
+    CHECK(lh == 0, "the lookup of the fetch VS at the end of memory returned %d, want 0", lh);
+    gcn_shader_destroy(last);
+}
+
 void TestPushDataSize(id<MTLDevice> dev) {
     Guest g;
     const uint64_t code = kGuestBase, table = kGuestBase + 0x1000, out = kGuestBase + 0x2000;
@@ -350,6 +450,7 @@ int main() {
         }
         TestPermutationsWithAnotherSrtProgram();
         TestVertexFetchDecisionKept();
+        TestRepeatedLookupReadsLittle();
         TestPushDataSize(dev);
         if (g_fail) {
             std::fprintf(stderr, "gnm_shader_perm_test: %d failure(s)\n", g_fail);

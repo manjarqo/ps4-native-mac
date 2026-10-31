@@ -1,6 +1,6 @@
 // Wave-level GCN instructions on Metal, whose simdgroups are 32 wide (a wave64 compute shader
 // runs as two simdgroups), checked by running small compute shaders and reading their output.
-// Uncharted 4's chapter 1 compute shaders (gcn_u4_cs_test, local fixtures) use them:
+// Uncharted 4's chapter 1 compute shaders (tests/host/data/u4_cs_*, gcn_u4_cs_test) use them:
 //  A. s_mov_b32 exec_hi after v_cmpx: lanes 32-63 must take the written half, not the low half
 //     (they ran with exec_lo's bits: 16 lanes of 32 in the upper half here).
 //  B. V# dwords spilled to VGPR lanes (v_writelane / v_readlane) and used for a store.
@@ -239,6 +239,42 @@ gcn_shader* Compile(Guest& g, uint64_t code, const uint32_t ud[16], uint32_t thr
     return st == GCN_OK ? sh : nullptr;
 }
 
+// A local that the MSL declares without a value and reads before it writes it is undefined: the
+// GPU leaves whatever its register held (in Uncharted 4, values that kept a loop running). Every
+// case runs with every such declaration given all bits set (true, 0xFFFFFFFF, a NaN), so a kernel
+// whose result depends on one gives that result every time. A translation must not depend on
+// them: each case checks the guest program's result. GCN_WAVE_TEST_NO_POISON=1 runs the MSL as
+// generated (for inspection).
+const bool g_poison_locals = std::getenv("GCN_WAVE_TEST_NO_POISON") == nullptr;
+
+void PoisonUninitializedLocals(std::string& msl) {
+    std::string out;
+    out.reserve(msl.size() + msl.size() / 8);
+    size_t at = 0;
+    while (at < msl.size()) {
+        size_t end = msl.find('\n', at);
+        if (end == std::string::npos) end = msl.size();
+        std::string line = msl.substr(at, end - at);
+        const size_t f = line.find_first_not_of(' ');
+        static const char* const kInits[][2] = {
+            {"bool _", " = true;"}, {"uint _", " = 0xFFFFFFFFu;"}, {"int _", " = int(0xFFFFFFFFu);"},
+            {"float _", " = as_type<float>(0xFFFFFFFFu);"}};
+        for (const auto& [type, init] : kInits) {
+            const size_t n = std::strlen(type);
+            if (f != std::string::npos && line.compare(f, n, type) == 0 && line.back() == ';' &&
+                line.find_first_not_of("0123456789", f + n) == line.size() - 1) {
+                line.pop_back();
+                line += init;
+                break;
+            }
+        }
+        out += line;
+        if (end < msl.size()) out += '\n';
+        at = end + 1;
+    }
+    msl = std::move(out);
+}
+
 constexpr int kKernelTimeoutSec = 10; // a test kernel runs in microseconds
 
 // Binds like the renderer's BindStage: a guest buffer at the dword below its base, with
@@ -266,7 +302,9 @@ bool Run(id<MTLDevice> dev, Guest& g, const gcn_shader* sh, const uint32_t ud[16
           (unsigned long long)g_case_hash, barrier_errors.size());
     if (!barrier_errors.empty()) return false;
     if (std::getenv("GCN_WAVE_TEST_NO_RUN")) return false; // translate and check only
-    id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:gcn_shader_msl(sh)] options:o error:&e];
+    std::string source = gcn_shader_msl(sh);
+    if (g_poison_locals) PoisonUninitializedLocals(source);
+    id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()] options:o error:&e];
     if (!lib) {
         std::fprintf(stderr, "MSL: %s\n", e.localizedDescription.UTF8String);
         return false;
@@ -1413,6 +1451,238 @@ void TestEndWithoutWaveNeeds(id<MTLDevice> dev) {
     gcn_shader_destroy(sh);
 }
 
+// A scope of lanes 0-39 with an EXEC loop of 1 iteration (even lanes) or 2 (odd lanes). Each
+// iteration computes s[26:27] with `mask` and runs a waterfall over it: s16 += 1,
+// v_readfirstlane, v_cmpx_eq, s_andn2_b64 s[26:27] between VALU instructions (the branch then
+// reads SCC in the next block), s_mov exec, s_cbranch_scc1, with a bail-out (s[26:27] = 0 once s16
+// reaches 64). The value is the same in every lane, so when `mask` gives no bit outside EXEC each
+// waterfall runs once: s16 = 2 after the scope, stored by every lane. A bit set in lanes 40-63
+// (outside the scope) kept the waterfall going until the bail-out (s16 = 65 there).
+std::vector<uint32_t> MaskWaterfall(const std::vector<uint32_t>& mask) {
+    std::vector<uint32_t> b = {
+        0xBE900380,             // s16 = 0
+        0xBE94047E,             // s_mov_b64 s[20:21], exec
+        0x7DA80002, 0,          // v_cmpx_gt_u32 exec, s2, v0; s_cbranch_execz -> end (the scope's end)
+        0x36100081, 0x4A101081, // v8 = (v0 & 1) + 1
+        0x7E0E0280,             // v7 = 0
+        0xBE96047E,             // s_mov_b64 s[22:23], exec
+    };
+    const size_t loop = b.size();
+    b.insert(b.end(), {0x7DA21107, 0}); // loop: v_cmpx_lt_u32 exec, v7, v8; s_cbranch_execz -> end
+    b.push_back(0xBE98047E);            // s_mov_b64 s[24:25], exec
+    b.insert(b.end(), mask.begin(), mask.end());
+    b.insert(b.end(), {0x7E1E0500, 0x7E12020F}); // v_readfirstlane_b32 s15, v0; v9 = s15 (one value)
+    const size_t waterfall = b.size();
+    b.insert(b.end(), {
+                          0x80108110,             // s_add_u32 s16, s16, 1
+                          0xBF09C010, 0x859A1A80, // s_cmp_ge_u32 s16, 64; s_cselect_b64 s[26:27], 0, s[26:27]
+                          0x7E1C0509,             // v_readfirstlane_b32 s14, v9
+                          0xD1A4001C, 0x0002120E, // v_cmpx_eq_u32 s[28:29], s14, v9
+                          0x7E280300,             // v_mov_b32 v20, v0
+                          0x8A9A1C1A,             // s_andn2_b64 s[26:27], s[26:27], s[28:29]
+                          0x7E2A0300,             // v_mov_b32 v21, v0
+                          0xBEFE041A,             // s_mov_b64 exec, s[26:27]
+                      });
+    const auto branch = [&](uint32_t op, size_t to) {
+        b.push_back(op | (uint32_t(int32_t(to) - int32_t(b.size()) - 1) & 0xFFFF));
+    };
+    branch(0xBF850000, waterfall); // s_cbranch_scc1
+    b.insert(b.end(), {0xBEFE0418, 0x4A0E0E81}); // s_mov_b64 exec, s[24:25]; v7 += 1
+    branch(0xBF820000, loop);                    // s_branch
+    const size_t end = b.size();
+    b[3] = 0xBF880000 | uint32_t(end - 4);
+    b[loop + 1] = 0xBF880000 | uint32_t(end - loop - 2);
+    b.insert(b.end(), {0xBEFE0414, 0x7E060210, kStoreV3, kStoreV3b}); // exec = s[20:21]; out[l] = s16
+    return b;
+}
+
+void RunMaskWaterfall(id<MTLDevice> dev, const char* name, uint64_t hash, const std::vector<uint32_t>& mask) {
+    gcn_shader_info info{};
+    const auto out = RunWave64(dev, name, hash, MaskWaterfall(mask), 64, {{2, 40}}, 64, nullptr, &info);
+    CHECK(info.unpredicated_wave_regions == 0, "%s: %u region(s) not predicated", name, info.unpredicated_wave_regions);
+    ExpectLanes(name, out, [](uint32_t) { return 2u; });
+}
+
+//  AA. A copy of EXEC into an SGPR pair in a predicated loop, then a waterfall loop over the pair
+//     (as in Uncharted 4's async 1x1x1 CS, pgm 0x4c7184e105f63818, whose waterfall never ended):
+//     MaskWaterfall with s_mov_b64 s[26:27], exec. s_mov_b64 is a scalar instruction: it writes all
+//     64 bits for the wave, 0 for the lanes outside EXEC (40-63 here). Written only for the lanes in
+//     EXEC, those lanes' bits stayed undefined, and while one was set the waterfall went on for
+//     those lanes; with the undefined locals set (g_poison_locals), it went on until the bail-out
+//     (s16 = 65 in lanes 40-63).
+//  AB, AC. The bit outside EXEC of masks combined by s_orn2_b64 (LogicalOr, LogicalNot) and
+//     s_xnor_b64 (LogicalXor, LogicalNot) from a v_cmp result (0 outside EXEC) and an SGPR pair of
+//     all ones (the lane's own bit): s_orn2_b64 s[26:27], cmp, ones and s_xnor_b64 s[26:27], ones,
+//     cmp are 0 in every lane, the lanes outside EXEC included.
+void TestExecCopyInPredicatedLoop(id<MTLDevice> dev) {
+    RunMaskWaterfall(dev, "exec copy in a predicated loop", 0x5CA1AB1E0000005DULL, {0xBE9A047E});
+    const std::vector<uint32_t> ones_and_cmp = {
+        0xBE9E03C1, 0xBE9F03C1, // s30 = -1; s31 = -1
+        0xD1880020, 0x00020080, // v_cmp_gt_u32 s[32:33], 0, v0 (false)
+    };
+    std::vector<uint32_t> orn2 = ones_and_cmp, xnor = ones_and_cmp;
+    orn2.push_back(0x8B9A1E20); // s_orn2_b64 s[26:27], s[32:33], s[30:31]
+    xnor.push_back(0x8E9A201E); // s_xnor_b64 s[26:27], s[30:31], s[32:33]
+    RunMaskWaterfall(dev, "s_orn2_b64 mask in a predicated loop", 0x5CA1AB1E0000005EULL, orn2);
+    RunMaskWaterfall(dev, "s_xnor_b64 mask in a predicated loop", 0x5CA1AB1E0000005FULL, xnor);
+}
+
+//  AD. A copy of EXEC made in a loop and used after it (a loop result, KeepLoopResults): a scope of
+//     lanes 0-39 with an EXEC loop whose first block copies EXEC into s[26:27] and that is left by a
+//     scalar exit after 2 iterations (s_cbranch_scc1) or by EXEC (s_cbranch_execz); after the
+//     scalar exit, a waterfall over s[26:27] as in MaskWaterfall (one value in the wave: one
+//     iteration, s16 = 1 in every lane). The register that carries the copy out of the loop holds
+//     a 64-bit mask's bit, written for the whole wave (0 for lanes 40-63); written only for the
+//     lanes in EXEC, those lanes kept an undefined bit.
+void TestMaskLoopResult(id<MTLDevice> dev) {
+    const std::vector<uint32_t> b = {
+        0xBE900380, 0xBE94047E, // s16 = 0; s_mov_b64 s[20:21], exec
+        0x7DA80002, 0xBF88001B, // v_cmpx_gt_u32 exec, s2, v0; s_cbranch_execz -> 31
+        0xBE910380, 0x7E0E0280, // s17 = 0; v7 = 0
+        0x36100081, 0x4A101081, // v8 = (v0 & 1) + 1
+        0xBE9A047E,             // 8: loop: s_mov_b64 s[26:27], exec
+        0x80118111, 0xBF098211, // s_add_u32 s17, s17, 1; s_cmp_ge_u32 s17, 2
+        0xBF850004,             // s_cbranch_scc1 -> 16
+        0x7DA21107, 0xBF880010, // v_cmpx_lt_u32 exec, v7, v8; s_cbranch_execz -> 30
+        0x4A0E0E81, 0xBF82FFF8, // v7 += 1; s_branch -> 8
+        0x7E1E0500, 0x7E12020F, // 16: v_readfirstlane_b32 s15, v0; v9 = s15
+        0x80108110,             // 18: waterfall: s_add_u32 s16, s16, 1
+        0xBF09C010, 0x859A1A80, // s_cmp_ge_u32 s16, 64; s_cselect_b64 s[26:27], 0, s[26:27] (bail out)
+        0x7E1C0509,             // v_readfirstlane_b32 s14, v9
+        0xD1A4001C, 0x0002120E, // v_cmpx_eq_u32 s[28:29], s14, v9
+        0x7E280300, 0x8A9A1C1A, // v_mov_b32 v20, v0; s_andn2_b64 s[26:27], s[26:27], s[28:29]
+        0x7E2A0300, 0xBEFE041A, // v_mov_b32 v21, v0; s_mov_b64 exec, s[26:27]
+        0xBF85FFF5,             // 28: s_cbranch_scc1 -> 18
+        0xBF820001,             // s_branch -> 31
+        0xBF800000,             // 30: s_nop (the EXEC exit)
+        0xBEFE0414,             // 31: s_mov_b64 exec, s[20:21]
+        0x7E060210, kStoreV3, kStoreV3b, // out[l] = s16
+    };
+    gcn_shader_info info{};
+    const auto out = RunWave64(dev, "exec copy as a loop result", 0x5CA1AB1E00000071ULL, b, 64, {{2, 40}}, 64,
+                               nullptr, &info);
+    CHECK(info.unpredicated_wave_regions == 0, "exec copy as a loop result: %u region(s) not predicated",
+          info.unpredicated_wave_regions);
+    ExpectLanes("exec copy as a loop result", out, [](uint32_t) { return 1u; });
+}
+
+//  AE. A v_cmp result of a predicated loop combined with EXEC after it into a mask: a scope of
+//     lanes 0-39 with an EXEC loop (v_cmp_lt_u32 vcc, v7, v8; s_and_b64 exec, exec, vcc;
+//     s_cbranch_execz), then s_and_b64 s[26:27], exec, vcc and a waterfall over s[26:27] as in
+//     MaskWaterfall. VCC is 0 when the loop ends, so the waterfall runs once: s16 = 1 in every
+//     lane. The loop's VCC reaches the mask only through LogicalAnd(EXEC, cmp), which has no
+//     lane's-own-bit source: its loop-result register was not counted as a mask register and the
+//     shader stopped translating (OutsideExecBit: an unhandled source).
+void TestMaskOfLoopCompare(id<MTLDevice> dev) {
+    const std::vector<uint32_t> b = {
+        0xBE900380, 0xBE94047E, // s16 = 0; s_mov_b64 s[20:21], exec
+        0x7DA80002, 0xBF880018, // v_cmpx_gt_u32 exec, s2, v0; s_cbranch_execz -> 28
+        0x36100081, 0x4A101081, // v8 = (v0 & 1) + 1
+        0x7E0E0280, 0xBE96047E, // v7 = 0; s_mov_b64 s[22:23], exec
+        0x7D821107, 0x87FE6A7E, // 8: loop: v_cmp_lt_u32 vcc, v7, v8; s_and_b64 exec, exec, vcc
+        0xBF880002,             // s_cbranch_execz -> 13
+        0x4A0E0E81, 0xBF82FFFB, // v7 += 1; s_branch -> 8
+        0xBEFE0416, 0x879A6A7E, // 13: s_mov_b64 exec, s[22:23]; s_and_b64 s[26:27], exec, vcc
+        0x7E1E0500, 0x7E12020F, // v_readfirstlane_b32 s15, v0; v9 = s15
+        0x80108110,             // 17: waterfall: s_add_u32 s16, s16, 1
+        0xBF09C010, 0x859A1A80, // s_cmp_ge_u32 s16, 64; s_cselect_b64 s[26:27], 0, s[26:27] (bail out)
+        0x7E1C0509,             // v_readfirstlane_b32 s14, v9
+        0xD1A4001C, 0x0002120E, // v_cmpx_eq_u32 s[28:29], s14, v9
+        0x7E280300, 0x8A9A1C1A, // v_mov_b32 v20, v0; s_andn2_b64 s[26:27], s[26:27], s[28:29]
+        0x7E2A0300, 0xBEFE041A, // v_mov_b32 v21, v0; s_mov_b64 exec, s[26:27]
+        0xBF85FFF5,             // 27: s_cbranch_scc1 -> 17
+        0xBEFE0414,             // 28: s_mov_b64 exec, s[20:21]
+        0x7E060210, kStoreV3, kStoreV3b, // out[l] = s16
+    };
+    gcn_shader_info info{};
+    const auto out = RunWave64(dev, "loop v_cmp in a mask", 0x5CA1AB1E00000072ULL, b, 64, {{2, 40}}, 64, nullptr, &info);
+    CHECK(info.unpredicated_wave_regions == 0, "loop v_cmp in a mask: %u region(s) not predicated",
+          info.unpredicated_wave_regions);
+    ExpectLanes("loop v_cmp in a mask", out, [](uint32_t) { return 1u; });
+}
+
+//  AF. A copy of EXEC made in a loop, used outside every region of a program whose lanes may end:
+//     128 threads; lanes 0-31 end (s_endpgm in an EXEC scope: wave 0 ends). Then a do-while EXEC
+//     loop (s_mov_b64 s[26:27], exec; v7 += 1; v_cmpx_lt_u32 v7, v8; s_cbranch_execnz) of 1
+//     iteration (even lanes) or 2 (odd lanes): s[26:27] holds the odd lanes when it ends. Then
+//     s_mov_b64 exec, s[26:27] and a waterfall over s[26:27] that stores s16 in the lanes of its
+//     EXEC: odd lanes of wave 1 store 1, the others nothing. The loop-result register was written
+//     only where P held, so even lanes kept their first iteration's bit (1) and stored too.
+void TestMaskLoopResultWithEnds(id<MTLDevice> dev) {
+    const std::vector<uint32_t> b = {
+        0x7D8800A0, 0xBE8C246A, // v_cmp_gt_u32 vcc, 32, v0; s_and_saveexec_b64 s[12:13], vcc
+        0xBF880001, kEnd,       // s_cbranch_execz -> 4; s_endpgm
+        0xBEFE040C,             // 4: s_mov_b64 exec, s[12:13]
+        0xBE900380, 0xBE94047E, // s16 = 0; s_mov_b64 s[20:21], exec
+        0x7E0E0280, 0x36100081, 0x4A101081, // v7 = 0; v8 = (v0 & 1) + 1
+        0xBE9A047E, 0x4A0E0E81, // 10: loop: s_mov_b64 s[26:27], exec; v7 += 1
+        0x7DA21107, 0xBF89FFFC, // v_cmpx_lt_u32 exec, v7, v8; s_cbranch_execnz -> 10
+        0xBEFE041A,             // s_mov_b64 exec, s[26:27]
+        0x7E1E0500, 0x7E12020F, // v_readfirstlane_b32 s15, v0; v9 = s15
+        0x80108110,             // 17: waterfall: s_add_u32 s16, s16, 1
+        0xBF09C010, 0x859A1A80, // s_cmp_ge_u32 s16, 64; s_cselect_b64 s[26:27], 0, s[26:27] (bail out)
+        0x7E1C0509,             // v_readfirstlane_b32 s14, v9
+        0xD1A4001C, 0x0002120E, // v_cmpx_eq_u32 s[28:29], s14, v9
+        0x7E060210, kStoreV3, kStoreV3b, // out[l] = s16
+        0x8A9A1C1A, 0x7E2A0300, // s_andn2_b64 s[26:27], s[26:27], s[28:29]; v_mov_b32 v21, v0
+        0xBEFE041A, 0xBF85FFF3, // s_mov_b64 exec, s[26:27]; 29: s_cbranch_scc1 -> 17
+        0xBEFE0414,             // s_mov_b64 exec, s[20:21]
+    };
+    gcn_shader_info info{};
+    const auto out = RunWave64(dev, "loop result with ends", 0x5CA1AB1E00000073ULL, b, 128, {}, 128, nullptr, &info);
+    CHECK(info.unpredicated_wave_regions == 0, "loop result with ends: %u region(s) not predicated",
+          info.unpredicated_wave_regions);
+    ExpectLanes("loop result with ends", out, [](uint32_t l) { return l >= 64 && (l & 1) ? 1u : 0u; }, 128);
+}
+
+//  AG. Two predicated EXEC loops in a scope of lanes 0-39 whose results meet in masks (found by
+//     review): loop 1 makes C1 (v_cmp_lt_u32 s[30:31], v7, 1) and VCC; after it s[26:27] = exec &
+//     vcc and s[36:37] = vcc; loop 2 makes s[32:33] = s[36:37] & s[30:31] (L). After loop 2,
+//     v10 = v_cndmask(0, 1, s[32:33]) and a waterfall over s[26:27] as in MaskWaterfall; every
+//     lane stores s16 + v10 = 1. Whether a loop result is a mask register depends on the other
+//     results: KeepLoopResults decided it result by result on the program it was changing, so a
+//     mask write read a result's plain register and the shader stopped translating
+//     (OutsideExecBit: an unhandled source). The marked set is now decided as a fixpoint before
+//     Unsupported().
+void TestTwoLoopMaskResults(id<MTLDevice> dev) {
+    const std::vector<uint32_t> b = {
+        0xBE900380, 0xBE94047E, // s16 = 0; s_mov_b64 s[20:21], exec
+        0x7DA80002, 0xBF880027, // v_cmpx_gt_u32 exec, s2, v0; s_cbranch_execz -> 45
+        0x36100081, 0x4A101081, // v8 = (v0 & 1) + 1
+        0x7E0E0280, 0xBE96047E, // v7 = 0; s_mov_b64 s[22:23], exec
+        0xD182001E, 0x00010307, // 8: loop 1: v_cmp_lt_u32 s[30:31], v7, 1 (C1)
+        0x7D821107, 0x87FE6A7E, // v_cmp_lt_u32 vcc, v7, v8; s_and_b64 exec, exec, vcc
+        0xBF880002,             // s_cbranch_execz -> 15
+        0x4A0E0E81, 0xBF82FFF9, // v7 += 1; s_branch -> 8
+        0xBEFE0416, 0x879A6A7E, // 15: s_mov_b64 exec, s[22:23]; s_and_b64 s[26:27], exec, vcc
+        0xBEA4046A, 0x7E0E0280, // s_mov_b64 s[36:37], vcc; v7 = 0
+        0xBE98047E,             // s_mov_b64 s[24:25], exec
+        0x87A01E24,             // 20: loop 2: s_and_b64 s[32:33], s[36:37], s[30:31] (L)
+        0xD1820022, 0x00021107, // v_cmp_lt_u32 s[34:35], v7, v8
+        0x87FE227E, 0xBF880002, // s_and_b64 exec, exec, s[34:35]; s_cbranch_execz -> 27
+        0x4A0E0E81, 0xBF82FFF9, // v7 += 1; s_branch -> 20
+        0xBEFE0418,             // 27: s_mov_b64 exec, s[24:25]
+        0xD200000A, 0x00810280, // v_cndmask_b32 v10, 0, 1, s[32:33]
+        0x7E1E0500, 0x7E12020F, // v_readfirstlane_b32 s15, v0; v9 = s15
+        0x80108110,             // 32: waterfall: s_add_u32 s16, s16, 1
+        0xBF09C010, 0x859A1A80, // s_cmp_ge_u32 s16, 64; s_cselect_b64 s[26:27], 0, s[26:27] (bail out)
+        0x7E1C0509,             // v_readfirstlane_b32 s14, v9
+        0xD1A4001C, 0x0002120E, // v_cmpx_eq_u32 s[28:29], s14, v9
+        0x7E280300, 0x8A9A1C1A, // v_mov_b32 v20, v0; s_andn2_b64 s[26:27], s[26:27], s[28:29]
+        0x7E2A0300, 0xBEFE041A, // v_mov_b32 v21, v0; s_mov_b64 exec, s[26:27]
+        0xBF85FFF5,             // s_cbranch_scc1 -> 32
+        0xBEFE0414,             // 45: s_mov_b64 exec, s[20:21]
+        0x7E060210, 0x4A06070A, // v3 = s16; v3 += v10
+        kStoreV3, kStoreV3b,    // out[l] = v3
+    };
+    gcn_shader_info info{};
+    const auto out = RunWave64(dev, "two loops' mask results", 0x5CA1AB1E00000074ULL, b, 64, {{2, 40}}, 64, nullptr,
+                               &info);
+    CHECK(info.unpredicated_wave_regions == 0, "two loops' mask results: %u region(s) not predicated",
+          info.unpredicated_wave_regions);
+    ExpectLanes("two loops' mask results", out, [](uint32_t) { return 1u; });
+}
+
 void TestAddTid(id<MTLDevice> dev) {
     uint32_t v[4];
     VSharp(v, kGuestBase + 0x1000, 64, 4);
@@ -1542,6 +1812,11 @@ int main() {
         TestWriteLaneInPredicatedScope(dev);
         TestFallbackRefusesBarriers(dev);
         TestVectorRegisterInPredicatedScope(dev);
+        TestExecCopyInPredicatedLoop(dev);
+        TestMaskLoopResult(dev);
+        TestMaskOfLoopCompare(dev);
+        TestMaskLoopResultWithEnds(dev);
+        TestTwoLoopMaskResults(dev);
         if (g_fail) {
             std::fprintf(stderr, "gcn_wave_exec_test: %d failure(s)\n", g_fail);
             return 1;

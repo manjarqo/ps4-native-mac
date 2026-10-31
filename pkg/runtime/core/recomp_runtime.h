@@ -42,6 +42,7 @@ void shim_guest_nonlocal_jump(GuestContext *ctx);
 void shim_guest_cxa_throw(GuestContext *ctx);
 void recomp_free_runtime(GuestContext *ctx);
 GuestContext *recomp_create_thread_context(GuestContext *parent, uint64_t stack_size);
+GuestContext *recomp_create_thread_context_guarded(GuestContext *parent, uint64_t stack_size, uint64_t guard_size);
 uint64_t recomp_vm_alloc(GuestContext *ctx, size_t size);
 uint64_t recomp_vm_alloc_named(GuestContext *ctx, size_t size, int prot, int flags, const char *name);
 uint64_t recomp_vm_alloc_named_aligned(GuestContext *ctx, size_t size, size_t alignment, int prot, int flags, const char *name);

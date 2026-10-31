@@ -802,7 +802,9 @@ static void hud_tick(NSUInteger src_w, NSUInteger src_h, NSUInteger out_w, NSUIn
     const double span = now - g_hud.window_start;
     if (span < 0.5 || g_hud.frames == 0) return;
     const double fps = g_hud.frames / span;
-    const char *mode = ps4_host_setting_pro_mode() ? "PS4 Pro" : "PS4";
+    // The mode the title runs in (ps4_neo.h): a Pro host runs a title without Pro support in base mode.
+    extern int32_t sceKernelIsNeoMode(void);
+    const char *mode = sceKernelIsNeoMode() ? "PS4 Pro" : ps4_host_setting_pro_mode() ? "PS4 Pro, base mode" : "PS4";
     const char *backend = ps4_metal_screen_backend_label();
     const char *sep = backend ? "  " : "";
     if (!backend) backend = "";

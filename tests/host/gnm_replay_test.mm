@@ -464,6 +464,50 @@ std::string WriteDrawCapture(const std::string& root, int pending, std::vector<u
     return dir;
 }
 
+// CPU framebuffer stores are ordinary guest stores, without NotifyGuestWrite. Each new
+// submission must see them rather than a sampled copy left from the previous submission.
+// Run separately: the renderer retains the process context until process exit.
+void TestCpuSubmission() {
+    static GuestContext ctx{};
+    static GuestVMExtent extent{};
+    ctx.mem_size = kMemSize;
+    ctx.mem_base = (uint8_t*)mmap(nullptr, kMemSize, PROT_READ | PROT_WRITE,
+                                MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
+    CHECK(ctx.mem_base != MAP_FAILED, "CPU submission guest memory");
+    if (ctx.mem_base == MAP_FAILED) return;
+    ctx.process_ctx = &ctx;
+    pthread_mutex_init(&ctx.vm_mutex, nullptr);
+    extent.size = kMemSize;
+    extent.prot = PROT_READ | PROT_WRITE;
+    ctx.vm_extents = &extent;
+    const auto vs = WithFooter({0xE00C2000, 0x80000100, 0xBF8C0F70, 0xF800020F, 0x04030201,
+                               0xF80008CF, 0x04030201, kEnd}, 0x5CA1AB1E000000B1ull);
+    const auto ps = WithFooter({0x7E0002FF, 0x3EA00000, 0x7E0202FF, 0x3EA00000, 0xF09C0F00,
+                               0x00400000, 0xBF8C0F70, 0xF800180F, 0x03020100, kEnd}, 0x5CA1AB1E000000B2ull);
+    memcpy(ctx.mem_base + kVs, vs.data(), vs.size() * 4);
+    memcpy(ctx.mem_base + kPs, ps.data(), ps.size() * 4);
+    const float verts[12] = {0, -3, 0.5f, 1, 0, 3, 0.5f, 1, -4, 0, 0.5f, 1};
+    memcpy(ctx.mem_base + kVb, verts, sizeof(verts));
+    auto regs = DrawRegs();
+    regs[0xA31C] &= ~(1u << 13); // no CMASK fast clear
+    CHECK(ps4draw::Init(&ctx), "CPU submission renderer init");
+    const GpuTextureId target = TargetId(regs);
+    ps4draw::DrawArgs args;
+    args.count = 3;
+    for (uint16_t value : {uint16_t(0x3400), uint16_t(0x3A00), uint16_t(0x3800)}) {
+        auto* texels = (uint16_t*)(ctx.mem_base + kSampled);
+        for (size_t i = 0; i < 8 * 8 * 4; ++i) texels[i] = value;
+        CHECK(ps4draw::Draw(&ctx, regs.data(), args), "CPU submission draw");
+        ps4draw::OnSubmit();
+        ps4draw::Flush(true);
+        std::vector<uint8_t> raw;
+        CHECK(ps4draw::ReplayReadTexture(target, &raw), "CPU submission target readback");
+        uint16_t got = 0;
+        if (raw.size() >= (3 * 8 + 1) * 8 + 2) memcpy(&got, raw.data() + (3 * 8 + 1) * 8, 2);
+        CHECK(got == value, "CPU submission sampled stale pixels: got %04x, want %04x", got, value);
+    }
+}
+
 void TestDrawReplay(const std::string& root) {
     for (int pending = 0; pending < 3; ++pending) {
         ps4replay::Options o;
@@ -1370,6 +1414,14 @@ void TestPassSpec() {
 
 int main(int argc, char** argv) {
     @autoreleasepool {
+        if (argc == 2 && !strcmp(argv[1], "cpu-texture")) {
+            setenv("PS4_GNM_SYNC_COMPILE", "1", 1);
+            setenv("PS4_GNM_NO_SHADER_CACHE", "1", 1);
+            setenv("PS4_GNM_NO_LIB_STORE", "1", 1);
+            TestCpuSubmission();
+            printf("gnm_replay_test cpu-texture: %s\n", g_fail ? "FAIL" : "PASS");
+            return g_fail ? 1 : 0;
+        }
         // write-capture <dir>: only writes the synthetic dispatch capture (<dir>/frame_1), for
         // run_host_tests.sh to replay through tools/gnm_replay under other settings.
         if (argc == 3 && !strcmp(argv[1], "write-capture")) {
@@ -1381,7 +1433,7 @@ int main(int argc, char** argv) {
         // pending-compile: the background compile counters (run_host_tests.sh sets the environment)
         const bool pending_compile = argc == 2 && !strcmp(argv[1], "pending-compile");
         if (argc > 1 && !only_clears && !pending_compile) {
-            fprintf(stderr, "usage: gnm_replay_test [only-clears | pending-compile | write-capture <dir>]\n");
+            fprintf(stderr, "usage: gnm_replay_test [cpu-texture | only-clears | pending-compile | write-capture <dir>]\n");
             return 2;
         }
         char tmpl[] = "/tmp/gnm_replay_test.XXXXXX";

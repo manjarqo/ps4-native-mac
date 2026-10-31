@@ -14,6 +14,14 @@
 #define ORBIS_RTC_ERROR_INVALID_POINTER ((int32_t)0x80B50002)
 #define ORBIS_RTC_ERROR_INVALID_VALUE   ((int32_t)0x80B50003)
 
+#define ORBIS_RTC_ERROR_INVALID_YEAR        ((int32_t)0x80B50008)
+#define ORBIS_RTC_ERROR_INVALID_MONTH       ((int32_t)0x80B50009)
+#define ORBIS_RTC_ERROR_INVALID_DAY         ((int32_t)0x80B5000A)
+#define ORBIS_RTC_ERROR_INVALID_HOUR        ((int32_t)0x80B5000B)
+#define ORBIS_RTC_ERROR_INVALID_MINUTE      ((int32_t)0x80B5000C)
+#define ORBIS_RTC_ERROR_INVALID_SECOND      ((int32_t)0x80B5000D)
+#define ORBIS_RTC_ERROR_INVALID_MICROSECOND ((int32_t)0x80B5000E)
+
 #define RTC_UNIX_EPOCH_PS4_TICKS 62135596800000000ULL // 0001-01-01 -> 1970-01-01, in us
 
 int64_t ps4_rtc_tick_to_unix_us(uint64_t tick) {
@@ -196,5 +204,27 @@ void shim_sceRtcFormatRFC3339LocalTime(GuestContext *ctx) {
     char *out = ctx->rdi ? (char *)(ctx->mem_base + ctx->rdi) : NULL;
     const OrbisRtcTick *tick = ctx->rsi ? (const OrbisRtcTick *)(ctx->mem_base + ctx->rsi) : NULL;
     ctx->rax = (uint64_t)(int64_t)sceRtcFormatRFC3339LocalTime(out, tick);
+    SHIM_RETURN();
+}
+
+// int sceRtcCheckValid(const SceRtcDateTime *pTime): SCE_OK for a date and time of years
+// 1..9999, the first field out of range otherwise.
+int32_t sceRtcCheckValid(const OrbisDateTime *t) {
+    if (!t) return ORBIS_RTC_ERROR_INVALID_POINTER;
+    if (t->year == 0 || t->year > 9999) return ORBIS_RTC_ERROR_INVALID_YEAR;
+    if (t->month == 0 || t->month > 12) return ORBIS_RTC_ERROR_INVALID_MONTH;
+    static const uint8_t days[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    const unsigned last = days[t->month - 1] + (t->month == 2 && sceRtcIsLeapYear(t->year));
+    if (t->day == 0 || t->day > last) return ORBIS_RTC_ERROR_INVALID_DAY;
+    if (t->hour >= 24) return ORBIS_RTC_ERROR_INVALID_HOUR;
+    if (t->minute >= 60) return ORBIS_RTC_ERROR_INVALID_MINUTE;
+    if (t->second >= 60) return ORBIS_RTC_ERROR_INVALID_SECOND;
+    if (t->microsecond >= 1000000) return ORBIS_RTC_ERROR_INVALID_MICROSECOND;
+    return 0;
+}
+
+void shim_sceRtcCheckValid(GuestContext *ctx) {
+    const OrbisDateTime *t = ctx->rdi ? (const OrbisDateTime *)(ctx->mem_base + ctx->rdi) : NULL;
+    ctx->rax = (uint64_t)(int64_t)sceRtcCheckValid(t);
     SHIM_RETURN();
 }

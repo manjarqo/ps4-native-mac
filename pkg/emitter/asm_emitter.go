@@ -74,6 +74,7 @@ type AsmEmitter struct {
 	Funcs        []disasm.ReachableFunc
 	HLE          *HLEReport
 	linesBuf     []string
+	fnBuf        bytes.Buffer // one function's assembly, before relaxFarBranches
 	knownFuncSet map[uint64]bool
 	// unresolved describes every import slot (PLT stub and GOT slot address) that no host
 	// shim and no loaded module satisfies. Each one is bound to shim_unresolved_stub.
@@ -429,6 +430,11 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 			continue
 		}
 
+		// The body goes through fnBuf: a huge function needs its far branches relaxed.
+		chunkW := w
+		e.fnBuf.Reset()
+		w := bufio.NewWriter(&e.fnBuf)
+
 		fmt.Fprintf(w, ".globl _fn_0x%x\n_fn_0x%x:\n", addr, addr)
 		fmt.Fprintf(w, "    str x30, [sp, #-16]!\n")
 
@@ -477,6 +483,10 @@ func (e *AsmEmitter) emitSingleAsmChunk(path string, chunkIdx int, chunkAddrs []
 			}
 		}
 		w.WriteString("    ldr x30, [sp], #16\n    ret\n\n")
+		if err := w.Flush(); err != nil {
+			return err
+		}
+		chunkW.Write(relaxFarBranches(e.fnBuf.Bytes(), addr))
 	}
 
 	// Chunk registration function in C (for dispatch table)

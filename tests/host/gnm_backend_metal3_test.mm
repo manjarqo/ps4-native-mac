@@ -1,6 +1,9 @@
 // Metal3Backend (ps4_gnm_backend_metal3.h): the seq timeline (Commit, CompletedSeq, the
 // completion callback), the upload command buffer committed before the main one, and queue-level
-// event waits. The per-target encoder state (OpenEncoder, EncoderSerial) is checked on both
+// event waits. The asynchronous compute queue (CommitAsync): a seq of it completes while an earlier
+// main seq is held, CompletedSeq stays at the completed prefix of both queues, and an access fence
+// is reported on the other queue from Main and from AsyncCompute, and is not reused while its own
+// seq is in flight. The per-target encoder state (OpenEncoder, EncoderSerial) is checked on both
 // backends by gnm_backend_cmd_test (backend_harness.h, CheckEncoderTracking).
 #include <stdio.h>
 #include <string.h>
@@ -66,7 +69,7 @@ int main() {
         }
         std::unique_ptr<GnmBackend> owned = MakeMetal3Backend();
         CHECK(owned->Kind() == GnmBackendKind::Metal3, "kind %d", (int)owned->Kind());
-        CHECK(owned->Caps() == kGnmCapAll, "caps 0x%x", owned->Caps());
+        CHECK(owned->Caps() == (kGnmCapAll | kGnmCapAsyncCompute), "caps 0x%x", owned->Caps());
         std::string why;
         CHECK(owned->Init(dev, &why), "Init: %s", why.c_str());
         Metal3Backend& be = *static_cast<Metal3Backend*>(owned.get());
@@ -148,6 +151,43 @@ int main() {
             CHECK(done.calls.size() == 3 && done.calls[1].seq == 2 && done.calls[2].seq == 3, "completion order");
         }
         CHECK(be.Stats().commits == 5, "commits %llu", (unsigned long long)be.Stats().commits);
+
+        // ---- asynchronous compute: main seq 4 is held by an event; async seq 5 (a fill of a)
+        // completes meanwhile. CompletedSeq stays at 3 (the prefix), then reaches 5.
+        id<MTLSharedEvent> ev2 = [dev newSharedEvent];
+        be.BeginCmd(GnmCmdTarget::Main, @"test main 4", false);
+        be.QueueWait(ev2, 1);
+        be.BeginCompute(true);
+        const uint64_t main_fence = be.AccessFence();
+        be.EndEncoder();
+        be.Commit(4, Done::Fn, &done);
+        be.UseTarget(GnmCmdTarget::AsyncCompute);
+        be.BeginCmd(GnmCmdTarget::AsyncCompute, @"test async 5", false);
+        CHECK(be.CmdOpen(GnmCmdTarget::AsyncCompute), "the async command buffer is open");
+        be.BeginCopies();
+        const uint64_t async_fence = be.AccessFence();
+        CHECK(be.AccessFenceOtherQueue(main_fence), "a main fence is not reported as the other queue's from AsyncCompute");
+        CHECK(!be.AccessFenceOtherQueue(async_fence), "the async encoder's own fence is reported as the other queue's");
+        be.FillBuffer(a, 0, n, 0x7E);
+        be.EndEncoder();
+        be.CommitAsync(5, Done::Fn, &done);
+        be.UseTarget(GnmCmdTarget::Main);
+        CHECK(be.AccessFenceOtherQueue(async_fence), "an async fence is not reported as the other queue's from Main");
+        CHECK(!be.AccessFenceOtherQueue(main_fence), "a main fence is reported as the other queue's from Main");
+        CHECK(done.WaitFor(4), "async seq 5 did not complete while main seq 4 is held");
+        CHECK(AllBytes(a, 0x7E), "the async fill did not run");
+        CHECK(be.CompletedSeq() == 3, "main seq 4 is held: CompletedSeq %llu, want 3", (unsigned long long)be.CompletedSeq());
+        {
+            std::lock_guard<std::mutex> lk(done.mu);
+            CHECK(done.calls.size() == 4 && done.calls[3].seq == 5, "the async seq's completion came first");
+        }
+        // a fence of seq 4 (held) is not retired by a later commit: still live
+        be.BeginCmd(GnmCmdTarget::Main, @"test main 6", false);
+        be.Commit(6, Done::Fn, &done);
+        CHECK(be.AccessFenceOtherQueue(async_fence), "the async fence was retired before main seq 4 completed");
+        ev2.signaledValue = 1;
+        CHECK(done.WaitFor(6), "seqs 4 and 6 did not complete after the signal");
+        CHECK(be.CompletedSeq() == 6, "CompletedSeq %llu after seq 6", (unsigned long long)be.CompletedSeq());
     }
     if (g_fail) return 1;
     printf("gnm_backend_metal3_test: PASS\n");

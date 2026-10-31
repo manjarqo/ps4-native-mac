@@ -26,6 +26,18 @@ static char g_content_id[64] = {0};
 static Ps4AddContEntry g_addcont[ORBIS_APP_CONTENT_INFO_LIST_MAX_SIZE];
 static uint32_t g_addcont_count = 0;
 
+static bool addcont_known(const char *label) {
+    for (uint32_t i = 0; i < g_addcont_count; i++) {
+        if (strncmp(g_addcont[i].entitlement_label, label, sizeof(g_addcont[i].entitlement_label) - 1) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Adds every DLC directory under addon_path (one per entitlement, holding sce_sys/param.sfo
+// or param.sfo of CATEGORY "ac") to g_addcont. A label found by an earlier scan is kept and
+// the later directory is skipped, so each entitlement is listed and mounted once.
 static void scan_addcont_directory(const char *addon_path) {
     DIR *dir = opendir(addon_path);
     if (!dir) return;
@@ -75,6 +87,9 @@ static void scan_addcont_directory(const char *addon_path) {
         }
 
         const char *entitlement = content_id + ORBIS_APP_CONTENT_ENTITLEMENT_LABEL_OFFSET;
+        if (addcont_known(entitlement)) {
+            continue;
+        }
         if (g_addcont_count < ORBIS_APP_CONTENT_INFO_LIST_MAX_SIZE) {
             Ps4AddContEntry *e = &g_addcont[g_addcont_count++];
             strncpy(e->entitlement_label, entitlement, sizeof(e->entitlement_label) - 1);
@@ -83,6 +98,7 @@ static void scan_addcont_directory(const char *addon_path) {
             strncpy(e->host_dir, full_entry_path, sizeof(e->host_dir) - 1);
             e->host_dir[sizeof(e->host_dir) - 1] = '\0';
             memset(e->key, 0, sizeof(e->key));
+            fprintf(stderr, "[ps4-appcontent] DLC %s: %s\n", e->entitlement_label, e->host_dir);
         }
     }
     closedir(dir);
@@ -218,7 +234,9 @@ int32_t sceAppContentInitialize(const OrbisAppContentInitParam *initParam, Orbis
     // Mount /download0 (always present for an application on real hardware).
     mount_download0();
 
-    // Scan for DLCs
+    // Scan for DLCs: <app>/addcont (a copied game in the library), <app>/../addcont/<TITLE_ID>,
+    // then $PS4_ADDCONT_DIR, which the game manager sets for a game used in place (its DLC is
+    // kept outside the user's folder, in the library's games/<TITLE_ID>/addcont).
     const char *app_root = ps4_vfs_get_app_root();
     if (app_root && *app_root) {
         char addon_dir[1024];
@@ -227,6 +245,10 @@ int32_t sceAppContentInitialize(const OrbisAppContentInitParam *initParam, Orbis
 
         snprintf(addon_dir, sizeof(addon_dir), "%s/../addcont/%s", app_root, g_title_id);
         scan_addcont_directory(addon_dir);
+    }
+    const char *env_addcont = getenv("PS4_ADDCONT_DIR");
+    if (env_addcont && *env_addcont) {
+        scan_addcont_directory(env_addcont);
     }
 
     s_initialized = true;

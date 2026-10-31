@@ -94,6 +94,49 @@ another. `gnm_backend_alias_test` and `gnm_alias_dma_test` check this on both ba
 - The re-run queue's raw encoders, which the queue events order.
 - Accesses inside one encoder, which the renderer's barriers order.
 
+## Asynchronous compute (`PS4_GNM_ASYNC_COMPUTE=1`)
+
+On GCN the compute (ASC) rings run beside the graphics ring. A guest job on a compute ring that
+does not wait for graphics finishes while the graphics frame runs. With every GNM queue on one
+Metal queue, such a job first waits for the graphics command buffers committed before it. In
+inFAMOUS Second Son that is about 36 ms per frame, which the render thread spends polling the job's
+label (Task 10.2.1).
+
+With the switch on, compute-ring work goes to a second Metal queue (`GnmCmdTarget::AsyncCompute`)
+when it is **eligible**. Otherwise it **joins** the main queue.
+
+- **Eligible:** a dispatch that is not a guest-memory dispatch, binds no image, and whose
+  preparation encoded nothing on Main or Upload; and a compute-ring DMA. Anything else runs on Main.
+  So does every job of a submission after a wait met by graphics work. Two more cases also run on
+  Main:
+  - **main-held:** the open main command buffer already holds compute-ring work. The rings run in
+    order, so the next job would wait for it anyway.
+  - **gfx-consumed:** a ring whose label a graphics wait met. It stays on Main for the next 120
+    presents. Graphics consumes its results, so running it on the other queue would only add a
+    join per frame. Other rings are not affected.
+- **Seqs:** both queues commit seqs of one numbering. `completed_seq` is the longest completed
+  prefix, whatever the queue. What is released "after seq N" (arena chunks, alias accesses, fences,
+  pending writes) is released after its own command buffer's seq, stamped at that commit.
+- **Fences:** fence actions belong to their GNM queue. A compute ring's label needs the compute
+  work on both targets, a graphics label only Main's. Actions of one GNM queue run in issue order;
+  actions of the two run in issue order among the ready ones.
+
+| what orders | how |
+|---|---|
+| A graphics wait met only by a pending compute label (`JoinQueues`) | Main waits on the GPU for the compute queue's work committed so far: an event wait in the main command buffer, after the compute queue's open work is committed. That work's writes stay pending writes until it completes. Texture refreshes from that memory are therefore encoded on Main, behind the wait. Bind-time uploads in the upload command buffer skip memory with pending writes, so that buffer needs no wait. |
+| A compute wait met only by a pending graphics label, the "earlier work" fallback, a timed-out wait | The rest of that compute submission runs on Main, behind graphics. |
+| One compute ring's work on both targets | Events (`main_ev`, `async_ev`, signalled with each target's generation at commit). Main waits before compute work it takes over; AsyncCompute waits for the compute work Main holds. The signaller is committed before the wait is encoded. |
+| Async buffer stores that mark a GPU surface guest-newer | The refresh copy on Main is encoded behind a GPU wait for the async queue. |
+| Alias windows | Accesses are recorded per target. An access recorded by the other queue is not waited for: a fence orders one queue, and accesses of two GNM queues are ordered only through the joins above (`alias waits across queues left out` on the counters line). |
+
+The counters line, with the perf line:
+`[gnm-draw] async compute: eligible N, joined <reasons>, cross waits N, alias waits across queues left out N; GPU busy main X ms, async Y ms per frame`.
+`cross waits` counts the GPU waits encoded of one queue for the other, in either direction. A join
+with nothing pending on the other queue encodes no wait.
+
+Both backends have the second queue. On Metal 4 it is a second `MTL4CommandQueue` with the same
+residency sets and a timeline of its own (docs/metal4-backend.md, "Two queues").
+
 ## Known gaps on both backends
 
 None of these is ordered by either backend. Each is safe only for the reason given.

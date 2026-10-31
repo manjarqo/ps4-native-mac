@@ -221,20 +221,43 @@ static void RaiseInterrupt(uint32_t irq_id, const char *src) {
 //   p[3] data_lo
 //   p[4] data_hi
 // Fence values that encoded but not yet completed GPU work will write (EOP / RELEASE_MEM /
-// EOS). All GNM queues execute in order on one Metal queue, so for a WAIT_REG_MEM of another
-// queue such a value is as good as written: work encoded after the wait runs after it.
+// EOS), per GNM queue: the key is the dword address with the queue in bit 0 (PendingKey). Work
+// encoded after a wait that such a value meets runs after the writing work when both are on one
+// Metal queue (every GNM queue, or the waiting queue's own work).
 static std::mutex g_pending_mu;
-static std::unordered_map<uint64_t, uint32_t> g_pending_labels; // dword address -> value
+struct PendingValue {
+    uint32_t v;
+    int ring; // the compute ring that will write it (-1: graphics)
+};
+static std::unordered_map<uint64_t, PendingValue> g_pending_labels; // PendingKey -> value
+static inline uint64_t PendingKey(uint64_t dword_addr, int queue) { return dword_addr | (queue ? 1u : 0u); }
 
-static void PendingLabel(uint64_t addr, uint32_t data_sel, uint32_t lo, uint32_t hi, bool add) {
+// The GNM queue whose packets the CP thread processes: 0 the graphics ring, 1 a compute ring
+// (ProcessComputePackets). Fence actions and labels belong to it.
+static thread_local int t_cp_queue = 0;
+static thread_local int t_cp_ring = -1; // the compute ring's slot (ProcessComputePackets), -1: graphics
+static int CpQueue() { return t_cp_queue ? ps4draw::kQueueCompute : ps4draw::kQueueGfx; }
+// PS4_GNM_LABEL_TRACE (diagnostics): the queue whose packet left each pending label, and the
+// WAIT_REG_MEM outcomes per waiting queue.
+static const bool g_label_trace = getenv("PS4_GNM_LABEL_TRACE") != nullptr;
+struct WaitTrace {
+    uint64_t mem = 0, pending[2] = {}, unmet = 0;
+};
+static WaitTrace g_wait_trace[2]; // by waiting queue, under g_pending_mu
+
+// queue: the issuing GNM queue (the CP's when the label is added; the fence action passes it on);
+// ring: the compute ring (CP slot) it belongs to, -1 for graphics.
+static void PendingLabel(uint64_t addr, uint32_t data_sel, uint32_t lo, uint32_t hi, bool add, int queue,
+                         int ring = -1) {
     if (data_sel != kDataSel32 && data_sel != kDataSel64) return;
     std::lock_guard<std::mutex> lk(g_pending_mu);
     auto set = [&](uint64_t a, uint32_t v) {
+        const uint64_t key = PendingKey(a, queue);
         if (add) {
-            g_pending_labels[a] = v;
+            g_pending_labels[key] = {v, ring};
         } else {
-            auto it = g_pending_labels.find(a);
-            if (it != g_pending_labels.end() && it->second == v) g_pending_labels.erase(it);
+            auto it = g_pending_labels.find(key);
+            if (it != g_pending_labels.end() && it->second.v == v) g_pending_labels.erase(it);
         }
     };
     if (data_sel == kDataSel32) {
@@ -245,11 +268,13 @@ static void PendingLabel(uint64_t addr, uint32_t data_sel, uint32_t lo, uint32_t
     }
 }
 
-static bool PendingLabelValue(uint64_t addr, uint32_t *out) {
+// The pending value of GNM queue `queue` at the dword `addr` (ring: its compute ring, optional).
+static bool PendingLabelValue(uint64_t addr, int queue, uint32_t *out, int *ring = nullptr) {
     std::lock_guard<std::mutex> lk(g_pending_mu);
-    auto it = g_pending_labels.find(addr & ~3ULL);
+    auto it = g_pending_labels.find(PendingKey(addr & ~3ULL, queue));
     if (it == g_pending_labels.end()) return false;
-    *out = it->second;
+    *out = it->second.v;
+    if (ring) *ring = it->second.ring;
     return true;
 }
 
@@ -262,10 +287,11 @@ static void HandleEventWriteEop(GuestContext *ctx, const uint32_t *p, uint32_t p
     const uint32_t data_hi = payload_dw >= 5 ? p[4] : 0;
 
     // End of pipe: performed when all GPU work submitted before it has completed.
-    PendingLabel(addr, data_sel, data_lo, data_hi, true);
-    ps4draw::AfterGpu([=]() {
+    const int queue = CpQueue();
+    PendingLabel(addr, data_sel, data_lo, data_hi, true, queue, t_cp_ring);
+    ps4draw::AfterGpuLabel(addr, (uint64_t)data_lo | ((uint64_t)data_hi << 32), queue ? "compute EOP" : "EOP", queue, [=]() {
         bool wrote = WriteFenceData(ctx, addr, data_sel, data_lo, data_hi);
-        PendingLabel(addr, data_sel, data_lo, data_hi, false);
+        PendingLabel(addr, data_sel, data_lo, data_hi, false, queue);
         if (LogOnce(s_logged_first_eop)) {
             fprintf(stderr, "[ps4-gnm] first EVENT_WRITE_EOP: addr=0x%llx data_sel=%u int_sel=%u data=0x%08x%08x wrote=%d\n",
                     (unsigned long long)addr, data_sel, int_sel, data_hi, data_lo, wrote ? 1 : 0);
@@ -291,10 +317,11 @@ static void HandleReleaseMem(GuestContext *ctx, const uint32_t *p, uint32_t payl
     const uint32_t data_lo = p[4];
     const uint32_t data_hi = payload_dw >= 6 ? p[5] : 0;
 
-    PendingLabel(addr, data_sel, data_lo, data_hi, true);
-    ps4draw::AfterGpu([=]() {
+    const int queue = CpQueue();
+    PendingLabel(addr, data_sel, data_lo, data_hi, true, queue, t_cp_ring);
+    ps4draw::AfterGpuLabel(addr, (uint64_t)data_lo | ((uint64_t)data_hi << 32), queue ? "compute RELEASE_MEM" : "RELEASE_MEM", queue, [=]() {
         bool wrote = WriteFenceData(ctx, addr, data_sel, data_lo, data_hi);
-        PendingLabel(addr, data_sel, data_lo, data_hi, false);
+        PendingLabel(addr, data_sel, data_lo, data_hi, false, queue);
         if (LogOnce(s_logged_first_release_mem)) {
             fprintf(stderr, "[ps4-gnm] first RELEASE_MEM: addr=0x%llx data_sel=%u int_sel=%u data=0x%08x%08x wrote=%d irq=0x%x\n",
                     (unsigned long long)addr, data_sel, int_sel, data_hi, data_lo, wrote ? 1 : 0, irq_id);
@@ -316,10 +343,11 @@ static void HandleEventWriteEos(GuestContext *ctx, const uint32_t *p, uint32_t p
     const uint32_t command = (p[2] >> 29) & 0x7u;
     if (command == 2) {
         const uint32_t v = p[3];
-        PendingLabel(addr, kDataSel32, v, 0, true);
-        ps4draw::AfterGpu([=]() {
+        const int queue = CpQueue();
+        PendingLabel(addr, kDataSel32, v, 0, true, queue, t_cp_ring);
+        ps4draw::AfterGpuLabel(addr, v, queue ? "compute EOS" : "EOS", queue, [=]() {
             WriteFenceData(ctx, addr, kDataSel32, v, 0);
-            PendingLabel(addr, kDataSel32, v, 0, false);
+            PendingLabel(addr, kDataSel32, v, 0, false, queue);
         });
     }
 }
@@ -370,17 +398,54 @@ static bool WaitSatisfied(uint32_t function, uint32_t v, uint32_t ref) {
     }
 }
 
-static bool WaitRegMemReady(GuestContext *ctx, const uint32_t *p, uint32_t payload_dw) {
-    if (payload_dw < 5) return true;
+// What meets a memory WAIT_REG_MEM of the CP's current queue right now: its value in memory, a
+// value pending from GPU work of the same GNM queue or of the other one, or nothing yet. A register
+// wait (or one outside guest memory) counts as met by memory.
+enum class WaitMet { Memory, PendingOwn, PendingOther, Unmet };
+static WaitMet WaitMetBy(GuestContext *ctx, const uint32_t *p, uint32_t payload_dw, int *other_ring = nullptr) {
+    if (payload_dw < 5 || !((p[0] >> 4) & 1u)) return WaitMet::Memory;
     const uint32_t function = p[0] & 0x7u;
-    const bool mem_space = ((p[0] >> 4) & 1u) != 0;
-    if (!mem_space) return true;
     const uint64_t addr = ((uint64_t)p[1] & ~3ULL) | ((uint64_t)(p[2] & 0xFFFFu) << 32);
     const uint32_t *src = (const uint32_t *)GuestMemPtr(ctx, addr, 4);
-    if (!src) return true;
-    if (WaitSatisfied(function, __atomic_load_n(src, __ATOMIC_SEQ_CST) & p[4], p[3])) return true;
+    if (!src) return WaitMet::Memory;
+    if (WaitSatisfied(function, __atomic_load_n(src, __ATOMIC_SEQ_CST) & p[4], p[3])) return WaitMet::Memory;
+    const int own = CpQueue();
     uint32_t pv;
-    return PendingLabelValue(addr, &pv) && WaitSatisfied(function, pv & p[4], p[3]);
+    if (PendingLabelValue(addr, own, &pv) && WaitSatisfied(function, pv & p[4], p[3])) return WaitMet::PendingOwn;
+    if (PendingLabelValue(addr, !own, &pv, other_ring) && WaitSatisfied(function, pv & p[4], p[3])) return WaitMet::PendingOther;
+    return WaitMet::Unmet;
+}
+
+// PS4_GNM_LABEL_TRACE: what met the WAIT_REG_MEMs of the current queue (memory, a pending label of
+// either queue, nothing yet); a summary line every 2000 waits of a queue.
+static void TraceWait(GuestContext *ctx, const uint32_t *p, uint32_t payload_dw) {
+    if (!g_label_trace) return;
+    const WaitMet m = WaitMetBy(ctx, p, payload_dw);
+    std::lock_guard<std::mutex> lk(g_pending_mu);
+    WaitTrace &w = g_wait_trace[t_cp_queue];
+    const int own = t_cp_queue;
+    if (m == WaitMet::Memory) w.mem++;
+    else if (m == WaitMet::Unmet) w.unmet++;
+    else w.pending[m == WaitMet::PendingOwn ? own : !own]++;
+    const uint64_t n = w.mem + w.pending[0] + w.pending[1] + w.unmet;
+    if (n % 2000 == 0)
+        fprintf(stderr, "[gnm-label] %s WAIT_REG_MEM so far: in memory %llu, pending from graphics %llu, pending from "
+                        "compute %llu, unmet %llu\n",
+                t_cp_queue ? "compute" : "graphics", (unsigned long long)w.mem, (unsigned long long)w.pending[0],
+                (unsigned long long)w.pending[1], (unsigned long long)w.unmet);
+}
+
+static bool WaitRegMemReady(GuestContext *ctx, const uint32_t *p, uint32_t payload_dw) {
+    return WaitMetBy(ctx, p, payload_dw) != WaitMet::Unmet;
+}
+
+// Asynchronous compute (ps4draw::AsyncComputeOn): the GNM queues run on two Metal queues, so a wait
+// that only the other queue's pending label meets orders this queue's later work after the other's
+// (ps4draw::JoinQueues). Met by memory or by its own queue: in order already.
+static void JoinAtWait(GuestContext *ctx, const uint32_t *p, uint32_t payload_dw) {
+    if (!ps4draw::AsyncComputeOn()) return;
+    int ring = -1;
+    if (WaitMetBy(ctx, p, payload_dw, &ring) == WaitMet::PendingOther) ps4draw::JoinQueues(CpQueue(), false, ring);
 }
 
 static bool HandleWaitRegMem(GuestContext *ctx, const uint32_t *p, uint32_t payload_dw, bool can_suspend) {
@@ -406,8 +471,10 @@ static bool HandleWaitRegMem(GuestContext *ctx, const uint32_t *p, uint32_t payl
     if (strict < 0) strict = getenv("PS4_GNM_STRICT_WAIT") != NULL;
     if (ps4draw::HasPendingWork() && !strict) {
         // The value is most likely produced by GPU work submitted earlier (any queue: all GNM
-        // queues execute in order on one Metal queue), so work encoded after this packet is
-        // ordered behind it anyway. No CPU-side wait.
+        // queues execute in order on one Metal queue, or, with asynchronous compute, the two queues
+        // are joined here), so work encoded after this packet is ordered behind it anyway. No
+        // CPU-side wait.
+        ps4draw::JoinQueues(CpQueue(), true);
         return true;
     }
     if (ps4draw::HasPendingWork()) {
@@ -473,7 +540,7 @@ static void HandleDmaData(GuestContext *ctx, const uint32_t *p, uint32_t payload
     // (games read GDS append counters back this way every frame).
     if (ps4draw::HasPendingWork() &&
         ps4draw::GpuDma(src_gds, src_sel == 2, src_sel == 2 ? 0 : (src_gds ? p[1] : src), p[1], dst_gds,
-                        dst_gds ? p[3] : dst, n))
+                        dst_gds ? p[3] : dst, n, CpQueue()))
         return;
     SyncGpu(4);
     if (src_sel == 2) {
@@ -856,23 +923,16 @@ static bool ProcessGfxPackets(GuestContext *ctx, GfxStream &st) {
                 // Cache flushes / VS/PS/CS partial flushes: Metal tracks hazards between encoders;
                 // concurrent dispatches get a barrier.
                 ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
-                // Occlusion queries (ZPASS_DONE / PIXEL_PIPE_STAT_DUMP): report fake, growing
-                // pixel counts like shadPS4 (liverpool.cpp EventWrite) so queries never read 0.
-                if (payload_dw >= 3 && ((payload[0] >> 8) & 0xF) == 1 && (payload[0] & 0x3F) == 57) {
-                    static uint64_t pixel_counter = 0;
-                    const uint64_t qaddr = ((uint64_t)payload[1] & ~7ull) | ((uint64_t)payload[2] << 32);
-                    const int pairs = sceKernelIsNeoMode() ? 16 : 8;
-                    const uint64_t value = pixel_counter | 0x8000000000000000ULL;
-                    pixel_counter += 0x2FFFFFFULL;
-                    ps4draw::AfterGpu([=]() {
-                        uint64_t *r = (uint64_t *)GuestMemPtr(ctx, qaddr, (size_t)pairs * 16);
-                        if (!r) return;
-                        for (int i = 0; i < pairs; i++) r[i * 2] = value;
-                    });
-                }
+                // Occlusion queries (ZPASS_DONE: PIXEL_PIPE_STAT_DUMP, event index 1): the DB's
+                // sample counts of the draws between a query's begin and end events, one counter
+                // pair per render backend (8; 16 on PS4 Pro, shadPS4 liverpool.cpp num_counter_pairs).
+                if (const uint64_t qaddr = ps4draw::ZpassDoneAddress(payload, payload_dw))
+                    ps4draw::ZpassDone(qaddr, sceKernelIsNeoMode() ? 16 : 8);
                 break;
             case PM4_OP_WAIT_REG_MEM:
                 ps4draw::ComputeBarrier(ps4draw::kQueueGfx);
+                TraceWait(ctx, payload, payload_dw);
+                JoinAtWait(ctx, payload, payload_dw);
                 if (!HandleWaitRegMem(ctx, payload, payload_dw, true)) {
                     f.pc = pc; // re-evaluate this packet when the stream resumes
                     return false;
@@ -1061,6 +1121,19 @@ static constexpr uint64_t kComputeWaitLimitMs = 50;
 // Runs the submission until it finishes (true) or a WAIT_REG_MEM suspends it (false).
 // skip_wait: the first WAIT_REG_MEM reached continues without waiting (watchdog timeout).
 static bool ProcessComputePackets(ComputeSubmit &sub, bool skip_wait) {
+    struct QueueScope {
+        int saved = t_cp_queue, saved_ring = t_cp_ring;
+        explicit QueueScope(int ring) {
+            t_cp_queue = 1;
+            t_cp_ring = ring;
+            ps4draw::SetCpComputeRing(ring);
+        }
+        ~QueueScope() {
+            t_cp_queue = saved;
+            t_cp_ring = saved_ring;
+            ps4draw::SetCpComputeRing(saved_ring);
+        }
+    } queue_scope((int)sub.slot); // labels, fence actions and waits of this submission belong to its compute ring
     GuestContext *ctx = sub.ctx;
     const uint32_t pipe_id = sub.pipe_id, slot = sub.slot;
     auto exec = [&](const ps4gnm_ib::Frame &f, int depth, ps4gnm_ib::Packet &pk) {
@@ -1102,8 +1175,11 @@ static bool ProcessComputePackets(ComputeSubmit &sub, bool skip_wait) {
             break;
         case PM4_OP_WAIT_REG_MEM:
             ps4draw::ComputeBarrier(ps4draw::kQueueCompute);
+            TraceWait(ctx, payload, payload_dw);
+            JoinAtWait(ctx, payload, payload_dw);
             if (skip_wait) {
                 skip_wait = false; // timed out: continue as before suspension existed
+                ps4draw::JoinQueues(ps4draw::kQueueCompute, true); // behind whatever may produce it
             } else if (!HandleWaitRegMem(ctx, payload, payload_dw, true)) {
                 pk.suspend = true; // the queue stops at this packet
                 return;

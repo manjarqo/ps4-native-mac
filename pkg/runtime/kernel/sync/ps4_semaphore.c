@@ -508,18 +508,45 @@ void shim_scePthreadSemGetvalue(GuestContext *ctx) {
 }
 
 // Orbis Kernel Semaphore implementations
+//
+// As the console kernel does (and shadPS4's OrbisSem), sceKernelSignalSema hands the tokens to
+// the waiting threads at once: in queue order, each waiter whose need_count the count covers
+// takes its tokens and is woken, the others stay queued. A thread blocked in sceKernelWaitSema
+// therefore owns its tokens before it runs again, so a second signal that comes before it wakes
+// sees the count the first one left (with max_count 1, one waiter and two signals, both
+// succeed: one wakes the waiter, the other leaves the count at 1). Waiters queue in arrival
+// order for both SCE_KERNEL_SEMA_ATTR_TH_FIFO and _TH_PRIO (the runtime keeps no guest
+// priority to sort by). A waiter woken by sceKernelDeleteSema returns EACCES, one woken by
+// sceKernelCancelSema ECANCELED, as shadPS4.
 #define MAX_KSEMS 1024
 #define KSEM_MAGIC 0x4b53454d // 'KSEM'
+
+#define KSEM_ERROR_ESRCH 0x80020003
+#define KSEM_ERROR_EACCES 0x8002000d
+#define KSEM_ERROR_EBUSY 0x80020010
+#define KSEM_ERROR_EINVAL 0x80020016
+#define KSEM_ERROR_ENFILE 0x80020018
+#define KSEM_ERROR_ETIMEDOUT 0x8002003c
+#define KSEM_ERROR_ECANCELED 0x80020055
+
+enum { KSEM_WAITING = 0, KSEM_SIGNALED, KSEM_DELETED, KSEM_CANCELED };
+
+typedef struct KsemWaiter {
+  int32_t need_count;
+  int state; // KSEM_WAITING until Signal / Delete / Cancel decides
+  struct KsemWaiter *next;
+} KsemWaiter;
 
 typedef struct {
   uint32_t magic;
   int in_use;
+  int sync_inited; // mutex and cond are created once per slot and kept (see DeleteSema)
   char name[32];
   int32_t current_count;
   int32_t init_count;
   int32_t max_count;
   uint32_t attr;
-  int num_waiters;
+  KsemWaiter *waiters; // queue order; each waiter lives on its waiting thread's stack
   pthread_mutex_t mutex;
   pthread_cond_t cond;
 } RecompKernelSema;
@@ -547,13 +574,34 @@ static RecompKernelSema *get_ksem(OrbisKernelSema id) {
   return s;
 }
 
+static void ksem_unlink(RecompKernelSema *s, KsemWaiter *w) {
+  for (KsemWaiter **pp = &s->waiters; *pp; pp = &(*pp)->next) {
+    if (*pp == w) {
+      *pp = w->next;
+      return;
+    }
+  }
+}
+
+// Ends every queued wait with `state` (Delete / Cancel). Called with s->mutex held.
+static int ksem_release_all(RecompKernelSema *s, int state) {
+  int n = 0;
+  for (KsemWaiter *w = s->waiters; w; w = w->next) {
+    w->state = state;
+    n++;
+  }
+  s->waiters = NULL;
+  if (n) pthread_cond_broadcast(&s->cond);
+  return n;
+}
+
 int sceKernelCreateSema(OrbisKernelSema *sem, const char *pName, uint32_t attr, int32_t initCount, int32_t maxCount, const void *pOptParam) {
   (void)pOptParam;
   if (!sem || !pName || attr > 2 || initCount < 0 || maxCount <= 0 || initCount > maxCount) {
-    return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+    return KSEM_ERROR_EINVAL;
   }
   int slot = alloc_ksem_slot();
-  if (slot < 0) return 0x80020018; // ORBIS_KERNEL_ERROR_ENFILE
+  if (slot < 0) return KSEM_ERROR_ENFILE;
 
   RecompKernelSema *s = &g_ksem_table[slot];
   s->magic = KSEM_MAGIC;
@@ -563,9 +611,12 @@ int sceKernelCreateSema(OrbisKernelSema *sem, const char *pName, uint32_t attr, 
   s->max_count = maxCount;
   s->current_count = initCount;
   s->attr = attr;
-  s->num_waiters = 0;
-  pthread_mutex_init(&s->mutex, NULL);
-  pthread_cond_init(&s->cond, NULL);
+  s->waiters = NULL;
+  if (!s->sync_inited) {
+    pthread_mutex_init(&s->mutex, NULL);
+    pthread_cond_init(&s->cond, NULL);
+    s->sync_inited = 1;
+  }
 
   *sem = (OrbisKernelSema)slot;
   return 0;
@@ -573,102 +624,115 @@ int sceKernelCreateSema(OrbisKernelSema *sem, const char *pName, uint32_t attr, 
 
 int sceKernelDeleteSema(OrbisKernelSema sem) {
   RecompKernelSema *s = get_ksem(sem);
-  if (!s) return 0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
+  if (!s) return KSEM_ERROR_ESRCH;
 
   pthread_mutex_lock(&s->mutex);
   s->magic = 0;
-  pthread_cond_broadcast(&s->cond);
+  ksem_release_all(s, KSEM_DELETED);
   pthread_mutex_unlock(&s->mutex);
 
+  // A woken waiter still takes the mutex to read its state, so the slot keeps its mutex and
+  // cond for good; a later CreateSema in this slot reuses them.
   pthread_mutex_lock(&g_ksem_table_lock);
-  pthread_mutex_destroy(&s->mutex);
-  pthread_cond_destroy(&s->cond);
   s->in_use = 0;
   pthread_mutex_unlock(&g_ksem_table_lock);
   return 0;
 }
 
 int sceKernelSignalSema(OrbisKernelSema sem, int32_t signalCount) {
-  if (signalCount <= 0) return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+  if (signalCount <= 0) return KSEM_ERROR_EINVAL;
   RecompKernelSema *s = get_ksem(sem);
-  if (!s) return 0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
+  if (!s) return KSEM_ERROR_ESRCH;
 
   pthread_mutex_lock(&s->mutex);
   if (s->current_count + signalCount > s->max_count) {
     pthread_mutex_unlock(&s->mutex);
-    return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+    return KSEM_ERROR_EINVAL;
   }
   s->current_count += signalCount;
-  pthread_cond_broadcast(&s->cond);
+  bool woke = false;
+  for (KsemWaiter **pp = &s->waiters; *pp;) {
+    KsemWaiter *w = *pp;
+    if (w->need_count > s->current_count) {
+      pp = &w->next;
+      continue;
+    }
+    *pp = w->next;
+    s->current_count -= w->need_count;
+    w->state = KSEM_SIGNALED;
+    woke = true;
+  }
+  if (woke) pthread_cond_broadcast(&s->cond);
   pthread_mutex_unlock(&s->mutex);
   return 0;
 }
 
 int sceKernelWaitSema(OrbisKernelSema sem, int32_t needCount, uint32_t *pTimeout) {
-  if (needCount <= 0) return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+  if (needCount <= 0) return KSEM_ERROR_EINVAL;
   RecompKernelSema *s = get_ksem(sem);
-  if (!s) return 0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
+  if (!s) return KSEM_ERROR_ESRCH;
 
   pthread_mutex_lock(&s->mutex);
-
+  if (needCount > s->max_count) {
+    pthread_mutex_unlock(&s->mutex);
+    return KSEM_ERROR_EINVAL;
+  }
   if (s->current_count >= needCount) {
     s->current_count -= needCount;
     pthread_mutex_unlock(&s->mutex);
     return 0;
   }
-
   if (pTimeout && *pTimeout == 0) {
     pthread_mutex_unlock(&s->mutex);
-    return 0x8002003c; // ORBIS_KERNEL_ERROR_ETIMEDOUT
+    return KSEM_ERROR_ETIMEDOUT;
   }
 
-  struct timespec ts;
-  int has_timeout = 0;
+  struct timespec start, deadline;
   if (pTimeout) {
+    clock_gettime(CLOCK_REALTIME, &start);
+    const uint64_t usec = *pTimeout;
+    deadline.tv_sec = start.tv_sec + (time_t)(usec / 1000000ULL);
+    deadline.tv_nsec = start.tv_nsec + (long)((usec % 1000000ULL) * 1000ULL);
+    if (deadline.tv_nsec >= 1000000000L) {
+      deadline.tv_sec += 1;
+      deadline.tv_nsec -= 1000000000L;
+    }
+  }
+
+  KsemWaiter w = {needCount, KSEM_WAITING, NULL};
+  KsemWaiter **tail = &s->waiters;
+  while (*tail) tail = &(*tail)->next;
+  *tail = &w;
+
+  while (w.state == KSEM_WAITING) {
+    if (!pTimeout) {
+      pthread_cond_wait(&s->cond, &s->mutex);
+    } else if (pthread_cond_timedwait(&s->cond, &s->mutex, &deadline) == ETIMEDOUT && w.state == KSEM_WAITING) {
+      ksem_unlink(s, &w);
+      *pTimeout = 0;
+      pthread_mutex_unlock(&s->mutex);
+      return KSEM_ERROR_ETIMEDOUT;
+    }
+  }
+  pthread_mutex_unlock(&s->mutex);
+
+  if (pTimeout) { // the time left, as the console reports it
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
-    uint64_t usec = *pTimeout;
-    ts.tv_sec = now.tv_sec + (time_t)(usec / 1000000ULL);
-    ts.tv_nsec = now.tv_nsec + (long)((usec % 1000000ULL) * 1000ULL);
-    if (ts.tv_nsec >= 1000000000L) {
-      ts.tv_sec += 1;
-      ts.tv_nsec -= 1000000000L;
-    }
-    has_timeout = 1;
+    const int64_t used = (int64_t)(now.tv_sec - start.tv_sec) * 1000000 + (now.tv_nsec - start.tv_nsec) / 1000;
+    *pTimeout = used >= (int64_t)*pTimeout ? 0 : *pTimeout - (uint32_t)used;
   }
-
-  s->num_waiters++;
-  while (s->magic == KSEM_MAGIC && s->current_count < needCount) {
-    if (has_timeout) {
-      int rc = pthread_cond_timedwait(&s->cond, &s->mutex, &ts);
-      if (rc == ETIMEDOUT) {
-        s->num_waiters--;
-        if (pTimeout) {
-          *pTimeout = 0;
-        }
-        pthread_mutex_unlock(&s->mutex);
-        return 0x8002003c; // ORBIS_KERNEL_ERROR_ETIMEDOUT
-      }
-    } else {
-      pthread_cond_wait(&s->cond, &s->mutex);
-    }
+  switch (w.state) {
+  case KSEM_SIGNALED: return 0;
+  case KSEM_DELETED: return KSEM_ERROR_EACCES;
+  default: return KSEM_ERROR_ECANCELED;
   }
-
-  s->num_waiters--;
-  if (s->magic != KSEM_MAGIC) {
-    pthread_mutex_unlock(&s->mutex);
-    return 0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
-  }
-
-  s->current_count -= needCount;
-  pthread_mutex_unlock(&s->mutex);
-  return 0;
 }
 
 int sceKernelPollSema(OrbisKernelSema sem, int32_t needCount) {
-  if (needCount <= 0) return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+  if (needCount <= 0) return KSEM_ERROR_EINVAL;
   RecompKernelSema *s = get_ksem(sem);
-  if (!s) return 0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
+  if (!s) return KSEM_ERROR_ESRCH;
 
   pthread_mutex_lock(&s->mutex);
   if (s->current_count >= needCount) {
@@ -677,19 +741,21 @@ int sceKernelPollSema(OrbisKernelSema sem, int32_t needCount) {
     return 0;
   }
   pthread_mutex_unlock(&s->mutex);
-  return 0x80020010; // ORBIS_KERNEL_ERROR_EBUSY
+  return KSEM_ERROR_EBUSY;
 }
 
 int sceKernelCancelSema(OrbisKernelSema sem, int32_t setCount, int32_t *pNumWaitThreads) {
   RecompKernelSema *s = get_ksem(sem);
-  if (!s) return 0x80020003; // ORBIS_KERNEL_ERROR_ESRCH
+  if (!s) return KSEM_ERROR_ESRCH;
 
   pthread_mutex_lock(&s->mutex);
-  if (pNumWaitThreads) {
-    *pNumWaitThreads = s->num_waiters;
+  if (setCount > s->max_count) {
+    pthread_mutex_unlock(&s->mutex);
+    return KSEM_ERROR_EINVAL;
   }
+  const int n = ksem_release_all(s, KSEM_CANCELED);
+  if (pNumWaitThreads) *pNumWaitThreads = n;
   s->current_count = (setCount < 0) ? s->init_count : setCount;
-  pthread_cond_broadcast(&s->cond);
   pthread_mutex_unlock(&s->mutex);
   return 0;
 }

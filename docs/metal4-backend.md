@@ -105,6 +105,27 @@ Builds set no deployment target, so their minimum macOS is the build host's. The
 - A/B runs take no screenshots (`EVERY=0`, which also ignores `EVERY_SEC`). Their absolute fps is
   therefore not comparable with runs that took screenshots (every 600 flips by default, as the
   routes of Phases 0-4 did); within one A/B both sides are alike.
+- Other games run the same route script with their own save, pad script and camera program
+  (inFAMOUS Second Son, the cannery route of its bring-up plan, Task 10):
+
+  ```bash
+  export DATASRC=$W/infamous_research/runs/gate3_1/data SCRIPT=$W/infamous_research/routes/perf_cannery.txt \
+    CTL=$W/infamous_research/routes/perf_cannery_cam.txt OUT=$W/infamous_research/runs/ab REPORT_ARGS=--after-marker
+  N=5 SECS=300 A=<A build>:3 B=<B build>:3 TAG=<name> tools/metal4_perf_ab.sh PS4_PAD_AUTOPRESS=0 PS4_LANG=en PS4_AUDIO_NULL=1
+  ```
+
+  - `DATASRC` is a data directory whose `saves/` boot into the scene.
+  - `SCRIPT` holds the `PS4_PAD_SCRIPT` steps. The first, `25000:0:1`, is a neutral 1 ms step:
+    its `[pad] script started` line marks the start of gameplay.
+  - `CTL` is a `PS4_PAD_CTL` program, here the camera turns on the right stick, which a pad
+    script cannot hold. metal4_route.sh appends it to the run's control file once the log has
+    the marker, so its waits are timed from the marker. The mon file says `camera program
+    appended at t=<s>`.
+  - `REPORT_ARGS=--after-marker` changes which perf lines every report call uses, the verdict
+    included. Instead of skipping 13, it takes the lines after the first one that follows the
+    marker. inFAMOUS boots with 4-6 perf lines at 120 fps, then prints one every 37 s at 8 fps.
+  - The trailing variables override the route's TLOU settings: no Cross autopress (a jump in
+    inFAMOUS), English, no audio device.
 - Replay parity: `gnm_replay <frame> all --sha` writes one SHA-256 per output, and
   `tools/metal4_replay_cmp.py` compares two such lists.
 - The allocation count of `gnm_replay --allocs` (tools/gnm_replay/alloc_count) is process-wide
@@ -117,6 +138,8 @@ Builds set no deployment target, so their minimum macOS is the build host's. The
 | variable | backend | effect |
 |---|---|---|
 | `PS4_GNM_ENCODER_STATUS=1` | Metal 3 only | per-encoder fault attribution of failed command buffers |
+| `PS4_GNM_ASYNC_COMPUTE=1` | both | eligible compute-ring work on a second command queue, beside graphics (docs/gnm-ordering.md, "Asynchronous compute"); the `async compute:` counters line with the perf line. Off by default until its checks pass |
+| `PS4_GNM_LABEL_TRACE=<guest address>` | both | each EOP / RELEASE_MEM / EOS label write to that qword logs a `[gnm-label]` line: its queue and value, CP -> encoder, encoder -> commit of the command buffer the write waits for (with the work encoded into it after the label), commit -> GPU start, that command buffer's GPU time, GPU end -> write. Every 2000 WAIT_REG_MEMs of a queue, a line says what met them: memory, a label pending from graphics or compute work, or nothing yet. Off: nothing recorded |
 | `PS4_GNM_COMMIT_EACH=1` | both | one command buffer per draw or dispatch (bisecting a fault or hang; the Metal 4 tool for what ENCODER_STATUS does on Metal 3) |
 | `PS4_GNM_MTL4_ONLY_CLEARS=1` | Metal 4 | draws are skipped after their render pass begins, so clears happen; dispatches, GPU DMA and GPU texture uploads are skipped or done on the CPU while the backend lacks compute and copies (see Selection); counted in the `backend` log line, not as skipped draws |
 | `PS4_GNM_MTL4_FULL_BARRIERS=1` | Metal 4 | a barrier after every draw, dispatch and copy, for ordering A/B checks |
@@ -213,6 +236,28 @@ command buffer ever uses a drawable.
 - The presenter's queue is ordered after the renderer's timeline by the present event (Task 1.8):
   its command buffer waits for the event value the renderer signals once the frame is written
   (`encodeWaitForEvent`).
+
+## Two queues
+
+With `PS4_GNM_ASYNC_COMPUTE=1`, AsyncCompute work goes to a second `MTL4CommandQueue`
+(`kGnmCapAsyncCompute`). Main and Upload stay on the first. Both queues share the residency sets
+and the feedback dispatch queue. Each queue has its own timeline event, signalled with the queue's
+seqs. The seqs of both queues share one numbering.
+
+- **CompletedSeq** is the longest prefix of committed seqs that the timelines show complete (as
+  on Metal 3), or the prefix whose feedback arrived, if that is further.
+- **Completions** run in seq order within a queue. A seq of one queue does not wait for an earlier
+  seq of the other queue, so an AsyncCompute label is written while graphics still runs.
+- **Seq numbers arrive late.** A seq's number is known only at its final commit, while split parts
+  may be committed and complete before it. Until that commit, three things wait for the number:
+  - the parts' command allocators (busy until then);
+  - the bytes chunks the seq filled (each queue has its own current chunk);
+  - an `Evict` made while that queue's seq is open. Its removal waits for that seq's number, or
+    for the renderer's `after_seq` if that is later. The renderer's `after_seq` counts committed
+    seqs only. Without the wait, a buffer that the open main seq uses could leave its set once
+    async seqs numbered past `after_seq` complete.
+- **Splits** happen on AsyncCompute too: a queue-level signal or wait after recorded work commits
+  that target's part. A wait holds only its own queue.
 
 ## Guest memory on Metal 4
 

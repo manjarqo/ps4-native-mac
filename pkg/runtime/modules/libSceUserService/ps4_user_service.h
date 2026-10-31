@@ -29,7 +29,9 @@ typedef struct OrbisUserServiceRegisteredUserIdList {
 
 #define ORBIS_USER_SERVICE_EVENT_TYPE_LOGIN 0
 #define ORBIS_USER_SERVICE_EVENT_TYPE_LOGOUT 1
-#define ORBIS_USER_SERVICE_ERROR_NO_EVENT 0x80960004
+// Error codes (shadPS4 userservice_error.h).
+#define ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT 0x80960005
+#define ORBIS_USER_SERVICE_ERROR_NO_EVENT 0x80960007
 
 typedef struct OrbisUserServiceEvent {
     int32_t eventType;

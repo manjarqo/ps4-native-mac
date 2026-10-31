@@ -544,6 +544,28 @@ void shim_stat(GuestContext *ctx) {
   SHIM_RETURN();
 }
 
+// int sceKernelCheckReachability(const char *path): SCE_OK when the path names an existing file
+// or directory (through the guest mounts, like stat), SCE_KERNEL_ERROR_ENOENT otherwise and
+// SCE_KERNEL_ERROR_ENAMETOOLONG for a path of more than 255 bytes.
+void shim_sceKernelCheckReachability(GuestContext *ctx) {
+  const char *path = ctx->rdi ? (const char *)(ctx->mem_base + ctx->rdi) : NULL;
+  if (!path) {
+    ctx->rax = (uint64_t)(int64_t)(int32_t)0x80020016; // SCE_KERNEL_ERROR_EINVAL
+    SHIM_RETURN();
+  }
+  if (strnlen(path, 256) > 255) {
+    ctx->rax = (uint64_t)(int64_t)(int32_t)0x8002003F; // SCE_KERNEL_ERROR_ENAMETOOLONG
+    SHIM_RETURN();
+  }
+  char resolved_path[1024];
+  if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
+    path = resolved_path;
+  }
+  struct stat st;
+  ctx->rax = stat(path, &st) == 0 ? 0 : (uint64_t)(int64_t)(int32_t)0x80020002; // SCE_KERNEL_ERROR_ENOENT
+  SHIM_RETURN();
+}
+
 // fstat
 void shim_fstat(GuestContext *ctx) {
   int fd = (int)ctx->rdi;
