@@ -1,0 +1,249 @@
+{
+  "34": {
+    "renderer": "Metal 3",
+    "resolution": "1920x1080",
+    "measurement_window_s": [
+      280,
+      320
+    ],
+    "log_sha256": "e2c3e3834cb6554bdca5c760f5c701db17f35be13569a581db9cf2049e1259ac",
+    "binary_sha256": "1c854d26ec16c783fba017a5e899456a49cc4317f16fad2fac68e0496290252d",
+    "metrics": {
+      "fps": {
+        "median": 55.5,
+        "count": 8,
+        "samples": [
+          56.1,
+          54.9,
+          55.1,
+          56.0,
+          55.4,
+          55.5,
+          55.9,
+          55.5
+        ]
+      },
+      "frame_p50_ms": {
+        "median": 18.15,
+        "count": 4,
+        "samples": [
+          18.2,
+          18.2,
+          18.1,
+          18.0
+        ]
+      },
+      "frame_p95_ms": {
+        "median": 19.35,
+        "count": 4,
+        "samples": [
+          19.5,
+          19.0,
+          19.2,
+          19.6
+        ]
+      },
+      "frame_p99_ms": {
+        "median": 32.25,
+        "count": 4,
+        "samples": [
+          33.5,
+          32.1,
+          32.4,
+          32.1
+        ]
+      },
+      "gpu_busy_ms": {
+        "median": 6.8,
+        "count": 8,
+        "samples": [
+          6.6,
+          6.8,
+          6.9,
+          6.6,
+          6.9,
+          6.8,
+          6.7,
+          6.8
+        ]
+      },
+      "gpu_wait_ms": {
+        "median": 9.45,
+        "count": 8,
+        "samples": [
+          9.3,
+          9.5,
+          9.6,
+          9.3,
+          9.5,
+          9.4,
+          9.5,
+          8.6
+        ]
+      },
+      "cp_ms": {
+        "median": 16.9,
+        "count": 8,
+        "samples": [
+          16.4,
+          17.5,
+          17.5,
+          17.2,
+          16.9,
+          16.6,
+          16.9,
+          15.1
+        ]
+      },
+      "encoder_ms": {
+        "median": 17.7,
+        "count": 8,
+        "samples": [
+          17.6,
+          17.9,
+          18.0,
+          17.7,
+          17.8,
+          17.7,
+          17.7,
+          16.9
+        ]
+      },
+      "encoder_cpu_ms": {
+        "median": 8.2,
+        "count": 8,
+        "samples": [
+          8.2,
+          8.4,
+          8.3,
+          8.3,
+          8.2,
+          8.2,
+          8.2,
+          8.2
+        ]
+      }
+    },
+    "errors": [],
+    "limitations": "Arithmetic over renderer-reported windows, selected by screenshot timestamps; not independent hardware timing or proof of statistical significance."
+  },
+  "35": {
+    "renderer": "Metal 3",
+    "resolution": "1920x1080",
+    "measurement_window_s": [
+      280,
+      320
+    ],
+    "log_sha256": "1d38430fd33dfa496a86d9e85f7aa99fc70df71180e246a305968432841dddee",
+    "binary_sha256": "4e6e0923feac67b5360b0c71ce049acc96761b9272c954b1a51024ab9b3549e7",
+    "metrics": {
+      "fps": {
+        "median": 54.7,
+        "count": 7,
+        "samples": [
+          54.8,
+          54.5,
+          54.8,
+          54.8,
+          54.7,
+          54.3,
+          54.7
+        ]
+      },
+      "frame_p50_ms": {
+        "median": 18.4,
+        "count": 3,
+        "samples": [
+          18.4,
+          18.4,
+          18.5
+        ]
+      },
+      "frame_p95_ms": {
+        "median": 19.7,
+        "count": 3,
+        "samples": [
+          19.8,
+          19.7,
+          19.7
+        ]
+      },
+      "frame_p99_ms": {
+        "median": 34.7,
+        "count": 3,
+        "samples": [
+          33.4,
+          34.7,
+          34.8
+        ]
+      },
+      "gpu_busy_ms": {
+        "median": 6.1,
+        "count": 7,
+        "samples": [
+          6.1,
+          6.2,
+          6.0,
+          6.1,
+          6.1,
+          6.2,
+          6.1
+        ]
+      },
+      "gpu_wait_ms": {
+        "median": 8.9,
+        "count": 7,
+        "samples": [
+          8.9,
+          9.0,
+          8.9,
+          8.9,
+          9.0,
+          9.1,
+          8.9
+        ]
+      },
+      "cp_ms": {
+        "median": 18.0,
+        "count": 7,
+        "samples": [
+          18.0,
+          18.1,
+          18.0,
+          18.0,
+          18.1,
+          18.2,
+          18.0
+        ]
+      },
+      "encoder_ms": {
+        "median": 18.1,
+        "count": 7,
+        "samples": [
+          18.1,
+          18.1,
+          18.1,
+          18.0,
+          18.1,
+          18.2,
+          18.1
+        ]
+      },
+      "encoder_cpu_ms": {
+        "median": 9.1,
+        "count": 7,
+        "samples": [
+          9.1,
+          9.1,
+          9.1,
+          9.0,
+          9.0,
+          9.1,
+          9.1
+        ]
+      }
+    },
+    "errors": [],
+    "limitations": "Arithmetic over renderer-reported windows, selected by screenshot timestamps; not independent hardware timing or proof of statistical significance."
+  }
+}

@@ -10,7 +10,8 @@ that renders with Metal. There is no JIT, no interpreter, no Rosetta and no Molt
 **The Last of Us Remastered** is playable on Mac from boot to gameplay, at about 99 fps in 1080p
 on a scripted chapter 1 route on an M1 Pro. **Uncharted 4: A Thief's End** is in progress: it boots
 and reaches gameplay in chapter 1 at about 20 fps, with visible rendering differences from a PS4
-still open. See [Supported games](#supported-games-on-mac) for the exact status.
+still open. Sonic Origins Plus now reaches basic Sonic 1 and Sonic CD gameplay on Metal 3, at about 55 FPS
+in the measured scenario. See [Supported games](#supported-games-on-mac) for the exact status.
 
 ![The Last of Us Remastered on a Mac: Joel and Ellie in the Beyond the Wall warehouse](images/tlou_beyond_the_wall.jpg)
 
@@ -51,13 +52,15 @@ bring-up work.
 
 ## Supported games on Mac
 
-Measured on an Apple M1 Pro (16 GB), macOS 27.0.1. Only measured numbers are listed; "TBD" means
-not measured yet.
+Measured on an Apple M1 Pro (16 GB), macOS 27.0.1 (Sonic: macOS 27.2). Only measured numbers are listed; "TBD" means
+not measured yet. The TLOU/U4 results below predate 0.4.2; gameplay has not yet been
+rechecked with the final 0.4.2 runtime.
 
 | Game | Stage | fps | Resolution | Notes |
 | --- | --- | --- | --- | --- |
 | The Last of Us Remastered (CUSA00557) | Playable: boot, menus, movies, gameplay, saves | Chapter 1 courtyard route (300 s, median of 5 runs): **98.9 fps** on Metal 3 (the default), 85.5 fps on Metal 4. Earlier walking and standing numbers: see below. | 1920x1080 (base PS4 mode, `PS4_PRO=0`), MetalFX off. Pro mode: TBD | 30-minute courtyard soak (commit 8145002): no fatal errors, no hangs, memory footprint flat at ~3.5 GB. Exit: 3/3 by closing the window, 3/3 by terminate, no crash reports. 300 s route on Metal 3 and on Metal 4: no fatal errors, GPU errors or watchdog reports. Since v0.3.0 the colours are close to a PS4 reference in interiors and on characters; sunlit daylight surfaces are still darker (see [Colour fidelity](#colour-fidelity-tlou)). |
 | Uncharted 4: A Thief's End (CUSA04529) | In progress: boots, menus, New Game, chapter 1 (boat cutscene and boat gameplay), saves, audio | Title screen about 21–22 fps, boat gameplay about 20–21 fps (`PS4_PRO=0`, 1080p, measured while other work ran on the machine). Pro mode: not re-measured (TBD) | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Title screen: the scene is lit, but fog and light shafts are missing. Boat cutscene: Drake and Sully are lit and the motion-blur smear is fixed. Gameplay: water colour and foam differ from a PS4 and the sky is too dark. Base mode is recommended. |
+| Sonic Origins Plus (CUSA30448, update 02.00) | Experimental: Sonic 1 and Sonic CD basic gameplay/control verified; Sonic 2 launcher selection verified | Sonic 1, idle Green Hill: **54.7 fps** in the measured candidate; earlier control run **55.5 fps**. Sonic CD: about 55 fps observed, not a controlled benchmark | 1920x1080, base PS4 mode (`PS4_PRO=0`), Metal 3, MetalFX off | Menu text/sky and SaveDataMemory2 persistence fixes included. Sonic 2/3 gameplay and campaign save/reload remain unverified. Metal 4 flickers and is not recommended for this title. |
 
 How the TLOU numbers were taken:
 
@@ -77,6 +80,57 @@ How the TLOU numbers were taken:
 - The route numbers were taken before the v0.3.0 colour fixes. The hair and foliage shadow work
   that now runs costs about 0.4 ms of GPU time per frame in scenes with much hair and foliage; the
   route was not re-measured.
+
+### Sonic Origins Plus
+
+Status as of 2026-10-31: Sonic 1 and Sonic CD launch, render gameplay and accept input. Sonic 1
+was also controlled by the user; Sonic CD was checked by starting a new game, pausing/resuming,
+and issuing movement input. Attract-mode footage was excluded from control verification. The
+base game, update 02.00 and four DLC packages are installed in the local bring-up project.
+
+#### Measured performance
+
+Both runs used an Apple M1 Pro with 16 GB RAM, macOS 27.2, AC power, Metal 3, 1920x1080,
+`PS4_PRO=0`, MetalFX off and synchronous shader compilation with an existing cache. Automatic
+confirmation stopped at 200 seconds; the measurement window was 280–320 seconds in idle
+Green Hill, with physical input isolated. No compilation or GPU tests ran during that window.
+
+| Run | Build | Median logged fps | Frame p50 | Frame p95 |
+| --- | --- | --- | --- | --- |
+| 34 | Control build with the preceding renderer fixes | 55.5 | 18.15 ms | 19.35 ms |
+| 35 | Measured candidate: proven visible-texel write coverage and stronger save I/O error handling | **54.7** | **18.4 ms** | **19.7 ms** |
+
+These are medians of renderer-reported telemetry windows, not independent hardware timing,
+a full-game average or proof of statistical significance. The measured correctness changes did
+**not** demonstrate an FPS improvement over the control run. Sustained 60 fps has not been
+established. Sonic CD reached about 55 fps in a gameplay smoke run, but was not benchmarked
+under this controlled scenario. No Sonic 2/3 gameplay FPS is claimed. The final 0.4.2 release
+adds save-error and dense-branch regression fixes after these measurements; it was not re-benchmarked.
+
+**Use Metal 3 for Sonic.** The Metal 4 comparison was stopped after the user observed flickering;
+early telemetry was also slower. Static host readback tests passing on Metal 4 do not establish
+stable live rendering.
+
+#### Implemented fixes and current limits
+
+- Correct display interpretation of integer textures and refresh of CPU-backed sampled images,
+  resolving the earlier black-screen/stale-framebuffer failures.
+- GPU aliases must cover the requested image's byte range; 3D storage textures retain their depth.
+- Pending GPU buffer writes initialize color/storage images on the GPU timeline; depth-decompress
+  copy handling fixes menu rendering. Full refresh now requires coverage of all consumed visible
+  texels rather than an arbitrary 8 KiB prefix.
+- A fixed-size CPU detile path accelerates complete single-sample 32-bit microtiles.
+- SaveDataMemory2 preserves repeated setup and persists writes without requiring explicit Sync.
+  Write/flush/fsync/close failures propagate before replacing the prior save. Disk writes and
+  subsequent reload are verified; campaign progress across restart is not yet verified.
+- The local Sonic launcher offers Sonic 1, Sonic CD, Sonic 2 and Sonic 3 & Knuckles. It selects the
+  game's carousel through observed UI state and real controller input; startup notices and the
+  final mode/character confirmation remain manual. Sonic 2 selection was checked live; this is
+  not a Sonic 2 gameplay claim.
+
+Measurement data: [Sonic performance report](docs/sonic-origins-performance.json).
+The optional [startup chooser](examples/sonic-origins/README.md) is published separately
+from game content; no game files or memory captures are distributed.
 
 ### Colour fidelity (TLOU)
 
@@ -104,6 +158,9 @@ slice of the shadow depth array). Sunlit daylight surfaces are still darker than
 ---
 
 ## Known issues
+
+- **Sonic Origins Plus:** Metal 4 flickers; use Metal 3. Sonic 2/3 gameplay and campaign
+  save/reload remain unverified. The final 0.4.2 build has not been re-benchmarked.
 
 - **The Last of Us: daylight.** Sunlit daylight surfaces are darker than on a PS4 (plank courtyard
   L\* 11–19 against 32). The sun direction is the game's own data, so the remaining difference is in
@@ -230,9 +287,10 @@ with its icon, title, kind, TITLE_ID and version and the space it needs on the l
   shows it against the free space and warns when it does not fit.
 - A retail PKG is refused with the message "this PKG is encrypted with console keys; use a dump of
   your own console or an fpkg". The engine never tries to decrypt it.
-- An update (patch) PKG is laid over its game, and DLC goes to `content/addcont/<entitlement>`. A
-  patch that arrives before its game is kept until the game is imported. Updates and DLC need a
-  copied game, not one used in place.
+- An update (patch) PKG is laid over a copied game; a patch that arrives before its game is kept
+  until the game is imported. DLC goes to `content/addcont/<entitlement>` for a copy, or to
+  `games/<TITLE_ID>/addcont/<entitlement>` for a game used in place. The source folder is never
+  modified; applying updates still requires a copy.
 
 **Automatic analysis.** After an import the app runs the analysis of `eboot.bin`. It reports the
 code coverage (the share of reachable code the lifter handles), the unresolved HLE imports, and the
@@ -321,6 +379,7 @@ The library, by default `~/Library/Application Support/PS4Native/`:
 library.json                 the game list: title, version, patches, DLC, status, sizes, last played, play time
 games/<TITLE_ID>/
   content/                   the game with updates applied, DLC in content/addcont/; a symlink when used in place
+  addcont/                   DLC of a game used in place; passed to the runtime as PS4_ADDCONT_DIR
   build/                     the signed eboot.app
   logs/                      build, run and analysis logs
   analysis.json              the last analysis
@@ -344,7 +403,7 @@ Saves and per-game settings are not in the library. The runtime keeps them in
         v
  import         PKG: PFS/PFSC extraction to games/<TITLE_ID>/content
                 folder: APFS clone, copy, or a symlink (in place)
-                update -> laid over content/; DLC -> content/addcont/<label>
+                update -> laid over copied content/; DLC -> content/addcont/<label> (copy) or addcont/<label> (in place)
         |
         v
  analyze-game   eboot.bin: coverage, unresolved imports; compat.json -> status, tested versions,
@@ -401,7 +460,8 @@ Saves and per-game settings are not in the library. The runtime keeps them in
 - **Signing.** The app and the built games are signed ad hoc, not notarized. On another Mac,
   Gatekeeper blocks the first launch of a downloaded copy of the app; allow it in System Settings,
   Privacy & Security, "Open Anyway".
-- **Status: preview.** The v0.4.0 release is the first to ship the app (`PS4Native-0.4.0.dmg`).
+- **Status: preview.** Download the app as `PS4Native-0.4.2.dmg` from GitHub Releases. The app
+  first shipped in v0.4.0.
   `app/PS4Native/scripts/package.sh` builds the engine kit and packages `PS4 Native.app` and a
   `.dmg`; `scripts/smoke.sh` smoke-tests that
   package with a fake engine. To run it from source, build the engine first
