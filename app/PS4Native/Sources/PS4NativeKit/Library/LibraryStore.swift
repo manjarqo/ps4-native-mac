@@ -22,9 +22,38 @@ public struct LibraryStore: Sendable {
         return root.appendingPathComponent("games", isDirectory: true).appendingPathComponent(titleID, isDirectory: true)
     }
 
-    /// The game with its patches and DLC; a symlink to the source folder in reference mode.
+    /// The game with its patches and DLC; a symlink to the source folder in reference mode (its
+    /// DLC is then in `referencedAddcontDir`).
     public func contentDir(titleID: String) throws -> URL {
         try gameDir(titleID: titleID).appendingPathComponent("content", isDirectory: true)
+    }
+
+    /// The DLC of a game used in place, games/<TITLE_ID>/addcont/<entitlement>: its content is the
+    /// user's folder, which the engine never writes to. A copied game's DLC is in content/addcont.
+    public func referencedAddcontDir(titleID: String) throws -> URL {
+        try gameDir(titleID: titleID).appendingPathComponent("addcont", isDirectory: true)
+    }
+
+    /// Whether the game is used in place: its content/ is a symlink to the folder it was imported from.
+    public func isUsedInPlace(titleID: String) throws -> Bool {
+        try Self.fileType(contentDir(titleID: titleID)) == S_IFLNK
+    }
+
+    /// The DLC directory the runtime is given in `PS4_ADDCONT_DIR`: games/<TITLE_ID>/addcont of a
+    /// game used in place, when it exists. nil for a copied game, whose content/addcont the
+    /// runtime scans on its own, and for a game used in place without DLC.
+    public func launchAddcontDir(titleID: String) throws -> URL? {
+        guard try isUsedInPlace(titleID: titleID) else { return nil }
+        let dir = try referencedAddcontDir(titleID: titleID)
+        return Self.fileType(dir) == S_IFDIR ? dir : nil
+    }
+
+    /// The `lstat` file type of `url` (S_IFDIR, S_IFLNK, ...), nil when it is missing.
+    private static func fileType(_ url: URL) -> mode_t? {
+        url.withUnsafeFileSystemRepresentation { path in
+            var st = stat()
+            return lstat(path!, &st) == 0 ? st.st_mode & S_IFMT : nil
+        }
     }
 
     /// The build directory with the signed .app.

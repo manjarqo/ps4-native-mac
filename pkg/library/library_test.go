@@ -822,3 +822,127 @@ func TestLockWaitIsCancellable(t *testing.T) {
 		t.Error("game dir created while waiting for the lock")
 	}
 }
+
+// A DLC for a referenced game goes to games/<ID>/addcont/<label>; the folder is not touched.
+func TestDLCForReferencedGame(t *testing.T) {
+	src := gameFolder(t, sfoFor("gd", "01.00", "UP9000-CUSA04529_00-BASE"))
+	before := snapshot(t, src)
+	l := Library{Root: t.TempDir()}
+	mustImport(t, l, src, "reference")
+	const id = "CUSA04529"
+	dlcDir := filepath.Join(l.GameDir(id), "addcont")
+	if got := l.AddcontDir(id); got != dlcDir {
+		t.Fatalf("AddcontDir = %s, want %s", got, dlcDir)
+	}
+	for _, v := range []string{"D1", "D2"} { // the second import replaces the first
+		r := mustImport(t, l, pkgFile(t, "ac", "01.00", "UP9000-CUSA04529_00-EXTRAPACK", map[string][]byte{"dlc.dat": []byte(v)}), "copy")
+		if r.Kind != "dlc" || !slices.Equal(r.Game.DLC, []string{"EXTRAPACK"}) {
+			t.Fatalf("result = %+v", r)
+		}
+	}
+	mustImport(t, l, pkgFile(t, "ac", "01.00", "UP9000-CUSA04529_00-SECONDPACK", map[string][]byte{"two.dat": []byte("2")}), "copy")
+	if b, _ := os.ReadFile(filepath.Join(dlcDir, "EXTRAPACK", "dlc.dat")); string(b) != "D2" {
+		t.Errorf("dlc = %q", b)
+	}
+	if s := loadParam(t, filepath.Join(dlcDir, "SECONDPACK")); sfoString(s, "CATEGORY") != "ac" {
+		t.Errorf("DLC param.sfo CATEGORY = %q", sfoString(s, "CATEGORY"))
+	}
+	if got := snapshot(t, src); !maps.Equal(got, before) {
+		t.Errorf("referenced folder changed: %v", got)
+	}
+	if fi, err := os.Lstat(l.ContentDir(id)); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("content is no longer a symlink: %v %v", fi, err)
+	}
+	games, _ := l.Load()
+	g := games[id]
+	if !slices.Equal(g.DLC, []string{"EXTRAPACK", "SECONDPACK"}) || g.ContentBytes != treeBytes(t, src)+treeBytes(t, dlcDir) {
+		t.Errorf("game = %+v", g)
+	}
+	entries, _ := os.ReadDir(l.GameDir(id))
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if !slices.Equal(names, []string{"addcont", "content"}) {
+		t.Errorf("game dir = %v", names)
+	}
+	// Patches stay refused for a referenced game.
+	if _, err := l.Import(pkgFile(t, "gp", "01.32", "UP9000-CUSA04529_00-PATCH", map[string][]byte{"eboot.bin": []byte("v132")}), "copy", ev(), nil); codeOf(err) != "bad_input" || !strings.Contains(err.Error(), "used in place") {
+		t.Errorf("patch err = %v", err)
+	}
+}
+
+// Re-importing a game keeps its DLC whichever way it was and is imported: by reference again,
+// from a copy to a reference and back.
+func TestDLCKeptAcrossImportModes(t *testing.T) {
+	src := gameFolder(t, sfoFor("gd", "01.00", "UP9000-CUSA04529_00-BASE"))
+	before := snapshot(t, src)
+	l := Library{Root: t.TempDir()}
+	const id = "CUSA04529"
+	refDLC := filepath.Join(l.GameDir(id), "addcont")
+	copyDLC := filepath.Join(l.ContentDir(id), "addcont")
+	check := func(step, dir string, gone string) {
+		t.Helper()
+		if b, _ := os.ReadFile(filepath.Join(dir, "EXTRAPACK", "dlc.dat")); string(b) != "D" {
+			t.Errorf("%s: dlc in %s = %q", step, dir, b)
+		}
+		if l.AddcontDir(id) != dir {
+			t.Errorf("%s: AddcontDir = %s, want %s", step, l.AddcontDir(id), dir)
+		}
+		if _, err := os.Lstat(gone); !os.IsNotExist(err) {
+			t.Errorf("%s: %s left", step, gone)
+		}
+		games, _ := l.Load()
+		if g := games[id]; !slices.Equal(g.DLC, []string{"EXTRAPACK"}) || g.ContentBytes != treeBytes(t, src)+treeBytes(t, dir) {
+			t.Errorf("%s: game = %+v", step, g)
+		}
+		if got := snapshot(t, src); !maps.Equal(got, before) {
+			t.Errorf("%s: referenced folder changed: %v", step, got)
+		}
+	}
+	mustImport(t, l, src, "copy")
+	mustImport(t, l, pkgFile(t, "ac", "01.00", "UP9000-CUSA04529_00-EXTRAPACK", map[string][]byte{"dlc.dat": []byte("D")}), "copy")
+	mustImport(t, l, src, "reference")
+	check("copy to reference", refDLC, filepath.Join(l.GameDir(id), "content.old"))
+	mustImport(t, l, src, "reference")
+	check("reference again", refDLC, filepath.Join(l.GameDir(id), "content.old"))
+	mustImport(t, l, src, "copy")
+	check("reference to copy", copyDLC, refDLC)
+}
+
+// A crash during the DLC commit of a referenced game is repaired in games/<ID>/addcont, and a
+// games/<ID>/addcont left next to copied content is removed.
+func TestRecoverReferencedDLC(t *testing.T) {
+	src := gameFolder(t, sfoFor("gd", "01.00", "UP9000-CUSA04529_00-BASE"))
+	l := Library{Root: t.TempDir()}
+	const id = "CUSA04529"
+	mustImport(t, l, src, "reference")
+	mustImport(t, l, pkgFile(t, "ac", "01.00", "UP9000-CUSA04529_00-EXTRAPACK", map[string][]byte{"dlc.dat": []byte("D")}), "copy")
+	live := filepath.Join(l.GameDir(id), "addcont", "EXTRAPACK")
+	// A crash after the live DLC moved to its .old name, before the new one took its place.
+	if err := os.Rename(live, filepath.Join(l.GameDir(id), "dlc-EXTRAPACK.old")); err != nil {
+		t.Fatal(err)
+	}
+	mustImport(t, l, pkgFile(t, "ac", "01.00", "UP9000-CUSA04529_00-SECONDPACK", map[string][]byte{"two.dat": []byte("2")}), "copy")
+	if b, _ := os.ReadFile(filepath.Join(live, "dlc.dat")); string(b) != "D" {
+		t.Errorf("restored dlc = %q", b)
+	}
+	// A crash after a switch to a copy committed, before games/<ID>/addcont was removed.
+	mustImport(t, l, src, "copy")
+	stale := filepath.Join(l.GameDir(id), "addcont", "EXTRAPACK")
+	os.MkdirAll(stale, 0o755)
+	os.WriteFile(filepath.Join(stale, "dlc.dat"), []byte("D"), 0o644)
+	mustImport(t, l, pkgFile(t, "ac", "01.00", "UP9000-CUSA04529_00-THIRDPACK", map[string][]byte{"three.dat": []byte("3")}), "copy")
+	if _, err := os.Lstat(filepath.Join(l.GameDir(id), "addcont")); !os.IsNotExist(err) {
+		t.Error("games/<ID>/addcont left next to copied content")
+	}
+	games, _ := l.Load()
+	if g := games[id]; !slices.Equal(g.DLC, []string{"EXTRAPACK", "SECONDPACK", "THIRDPACK"}) {
+		t.Errorf("game = %+v", g)
+	}
+	for _, label := range []string{"EXTRAPACK", "SECONDPACK", "THIRDPACK"} {
+		if !isRealDir(filepath.Join(l.ContentDir(id), "addcont", label)) {
+			t.Errorf("%s missing from content/addcont", label)
+		}
+	}
+}

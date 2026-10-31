@@ -122,13 +122,27 @@ extension AppModel {
         }
         pendingCandidates.removeAll { $0.id == c.id }
         Task { await measureFreeSpace() }
-        // The game directory may not exist yet, so import logs live in the library's own logs/.
-        let log = library.root.appendingPathComponent("logs", isDirectory: true)
-            .appendingPathComponent("\(Self.stamp())-import-\(titleID ?? "game").log")
+        let log = importLogURL(titleID)
         let engine = engine, root = library.root, url = c.url
         queue.enqueue(kind: .importGame, title: inspect.title, titleID: titleID, log: log) { [weak self] progress in
             let result = try await engine.importGame(url, library: root, mode: mode, log: log, onEvent: progress)
             await self?.imported(result)
+        }
+    }
+
+    /// logs/<stamp>-import-<TITLE_ID>.log in the library root (the game directory may not exist
+    /// yet), with "-2", "-3", ... added while a queued operation or a file already has the name:
+    /// "Import all" confirms several items in one second, and each import keeps its own log.
+    func importLogURL(_ titleID: String?) -> URL {
+        let dir = library.root.appendingPathComponent("logs", isDirectory: true)
+        let base = "\(Self.stamp())-import-\(titleID ?? "game")"
+        let taken = Set(queue.items.map(\.log.lastPathComponent))
+        var n = 1
+        while true {
+            let name = n == 1 ? "\(base).log" : "\(base)-\(n).log"
+            let url = dir.appendingPathComponent(name)
+            if !taken.contains(name) && !FileManager.default.fileExists(atPath: url.path) { return url }
+            n += 1
         }
     }
 

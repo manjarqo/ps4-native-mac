@@ -117,7 +117,7 @@ only `build/` has to be on APFS.
 |---|---|
 | The app | `/Applications/PS4 Native.app`, copied from the disk image. |
 | The engine | `PS4 Native.app/Contents/Resources/engine` (`ps4-recomp`, `pkg/runtime`, `3rdparty`, `bin/ninja`, `licenses`). |
-| The library | On APFS only (see the note under the overrides). `~/Library/Application Support/PS4Native/`: `library.json`, `games/<TITLE_ID>/` with `content/` (a symlink for a folder used in place), `build/` (the built `.app`), `logs/` (build, run and analysis logs) and `analysis.json`. Import logs are in `logs/`, save backups in `backups/`. |
+| The library | On APFS only (see the note under the overrides). `~/Library/Application Support/PS4Native/`: `library.json`, `games/<TITLE_ID>/` with `content/` (a symlink for a folder used in place), `addcont/` (the DLC of a game used in place: its folder is never written to; the app passes the directory to the game in `PS4_ADDCONT_DIR`), `build/` (the built `.app`), `logs/` (build, run and analysis logs) and `analysis.json`. Import logs are in `logs/`, one per import (`<stamp>-import-<TITLE_ID>.log`, with `-2`, `-3`, ... for imports started in the same second, as "Import all" does), save backups in `backups/`. |
 | Saves | `~/Library/Application Support/PS4Recomp/saves/`, where the runtime keeps them. An uninstall moves them to the Trash only when asked to. |
 | Per-game settings | `~/Library/Application Support/PS4Recomp/settings/<TITLE_ID>.cfg`: `lang`, `pro`, `upscale`, `hud` and `metal`, read by the runtime when the game starts, however it is started (`metal` becomes `PS4_GNM_METAL` when the environment has none). Lines the app does not know are kept, by the app and by the runtime's own settings window. |
 | App preferences | The defaults domain `org.ps4native.manager` (the first-run flag). |
@@ -162,3 +162,10 @@ The packaged app's real path (a real engine, a real game) is the owner's play te
    off, then start the game: it uses the new values.
 8. **Metal 4 choice honoured.** Set the renderer to Metal 4 and start the game: the run log
    (Build log tab, **Run**) has the line `[gnm-draw] backend metal4 (...)`. Set it back to Automatic or Metal 3 afterwards.
+9. **DLC for a game used in place.** On the DLC & updates tab, add the TLOU DLC `.pkg` files
+   (several at once with "Import all" is fine: each import has its own log). Each one is listed
+   under DLC and lands in `games/CUSA00557/addcont/<entitlement>`; the TLOU folder is unchanged.
+   The run log of the next start has a line `[ps4-appcontent] DLC <entitlement>: <dir>` for each
+   one, with the dir under `games/CUSA00557/addcont/` (the app sets `PS4_ADDCONT_DIR` to it). An
+   update `.pkg` for the same game is refused with a message that names a copy as the way to
+   update it.

@@ -82,6 +82,8 @@ public final class AppModel {
     /// The games being uninstalled now.
     public private(set) var uninstalling: Set<String> = []
 
+    /// The games used in place (content/ is a symlink to their folder), read by `refresh()`.
+    public private(set) var usedInPlace: Set<String> = []
     /// Each game's built bundle, read by `refresh()` so that views do no disk I/O.
     var builtApps: [String: BuiltApp] = [:]
     /// The bytes of each built game's build directory, measured off the main actor after
@@ -171,6 +173,8 @@ public final class AppModel {
             }
         }
         if built != builtApps { builtApps = built }
+        let inPlace = Set(games.map(\.titleID).filter { (try? library.isUsedInPlace(titleID: $0)) == true })
+        if inPlace != usedInPlace { usedInPlace = inPlace }
         measureTask?.cancel()
         measureTask = Task { [weak self] in
             await self?.measureBuilds()
@@ -221,12 +225,14 @@ public final class AppModel {
         }
     }
 
-    /// Starts the built game with its settings' environment, logging to `logs/<date>-run.log`.
+    /// Starts the built game with its settings' environment, logging to `logs/<date>-run.log`. A
+    /// game used in place with DLC is also given `PS4_ADDCONT_DIR`, its games/<ID>/addcont.
     public func play(_ titleID: String) throws {
         _ = try record(titleID)
         if uninstalling.contains(titleID) || hasActiveBuild(titleID) { throw AppError.busy(titleID) }
         guard let app = try library.appBundle(titleID: titleID) else { throw AppError.notBuilt(titleID) }
-        let environment = GameSettings.load(titleID: titleID, settingsDir: paths.settingsDir).launchEnvironment
+        var environment = GameSettings.load(titleID: titleID, settingsDir: paths.settingsDir).launchEnvironment
+        if let dlc = try library.launchAddcontDir(titleID: titleID) { environment["PS4_ADDCONT_DIR"] = dlc.path }
         let log = try logURL(titleID, "run")
         try launcher.launch(titleID: titleID, app: app, environment: environment, log: log)
         runLogs[titleID] = log

@@ -68,9 +68,38 @@ type Library struct{ Root string }
 // GameDir is the directory of one game.
 func (l Library) GameDir(titleID string) string { return filepath.Join(l.Root, "games", titleID) }
 
-// ContentDir holds the extracted game with its patches applied and DLC in addcont/.
+// ContentDir holds the extracted game with its patches applied and, for a copied game, its DLC
+// in addcont/. For a game imported by reference it is a symlink to the user's folder.
 func (l Library) ContentDir(titleID string) string {
 	return filepath.Join(l.GameDir(titleID), "content")
+}
+
+// AddcontDir is the directory that holds the game's DLC, one directory per entitlement label:
+// content/addcont for a copied game, games/<TITLE_ID>/addcont for a game imported by reference,
+// whose content is the user's folder and is never written to. The runtime scans content/addcont
+// on its own; the launcher names games/<TITLE_ID>/addcont to it with PS4_ADDCONT_DIR.
+func (l Library) AddcontDir(titleID string) string {
+	if isSymlink(l.ContentDir(titleID)) {
+		return l.refAddcontDir(titleID)
+	}
+	return filepath.Join(l.ContentDir(titleID), "addcont")
+}
+
+// refAddcontDir is the DLC directory of a game imported by reference, games/<TITLE_ID>/addcont.
+func (l Library) refAddcontDir(titleID string) string {
+	return filepath.Join(l.GameDir(titleID), "addcont")
+}
+
+// gameBytes is the size of a game's files: its content and, for a referenced game, the DLC
+// kept next to it in games/<TITLE_ID>/addcont.
+func (l Library) gameBytes(titleID string) (int64, error) {
+	content := l.ContentDir(titleID)
+	n, err := dirSize(content)
+	if err != nil || !isSymlink(content) {
+		return n, err
+	}
+	dlc, err := optionalDirSize(l.refAddcontDir(titleID))
+	return n + dlc, err
 }
 
 // BuildDir holds the game's build directory and its .app.
@@ -91,7 +120,7 @@ type Game struct {
 	AppVer       string   `json:"app_ver"`
 	Version      string   `json:"version"`
 	Patches      []string `json:"patches"` // APP_VER of each applied patch
-	DLC          []string `json:"dlc"`     // entitlement labels under content/addcont
+	DLC          []string `json:"dlc"`     // entitlement labels under AddcontDir
 	ContentBytes int64    `json:"content_bytes"`
 	Status       string   `json:"status"` // written by the app from the analyze-game verdict; "" until then
 	BuiltWith    string   `json:"built_with"`
@@ -552,7 +581,10 @@ func (im *importer) importPKG(src string) (*ImportResult, error) {
 
 // recoverGame repairs an interrupted commit of game id: a ".old" tree whose live tree is
 // missing (a crash between the two renames) is moved back; one whose live tree exists
-// (a crash after the commit) is removed. A stale content.next is removed too.
+// (a crash after the commit) is removed. A stale content.next is removed too, and so is a
+// games/<id>/addcont next to copied content: it is the DLC of a referenced game left by a
+// switch to a copy (or a switch to reference that did not commit), whose files the copy
+// already holds as hard links.
 func (im *importer) recoverGame(id string) error {
 	dir := im.lib.GameDir(id)
 	content := im.lib.ContentDir(id)
@@ -562,6 +594,11 @@ func (im *importer) recoverGame(id string) error {
 	if err := os.RemoveAll(content + ".next"); err != nil {
 		return err
 	}
+	if isRealDir(content) {
+		if err := os.RemoveAll(im.lib.refAddcontDir(id)); err != nil {
+			return err
+		}
+	}
 	olds, err := filepath.Glob(filepath.Join(dir, "dlc-*.old"))
 	if err != nil {
 		return err
@@ -569,7 +606,7 @@ func (im *importer) recoverGame(id string) error {
 	for _, old := range olds {
 		label := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(old), "dlc-"), ".old")
 		if labelPattern.MatchString(label) {
-			if err := im.recoverPair(filepath.Join(content, "addcont", label), old); err != nil {
+			if err := im.recoverPair(filepath.Join(im.lib.AddcontDir(id), label), old); err != nil {
 				return err
 			}
 		}
@@ -847,8 +884,10 @@ func (im *importer) installGame(p *fpkg.Package, s *sfo.File, id string, size in
 // finishCopy completes a staged copy of a base game: it carries the installed DLC over,
 // applies a pending patch, and commits the staged tree as content. The DLC and the
 // pending patch are hard-linked into the staged tree, so they stay intact until the
-// commit. The DLC carried over is decided by the live content and its record alone: a
-// resumed staged tree (from which the extraction pruned earlier links) is relinked.
+// commit. The DLC carried over is decided by the live game and its record alone: a
+// resumed staged tree (from which the extraction pruned earlier links) is relinked. The DLC
+// of a game that was referenced comes from games/<id>/addcont, which is removed after the
+// commit (or by the next recoverGame).
 func (im *importer) finishCopy(s *sfo.File, id, partial string, games map[string]*Game) (*ImportResult, error) {
 	if err := dropMarker(partial); err != nil {
 		return nil, err
@@ -856,8 +895,9 @@ func (im *importer) finishCopy(s *sfo.File, id, partial string, games map[string
 	prev := games[id]
 	g := newGame(s, id, prev)
 	content := im.lib.ContentDir(id)
-	addcont := filepath.Join(content, "addcont")
-	if prev != nil && isRealDir(content) && isRealDir(addcont) {
+	addcont := im.lib.AddcontDir(id)
+	wasRef := isSymlink(content)
+	if prev != nil && isRealDir(addcont) {
 		if err := linkTree(addcont, filepath.Join(partial, "addcont")); err != nil {
 			return nil, err
 		}
@@ -872,6 +912,11 @@ func (im *importer) finishCopy(s *sfo.File, id, partial string, games map[string
 	}
 	if err := im.commit(content, partial, content+".old", g); err != nil {
 		return nil, err
+	}
+	if wasRef {
+		if err := os.RemoveAll(addcont); err != nil {
+			im.warn("could not remove the DLC directory %s of the referenced game: %v", addcont, err)
+		}
 	}
 	if applied {
 		im.dropPending(id)
@@ -991,7 +1036,7 @@ func (im *importer) installPatch(p *fpkg.Package, s *sfo.File, id string, size i
 		return im.storePending(p, s, id, size)
 	}
 	if isSymlink(content) {
-		return nil, fail("bad_input", "%s was imported by reference; a patch is applied only to a copied game", id)
+		return nil, fail("bad_input", "%s is used in place (imported by reference) and its folder is never modified, so an update cannot be applied to it; import the folder again as a copy to apply updates", id)
 	}
 	v := appVer(s)
 	if older(v, g.AppVer) {
@@ -1113,7 +1158,8 @@ func entitlement(contentID string) string {
 }
 
 // installDLC stages the DLC in games/<id>/dlc-<label>.partial and commits it as
-// content/addcont/<label>.
+// <AddcontDir>/<label>: content/addcont/<label> for a copied game, games/<id>/addcont/<label>
+// for a referenced one (whose folder is never written to).
 func (im *importer) installDLC(p *fpkg.Package, s *sfo.File, id string, size int64, games map[string]*Game) (*ImportResult, error) {
 	cid, ok := s.String("CONTENT_ID")
 	if !ok {
@@ -1128,9 +1174,6 @@ func (im *importer) installDLC(p *fpkg.Package, s *sfo.File, id string, size int
 	if g == nil || !exists(content) {
 		return nil, fail("bad_input", "%s is not in the library; import the game before its DLC", id)
 	}
-	if isSymlink(content) {
-		return nil, fail("bad_input", "%s was imported by reference; DLC is installed only into a copied game", id)
-	}
 	if err := im.checkSpace(size + spaceMargin); err != nil {
 		return nil, err
 	}
@@ -1142,10 +1185,10 @@ func (im *importer) installDLC(p *fpkg.Package, s *sfo.File, id string, size int
 	if err := dropMarker(partial); err != nil {
 		return nil, err
 	}
-	live := filepath.Join(content, "addcont", label)
+	live := filepath.Join(im.lib.AddcontDir(id), label)
 	ng := g.clone()
 	ng.DLC = addUnique(ng.DLC, label)
-	total, err := dirSize(content)
+	total, err := im.lib.gameBytes(id)
 	if err != nil {
 		return nil, err
 	}
@@ -1194,6 +1237,14 @@ func dirSize(dir string) (int64, error) {
 		return nil
 	})
 	return n, err
+}
+
+// optionalDirSize is dirSize of a directory that may be missing (0 then).
+func optionalDirSize(dir string) (int64, error) {
+	if !exists(dir) {
+		return 0, nil
+	}
+	return dirSize(dir)
 }
 
 // within reports whether path is dir or lies under it; both are resolved paths.
@@ -1278,7 +1329,10 @@ func (im *importer) importFolder(src, mode string) (*ImportResult, error) {
 }
 
 // reference commits content as a symlink to the folder dir. The folder is never written
-// to, so neither DLC nor a pending patch is applied to it.
+// to: a pending patch is not applied, and DLC lives in games/<id>/addcont. The DLC of an
+// earlier import is kept: a referenced game's stays where it is, and a copied game's is
+// hard-linked from content/addcont into games/<id>/addcont before the commit (recoverGame
+// removes it again if the commit does not happen).
 func (im *importer) reference(s *sfo.File, id, dir string, games map[string]*Game) (*ImportResult, error) {
 	content := im.lib.ContentDir(id)
 	ref := content + ".ref.partial"
@@ -1288,19 +1342,36 @@ func (im *importer) reference(s *sfo.File, id, dir string, games map[string]*Gam
 	if err := os.Symlink(dir, ref); err != nil {
 		return nil, err
 	}
-	g := newGame(s, id, games[id])
-	if prev := games[id]; prev != nil && len(prev.DLC) > 0 && isRealDir(content) {
-		im.warn("the DLC of the copied %s is not carried over to a referenced folder", id)
+	prev := games[id]
+	g := newGame(s, id, prev)
+	refAddcont := im.lib.refAddcontDir(id)
+	if prev != nil {
+		if copied := filepath.Join(content, "addcont"); isRealDir(content) && isRealDir(copied) {
+			if err := im.scratchDir(refAddcont, false); err != nil {
+				return nil, err
+			}
+			if err := linkTree(copied, refAddcont); err != nil {
+				return nil, err
+			}
+		}
+		if isRealDir(refAddcont) {
+			g.DLC = slices.Clone(prev.DLC)
+		}
 	}
 	if pp, err := im.readPending(id); err != nil {
 		return nil, err
 	} else if pp != nil {
 		im.warn("the pending patch for %s is kept: a referenced game is never modified", id)
 	}
-	var err error
-	if g.ContentBytes, err = dirSize(dir); err != nil {
+	size, err := dirSize(dir)
+	if err != nil {
 		return nil, err
 	}
+	dlc, err := optionalDirSize(refAddcont)
+	if err != nil {
+		return nil, err
+	}
+	g.ContentBytes = size + dlc
 	if err := im.commit(content, ref, content+".old", g); err != nil {
 		return nil, err
 	}

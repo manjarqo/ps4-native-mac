@@ -194,6 +194,26 @@ private func makeApp(at app: URL, version: String) throws {
         #expect(h.model.queue.items.first?.state == .done)
     }
 
+    @Test func importAllGivesEachImportItsOwnLog() async throws {
+        let h = try Harness()
+        defer { h.cleanUp() }
+        h.engine.setScript("import", lines: [
+            #"{"event":"error","op":"import","code":"bad_input","message":"CUSA00557 is not in the library; import the game before its DLC"}"#,
+        ], exitOK: false)
+        let urls = ["a.pkg", "b.pkg", "c.pkg"].map { h.src.appendingPathComponent($0) }
+        await h.model.add(urls)
+        // As "Import all" does: every candidate confirmed in one go, within one second.
+        for c in h.model.pendingCandidates { try h.model.confirm(c, mode: .copy) }
+        try await wait("imports") { finished(h.model.queue) }
+        let logs = h.model.queue.items.map(\.log)
+        #expect(logs.count == 3 && Set(logs).count == 3)
+        #expect(h.model.queue.items.allSatisfy { if case .failed = $0.state { true } else { false } })
+        for log in logs {
+            let text = try String(contentsOf: log, encoding: .utf8)
+            #expect(text.components(separatedBy: "is not in the library").count - 1 <= 1, "\(log.lastPathComponent): \(text)")
+        }
+    }
+
     @Test func retailCandidateCannotBeConfirmed() async throws {
         let h = try Harness()
         defer { h.cleanUp() }
@@ -385,6 +405,36 @@ private func makeApp(at app: URL, version: String) throws {
         #expect(ISO8601DateFormatter().date(from: record.lastPlayed) != nil)
         #expect(h.model.lastCrashLog[titleID] == nil)
         #expect(!h.model.isBusy(titleID))
+    }
+
+    @Test func gameUsedInPlaceIsGivenItsDLCDirectory() async throws {
+        let h = try Harness()
+        defer { h.cleanUp() }
+        let fm = FileManager.default
+        try await h.seed(GameRecord(titleID: titleID, title: "Test Game", status: "playable", builtWith: "0.3.0"), built: true)
+        try fm.createSymbolicLink(at: try h.library.contentDir(titleID: titleID), withDestinationURL: h.src)
+        h.model.refresh()
+        #expect(h.model.usedInPlace == [titleID])
+        // Without DLC, nothing is set.
+        try h.model.play(titleID)
+        #expect(h.spawner.lastEnvironment?["PS4_ADDCONT_DIR"] == nil)
+        try await wait("exit") { h.model.launcher.running[titleID] == nil }
+
+        let dlc = try h.library.referencedAddcontDir(titleID: titleID)
+        try fm.createDirectory(at: dlc.appendingPathComponent("PROMOJOELSKIN001"), withIntermediateDirectories: true)
+        try h.model.play(titleID)
+        #expect(h.spawner.lastEnvironment?["PS4_ADDCONT_DIR"] == dlc.path)
+        #expect(h.spawner.lastEnvironment?["PS4_NO_DIALOGS"] == "1")
+        try await wait("exit") { h.model.launcher.running[titleID] == nil }
+
+        // A copied game's DLC is in content/addcont, which the runtime finds by itself.
+        try fm.removeItem(at: try h.library.contentDir(titleID: titleID))
+        try fm.createDirectory(at: try h.library.contentDir(titleID: titleID).appendingPathComponent("addcont/PROMOJOELSKIN001"),
+                               withIntermediateDirectories: true)
+        h.model.refresh()
+        #expect(h.model.usedInPlace.isEmpty)
+        try h.model.play(titleID)
+        #expect(h.spawner.lastEnvironment?["PS4_ADDCONT_DIR"] == ProcessInfo.processInfo.environment["PS4_ADDCONT_DIR"])
     }
 
     @Test func crashExitKeepsTheRunLog() async throws {

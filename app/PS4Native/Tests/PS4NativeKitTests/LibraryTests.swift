@@ -195,6 +195,10 @@ import Testing
                                withIntermediateDirectories: true)
         try Data(count: 1000).write(to: try store.buildDir(titleID: "CUSA00557").appendingPathComponent("Game.app/bin"))
         try fm.createSymbolicLink(at: try store.contentDir(titleID: "CUSA00557"), withDestinationURL: target)
+        // The DLC of the game used in place, kept in the library next to content/.
+        let dlc = try store.referencedAddcontDir(titleID: "CUSA00557").appendingPathComponent("PROMOJOELSKIN001")
+        try fm.createDirectory(at: dlc, withIntermediateDirectories: true)
+        try Data(count: 500).write(to: dlc.appendingPathComponent("dlc.dat"))
         let pending = root.appendingPathComponent("pending", isDirectory: true)
         try fm.createDirectory(at: pending.appendingPathComponent("CUSA00557"), withIntermediateDirectories: true)
         try Data(#"{"app_ver":"01.09"}"#.utf8).write(to: pending.appendingPathComponent("CUSA00557.json"))
@@ -202,7 +206,7 @@ import Testing
         #expect(try store.appBundle(titleID: "CUSA00557")?.lastPathComponent == "Game.app")
 
         let freed = try await store.uninstall(titleID: "CUSA00557")
-        #expect(freed >= 1000)
+        #expect(freed >= 1500)
         #expect(try store.snapshot().games.isEmpty)
         #expect(try store.snapshot().extra["x_top"] == .number(1))
         #expect(!fm.fileExists(atPath: game.path))
@@ -210,6 +214,32 @@ import Testing
         #expect(!fm.fileExists(atPath: pending.appendingPathComponent("CUSA00557.json").path))
         #expect(try String(contentsOf: target.appendingPathComponent("eboot.bin"), encoding: .utf8) == "keep me")
         #expect(try store.appBundle(titleID: "CUSA00557") == nil)
+    }
+
+    @Test func launchAddcontDirOnlyForAGameUsedInPlaceWithDLC() throws {
+        let tmp = try makeTemp("addcont")
+        defer { cleanup(tmp) }
+        let fm = FileManager.default
+        let store = LibraryStore(root: tmp.appendingPathComponent("lib", isDirectory: true))
+        let folder = tmp.appendingPathComponent("folder", isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let inPlace = "CUSA00557", copied = "CUSA04529", missing = "CUSA00552"
+        try fm.createDirectory(at: try store.gameDir(titleID: inPlace), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: try store.contentDir(titleID: inPlace), withDestinationURL: folder)
+        // A copied game: content/ is a directory (with its own addcont/, which the runtime scans).
+        try fm.createDirectory(at: try store.contentDir(titleID: copied).appendingPathComponent("addcont/X"),
+                               withIntermediateDirectories: true)
+        try fm.createDirectory(at: try store.referencedAddcontDir(titleID: copied), withIntermediateDirectories: true)
+
+        #expect(try store.isUsedInPlace(titleID: inPlace))
+        #expect(try !store.isUsedInPlace(titleID: copied) && !store.isUsedInPlace(titleID: missing))
+        #expect(try store.launchAddcontDir(titleID: inPlace) == nil) // no DLC yet
+        let dlc = try store.referencedAddcontDir(titleID: inPlace)
+        #expect(dlc.path == store.root.path + "/games/CUSA00557/addcont")
+        try fm.createDirectory(at: dlc.appendingPathComponent("PROMOJOELSKIN001"), withIntermediateDirectories: true)
+        #expect(try store.launchAddcontDir(titleID: inPlace) == dlc)
+        #expect(try store.launchAddcontDir(titleID: copied) == nil)
+        #expect(try store.launchAddcontDir(titleID: missing) == nil)
     }
 
     @Test func badTitleIDIsRefused() async throws {
