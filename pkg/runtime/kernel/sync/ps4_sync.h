@@ -35,6 +35,8 @@ void shim_pthread_rwlock_init(GuestContext *ctx);
 void shim_pthread_rwlock_destroy(GuestContext *ctx);
 void shim_scePthreadRwlockTryrdlock(GuestContext *ctx);
 void shim_scePthreadRwlockTrywrlock(GuestContext *ctx);
+void shim_scePthreadRwlockTimedrdlock(GuestContext *ctx);
+void shim_scePthreadRwlockTimedwrlock(GuestContext *ctx);
 void shim_pthread_mutex_timedlock(GuestContext *ctx);
 void shim_pthread_mutexattr_setprotocol(GuestContext *ctx);
 void shim_pthread_once(GuestContext *ctx);

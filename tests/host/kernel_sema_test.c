@@ -128,10 +128,87 @@ static void test_delete_cancel(void) {
   CHECK(sceKernelDeleteSema(s) == 0, "delete");
   pthread_join(c.th, NULL);
   CHECK(c.rc == EACCES_K, "deleted 0x%x", c.rc);
-  // The slot is reused by the next semaphore and works.
+  // Monotonic non-reused ID: the next semaphore gets a strictly higher ID and the old ID stays ESRCH.
   OrbisKernelSema s2 = 0;
-  CHECK(sceKernelCreateSema(&s2, "reuse", 1, 1, 1, NULL) == 0 && sceKernelPollSema(s2, 1) == 0, "reuse");
+  CHECK(sceKernelCreateSema(&s2, "reuse", 1, 1, 1, NULL) == 0 && s2 > s && sceKernelPollSema(s2, 1) == 0, "monotonic id");
+  CHECK(sceKernelPollSema(s, 1) == ESRCH_K, "stale deleted id still fails with ESRCH");
   sceKernelDeleteSema(s2);
+}
+
+static void test_64bit_wire_abi(void) {
+  static uint8_t mem[0x10000];
+  GuestContext ctx = {0};
+  ctx.mem_base = mem;
+  ctx.mem_size = sizeof(mem);
+  strcpy((char *)(mem + 0x200), "bb_sema");
+
+  // pOptParam != 0 is checked first and returns EINVAL (0x80020016), even if maxCount <= 0.
+  *(uint64_t *)(mem + 0x100) = 0xDEADBEEF12345678ULL;
+  ctx.rsp = 0x1000;
+  ctx.rdi = 0x100;
+  ctx.rsi = 0x200;
+  ctx.rdx = 1;
+  ctx.rcx = 0;
+  ctx.r8 = 0; // maxCount == 0
+  ctx.r9 = 0x300; // non-null pOptParam
+  shim_sceKernelCreateSema(&ctx);
+  CHECK((int)ctx.rax == EINVAL_K && ctx.rsp == 0x1008, "pOptParam != 0 rejected with EINVAL");
+
+  // Invalid maxCount zeroes full 64-bit *pSema and returns EINVAL.
+  *(uint64_t *)(mem + 0x100) = 0xDEADBEEF12345678ULL;
+  ctx.rsp = 0x1000;
+  ctx.rdi = 0x100;
+  ctx.rsi = 0x200;
+  ctx.rdx = 1;
+  ctx.rcx = 0;
+  ctx.r8 = 0;
+  ctx.r9 = 0;
+  shim_sceKernelCreateSema(&ctx);
+  CHECK((int)ctx.rax == EINVAL_K && *(uint64_t *)(mem + 0x100) == 0, "invalid create zeroes 64-bit *pSema");
+
+  // Valid create overwrites upper 32 bits of *pSema with 0 (full 64-bit write).
+  *(uint64_t *)(mem + 0x100) = 0xDEADBEEF00000000ULL;
+  ctx.rsp = 0x1000;
+  ctx.rdi = 0x100;
+  ctx.rsi = 0x200;
+  ctx.rdx = 1;
+  ctx.rcx = 1;
+  ctx.r8 = 2;
+  ctx.r9 = 0;
+  shim_sceKernelCreateSema(&ctx);
+  uint64_t handle = *(uint64_t *)(mem + 0x100);
+  CHECK((int)ctx.rax == 0 && handle > 0 && (handle >> 32) == 0, "64-bit handle written: 0x%llx", (unsigned long long)handle);
+
+  // Corrupted upper 32 bits in rdi must be rejected with ESRCH (0x80020003) across all operations.
+  uint64_t corrupted = handle | 0xdead00000000ULL;
+  ctx.rsp = 0x1000; ctx.rdi = corrupted; ctx.rsi = 1; ctx.rdx = 0;
+  shim_sceKernelWaitSema(&ctx);
+  CHECK((int)ctx.rax == ESRCH_K, "WaitSema rejects corrupted upper 32 bits");
+
+  ctx.rsp = 0x1000; ctx.rdi = corrupted; ctx.rsi = 1;
+  shim_sceKernelPollSema(&ctx);
+  CHECK((int)ctx.rax == ESRCH_K, "PollSema rejects corrupted upper 32 bits");
+
+  ctx.rsp = 0x1000; ctx.rdi = corrupted; ctx.rsi = 1;
+  shim_sceKernelSignalSema(&ctx);
+  CHECK((int)ctx.rax == ESRCH_K, "SignalSema rejects corrupted upper 32 bits");
+
+  ctx.rsp = 0x1000; ctx.rdi = corrupted; ctx.rsi = 0; ctx.rdx = 0;
+  shim_sceKernelCancelSema(&ctx);
+  CHECK((int)ctx.rax == ESRCH_K, "CancelSema rejects corrupted upper 32 bits");
+
+  ctx.rsp = 0x1000; ctx.rdi = corrupted;
+  shim_sceKernelDeleteSema(&ctx);
+  CHECK((int)ctx.rax == ESRCH_K, "DeleteSema rejects corrupted upper 32 bits");
+
+  // Clean 64-bit handle succeeds.
+  ctx.rsp = 0x1000; ctx.rdi = handle; ctx.rsi = 1;
+  shim_sceKernelPollSema(&ctx);
+  CHECK((int)ctx.rax == 0, "PollSema with clean 64-bit handle succeeds");
+
+  ctx.rsp = 0x1000; ctx.rdi = handle;
+  shim_sceKernelDeleteSema(&ctx);
+  CHECK((int)ctx.rax == 0, "DeleteSema with clean 64-bit handle succeeds");
 }
 
 int main(void) {
@@ -139,6 +216,7 @@ int main(void) {
   test_need_count_order();
   test_timeout();
   test_delete_cancel();
+  test_64bit_wire_abi();
   if (g_failures) {
     printf("kernel_sema_test: %d failure(s)\n", g_failures);
     return 1;

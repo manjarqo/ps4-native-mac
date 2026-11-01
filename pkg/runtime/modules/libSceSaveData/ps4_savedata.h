@@ -100,6 +100,13 @@ int32_t sceSaveDataInitialize2(const void *param);
 int32_t sceSaveDataInitialize3(const void *param);
 int32_t sceSaveDataTerminate(void);
 
+int32_t sceSaveDataSetupSaveDataMemory(GuestContext *ctx, int32_t userId,
+                                       size_t memorySize, const void *param);
+int32_t sceSaveDataGetSaveDataMemory(GuestContext *ctx, int32_t userId,
+                                     void *buf, size_t bufSize, int64_t offset);
+int32_t sceSaveDataSetSaveDataMemory(GuestContext *ctx, int32_t userId,
+                                     const void *buf, size_t bufSize, int64_t offset);
+
 int32_t sceSaveDataSetupSaveDataMemory2(GuestContext *ctx,
                                        const OrbisSaveDataMemorySetup2 *setupParam,
                                        OrbisSaveDataMemorySetupResult *result);
@@ -119,6 +126,12 @@ void shim_sceSaveDataInitialize2(GuestContext *ctx);
 void shim_sceSaveDataInitialize3(GuestContext *ctx);
 void shim_sceSaveDataTerminate(GuestContext *ctx);
 
+void shim_sceSaveDataMount(GuestContext *ctx);
+void shim_sceSaveDataMount2(GuestContext *ctx);
+void shim_sceSaveDataUmount(GuestContext *ctx);
+void shim_sceSaveDataSetupSaveDataMemory(GuestContext *ctx);
+void shim_sceSaveDataGetSaveDataMemory(GuestContext *ctx);
+void shim_sceSaveDataSetSaveDataMemory(GuestContext *ctx);
 void shim_sceSaveDataSetupSaveDataMemory2(GuestContext *ctx);
 void shim_sceSaveDataGetSaveDataMemory2(GuestContext *ctx);
 void shim_sceSaveDataSetSaveDataMemory2(GuestContext *ctx);

@@ -161,7 +161,7 @@ static bool WriteFenceData(GuestContext *ctx, uint64_t addr, uint32_t data_sel,
     case kDataSel32: {
         uint32_t *dst = (uint32_t *)GuestMemPtr(ctx, addr & ~3ULL, 4);
         if (!dst) return false;
-        __atomic_store_n(dst, data_lo, __ATOMIC_SEQ_CST);
+        __atomic_store_n(dst, data_lo, __ATOMIC_RELEASE);
         return true;
     }
     case kDataSel64:
@@ -171,7 +171,7 @@ static bool WriteFenceData(GuestContext *ctx, uint64_t addr, uint32_t data_sel,
         // 64-bit fences must be qword aligned on HW; the low bits are ignored there.
         uint64_t *dst = (uint64_t *)GuestMemPtr(ctx, addr & ~7ULL, 8);
         if (!dst) return false;
-        __atomic_store_n(dst, value, __ATOMIC_SEQ_CST);
+        __atomic_store_n(dst, value, __ATOMIC_RELEASE);
         return true;
     }
     case kDataSelGdsMemStore:
@@ -342,12 +342,14 @@ static void HandleEventWriteEos(GuestContext *ctx, const uint32_t *p, uint32_t p
     const uint64_t addr = (uint64_t)p[1] | ((uint64_t)(p[2] & 0xFFFFu) << 32);
     const uint32_t command = (p[2] >> 29) & 0x7u;
     if (command == 2) {
-        const uint32_t v = p[3];
+        const uint32_t lo = p[3];
+        const uint32_t hi = payload_dw >= 5 ? p[4] : 0;
+        const uint32_t sel = payload_dw >= 5 ? kDataSel64 : kDataSel32;
         const int queue = CpQueue();
-        PendingLabel(addr, kDataSel32, v, 0, true, queue, t_cp_ring);
-        ps4draw::AfterGpuLabel(addr, v, queue ? "compute EOS" : "EOS", queue, [=]() {
-            WriteFenceData(ctx, addr, kDataSel32, v, 0);
-            PendingLabel(addr, kDataSel32, v, 0, false, queue);
+        PendingLabel(addr, sel, lo, hi, true, queue, t_cp_ring);
+        ps4draw::AfterGpuLabel(addr, (uint64_t)lo | ((uint64_t)hi << 32), queue ? "compute EOS" : "EOS", queue, [=]() {
+            WriteFenceData(ctx, addr, sel, lo, hi);
+            PendingLabel(addr, sel, lo, hi, false, queue);
         });
     }
 }
@@ -370,11 +372,20 @@ static void HandleWriteData(GuestContext *ctx, const uint32_t *p, uint32_t paylo
     if (!dst) return;
     SyncGpu(3); // previously encoded GPU work may still read the old contents
     ps4draw::NotifyGuestWrite(dst_addr & ~3ULL, wr_one_addr ? 4 : (uint64_t)ndw * 4, false, 0);
-    for (uint32_t w = 0; w < ndw; w++) {
-        if (wr_one_addr) {
-            __atomic_store_n(dst, p[3 + w], __ATOMIC_SEQ_CST);
-        } else {
-            __atomic_store_n(dst + w, p[3 + w], __ATOMIC_SEQ_CST);
+    if (wr_one_addr) {
+        for (uint32_t w = 0; w < ndw; w++) {
+            __atomic_store_n(dst, p[3 + w], __ATOMIC_RELEASE);
+        }
+    } else {
+        uint32_t w = 0;
+        if (((uintptr_t)dst & 7u) == 0) {
+            for (; w + 2 <= ndw; w += 2) {
+                const uint64_t val = (uint64_t)p[3 + w] | ((uint64_t)p[3 + w + 1] << 32);
+                __atomic_store_n((uint64_t *)(dst + w), val, __ATOMIC_RELEASE);
+            }
+        }
+        for (; w < ndw; w++) {
+            __atomic_store_n(dst + w, p[3 + w], __ATOMIC_RELEASE);
         }
     }
 }
@@ -545,7 +556,14 @@ static void HandleDmaData(GuestContext *ctx, const uint32_t *p, uint32_t payload
     SyncGpu(4);
     if (src_sel == 2) {
         uint32_t v = p[1];
-        for (uint32_t i = 0; i + 4 <= n; i += 4) memcpy(d + i, &v, 4);
+        if (!dst_gds && n == 8 && ((uintptr_t)d & 7u) == 0) {
+            const uint64_t val = (uint64_t)v | ((uint64_t)v << 32);
+            __atomic_store_n((uint64_t *)d, val, __ATOMIC_RELEASE);
+        } else if (!dst_gds && n == 4 && ((uintptr_t)d & 3u) == 0) {
+            __atomic_store_n((uint32_t *)d, v, __ATOMIC_RELEASE);
+        } else {
+            for (uint32_t i = 0; i + 4 <= n; i += 4) memcpy(d + i, &v, 4);
+        }
         if (!dst_gds) ps4draw::NotifyGuestWrite(dst, n, true, v, true);
         return;
     }
@@ -557,7 +575,17 @@ static void HandleDmaData(GuestContext *ctx, const uint32_t *p, uint32_t payload
         if (src + n > ctx->mem_size || src == 0) return;
         sp = ctx->mem_base + src;
     }
-    memmove(d, sp, n);
+    if (!dst_gds && n == 8 && ((uintptr_t)d & 7u) == 0) {
+        uint64_t val = 0;
+        memcpy(&val, sp, 8);
+        __atomic_store_n((uint64_t *)d, val, __ATOMIC_RELEASE);
+    } else if (!dst_gds && n == 4 && ((uintptr_t)d & 3u) == 0) {
+        uint32_t val = 0;
+        memcpy(&val, sp, 4);
+        __atomic_store_n((uint32_t *)d, val, __ATOMIC_RELEASE);
+    } else {
+        memmove(d, sp, n);
+    }
     if (!dst_gds) ps4draw::NotifyGuestWrite(dst, n, false, 0, true);
 }
 
@@ -812,11 +840,14 @@ static void DrawIndirectRecord(GuestContext *ctx, bool indexed, uint64_t args, u
     if (bvl && bvl < 0x400) g_liverpool_regs[0x2C00 + bvl] = base_vertex;
     if (sil && sil < 0x400) g_liverpool_regs[0x2C00 + sil] = start_inst;
     const uint32_t saved_inst = g_draw.num_instances;
+    const uint32_t saved_indx_offset = g_liverpool_regs[0xA102];
+    if (!indexed && !bvl) g_liverpool_regs[0xA102] = base_vertex;
     g_draw.num_instances = ia[1];
     if (indexed)
         DoDraw(ctx, name, true, ia[2], ia[0], g_draw.index_buffer_size);
     else
         DoDraw(ctx, name, false, 0, ia[0], 0);
+    g_liverpool_regs[0xA102] = saved_indx_offset;
     g_draw.num_instances = saved_inst;
 }
 
@@ -847,6 +878,21 @@ static bool ProcessGfxPackets(GuestContext *ctx, GfxStream &st) {
         bool push_chain = false;
         uint32_t header = dcb_words[pc];
         hist_pc[hist_n++ & 7] = pc;
+        if (header >= 0xabcdef10u && header <= 0xabcdef13u) {
+            const bool is_eop = (header == 0xabcdef12u || header == 0xabcdef13u);
+            const uint32_t step = is_eop ? 0x14u : 0x0fu;
+            if (pc + 4 <= dcb_dw) {
+                const uint64_t addr = (uint64_t)dcb_words[pc + 1] | ((uint64_t)dcb_words[pc + 2] << 32);
+                const uint32_t val = dcb_words[pc + 3];
+                WriteFenceData(ctx, addr, kDataSel32, val, 0);
+            }
+            if (is_eop) {
+                RaiseInterrupt(PS4_GNM_EVENT_GFX_EOP, "EOP");
+            }
+            pc += (pc + step <= dcb_dw) ? step : (dcb_dw - pc);
+            st.frames.back().pc = pc;
+            continue;
+        }
         uint32_t type = (header >> 30) & 0x3;
 
         if (type == 3) {
@@ -1075,8 +1121,12 @@ static bool ProcessGfxPackets(GuestContext *ctx, GfxStream &st) {
         } else if (type == 2) {
             pc += 1;
         } else if (type == 0) {
-            uint32_t count_dw = (header >> 16) & 0x3FFF;
-            pc += 1 + count_dw + 1;
+            if (header == 0) {
+                pc += 1;
+            } else {
+                uint32_t count_dw = (header >> 16) & 0x3FFF;
+                pc += 1 + count_dw + 1;
+            }
         } else {
             pc += 1;
         }
@@ -1140,7 +1190,7 @@ static bool ProcessComputePackets(ComputeSubmit &sub, bool skip_wait) {
         const uint32_t header = f.words[f.pc];
         const uint32_t type = (header >> 30) & 0x3;
         if (type == 0) {
-            pk.step = ((header >> 16) & 0x3FFF) + 2;
+            pk.step = header ? (((header >> 16) & 0x3FFF) + 2) : 1;
             return;
         }
         if (type != 3) {

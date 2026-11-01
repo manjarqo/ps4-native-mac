@@ -311,3 +311,55 @@ void shim_sceNpTrophyGetTrophyUnlockState(GuestContext *ctx) {
     ctx->rax = 0;
     SHIM_RETURN();
 }
+
+void shim_sceNpTrophyAbortHandle(GuestContext *ctx) {
+    ctx->rax = 0;
+    SHIM_RETURN();
+}
+
+void shim_sceNpTrophyGetGameIcon(GuestContext *ctx) {
+    uint64_t sizeGuest = ctx->rcx;
+    if (sizeGuest && ctx->mem_base) {
+        *(uint32_t *)(ctx->mem_base + sizeGuest) = 0;
+    }
+    ctx->rax = 0;
+    SHIM_RETURN();
+}
+
+void shim_sceNpTrophyGetGameInfo(GuestContext *ctx) {
+    uint64_t detailsGuest = ctx->rdx;
+    uint64_t dataGuest = ctx->rcx;
+    if (detailsGuest && ctx->mem_base) {
+        uint8_t *d = (uint8_t *)(ctx->mem_base + detailsGuest);
+        *(uint32_t *)(d + 4) = 40;  /* numTrophies */
+        *(uint32_t *)(d + 8) = 1;   /* numPlatinum */
+        *(uint32_t *)(d + 12) = 3;  /* numGold */
+        *(uint32_t *)(d + 16) = 7;  /* numSilver */
+        *(uint32_t *)(d + 20) = 29; /* numBronze */
+    }
+    if (dataGuest && ctx->mem_base) {
+        uint8_t *g = (uint8_t *)(ctx->mem_base + dataGuest);
+        *(uint32_t *)(g + 4) = 0;   /* unlockedTrophies */
+    }
+    ctx->rax = 0;
+    SHIM_RETURN();
+}
+
+void shim_sceNpTrophyGetTrophyInfo(GuestContext *ctx) {
+    int32_t trophyId = (int32_t)ctx->rdx;
+    uint64_t detailsGuest = ctx->rcx;
+    uint64_t dataGuest = ctx->r8;
+    if (detailsGuest && ctx->mem_base) {
+        uint8_t *d = (uint8_t *)(ctx->mem_base + detailsGuest);
+        *(int32_t *)(d + 4) = trophyId;
+        *(uint32_t *)(d + 8) = (trophyId == 0) ? 1u : 4u; /* grade */
+        *(int32_t *)(d + 12) = -1; /* groupId */
+    }
+    if (dataGuest && ctx->mem_base) {
+        uint8_t *g = (uint8_t *)(ctx->mem_base + dataGuest);
+        *(int32_t *)(g + 4) = trophyId;
+        g[8] = 0; /* unlocked = false */
+    }
+    ctx->rax = 0;
+    SHIM_RETURN();
+}

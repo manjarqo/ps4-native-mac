@@ -43,6 +43,18 @@ typedef union {
   double f64[2];
 } xmm_reg_t;
 
+// Active guest setjmp frame record for non-local jump unwinding in the ARM64 assembly backend.
+#define RECOMP_MAX_JMP_BUFS 64
+typedef struct RecompJmpBufEntry {
+  uint64_t guest_env;
+  uint64_t guest_rip;
+  uint64_t guest_rsp;
+  uint64_t host_sp;
+  uint64_t host_fp;
+  uint64_t host_lr;
+  uint64_t guest_fpcr;
+} RecompJmpBufEntry;
+
 // Guest CPU context
 typedef struct GuestContext {
   uint64_t rax;
@@ -118,6 +130,10 @@ typedef struct GuestContext {
   uint64_t static_tls_size;
   // Protected prefix of a thread's stack allocation (outside the usable stack).
   uint64_t stack_guard_size;
+
+  // Per-thread shadow table of active guest setjmp buffers for longjmp unwinding.
+  RecompJmpBufEntry jmp_bufs[RECOMP_MAX_JMP_BUFS];
+  uint32_t jmp_buf_next;
 } GuestContext;
 
 // The TCB slot (guest address fs_base + RECOMP_TCB_CTX_SLOT) that holds the GuestContext

@@ -274,3 +274,16 @@ void shim_sceSystemServiceEnablePersonalEyeToEyeDistanceSetting(GuestContext *ct
     ctx->rax = (uint64_t)(int64_t)sceSystemServiceEnablePersonalEyeToEyeDistanceSetting();
     SHIM_RETURN();
 }
+
+int32_t sceSystemServiceLaunchWebBrowser(const char *uri, const void *param) {
+    (void)uri;
+    (void)param;
+    return 0;
+}
+
+void shim_sceSystemServiceLaunchWebBrowser(GuestContext *ctx) {
+    const char *uri = ctx->rdi ? (const char *)(ctx->mem_base + ctx->rdi) : NULL;
+    const void *param = ctx->rsi ? (const void *)(ctx->mem_base + ctx->rsi) : NULL;
+    ctx->rax = (uint64_t)(int64_t)sceSystemServiceLaunchWebBrowser(uri, param);
+    SHIM_RETURN();
+}

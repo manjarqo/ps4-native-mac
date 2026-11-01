@@ -261,11 +261,11 @@ func TestBatchKernelAndPthreadShims(t *testing.T) {
 		{"scePthreadGetname", "How7B8Oet6k", "shim_scePthreadGetname"},
 		{"pthread_cancel", "0D4-FVvEikw", "shim_pthread_cancel"},
 		{"pthread_mutexattr_setprotocol", "5txKfcMUAok", "shim_pthread_mutexattr_setprotocol"},
-		{"sceKernelMkdir", "1-LFLmRFxxM", "shim_mkdir"},
+		{"sceKernelMkdir", "1-LFLmRFxxM", "shim_sceKernelMkdir"},
 		{"rmdir", "c7ZnT7V1B98", "shim_rmdir"},
-		{"sceKernelRename", "52NcYU9+lEo", "shim_rename"},
-		{"sceKernelUnlink", "AUXVxWeJU-A", "shim_unlink"},
-		{"sceKernelTruncate", "WlyEA-sLDf0", "shim_truncate"},
+		{"sceKernelRename", "52NcYU9+lEo", "shim_sceKernelRename"},
+		{"sceKernelUnlink", "AUXVxWeJU-A", "shim_sceKernelUnlink"},
+		{"sceKernelTruncate", "WlyEA-sLDf0", "shim_sceKernelTruncate"},
 		{"sceKernelMlock", "3k6kx-zOOSQ", "shim_mlock"},
 		{"__pthread_cxa_finalize", "kbw4UHHSYy0", "shim___pthread_cxa_finalize"},
 		{"sceKernelConvertUtcToLocaltime", "-o5uEDpN+oY", "shim_sceKernelConvertUtcToLocaltime"},
@@ -395,6 +395,9 @@ func TestVideoOutAndEqueueShims(t *testing.T) {
 // libc's exports bind to the shims that report them (by name and by NID).
 func TestNonLocalTransfersAreShimmed(t *testing.T) {
 	for name, want := range map[string]string{
+		"setjmp":        "shim_setjmp",
+		"_setjmp":       "shim_setjmp",
+		"sigsetjmp":     "shim_setjmp",
 		"longjmp":       "shim_guest_nonlocal_jump",
 		"_longjmp":      "shim_guest_nonlocal_jump",
 		"siglongjmp":    "shim_guest_nonlocal_jump",

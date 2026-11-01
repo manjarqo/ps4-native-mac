@@ -3295,7 +3295,8 @@ bool TextureCache::ComputeGuestDigestLocked(Entry* e, uint64_t* out) {
         return (h ^ v) * 0x9e3779b97f4a7c15ULL;
     };
     uint64_t h = n ^ 0x517cc1b727220a95ULL;
-    if (n <= 4096) {
+    const bool full_scan = (n <= 4096) || (!e->surf.is_block && e->levels == 1 && n <= 8 * 1024 * 1024);
+    if (full_scan) {
         uint64_t i = 0;
         for (; i + 8 <= n; i += 8) {
             uint64_t w;
@@ -3550,18 +3551,40 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
     if (Entry* e = rt) {
         stats.rt_aliased++;
         const MTLTextureSwizzleChannels swz = ToMTLSwizzle(img.view_swizzle);
-        if (e->width == width && e->height == height &&
-            (img.mtl_texture_type == MTLTextureType2D || is3d)) {
+        const bool can_view_slices =
+            is3d || (img.mtl_texture_type == MTLTextureTypeCube ? e->layers >= 6
+                     : img.mtl_texture_type == MTLTextureTypeCubeArray ? e->layers >= 6
+                                                                       : e->layers >= layers);
+        if (e->width == width && e->height == height && can_view_slices) {
+            uint32_t first_slice = 0;
+            uint32_t alias_slices = 1;
+            if (is3d) {
+                first_slice = 0;
+                alias_slices = 1;
+            } else if (img.mtl_texture_type == MTLTextureType2D || img.mtl_texture_type == MTLTextureType1D) {
+                first_slice = e->layers ? std::min<uint32_t>(img.base_array, e->layers - 1) : 0;
+                alias_slices = 1;
+            } else if (img.mtl_texture_type == MTLTextureTypeCube) {
+                first_slice = (img.base_array + 6 <= e->layers) ? img.base_array : 0;
+                alias_slices = 6;
+            } else if (img.mtl_texture_type == MTLTextureTypeCubeArray) {
+                first_slice = 0;
+                alias_slices = (e->layers / 6) * 6;
+            } else {
+                first_slice = 0;
+                alias_slices = e->layers;
+            }
             const uint32_t key = img.pixel.mtl_format ^ ((uint32_t)img.view_swizzle.r << 16) ^
                                  ((uint32_t)img.view_swizzle.g << 20) ^ ((uint32_t)img.view_swizzle.b << 24) ^
-                                 ((uint32_t)img.view_swizzle.a << 28);
+                                 ((uint32_t)img.view_swizzle.a << 28) ^ ((uint32_t)img.mtl_texture_type << 12) ^
+                                 (first_slice << 6) ^ alias_slices;
             const uint32_t alias_levels = is3d ? levels : 1;
             if (!e->alias || e->alias_key != key || e->alias.mipmapLevelCount != alias_levels) {
                 ReleaseTextureLocked(AliasCopy(e)); // a copy this view replaces
                 e->alias = [e->tex newTextureViewWithPixelFormat:(MTLPixelFormat)img.pixel.mtl_format
                                                      textureType:(MTLTextureType)img.mtl_texture_type
                                                           levels:NSMakeRange(0, alias_levels)
-                                                          slices:NSMakeRange(0, 1)
+                                                          slices:NSMakeRange(first_slice, alias_slices)
                                                          swizzle:swz];
                 e->alias_key = key;
             }
@@ -3746,7 +3769,8 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
 }
 
 id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_from_guest, bool written,
-                                            bool guest_write_pending) {
+                                            bool guest_write_pending, id<MTLTexture>* grown_from) {
+    if (grown_from) *grown_from = nil;
     if (!cb.bound || cb.mtl_format == 0 || !device_) return nil;
     TimedLock lk(mutex_);
     const uint32_t w = (cb.extent_width && cb.extent_width <= cb.pitch) ? cb.extent_width : cb.pitch;
@@ -3756,7 +3780,42 @@ id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_fro
     for (auto it = range.first; it != range.second; ++it) {
         Entry* e = it->second;
         if (e->kind == Entry::Color && e->mtl_format == cb.mtl_format && e->width == w &&
-            e->height == h && e->layers == layers && e->samples == cb.num_samples) {
+            e->height == h && e->samples == cb.num_samples) {
+            if (e->layers < layers && cb.num_samples == 1) {
+                MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+                td.textureType = MTLTextureType2DArray;
+                td.pixelFormat = (MTLPixelFormat)cb.mtl_format;
+                td.width = w;
+                td.height = h;
+                td.arrayLength = layers;
+                td.sampleCount = 1;
+                td.usage = e->tex.usage;
+                td.storageMode = e->tex.storageMode;
+                id<MTLTexture> t = NewTextureLocked(td);
+                if (!t) return e->tex;
+                if (grown_from) *grown_from = e->tex;
+                ReleaseTextureLocked(AliasCopy(e));
+                e->alias = nil;
+                e->alias_key = 0;
+                ReleaseTextureLocked(e->tex);
+                RetireLocked(e->tex); // the renderer forgets state keyed by the old texture
+                TrackLocked(e, -1);
+                e->tex = t;
+                e->tex_type = MTLTextureType2DArray;
+                e->alloc_bytes = (uint64_t)t.allocatedSize;
+                e->layers = layers;
+                e->surf = cb.ToSurfaceDesc();
+                e->surf.width = w;
+                e->surf.height = h;
+                cb.GetLayout(&e->layout);
+                e->size = e->layout.total_size;
+                e->readable_known = false;
+                e->visible_prefix_known = false;
+                TrackLocked(e, +1); // also marks the GPU range index stale
+                if (load_from_guest && !guest_write_pending) {
+                    UploadLocked(e);
+                }
+            }
             e->generation++;
             stats.hits++;
             GpuWroteLocked(e); // drawn into: earlier buffer writes no longer describe it

@@ -16,6 +16,7 @@ typedef struct DirectMemBlock {
     off_t phys_offset;
     size_t size;
     int is_free;
+    int mem_type;
     uint64_t mapped_guest_vaddr;
     struct DirectMemBlock *next;
     struct DirectMemBlock *prev;
@@ -23,6 +24,7 @@ typedef struct DirectMemBlock {
 
 static DirectMemBlock *g_direct_blocks = NULL;
 static pthread_mutex_t g_direct_mutex = PTHREAD_MUTEX_INITIALIZER;
+static GuestContext *g_direct_proc_ctx = NULL;
 
 // ---------------------------------------------------------------------------------
 // Physical backing for direct memory. Every direct-memory page lives at
@@ -285,6 +287,13 @@ void ps4_direct_mem_destroy(void) {
         curr = next;
     }
     g_direct_blocks = NULL;
+    DirectMapping *m = g_dmaps;
+    while (m) {
+        DirectMapping *next = m->next;
+        free(m);
+        m = next;
+    }
+    g_dmaps = NULL;
     g_direct_inited = 0;
     pthread_mutex_unlock(&g_direct_mutex);
 }
@@ -379,6 +388,7 @@ int sceKernelAllocateDirectMemory(off_t searchStart, off_t searchEnd, size_t len
     }
 
     best->is_free = 0;
+    best->mem_type = type;
     *physAddrOut = best->phys_offset;
     pthread_mutex_unlock(&g_direct_mutex);
 
@@ -397,6 +407,7 @@ int sceKernelMapDirectMemory(GuestContext *ctx, void **addrInOut, size_t length,
     ps4_direct_mem_init();
 
     pthread_mutex_lock(&g_direct_mutex);
+    g_direct_proc_ctx = ctx->process_ctx ? ctx->process_ctx : ctx;
     DirectMemBlock *curr = g_direct_blocks;
     DirectMemBlock *found = NULL;
     while (curr) {
@@ -435,9 +446,19 @@ int sceKernelMapDirectMemory(GuestContext *ctx, void **addrInOut, size_t length,
 
     found->mapped_guest_vaddr = vaddr;
     *addrInOut = (void *)vaddr;
-    if (dm_alias(ctx, vaddr, (uint64_t)physAddr, (length + 0x3fffULL) & ~0x3fffULL) != 0 && g_phys_base) {
-        fprintf(stderr, "[ps4-mem] WARNING: direct mapping 0x%llx (phys 0x%llx) is not physically aliased\n",
-                (unsigned long long)vaddr, (unsigned long long)physAddr);
+    if (dm_alias(ctx, vaddr, (uint64_t)physAddr, (length + 0x3fffULL) & ~0x3fffULL) != 0) {
+        if (g_phys_base) {
+            fprintf(stderr, "[ps4-mem] WARNING: direct mapping 0x%llx (phys 0x%llx) is not physically aliased\n",
+                    (unsigned long long)vaddr, (unsigned long long)physAddr);
+        }
+        DirectMapping *m = (DirectMapping *)calloc(1, sizeof(*m));
+        if (m) {
+            m->vaddr = vaddr;
+            m->size = aligned_len;
+            m->phys = (uint64_t)physAddr;
+            m->next = g_dmaps;
+            g_dmaps = m;
+        }
     }
 
     printf("[ps4-mem] sceKernelMapDirectMemory SUCCESS: out=%p\n", (void *)vaddr);
@@ -448,39 +469,76 @@ int sceKernelMapDirectMemory(GuestContext *ctx, void **addrInOut, size_t length,
 }
 
 int sceKernelReleaseDirectMemory(off_t physAddr, size_t length) {
-    (void)length;
     ps4_direct_mem_init();
 
+    uint64_t unmap_vaddrs[64];
+    size_t unmap_sizes[64];
+    size_t unmap_count = 0;
+
     pthread_mutex_lock(&g_direct_mutex);
+    GuestContext *proc = g_direct_proc_ctx;
+    bool found = false;
+    off_t rel_end = length > 0 ? (physAddr + (off_t)length) : (physAddr + 1);
+
     DirectMemBlock *curr = g_direct_blocks;
     while (curr) {
-        if (!curr->is_free && curr->phys_offset == physAddr) {
+        if (!curr->is_free &&
+            ((length == 0 && curr->phys_offset == physAddr) ||
+             (length > 0 && curr->phys_offset < rel_end && curr->phys_offset + (off_t)curr->size > physAddr))) {
             curr->is_free = 1;
+            curr->mem_type = 0;
             curr->mapped_guest_vaddr = 0;
+            found = true;
+        }
+        curr = curr->next;
+    }
 
-            // Merge with next if free
-            if (curr->next && curr->next->is_free) {
+    if (found) {
+        // Coalesce adjacent free blocks
+        curr = g_direct_blocks;
+        while (curr && curr->next) {
+            if (curr->is_free && curr->next->is_free) {
                 DirectMemBlock *next = curr->next;
                 curr->size += next->size;
                 curr->next = next->next;
                 if (next->next) next->next->prev = curr;
                 free(next);
+            } else {
+                curr = curr->next;
             }
-            // Merge with prev if free
-            if (curr->prev && curr->prev->is_free) {
-                DirectMemBlock *prev = curr->prev;
-                prev->size += curr->size;
-                prev->next = curr->next;
-                if (curr->next) curr->next->prev = prev;
-                free(curr);
-            }
-            pthread_mutex_unlock(&g_direct_mutex);
-            return 0;
         }
-        curr = curr->next;
+
+        // Remove any virtual mappings overlapping [physAddr, rel_end)
+        uint64_t pstart = (uint64_t)physAddr;
+        uint64_t pend = (uint64_t)rel_end;
+        DirectMapping **pp = &g_dmaps;
+        while (*pp) {
+            DirectMapping *m = *pp;
+            if (m->phys < pend && m->phys + m->size > pstart) {
+                if (unmap_count < 64) {
+                    unmap_vaddrs[unmap_count] = m->vaddr;
+                    unmap_sizes[unmap_count] = (size_t)m->size;
+                    unmap_count++;
+                }
+                *pp = m->next;
+                free(m);
+            } else {
+                pp = &m->next;
+            }
+        }
     }
     pthread_mutex_unlock(&g_direct_mutex);
-    return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+
+    if (!found) {
+        return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+    }
+
+    if (proc) {
+        for (size_t i = 0; i < unmap_count; i++) {
+            recomp_vm_free(proc, unmap_vaddrs[i], unmap_sizes[i]);
+        }
+    }
+    return 0;
 }
 
 int sceKernelMapNamedFlexibleMemory(GuestContext *ctx, void **addrInOut, size_t length, int prot, int flags, const char *name) {
@@ -1101,10 +1159,52 @@ int sceKernelDirectMemoryQuery(off_t offset, int flags, OrbisDirectMemoryQueryIn
 
     info->start = (uint64_t)target->phys_offset;
     info->end = (uint64_t)(target->phys_offset + target->size);
-    info->memoryType = 0; // Standard direct memory
+    info->memoryType = target->mem_type;
     pthread_mutex_unlock(&g_direct_mutex);
 
     return 0;
+}
+
+int sceKernelGetDirectMemoryType(off_t start, int *memTypeOut, off_t *regionStartOut, off_t *regionEndOut) {
+    if (!memTypeOut) {
+        return 0x80020016; // ORBIS_KERNEL_ERROR_EINVAL
+    }
+    ps4_direct_mem_init();
+
+    pthread_mutex_lock(&g_direct_mutex);
+    DirectMemBlock *curr = g_direct_blocks;
+    while (curr) {
+        if (!curr->is_free && start >= curr->phys_offset &&
+            start < curr->phys_offset + (off_t)curr->size) {
+            *memTypeOut = curr->mem_type;
+            if (regionStartOut) {
+                *regionStartOut = curr->phys_offset;
+            }
+            if (regionEndOut) {
+                *regionEndOut = curr->phys_offset + (off_t)curr->size;
+            }
+            pthread_mutex_unlock(&g_direct_mutex);
+            return 0;
+        }
+        curr = curr->next;
+    }
+    pthread_mutex_unlock(&g_direct_mutex);
+    return 0x80020002; // ORBIS_KERNEL_ERROR_ENOENT
+}
+
+void shim_sceKernelGetDirectMemoryType(GuestContext *ctx) {
+    off_t start = (off_t)ctx->rdi;
+    uint64_t typeGuest = ctx->rsi;
+    uint64_t regStartGuest = ctx->rdx;
+    uint64_t regEndGuest = ctx->rcx;
+
+    int *memTypeOut = typeGuest ? (int *)(ctx->mem_base + typeGuest) : NULL;
+    off_t *regionStartOut = regStartGuest ? (off_t *)(ctx->mem_base + regStartGuest) : NULL;
+    off_t *regionEndOut = regEndGuest ? (off_t *)(ctx->mem_base + regEndGuest) : NULL;
+
+    int rc = sceKernelGetDirectMemoryType(start, memTypeOut, regionStartOut, regionEndOut);
+    ctx->rax = (uint64_t)(int64_t)rc;
+    SHIM_RETURN();
 }
 
 void shim_sceKernelDirectMemoryQuery(GuestContext *ctx) {

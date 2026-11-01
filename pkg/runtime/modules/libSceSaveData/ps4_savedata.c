@@ -714,6 +714,144 @@ void shim_sceSaveDataSyncSaveDataMemory(GuestContext *ctx) {
     SHIM_RETURN();
 }
 
+int32_t sceSaveDataSetupSaveDataMemory(GuestContext *ctx, int32_t userId,
+                                       size_t memorySize, const void *param) {
+    (void)param;
+    OrbisSaveDataMemorySetup2 setup2;
+    memset(&setup2, 0, sizeof(setup2));
+    setup2.userId = userId;
+    setup2.memorySize = memorySize;
+    setup2.slotId = 0;
+    return sceSaveDataSetupSaveDataMemory2(ctx, &setup2, NULL);
+}
+
+int32_t sceSaveDataGetSaveDataMemory(GuestContext *ctx, int32_t userId,
+                                     void *buf, size_t bufSize, int64_t offset) {
+    (void)ctx;
+    (void)userId;
+    pthread_mutex_lock(&g_savedata_mutex);
+    if (!g_savedata_initialized) {
+        pthread_mutex_unlock(&g_savedata_mutex);
+        return ORBIS_SAVE_DATA_ERROR_NOT_INITIALIZED;
+    }
+    if ((!buf && bufSize > 0) || offset < 0) {
+        pthread_mutex_unlock(&g_savedata_mutex);
+        return ORBIS_SAVE_DATA_ERROR_PARAMETER;
+    }
+    SaveMemorySlot *slot = find_slot(0);
+    if (!slot || !slot->cache) {
+        pthread_mutex_unlock(&g_savedata_mutex);
+        return ORBIS_SAVE_DATA_ERROR_MEMORY_NOT_READY;
+    }
+    if (buf && bufSize > 0) {
+        if ((size_t)offset < slot->cache_size) {
+            size_t avail = slot->cache_size - (size_t)offset;
+            size_t n = bufSize < avail ? bufSize : avail;
+            memcpy(buf, slot->cache + offset, n);
+            if (n < bufSize) {
+                memset((uint8_t *)buf + n, 0, bufSize - n);
+            }
+        } else {
+            memset(buf, 0, bufSize);
+        }
+    }
+    pthread_mutex_unlock(&g_savedata_mutex);
+    return 0;
+}
+
+int32_t sceSaveDataSetSaveDataMemory(GuestContext *ctx, int32_t userId,
+                                     const void *buf, size_t bufSize, int64_t offset) {
+    (void)ctx;
+    (void)userId;
+    pthread_mutex_lock(&g_savedata_mutex);
+    if (!g_savedata_initialized) {
+        pthread_mutex_unlock(&g_savedata_mutex);
+        return ORBIS_SAVE_DATA_ERROR_NOT_INITIALIZED;
+    }
+    if ((!buf && bufSize > 0) || offset < 0) {
+        pthread_mutex_unlock(&g_savedata_mutex);
+        return ORBIS_SAVE_DATA_ERROR_PARAMETER;
+    }
+    SaveMemorySlot *slot = find_slot(0);
+    if (!slot || !slot->cache) {
+        pthread_mutex_unlock(&g_savedata_mutex);
+        return ORBIS_SAVE_DATA_ERROR_MEMORY_NOT_READY;
+    }
+    if (buf && bufSize > 0) {
+        size_t required_size = (size_t)offset + bufSize;
+        if (required_size > slot->cache_size) {
+            uint8_t *new_cache = (uint8_t *)realloc(slot->cache, required_size);
+            if (new_cache) {
+                memset(new_cache + slot->cache_size, 0, required_size - slot->cache_size);
+                slot->cache = new_cache;
+                slot->cache_size = required_size;
+            }
+        }
+        if (required_size <= slot->cache_size) {
+            memcpy(slot->cache + offset, buf, bufSize);
+            slot->dirty = true;
+        }
+        if (slot->dirty) {
+            int32_t sync_rc = sync_slot_to_disk(slot, "sceSaveDataSetSaveDataMemory");
+            if (sync_rc != 0) {
+                pthread_mutex_unlock(&g_savedata_mutex);
+                return sync_rc;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_savedata_mutex);
+    return 0;
+}
+
+void shim_sceSaveDataSetupSaveDataMemory(GuestContext *ctx) {
+    int32_t userId = (int32_t)ctx->rdi;
+    size_t memorySize = (size_t)ctx->rsi;
+    const void *param = ctx->rdx ? recomp_guest_to_host(ctx, ctx->rdx) : NULL;
+    ctx->rax = (uint64_t)(int64_t)sceSaveDataSetupSaveDataMemory(ctx, userId, memorySize, param);
+    SHIM_RETURN();
+}
+
+void shim_sceSaveDataGetSaveDataMemory(GuestContext *ctx) {
+    if (ctx->rsi == 0 && ctx->rdx == 0 && ctx->rdi >= 0x1000) {
+        const OrbisSaveDataMemoryGet2 *in = (const OrbisSaveDataMemoryGet2 *)recomp_guest_to_host(ctx, ctx->rdi);
+        if (!in) {
+            ctx->rax = (uint64_t)(int64_t)ORBIS_SAVE_DATA_ERROR_PARAMETER;
+            SHIM_RETURN();
+        }
+        OrbisSaveDataMemoryGet2 g2 = *in;
+        g2.slotId = 0;
+        ctx->rax = (uint64_t)(int64_t)sceSaveDataGetSaveDataMemory2(ctx, &g2);
+        SHIM_RETURN();
+    }
+    int32_t userId = (int32_t)ctx->rdi;
+    void *buf = ctx->rsi ? recomp_guest_to_host(ctx, ctx->rsi) : NULL;
+    size_t bufSize = (size_t)ctx->rdx;
+    int64_t offset = (int64_t)ctx->rcx;
+    ctx->rax = (uint64_t)(int64_t)sceSaveDataGetSaveDataMemory(ctx, userId, buf, bufSize, offset);
+    SHIM_RETURN();
+}
+
+void shim_sceSaveDataSetSaveDataMemory(GuestContext *ctx) {
+    if (ctx->rsi == 0 && ctx->rdx == 0 && ctx->rdi >= 0x1000) {
+        const OrbisSaveDataMemorySet2 *in = (const OrbisSaveDataMemorySet2 *)recomp_guest_to_host(ctx, ctx->rdi);
+        if (!in) {
+            ctx->rax = (uint64_t)(int64_t)ORBIS_SAVE_DATA_ERROR_PARAMETER;
+            SHIM_RETURN();
+        }
+        OrbisSaveDataMemorySet2 s2 = *in;
+        s2.slotId = 0;
+        s2.dataNum = 1;
+        ctx->rax = (uint64_t)(int64_t)sceSaveDataSetSaveDataMemory2(ctx, &s2);
+        SHIM_RETURN();
+    }
+    int32_t userId = (int32_t)ctx->rdi;
+    const void *buf = ctx->rsi ? recomp_guest_to_host(ctx, ctx->rsi) : NULL;
+    size_t bufSize = (size_t)ctx->rdx;
+    int64_t offset = (int64_t)ctx->rcx;
+    ctx->rax = (uint64_t)(int64_t)sceSaveDataSetSaveDataMemory(ctx, userId, buf, bufSize, offset);
+    SHIM_RETURN();
+}
+
 //=============================================================================
 // Directory-based save data: sceSaveDataMount2 / Umount / DirNameSearch /
 // SetParam / SaveIcon / Delete.
@@ -754,6 +892,19 @@ void shim_sceSaveDataSyncSaveDataMemory(GuestContext *ctx) {
 
 typedef struct SdDirName { char data[SD_DIRNAME_SIZE]; } SdDirName;
 typedef struct SdMountPoint { char data[SD_MOUNTPT_SIZE]; } SdMountPoint;
+
+typedef struct SdMount {
+    int32_t userId;
+    int32_t _pad0;
+    uint64_t titleId;      // +0x08 const SceSaveDataTitleId*
+    uint64_t dirName;      // +0x10 const SdDirName*
+    uint64_t fingerprint;  // +0x18 const char*
+    uint64_t blocks;       // +0x20
+    uint32_t mountMode;    // +0x28
+    uint8_t _reserved[32]; // +0x2c
+    int32_t _pad1;         // +0x4c
+} SdMount;                 // 80 bytes
+_Static_assert(sizeof(SdMount) == 80, "OrbisSaveDataMount v1 must be 80 bytes");
 
 typedef struct SdMount2 {
     int32_t userId;
@@ -987,10 +1138,10 @@ static int sd_rm_cb(const char *path, const struct stat *st, int flag, struct FT
     return unlink(path);
 }
 
-// SQL-LIKE style match: '%' matches any run of characters, '_' matches one.
+// SQL-LIKE and glob style match: '%' or '*' matches any run of characters, '_' or '?' matches one.
 static bool sd_match(const char *pat, const char *s) {
     if (*pat == '\0') return *s == '\0';
-    if (*pat == '%') {
+    if (*pat == '%' || *pat == '*') {
         for (;;) {
             if (sd_match(pat + 1, s)) return true;
             if (*s == '\0') return false;
@@ -998,7 +1149,7 @@ static bool sd_match(const char *pat, const char *s) {
         }
     }
     if (*s == '\0') return false;
-    if (*pat == '_' || *pat == *s) return sd_match(pat + 1, s + 1);
+    if (*pat == '_' || *pat == '?' || *pat == *s) return sd_match(pat + 1, s + 1);
     return false;
 }
 
@@ -1324,6 +1475,23 @@ int32_t sceSaveDataDirNameSearch(GuestContext *ctx, const SdDirNameSearchCond *c
     fprintf(stderr, "[ps4-savedata] DirNameSearch: user=%d pattern='%s' key=%u order=%u -> %zu hit(s)\n",
             cond->userId, pattern, cond->key, cond->order, count);
     return 0;
+}
+
+void shim_sceSaveDataMount(GuestContext *ctx) {
+    const SdMount *mount = (const SdMount *)recomp_guest_to_host(ctx, ctx->rdi);
+    SdMountResult *result = (SdMountResult *)recomp_guest_to_host(ctx, ctx->rsi);
+    if (!mount || !result) {
+        ctx->rax = (uint64_t)(int64_t)SD_ERR_PARAMETER;
+        SHIM_RETURN();
+    }
+    SdMount2 m2;
+    memset(&m2, 0, sizeof(m2));
+    m2.userId = mount->userId;
+    m2.dirName = mount->dirName;
+    m2.blocks = mount->blocks;
+    m2.mountMode = mount->mountMode;
+    ctx->rax = (uint64_t)(int64_t)sceSaveDataMount2(ctx, &m2, result);
+    SHIM_RETURN();
 }
 
 void shim_sceSaveDataMount2(GuestContext *ctx) {

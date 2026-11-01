@@ -998,6 +998,70 @@ void shim_scePthreadRwlockTrywrlock(GuestContext *ctx) {
   SHIM_RETURN();
 }
 
+static uint64_t rwlock_now_usec(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+void shim_scePthreadRwlockTimedrdlock(GuestContext *ctx) {
+  uint64_t rw_addr = ctx->rdi;
+  uint64_t usec = ctx->rsi;
+  if (!rw_addr) {
+    ctx->rax = 0x80020016ULL;
+    SHIM_RETURN();
+  }
+  pthread_rwlock_t *rw = get_host_rwlock(sync_handle(ctx, rw_addr, 0));
+  uint64_t deadline = rwlock_now_usec() + usec;
+  for (;;) {
+    int ret = pthread_rwlock_tryrdlock(rw);
+    if (ret == 0) {
+      ctx->rax = 0;
+      SHIM_RETURN();
+    }
+    if (ret != EBUSY) {
+      ctx->rax = 0x80020000ULL | (uint32_t)ret;
+      SHIM_RETURN();
+    }
+    uint64_t now = rwlock_now_usec();
+    if (now >= deadline) {
+      ctx->rax = 0x8002003cULL; // SCE_KERNEL_ERROR_ETIMEDOUT
+      SHIM_RETURN();
+    }
+    uint64_t rem = deadline - now;
+    usleep(rem > 50 ? 50 : (useconds_t)rem);
+  }
+}
+
+void shim_scePthreadRwlockTimedwrlock(GuestContext *ctx) {
+  uint64_t rw_addr = ctx->rdi;
+  uint64_t usec = ctx->rsi;
+  if (!rw_addr) {
+    ctx->rax = 0x80020016ULL;
+    SHIM_RETURN();
+  }
+  pthread_rwlock_t *rw = get_host_rwlock(sync_handle(ctx, rw_addr, 0));
+  uint64_t deadline = rwlock_now_usec() + usec;
+  for (;;) {
+    int ret = pthread_rwlock_trywrlock(rw);
+    if (ret == 0) {
+      ctx->rax = 0;
+      SHIM_RETURN();
+    }
+    if (ret != EBUSY) {
+      ctx->rax = 0x80020000ULL | (uint32_t)ret;
+      SHIM_RETURN();
+    }
+    uint64_t now = rwlock_now_usec();
+    if (now >= deadline) {
+      ctx->rax = 0x8002003cULL; // SCE_KERNEL_ERROR_ETIMEDOUT
+      SHIM_RETURN();
+    }
+    uint64_t rem = deadline - now;
+    usleep(rem > 50 ? 50 : (useconds_t)rem);
+  }
+}
+
 void shim_pthread_rwlock_unlock(GuestContext *ctx) {
   uint64_t rw_addr = ctx->rdi;
   pthread_rwlock_t *rw = get_host_rwlock(sync_handle(ctx, rw_addr, 0));

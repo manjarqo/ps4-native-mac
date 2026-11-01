@@ -1205,3 +1205,130 @@ func TestVectorShiftPreservesFlags(t *testing.T) {
 		t.Errorf("expected PSRLQ to preserve NZCV, got:\n%s", joinedPsrlq)
 	}
 }
+
+func TestIsOpcodeSupportedSync(t *testing.T) {
+	ops := []x86asm.Op{
+		x86asm.VPSHUFD, x86asm.VDPPS, x86asm.VMOVHLPS, x86asm.VANDNPS, x86asm.VMOVLHPS,
+		x86asm.BEXTR, x86asm.RDTSC, x86asm.RDTSCP, x86asm.VPADDD, x86asm.VPCMPEQD,
+		x86asm.VRCPPS, x86asm.VXORPD, x86asm.VPADDQ, x86asm.VPALIGNR, x86asm.VPEXTRD,
+		x86asm.VEXTRACTPS, x86asm.VPSHUFB, x86asm.VPEXTRQ, x86asm.VPTEST, x86asm.VPMAXSD,
+		x86asm.VPSRLQ, x86asm.VPSLLDQ, x86asm.VPMINSD, x86asm.VADDPD, x86asm.VPCMPGTD,
+		x86asm.ANDN, x86asm.VUNPCKHPD, x86asm.VCMPSS, x86asm.VUNPCKLPD, x86asm.VPUNPCKLQDQ,
+		x86asm.VMULPD, x86asm.VSUBPD, x86asm.VPSLLQ, x86asm.VPSUBD, x86asm.VLDDQU,
+		x86asm.VROUNDPS, x86asm.VPEXTRB, x86asm.VSHUFPD, x86asm.VPUNPCKHQDQ, x86asm.VMOVHPD,
+		x86asm.VPCMPEQQ, x86asm.VMOVLPD, x86asm.VPMOVZXDQ, x86asm.VANDPD, x86asm.VSQRTPS,
+		x86asm.VPMOVZXBD, x86asm.VCMPSD, x86asm.VPADDB, x86asm.VPSUBQ, x86asm.VPHADDD,
+		x86asm.MFENCE, x86asm.LFENCE, x86asm.SFENCE, x86asm.VPMULUDQ, x86asm.BLSR,
+		x86asm.VPMINUD, x86asm.VPMOVSXDQ, x86asm.VDIVPD, x86asm.VPEXTRW, x86asm.VPSADBW,
+		x86asm.VORPD, x86asm.BLSI, x86asm.BLSMSK, x86asm.BZHI, x86asm.SHLX, x86asm.SHRX,
+		x86asm.SARX, x86asm.RORX, x86asm.MULX, x86asm.VPMOVSXBD, x86asm.VPMAXUD,
+		x86asm.VMAXSD, x86asm.VMINSD, x86asm.VBLENDVPD, x86asm.VPCMPGTQ, x86asm.VCVTTPD2DQ,
+		x86asm.VPSRLDQ, x86asm.VPCMPEQB, x86asm.VPCMPEQW, x86asm.VPABSD, x86asm.VPINSRQ,
+		x86asm.VPSUBB, x86asm.LOOPNE, x86asm.LOOPE, x86asm.LOOP, x86asm.VPBLENDW,
+		x86asm.VPMOVZXWQ, x86asm.CLD, x86asm.STD, x86asm.STC, x86asm.CLC, x86asm.CMC,
+		x86asm.VBLENDPD, x86asm.VPADDUSW, x86asm.VPCMPGTW, x86asm.VPMOVZXBQ, x86asm.VPMOVZXBW,
+		x86asm.VANDNPD, x86asm.VPMAXSW, x86asm.VPMINSW, x86asm.LEAVE, x86asm.ENTER,
+		x86asm.VCMPPD, x86asm.VMAXPD, x86asm.VMINPD, x86asm.VMOVMSKPD, x86asm.VMOVNTDQA,
+		x86asm.FCMOVB, x86asm.FILD, x86asm.ICEBP, x86asm.VLDMXCSR, x86asm.VSTMXCSR,
+		x86asm.VPMOVSXWQ, x86asm.VZEROUPPER, x86asm.VZEROALL, x86asm.XLATB,
+		x86asm.VMASKMOVDQU, x86asm.MASKMOVDQU, x86asm.SYSCALL,
+		x86asm.VFNMADD132SS, x86asm.VFNMADD213SS, x86asm.VFNMADD231SS,
+		x86asm.VFMADD213SS, x86asm.VFMSUB213SS, x86asm.VFNMSUB213SS,
+		x86asm.VPMULHUW, x86asm.PMULHUW, x86asm.FNSTCW,
+		disasm.OpEXTRQ, disasm.OpINSERTQ,
+	}
+	for _, op := range ops {
+		if !IsOpcodeSupported(op) {
+			t.Errorf("expected IsOpcodeSupported(%v) to be true", op)
+		}
+	}
+}
+
+func TestBloodborneNewInstructions(t *testing.T) {
+	lifter := NewArm64Lifter(nil)
+	lifter.SetTSO(false)
+
+	cases := []struct {
+		name     string
+		bytes    []byte
+		expected []string
+	}{
+		{
+			name:     "vmaskmovdqu xmm1, xmm2",
+			bytes:    []byte{0xc5, 0xf9, 0xf7, 0xca},
+			expected: []string{"mov x16, x24", "add x16, x28, x16", "umov w17, v2.b[0]", "tbz w17, #7,", "umov w17, v1.b[0]", "strb w17, [x16, #0]"},
+		},
+		{
+			name:     "maskmovdqu xmm1, xmm2",
+			bytes:    []byte{0x66, 0x0f, 0xf7, 0xca},
+			expected: []string{"mov x16, x24", "add x16, x28, x16", "umov w17, v2.b[0]", "tbz w17, #7,", "umov w17, v1.b[0]", "strb w17, [x16, #0]"},
+		},
+		{
+			name:     "rdtscp",
+			bytes:    []byte{0x0f, 0x01, 0xf9},
+			expected: []string{"mrs x16, cntvct_el0", "mov w19, w16", "mov w22, w16", "mov w21, #0"},
+		},
+		{
+			name:     "syscall",
+			bytes:    []byte{0x0f, 0x05},
+			expected: []string{"mov x19, #-38"},
+		},
+		{
+			name:     "vfnmadd213ss xmm0, xmm1, xmm2",
+			bytes:    []byte{0xc4, 0xe2, 0x71, 0xad, 0xc2},
+			expected: []string{"fmsub s30, s1, s0, s2", "mov v0.s[0], v30.s[0]", "movi v16.16b, #0"},
+		},
+		{
+			name:     "vfnmadd132ss xmm0, xmm1, xmm2",
+			bytes:    []byte{0xc4, 0xe2, 0x71, 0x9d, 0xc2},
+			expected: []string{"fmsub s30, s0, s2, s1", "mov v0.s[0], v30.s[0]", "movi v16.16b, #0"},
+		},
+		{
+			name:     "vfnmadd231ss xmm0, xmm1, xmm2",
+			bytes:    []byte{0xc4, 0xe2, 0x71, 0xbd, 0xc2},
+			expected: []string{"fmsub s30, s1, s2, s0", "mov v0.s[0], v30.s[0]", "movi v16.16b, #0"},
+		},
+		{
+			name:     "vfnmadd213ps xmm0, xmm1, xmm2",
+			bytes:    []byte{0xc4, 0xe2, 0x71, 0xac, 0xc2},
+			expected: []string{"mov v28.16b, v2.16b", "fmls v28.4s, v1.4s, v0.4s", "mov v0.16b, v28.16b", "movi v16.16b, #0"},
+		},
+		{
+			name:     "vpmulhuw xmm0, xmm1, xmm2",
+			bytes:    []byte{0xc5, 0xf1, 0xe4, 0xc2},
+			expected: []string{"umull  v20.4s, v1.4h, v2.4h", "umull2 v21.4s, v1.8h, v2.8h", "uzp2   v0.8h, v20.8h, v21.8h", "movi v16.16b, #0"},
+		},
+		{
+			name:     "pmulhuw xmm0, xmm1",
+			bytes:    []byte{0x66, 0x0f, 0xe4, 0xc1},
+			expected: []string{"umull  v20.4s, v0.4h, v1.4h", "umull2 v21.4s, v0.8h, v1.8h", "uzp2   v0.8h, v20.8h, v21.8h"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lifter.ResetFlags()
+			inst, err := disasm.Decode(tc.bytes)
+			if err != nil {
+				t.Fatalf("Decode(%s) failed: %v", tc.name, err)
+			}
+			if !IsOpcodeSupported(inst.Op) {
+				t.Fatalf("IsOpcodeSupported(%v) = false", inst.Op)
+			}
+			dInst := disasm.Instruction{Address: 0x1000, Inst: inst}
+			lines, err := lifter.LiftInstructionToBuf(dInst, 0x1000+uint64(inst.Len), nil, nil)
+			if err != nil {
+				t.Fatalf("LiftInstructionToBuf(%s) failed: %v", tc.name, err)
+			}
+			joined := strings.Join(lines, "\n")
+			if strings.Contains(joined, "_recomp_unsupported_instruction") {
+				t.Fatalf("unexpected unsupported instruction for %s:\n%s", tc.name, joined)
+			}
+			for _, exp := range tc.expected {
+				if !strings.Contains(joined, exp) {
+					t.Errorf("missing %q in lifted %s:\n%s", exp, tc.name, joined)
+				}
+			}
+		})
+	}
+}

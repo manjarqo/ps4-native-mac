@@ -268,3 +268,27 @@ void shim_scePlayGoPrefetch(GuestContext *ctx) {
     ctx->rax = (uint64_t)(int64_t)ret;
     SHIM_RETURN();
 }
+
+int32_t scePlayGoGetChunkId(OrbisPlayGoHandle handle, OrbisPlayGoChunkId *outChunkIdList, uint32_t numberOfEntries, uint32_t *outEntries) {
+    (void)handle;
+    uint32_t n = numberOfEntries < 64 ? numberOfEntries : 64;
+    if (outChunkIdList) {
+        for (uint32_t i = 0; i < n; i++) {
+            outChunkIdList[i] = (OrbisPlayGoChunkId)i;
+        }
+    }
+    if (outEntries) {
+        *outEntries = n;
+    }
+    return 0;
+}
+
+void shim_scePlayGoGetChunkId(GuestContext *ctx) {
+    OrbisPlayGoHandle handle = (OrbisPlayGoHandle)ctx->rdi;
+    OrbisPlayGoChunkId *list = ctx->rsi ? (OrbisPlayGoChunkId *)(ctx->mem_base + ctx->rsi) : NULL;
+    uint32_t maxEntries = (uint32_t)ctx->rdx;
+    uint32_t *outEntries = ctx->rcx ? (uint32_t *)(ctx->mem_base + ctx->rcx) : NULL;
+    int32_t ret = scePlayGoGetChunkId(handle, list, maxEntries, outEntries);
+    ctx->rax = (uint64_t)(int64_t)ret;
+    SHIM_RETURN();
+}

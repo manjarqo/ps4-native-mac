@@ -397,48 +397,127 @@ void shim__is_signal_return(GuestContext *ctx) {
     SHIM_RETURN();
 }
 
-void shim_sceDiscMapIsRequestOnHDD(GuestContext *ctx) {
-    ctx->rax = 1;
+int32_t sceKernelGettimezone(OrbisKernelTimezone *tz) {
+    if (!tz) {
+        return -14; // -EFAULT
+    }
+    struct timeval tv;
+    struct timezone htz;
+    if (gettimeofday(&tv, &htz) == 0) {
+        tz->tz_minuteswest = htz.tz_minuteswest;
+        tz->tz_dsttime = htz.tz_dsttime;
+    } else {
+        time_t now = time(NULL);
+        struct tm lt;
+        memset(&lt, 0, sizeof(lt));
+        localtime_r(&now, &lt);
+        tz->tz_minuteswest = (int32_t)(-lt.tm_gmtoff / 60);
+        tz->tz_dsttime = lt.tm_isdst > 0 ? 1 : 0;
+    }
+    return 0;
+}
+
+void shim_sceKernelGettimezone(GuestContext *ctx) {
+    OrbisKernelTimezone *tz = ctx->rdi ? (OrbisKernelTimezone *)(ctx->mem_base + ctx->rdi) : NULL;
+    ctx->rax = (uint64_t)(int64_t)sceKernelGettimezone(tz);
     SHIM_RETURN();
 }
 
-void shim_Func_7C980FFB0AA27E7A(GuestContext *ctx) {
-    uint64_t flags_guest = ctx->rcx;
-    uint64_t ret1_guest = ctx->r8;
-    uint64_t ret2_guest = ctx->r9;
-    if (flags_guest && ctx->mem_base) {
-        *(int32_t *)(ctx->mem_base + flags_guest) = 0;
+void shim_sysctl(GuestContext *ctx) {
+    uint64_t name_addr = ctx->rdi;
+    uint32_t namelen = (uint32_t)ctx->rsi;
+    uint64_t oldp_addr = ctx->rdx;
+    uint64_t oldlenp_addr = ctx->rcx;
+    if (name_addr == 0 || namelen == 0 || !ctx->mem_base) {
+        ctx->rax = (uint64_t)-1;
+        SHIM_RETURN();
     }
-    if (ret1_guest && ctx->mem_base) {
-        *(int32_t *)(ctx->mem_base + ret1_guest) = 0;
+    const int32_t *name = (const int32_t *)(ctx->mem_base + name_addr);
+    void *oldp = oldp_addr ? (void *)(ctx->mem_base + oldp_addr) : NULL;
+    size_t *oldlenp = oldlenp_addr ? (size_t *)(ctx->mem_base + oldlenp_addr) : NULL;
+    size_t avail = oldlenp ? *oldlenp : 0;
+
+    /* CTL_KERN (1), KERN_PROC (14), KERN_PROC_PATHNAME (12) */
+    if (namelen >= 3 && name[0] == 1 && name[1] == 14 && name[2] == 12) {
+        const char *path = "/app0/eboot.bin";
+        size_t need = strlen(path) + 1;
+        if (oldp && avail >= need) memcpy(oldp, path, need);
+        if (oldlenp) *oldlenp = need;
+        ctx->rax = 0;
+        SHIM_RETURN();
     }
-    if (ret2_guest && ctx->mem_base) {
-        *(int32_t *)(ctx->mem_base + ret2_guest) = 0;
+    /* CTL_KERN (1), KERN_USRSTACK (35) */
+    if (namelen >= 2 && name[0] == 1 && name[1] == 35) {
+        uint64_t top = 0x7fffff000ULL;
+        if (oldp && avail >= sizeof(top)) memcpy(oldp, &top, sizeof(top));
+        if (oldlenp) *oldlenp = sizeof(top);
+        ctx->rax = 0;
+        SHIM_RETURN();
     }
+    /* CTL_HW (6), HW_PAGESIZE (7) */
+    if (namelen >= 2 && name[0] == 6 && name[1] == 7) {
+        int32_t pg = 4096;
+        if (oldp && avail >= sizeof(pg)) memcpy(oldp, &pg, sizeof(pg));
+        if (oldlenp) *oldlenp = sizeof(pg);
+        ctx->rax = 0;
+        SHIM_RETURN();
+    }
+    /* CTL_HW (6), HW_NCPU (3) */
+    if (namelen >= 2 && name[0] == 6 && name[1] == 3) {
+        int32_t ncpu = 8;
+        if (oldp && avail >= sizeof(ncpu)) memcpy(oldp, &ncpu, sizeof(ncpu));
+        if (oldlenp) *oldlenp = sizeof(ncpu);
+        ctx->rax = 0;
+        SHIM_RETURN();
+    }
+    /* CTL_HW (6), HW_PHYSMEM (5) */
+    if (namelen >= 2 && name[0] == 6 && name[1] == 5) {
+        uint64_t mem = 5ULL * 1024ULL * 1024ULL * 1024ULL;
+        if (oldp && avail >= sizeof(mem)) memcpy(oldp, &mem, sizeof(mem));
+        if (oldlenp) *oldlenp = sizeof(mem);
+        ctx->rax = 0;
+        SHIM_RETURN();
+    }
+    if (oldp && avail > 0) memset(oldp, 0, avail);
     ctx->rax = 0;
     SHIM_RETURN();
 }
 
-void shim_sceDiscMapGetPackageSize(GuestContext *ctx) {
-    uint64_t ret1_guest = ctx->rsi;
-    uint64_t ret2_guest = ctx->rdx;
-    if (ret1_guest && ctx->mem_base) {
-        *(int32_t *)(ctx->mem_base + ret1_guest) = 0;
-    }
-    if (ret2_guest && ctx->mem_base) {
-        *(int32_t *)(ctx->mem_base + ret2_guest) = 0;
-    }
+void shim_sigreturn(GuestContext *ctx) {
     ctx->rax = 0;
     SHIM_RETURN();
 }
 
-void shim_Func_8A828CAEE7EDD5E9(GuestContext *ctx) {
-    ctx->rax = 0x80820001; // ORBIS_DISC_MAP_ERROR_NO_BITMAP_INFO
-    SHIM_RETURN();
-}
-
-void shim_Func_E7EBCE96E92F91F8(GuestContext *ctx) {
-    ctx->rax = 0x80820001; // ORBIS_DISC_MAP_ERROR_NO_BITMAP_INFO
+void shim___Ux86_64_setcontext(GuestContext *ctx) {
+    uint64_t ucp = ctx->rdi;
+    if (ucp == 0 || !ctx->mem_base || ucp + 0x88 > ctx->mem_size) {
+        ctx->rax = (uint64_t)-1;
+        SHIM_RETURN();
+    }
+    const uint8_t *m = (const uint8_t *)(ctx->mem_base + ucp);
+    ctx->rdi = *(const uint64_t *)(m + 0x00);
+    ctx->rsi = *(const uint64_t *)(m + 0x08);
+    ctx->rdx = *(const uint64_t *)(m + 0x10);
+    ctx->rcx = *(const uint64_t *)(m + 0x18);
+    ctx->r8  = *(const uint64_t *)(m + 0x20);
+    ctx->r9  = *(const uint64_t *)(m + 0x28);
+    ctx->rax = *(const uint64_t *)(m + 0x30);
+    ctx->rbx = *(const uint64_t *)(m + 0x38);
+    ctx->rbp = *(const uint64_t *)(m + 0x40);
+    ctx->r10 = *(const uint64_t *)(m + 0x48);
+    ctx->r11 = *(const uint64_t *)(m + 0x50);
+    ctx->r12 = *(const uint64_t *)(m + 0x58);
+    ctx->r13 = *(const uint64_t *)(m + 0x60);
+    ctx->r14 = *(const uint64_t *)(m + 0x68);
+    ctx->r15 = *(const uint64_t *)(m + 0x70);
+    uint64_t rip = *(const uint64_t *)(m + 0x78);
+    uint64_t rsp = *(const uint64_t *)(m + 0x80);
+    if (rsp != 0) ctx->rsp = rsp;
+    if (rip != 0) {
+        ctx->rip = rip;
+        recomp_dispatch(ctx, rip);
+    }
+    ctx->rax = 0;
     SHIM_RETURN();
 }
 

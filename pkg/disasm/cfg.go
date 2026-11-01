@@ -109,7 +109,7 @@ func NewDisassembler(loaded *elfloader.LoadedELF) (*Disassembler, error) {
 }
 
 func collectFuncSymAddrs(loaded *elfloader.LoadedELF) []uint64 {
-	if loaded == nil || len(loaded.Symbols) == 0 {
+	if loaded == nil || (len(loaded.Symbols) == 0 && len(loaded.InitArray) == 0) {
 		return nil
 	}
 	seen := make(map[uint64]struct{}, 256)
@@ -123,6 +123,16 @@ func collectFuncSymAddrs(loaded *elfloader.LoadedELF) []uint64 {
 		}
 		seen[s.Address] = struct{}{}
 		addrs = append(addrs, s.Address)
+	}
+	for _, addr := range loaded.InitArray {
+		if addr == 0 {
+			continue
+		}
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+		seen[addr] = struct{}{}
+		addrs = append(addrs, addr)
 	}
 	slices.Sort(addrs)
 	return addrs
@@ -370,7 +380,7 @@ func (d *Disassembler) seedableFunc(addr uint64) bool {
 		return false
 	}
 	if d.elf.InUnwindScope(addr) {
-		return d.elf.IsFuncEntry(addr)
+		return d.elf.IsFuncEntry(addr) || (addr&0xf == 0 && d.elf.InUnwindGap(addr) && looksLikeFuncStart(d.elf.MemoryImage, addr))
 	}
 	return looksLikeFuncStart(d.elf.MemoryImage, addr)
 }

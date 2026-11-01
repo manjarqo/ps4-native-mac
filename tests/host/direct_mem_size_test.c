@@ -231,8 +231,18 @@ static void test_allocation_bounds(GuestContext *ctx) {
   rc = sceKernelAllocateDirectMemory(0, 0, 64 << 10, 64 << 10, 0, &phys);
   CHECK(rc == ORBIS_EAGAIN, "search end 0: rc 0x%x, want EAGAIN", rc);
   // The search starts inside a free block, not only at block starts.
-  rc = sceKernelAllocateDirectMemory((off_t)(2048 * MIB), (off_t)size, 64 * MIB, 64 << 10, 0, &phys);
+  rc = sceKernelAllocateDirectMemory((off_t)(2048 * MIB), (off_t)size, 64 * MIB, 64 << 10, 3, &phys);
   CHECK(rc == 0 && phys == (off_t)(2048 * MIB), "start inside a block: rc 0x%x phys 0x%llx", rc, (unsigned long long)phys);
+  // sceKernelGetDirectMemoryType returns the allocated block's type and range, ENOENT for free ranges, EINVAL for NULL memTypeOut.
+  int mtype = -1;
+  off_t rstart = -1, rend = -1;
+  CHECK(sceKernelGetDirectMemoryType(phys + (off_t)(16 * MIB), &mtype, &rstart, &rend) == 0 &&
+            mtype == 3 && rstart == (off_t)(2048 * MIB) && rend == (off_t)(2112 * MIB),
+        "GetDirectMemoryType inside allocated block: type=%d [0x%llx, 0x%llx)", mtype,
+        (unsigned long long)rstart, (unsigned long long)rend);
+  CHECK(sceKernelGetDirectMemoryType(phys, NULL, &rstart, &rend) == ORBIS_EINVAL, "GetDirectMemoryType NULL memTypeOut");
+  CHECK(sceKernelGetDirectMemoryType((off_t)(1800 * MIB), &mtype, &rstart, &rend) == (int)0x80020002,
+        "GetDirectMemoryType on unallocated block returns ENOENT");
   CHECK(sceKernelAvailableDirectMemorySize() == rest - 64 * MIB, "available %zu MiB, want %zu",
         sceKernelAvailableDirectMemorySize() / MIB, (rest - 64 * MIB) / MIB);
   // The rest, in two parts around that block, then nothing.

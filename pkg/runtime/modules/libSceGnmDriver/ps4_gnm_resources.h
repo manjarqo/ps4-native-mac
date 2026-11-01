@@ -801,7 +801,7 @@ public:
     // destination); false for a bind that only reads it (a resolve source). Only a write makes the
     // surface the last written at its address (LastWrittenLocked).
     id<MTLTexture> GetColorTarget(const ColorTarget& cb, bool load_from_guest = true, bool written = true,
-                                  bool guest_write_pending = false);
+                                  bool guest_write_pending = false, id<MTLTexture>* grown_from = nullptr);
     // One texture per depth surface: views of later slices grow it to a larger 2D array, and the
     // texture it replaced is returned in *grown_from so the caller can copy its slices over.
     // The replaced texture is also queued for TakeRetired.

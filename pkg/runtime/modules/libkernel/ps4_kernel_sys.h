@@ -14,6 +14,11 @@ typedef struct OrbisKernelTimeval {
     int64_t tv_usec;
 } OrbisKernelTimeval;
 
+typedef struct OrbisKernelTimezone {
+    int32_t tz_minuteswest;
+    int32_t tz_dsttime;
+} OrbisKernelTimezone;
+
 typedef struct OrbisKernelSwVersion {
     size_t Size;
     char VersionString[0x1C];
@@ -27,6 +32,7 @@ uint64_t sceKernelGetProcessTime(void);
 uint64_t sceKernelGetTscFrequency(void);
 uint64_t sceKernelReadTsc(void);
 int32_t sceKernelGettimeofday(OrbisKernelTimeval *tv);
+int32_t sceKernelGettimezone(OrbisKernelTimezone *tz);
 
 // CPU & System Configuration
 int32_t sceKernelGetCurrentCpu(void);
@@ -46,6 +52,11 @@ void shim_sceKernelGetProcessTime(GuestContext *ctx);
 void shim_sceKernelGetTscFrequency(GuestContext *ctx);
 void shim_sceKernelReadTsc(GuestContext *ctx);
 void shim_sceKernelGettimeofday(GuestContext *ctx);
+void shim_sceKernelGettimezone(GuestContext *ctx);
+void shim_sysctl(GuestContext *ctx);
+void shim_sigreturn(GuestContext *ctx);
+void shim___Ux86_64_setcontext(GuestContext *ctx);
+void shim_sceDiscMap_8A828CAEE7EDD5E9(GuestContext *ctx);
 void shim_sceKernelGetCurrentCpu(GuestContext *ctx);
 void shim_sceKernelGetCpumode(GuestContext *ctx);
 void shim_sceKernelIsNeoMode(GuestContext *ctx);

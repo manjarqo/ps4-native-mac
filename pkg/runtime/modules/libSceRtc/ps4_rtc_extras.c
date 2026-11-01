@@ -207,6 +207,66 @@ void shim_sceRtcFormatRFC3339LocalTime(GuestContext *ctx) {
     SHIM_RETURN();
 }
 
+int32_t sceRtcFormatRFC2822LocalTime(char *out, const OrbisRtcTick *tick_utc) {
+    if (!out) return ORBIS_RTC_ERROR_INVALID_POINTER;
+    int64_t us;
+    if (tick_utc) {
+        us = ps4_rtc_tick_to_unix_us(tick_utc->tick);
+    } else {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+    }
+    time_t secs = (time_t)(us >= 0 ? us / 1000000 : -((-us + 999999) / 1000000));
+    struct tm tm;
+    int tz_minutes = 0;
+    if (localtime_r(&secs, &tm)) tz_minutes = (int)(tm.tm_gmtoff / 60);
+    return sceRtcFormatRFC2822(out, tick_utc, tz_minutes);
+}
+
+void shim_sceRtcFormatRFC2822LocalTime(GuestContext *ctx) {
+    char *out = ctx->rdi ? (char *)(ctx->mem_base + ctx->rdi) : NULL;
+    const OrbisRtcTick *tick = ctx->rsi ? (const OrbisRtcTick *)(ctx->mem_base + ctx->rsi) : NULL;
+    ctx->rax = (uint64_t)(int64_t)sceRtcFormatRFC2822LocalTime(out, tick);
+    SHIM_RETURN();
+}
+
+int32_t sceRtcConvertUtcToLocalTime(const OrbisRtcTick *utc, OrbisRtcTick *localTime) {
+    if (!utc || !localTime) return ORBIS_RTC_ERROR_INVALID_POINTER;
+    int64_t us = ps4_rtc_tick_to_unix_us(utc->tick);
+    time_t secs = (time_t)(us >= 0 ? us / 1000000 : -((-us + 999999) / 1000000));
+    struct tm tm;
+    int64_t off_us = 0;
+    if (localtime_r(&secs, &tm)) off_us = (int64_t)tm.tm_gmtoff * 1000000LL;
+    localTime->tick = (uint64_t)((int64_t)utc->tick + off_us);
+    return 0;
+}
+
+void shim_sceRtcConvertUtcToLocalTime(GuestContext *ctx) {
+    const OrbisRtcTick *utc = ctx->rdi ? (const OrbisRtcTick *)(ctx->mem_base + ctx->rdi) : NULL;
+    OrbisRtcTick *localTime = ctx->rsi ? (OrbisRtcTick *)(ctx->mem_base + ctx->rsi) : NULL;
+    ctx->rax = (uint64_t)(int64_t)sceRtcConvertUtcToLocalTime(utc, localTime);
+    SHIM_RETURN();
+}
+
+int32_t sceRtcConvertLocalTimeToUtc(const OrbisRtcTick *localTime, OrbisRtcTick *utc) {
+    if (!localTime || !utc) return ORBIS_RTC_ERROR_INVALID_POINTER;
+    int64_t us = ps4_rtc_tick_to_unix_us(localTime->tick);
+    time_t secs = (time_t)(us >= 0 ? us / 1000000 : -((-us + 999999) / 1000000));
+    struct tm tm;
+    int64_t off_us = 0;
+    if (localtime_r(&secs, &tm)) off_us = (int64_t)tm.tm_gmtoff * 1000000LL;
+    utc->tick = (uint64_t)((int64_t)localTime->tick - off_us);
+    return 0;
+}
+
+void shim_sceRtcConvertLocalTimeToUtc(GuestContext *ctx) {
+    const OrbisRtcTick *localTime = ctx->rdi ? (const OrbisRtcTick *)(ctx->mem_base + ctx->rdi) : NULL;
+    OrbisRtcTick *utc = ctx->rsi ? (OrbisRtcTick *)(ctx->mem_base + ctx->rsi) : NULL;
+    ctx->rax = (uint64_t)(int64_t)sceRtcConvertLocalTimeToUtc(localTime, utc);
+    SHIM_RETURN();
+}
+
 // int sceRtcCheckValid(const SceRtcDateTime *pTime): SCE_OK for a date and time of years
 // 1..9999, the first field out of range otherwise.
 int32_t sceRtcCheckValid(const OrbisDateTime *t) {

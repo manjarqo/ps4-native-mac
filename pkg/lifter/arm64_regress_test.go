@@ -573,9 +573,13 @@ func TestRegressJumpDispatchKeepsFlags(t *testing.T) {
 	requireInOrder(t, "add; jmp 0x6000", lift("4801d8", "e9f84f0000"), "adds x19, x19, x20", "cfinv", "b _recomp_indirect_jump")
 }
 
-// STD was lifted as a NOP, so a following string instruction ran forward instead of backward.
-// DF is not modelled (0 sites in TLOU and U4): STD traps, CLD stays a NOP.
+// STD sets DF = 1 for the remainder of the block (or until CLD/CALL), so a following string
+// instruction steps RSI/RDI backward with SUB instead of ADD.
 func TestRegressStdTraps(t *testing.T) {
-	requireInOrder(t, "std", liftBlock(t, "fd")[0], "b _recomp_unsupported_instruction")
+	forbid(t, "std", liftBlock(t, "fd")[0], "b _recomp_unsupported_instruction")
 	forbid(t, "cld", liftBlock(t, "fc")[0], "b _recomp_unsupported_instruction")
+	// std; movsq; cld; movsq -> backward step then forward step
+	blk := liftBlock(t, "fd", "48a5", "fc", "48a5")
+	requireInOrder(t, "std; movsq", blk[1], "ldr x16, [x28, x23]", "str x16, [x28, x24]", "sub x23, x23, #8", "sub x24, x24, #8")
+	requireInOrder(t, "cld; movsq", blk[3], "ldr x16, [x28, x23]", "str x16, [x28, x24]", "add x23, x23, #8", "add x24, x24, #8")
 }

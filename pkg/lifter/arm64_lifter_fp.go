@@ -2,6 +2,8 @@ package lifter
 
 import (
 	"fmt"
+	"strings"
+
 	"golang.org/x/arch/x86/x86asm"
 	"ps4-recomp/pkg/disasm"
 )
@@ -759,11 +761,18 @@ func (l *Arm64Lifter) liftVphadd(inst disasm.Instruction, nextPC uint64, lines [
 	return lines, nil
 }
 
-// liftAvxMinMax handles VMAXSD, VMINSD, VMAXSS, and VMINSS.
+// liftAvxMinMax handles MAXSD, MINSD, MAXSS, MINSS, VMAXSD, VMINSD, VMAXSS, and VMINSS.
 func (l *Arm64Lifter) liftAvxMinMax(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	op := inst.Inst.Op
+	isVex := strings.HasPrefix(op.String(), "V")
 	dstReg, okDst := inst.Inst.Args[0].(x86asm.Reg)
-	s1Reg, okS1 := inst.Inst.Args[1].(x86asm.Reg)
+	s1Reg := dstReg
+	okS1 := okDst
+	src2 := inst.Inst.Args[1]
+	if isVex {
+		s1Reg, okS1 = inst.Inst.Args[1].(x86asm.Reg)
+		src2 = inst.Inst.Args[2]
+	}
 	_, _, _, dLowV, dHighV, _, _, okD := getVectorDesc(dstReg)
 	_, _, _, s1LowV, _, s1LowS, s1LowD, okS1D := getVectorDesc(s1Reg)
 	if !okDst || !okS1 || !okD || !okS1D {
@@ -771,8 +780,8 @@ func (l *Arm64Lifter) liftAvxMinMax(inst disasm.Instruction, nextPC uint64, line
 		return lines, nil
 	}
 
-	isDouble := (op == x86asm.VMAXSD || op == x86asm.VMINSD)
-	isMax := (op == x86asm.VMAXSD || op == x86asm.VMAXSS)
+	isDouble := (op == x86asm.MAXSD || op == x86asm.MINSD || op == x86asm.VMAXSD || op == x86asm.VMINSD)
+	isMax := (op == x86asm.MAXSD || op == x86asm.MAXSS || op == x86asm.VMAXSD || op == x86asm.VMAXSS)
 	armOp := "fmin"
 	if isMax {
 		armOp = "fmax"
@@ -782,7 +791,6 @@ func (l *Arm64Lifter) liftAvxMinMax(inst disasm.Instruction, nextPC uint64, line
 	// NaN or both are zero). The selected element ends up in lane 0 of v30.
 	_ = armOp
 	_, _ = s1LowS, s1LowD
-	src2 := inst.Inst.Args[2]
 	s2V := ""
 	if srcReg, okSrc := src2.(x86asm.Reg); okSrc {
 		if _, _, _, r2LowV, _, _, _, okS2 := getVectorDesc(srcReg); okS2 {
@@ -820,7 +828,9 @@ func (l *Arm64Lifter) liftAvxMinMax(inst disasm.Instruction, nextPC uint64, line
 	} else {
 		lines = append(lines, fmt.Sprintf("    mov %s.s[0], v30.s[0]", dLowV))
 	}
-	lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", dHighV))
+	if isVex {
+		lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", dHighV))
+	}
 	return lines, nil
 }
 
@@ -901,12 +911,18 @@ func (l *Arm64Lifter) liftAvxDoubleAlu(inst disasm.Instruction, nextPC uint64, l
 	return lines, nil
 }
 
-// liftVhadd handles VHADDPD and VHADDPS.
+// liftVhadd handles HADDPD, HADDPS, VHADDPD, and VHADDPS.
 func (l *Arm64Lifter) liftVhadd(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	op := inst.Inst.Op
+	isVex := strings.HasPrefix(op.String(), "V")
 	dstReg, okDst := inst.Inst.Args[0].(x86asm.Reg)
-	s1Reg, okS1 := inst.Inst.Args[1].(x86asm.Reg)
-	src2 := inst.Inst.Args[2]
+	s1Reg := dstReg
+	okS1 := okDst
+	src2 := inst.Inst.Args[1]
+	if isVex {
+		s1Reg, okS1 = inst.Inst.Args[1].(x86asm.Reg)
+		src2 = inst.Inst.Args[2]
+	}
 
 	isYmm, _, _, dLowV, dHighV, _, _, okD := getVectorDesc(dstReg)
 	_, _, _, s1LowV, s1HighV, _, _, okS1D := getVectorDesc(s1Reg)
@@ -916,7 +932,7 @@ func (l *Arm64Lifter) liftVhadd(inst disasm.Instruction, nextPC uint64, lines []
 	}
 
 	lane := ".2d"
-	if op == x86asm.VHADDPS {
+	if op == x86asm.HADDPS || op == x86asm.VHADDPS {
 		lane = ".4s"
 	}
 
@@ -942,8 +958,168 @@ func (l *Arm64Lifter) liftVhadd(inst disasm.Instruction, nextPC uint64, lines []
 	lines = append(lines, fmt.Sprintf("    faddp %s%s, %s%s, %s%s", dLowV, lane, s1LowV, lane, s2LowV, lane))
 	if isYmm {
 		lines = append(lines, fmt.Sprintf("    faddp %s%s, %s%s, %s%s", dHighV, lane, s1HighV, lane, s2HighV, lane))
-	} else {
+	} else if isVex {
 		lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", dHighV))
+	}
+	return lines, nil
+}
+
+// liftFmaScalar handles FMA3 scalar single/double instructions:
+// VFMADD{132,213,231}{SS,SD}, VFMSUB{132,213,231}{SS,SD},
+// VFNMADD{132,213,231}{SS,SD}, VFNMSUB{132,213,231}{SS,SD}.
+// In x86 FMA3:
+//   - 132: dst[0] = ±(op1[0] * op3[0]) ± op2[0]
+//   - 213: dst[0] = ±(op2[0] * op1[0]) ± op3[0]
+//   - 231: dst[0] = ±(op2[0] * op3[0]) ± op1[0]
+//
+// Upper bits of dst[127:32] (SS) or dst[127:64] (SD) stay as op1 (dst before the instruction),
+// and VEX.128 zeroes dst[255:128].
+// ARM64 scalar FMA conventions for product (a*b) and addend c:
+//   - fmadd  d, a, b, c : +a*b + c  (x86 VFMADD)
+//   - fnmsub d, a, b, c : +a*b - c  (x86 VFMSUB)
+//   - fmsub  d, a, b, c : -a*b + c  (x86 VFNMADD)
+//   - fnmadd d, a, b, c : -a*b - c  (x86 VFNMSUB)
+func (l *Arm64Lifter) liftFmaScalar(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
+	opStr := inst.Inst.Op.String()
+	isDouble := strings.HasSuffix(opStr, "SD")
+
+	r1, ok1 := inst.Inst.Args[0].(x86asm.Reg)
+	r2, ok2 := inst.Inst.Args[1].(x86asm.Reg)
+	_, _, _, v1, dHighV, s1, d1, okD1 := getVectorDesc(r1)
+	_, _, _, _, _, s2, d2, okD2 := getVectorDesc(r2)
+	if !ok1 || !ok2 || !okD1 || !okD2 {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported fma scalar dst/src2")...)
+		return lines, nil
+	}
+
+	el1, el2, el3 := s1, s2, "s31"
+	lane := "s"
+	if isDouble {
+		el1, el2, el3 = d1, d2, "d31"
+		lane = "d"
+	}
+
+	switch v := inst.Inst.Args[2].(type) {
+	case x86asm.Reg:
+		_, _, _, _, _, s3, d3, okD3 := getVectorDesc(v)
+		if !okD3 {
+			lines = append(lines, l.emitUnsupported(inst, "unsupported fma scalar src3")...)
+			return lines, nil
+		}
+		if isDouble {
+			el3 = d3
+		} else {
+			el3 = s3
+		}
+	case x86asm.Mem:
+		lines = append(lines, computeEffAddr(v, nextPC, "x16")...)
+		lines = append(lines, fmt.Sprintf("    ldr %s, [x28, x16]", el3))
+	default:
+		lines = append(lines, l.emitUnsupported(inst, "unsupported fma scalar src3")...)
+		return lines, nil
+	}
+
+	var mulA, mulB, addC string
+	switch {
+	case strings.Contains(opStr, "132"):
+		mulA, mulB, addC = el1, el3, el2
+	case strings.Contains(opStr, "213"):
+		mulA, mulB, addC = el2, el1, el3
+	default: // 231
+		mulA, mulB, addC = el2, el3, el1
+	}
+
+	armOp := "fmadd"
+	switch {
+	case strings.HasPrefix(opStr, "VFNMADD"):
+		armOp = "fmsub"
+	case strings.HasPrefix(opStr, "VFMSUB"):
+		armOp = "fnmsub"
+	case strings.HasPrefix(opStr, "VFNMSUB"):
+		armOp = "fnmadd"
+	}
+
+	lines = append(lines,
+		fmt.Sprintf("    %s %s30, %s, %s, %s", armOp, lane, mulA, mulB, addC),
+		fmt.Sprintf("    mov %s.%s[0], v30.%s[0]", v1, lane, lane),
+		fmt.Sprintf("    movi %s.16b, #0", dHighV),
+	)
+	return lines, nil
+}
+
+// liftFmaPacked handles FMA3 packed single/double instructions:
+// VFMADD{132,213,231}{PS,PD}, VFMSUB{132,213,231}{PS,PD},
+// VFNMADD{132,213,231}{PS,PD}, VFNMSUB{132,213,231}{PS,PD}.
+func (l *Arm64Lifter) liftFmaPacked(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
+	opStr := inst.Inst.Op.String()
+	isDouble := strings.HasSuffix(opStr, "PD")
+	lane := ".4s"
+	if isDouble {
+		lane = ".2d"
+	}
+
+	r1, ok1 := inst.Inst.Args[0].(x86asm.Reg)
+	r2, ok2 := inst.Inst.Args[1].(x86asm.Reg)
+	isYmm, _, _, v1L, v1H, _, _, okD1 := getVectorDesc(r1)
+	_, _, _, v2L, v2H, _, _, okD2 := getVectorDesc(r2)
+	if !ok1 || !ok2 || !okD1 || !okD2 {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported fma packed dst/src2")...)
+		return lines, nil
+	}
+
+	v3L, v3H := "v30", "v31"
+	switch v := inst.Inst.Args[2].(type) {
+	case x86asm.Reg:
+		_, _, _, r3L, r3H, _, _, okD3 := getVectorDesc(v)
+		if !okD3 {
+			lines = append(lines, l.emitUnsupported(inst, "unsupported fma packed src3")...)
+			return lines, nil
+		}
+		v3L, v3H = r3L, r3H
+	case x86asm.Mem:
+		lines = append(lines, computeEffAddr(v, nextPC, "x16")...)
+		lines = append(lines, "    ldr q30, [x28, x16]")
+		if isYmm {
+			lines = append(lines, "    add x16, x16, #16", "    ldr q31, [x28, x16]")
+		}
+	default:
+		lines = append(lines, l.emitUnsupported(inst, "unsupported fma packed src3")...)
+		return lines, nil
+	}
+
+	negProd := strings.HasPrefix(opStr, "VFNM")
+	negAdd := strings.Contains(opStr, "SUB")
+	fmlOp := "fmla"
+	if negProd {
+		fmlOp = "fmls"
+	}
+
+	emitHalf := func(d, o1, o2, o3 string) {
+		var mulA, mulB, addC string
+		switch {
+		case strings.Contains(opStr, "132"):
+			mulA, mulB, addC = o1, o3, o2
+		case strings.Contains(opStr, "213"):
+			mulA, mulB, addC = o2, o1, o3
+		default: // 231
+			mulA, mulB, addC = o2, o3, o1
+		}
+		if negAdd {
+			lines = append(lines, fmt.Sprintf("    fneg v28%s, %s%s", lane, addC, lane))
+		} else {
+			lines = append(lines, fmt.Sprintf("    mov v28.16b, %s.16b", addC))
+		}
+		lines = append(lines,
+			fmt.Sprintf("    %s v28%s, %s%s, %s%s", fmlOp, lane, mulA, lane, mulB, lane),
+			fmt.Sprintf("    mov %s.16b, v28.16b", d),
+		)
+	}
+
+	emitHalf(v1L, v1L, v2L, v3L)
+	if isYmm {
+		emitHalf(v1H, v1H, v2H, v3H)
+	} else {
+		lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", v1H))
 	}
 	return lines, nil
 }

@@ -126,7 +126,8 @@ void RLog(const char* key, const char* fmt, ...) {
 struct RegSnapRange {
     uint16_t lo, hi;
 };
-constexpr RegSnapRange kRegSnapRanges[] = {{0xA000, 0xA020}, {0xA100, 0xA190}, {0xA200, 0xA210}, {0xA2D0, 0xA310}};
+constexpr RegSnapRange kRegSnapRanges[] = {
+    {0xA000, 0xA020}, {0xA100, 0xA190}, {0xA200, 0xA210}, {0xA290, 0xA2B0}, {0xA2D0, 0xA310}};
 // index in RegSnap::a of the context registers 0xA000..0xA30F (0xFFFF: not captured)
 struct RegSnapIndex {
     uint16_t at[0x310];
@@ -144,7 +145,7 @@ constexpr RegSnapIndex kRegSnapIndex{};
 struct RegSnap {
     using Range = RegSnapRange;
     static constexpr const auto& kRanges = kRegSnapRanges;
-    static constexpr uint32_t kSize = 0x20 + 0x90 + 0x10 + 0x40;
+    static constexpr uint32_t kSize = 0x20 + 0x90 + 0x10 + 0x20 + 0x40;
     uint32_t a[kSize];
     uint32_t cs_num_thread[3]; // COMPUTE_NUM_THREAD_X/Y/Z
     void Capture(const uint32_t* r) {
@@ -575,13 +576,14 @@ struct Shader {
 
 struct PassKey {
     __unsafe_unretained id<MTLTexture> color[8] = {};
+    uint32_t color_slice[8] = {}; // CB_COLOR_VIEW.SLICE_START
     __unsafe_unretained id<MTLTexture> depth = nil;
     uint32_t depth_slice = 0; // DB_DEPTH_VIEW.SLICE_START
     uint32_t width = 0, height = 0;
     uint32_t sample_locs = 0; // PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 of multisampled passes
     bool operator==(const PassKey& o) const {
         for (int i = 0; i < 8; ++i)
-            if (color[i] != o.color[i]) return false;
+            if (color[i] != o.color[i] || color_slice[i] != o.color_slice[i]) return false;
         return depth == o.depth && depth_slice == o.depth_slice && width == o.width && height == o.height &&
                sample_locs == o.sample_locs;
     }
@@ -706,10 +708,10 @@ struct State {
     id<MTLTexture> pass_hold[9]; // keeps the textures of `pass` alive
     std::shared_ptr<WorkLog> cmd_log;
     std::vector<ps4_metal_screen_present_op> present_ops; // present signals in the open command buffer
-    std::vector<uint32_t> flat_scratch[3]; // per-stage flattened user data (VS, PS, CS)
+    std::vector<uint32_t> flat_scratch[7]; // per-stage flattened user data (VS, PS, CS, GS, ES, HS, LS)
     // flat_scratch[i] already holds this draw's flattened user data, built by GetShader with
     // the SRT program of the shader recorded here (all permutations of a program share it)
-    const Shader* flat_from[3] = {};
+    const Shader* flat_from[7] = {};
     bool pending = false;
     UploadArena arena;
     std::vector<GpuWrite> gpu_written; // guest ranges written by work in `cmd`
@@ -3271,12 +3273,10 @@ bool StoreMslInDiskCache(uint64_t mh, const char* msl);
 
 // The MSL that is compiled for a translated shader: the recompiler's output after the renderer's
 // post-processing (its hash keys the MSL cache, the library store and the pipelines).
-std::string FinalMsl(const gcn_shader* sh, uint32_t hw) {
-    // SPIRV-Cross implements SPIR-V NoContraction with [[clang::optnone]] helper functions
-    // (spvFMul/spvFAdd/...), i.e. a real function call per float op on the GPU. Dropping the
-    // attribute lets the compiler inline them (fma contraction may change the last ulp).
+std::string FinalMslStr(const char* raw_msl, bool invariant_pos) {
+    if (!raw_msl) return {};
     static const bool keep_optnone = getenv("PS4_GNM_KEEP_OPTNONE") != nullptr;
-    std::string msl_str = gcn_shader_msl(sh);
+    std::string msl_str = raw_msl;
     if (!keep_optnone) {
         const std::string tag = "[[clang::optnone]] ";
         for (size_t pos; (pos = msl_str.find(tag)) != std::string::npos;) msl_str.erase(pos, tag.size());
@@ -3284,12 +3284,16 @@ std::string FinalMsl(const gcn_shader* sh, uint32_t hw) {
     // Vertex positions must be bit-identical between pipelines that draw the same geometry
     // (depth pre-pass followed by a depth-EQUAL pass), like invariant/precise positions on the
     // console: mark the position output invariant (compiled with preserveInvariance).
-    if (hw == GCN_HW_VS) {
+    if (invariant_pos) {
         const std::string pos = "[[position]]";
         for (size_t at = 0; (at = msl_str.find(pos, at)) != std::string::npos; at += 23)
             msl_str.replace(at, pos.size(), "[[position, invariant]]");
     }
     return msl_str;
+}
+
+std::string FinalMsl(const gcn_shader* sh, uint32_t hw) {
+    return FinalMslStr(gcn_shader_msl(sh), hw == GCN_HW_VS);
 }
 
 // The function a pipeline is built with (encoder thread): the shader's own, or the one compiled
@@ -3384,6 +3388,24 @@ Shader* FinishShader(gcn_shader* sh, gcn_hw_stage hw, uint64_t code_addr, uint64
     s->attrs.resize(s->info.num_vertex_attribs);
     for (uint32_t i = 0; i < s->info.num_vertex_attribs; ++i)
         gcn_shader_get_vertex_attrib(sh, i, &s->attrs[i]);
+
+    const bool standalone_msl = (hw == GCN_HW_VS && s->info.sw_stage == GCN_SW_VERTEX) ||
+                                hw == GCN_HW_PS || hw == GCN_HW_CS;
+    if (!standalone_msl) {
+        // Multi-stage tessellation (LS, HS, TES) and geometry (ES, GS) shaders emit linked MSL in
+        // GetTessPipelines / GetGsPipelines via gcn_compile_tess_shaders_msl / gcn_compile_gs_shaders_msl.
+        const double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+        g_hitch.shader_ms += ms;
+        g_hitch.shaders++;
+        RLog("compiled", "compiled %s shader 0x%llx perm %zu: %u bufs %u imgs %u samplers %u attribs%s (%.0f ms)",
+             hw == GCN_HW_VS ? "TES" : hw == GCN_HW_GS ? "GS" : hw == GCN_HW_ES ? "ES" :
+             hw == GCN_HW_HS ? "HS" : hw == GCN_HW_LS ? "LS" : "??",
+             (unsigned long long)code_addr, vec.size(), s->info.num_buffers, s->info.num_images,
+             s->info.num_samplers, s->info.num_vertex_attribs,
+             s->info.translation_failed ? " [translation incomplete]" : "", ms);
+        vec.push_back(s);
+        return s;
+    }
 
     const std::string msl_str = FinalMsl(sh, hw);
     const char* msl = msl_str.c_str();
@@ -3581,9 +3603,12 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
                   const uint32_t ud[16], bool allow_async = false) {
     if (code_addr == 0 || code_addr >= S.ctx->mem_size) return nullptr;
     const uint64_t sig = CodeSignature(code_addr);
-    const uint64_t key = Fnv(&sig, sizeof(sig), code_addr ^ ((uint64_t)hw << 58));
+    const uint64_t sw_tag = (hw == GCN_HW_VS && sw == GCN_SW_TESS_EVAL) ? (1ull << 57) : 0ull;
+    const uint64_t key = Fnv(&sig, sizeof(sig), code_addr ^ ((uint64_t)hw << 58) ^ sw_tag);
     auto& vec = S.shaders[key];
-    const int fi = hw == GCN_HW_VS ? 0 : hw == GCN_HW_PS ? 1 : hw == GCN_HW_CS ? 2 : -1;
+    const int fi = hw == GCN_HW_VS ? 0 : hw == GCN_HW_PS ? 1 : hw == GCN_HW_CS ? 2 :
+                   hw == GCN_HW_GS ? 3 : hw == GCN_HW_ES ? 4 : hw == GCN_HW_HS ? 5 :
+                   hw == GCN_HW_LS ? 6 : -1;
     if (fi >= 0) S.flat_from[fi] = nullptr;
     if (!vec.empty()) {
         // The lookup builds the draw's specialization from list[0]: a permutation translated on
@@ -3637,9 +3662,10 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
 
     // Persistent translation cache: a permutation translated in an earlier session that is
     // compatible with this draw replaces the translation (synchronously, it is cheap).
+    const bool emit_msl = (hw == GCN_HW_VS && sw == GCN_SW_VERTEX) || hw == GCN_HW_PS || hw == GCN_HW_CS;
     namespace sc = ps4gnm_shader_cache;
     sc::Key ckey;
-    const bool cacheable = sc::Enabled() && sc::MakeKey(hw, sw, rt, code_addr, ReadGuest, S.ctx, &ckey);
+    const bool cacheable = emit_msl && sc::Enabled() && sc::MakeKey(hw, sw, rt, code_addr, ReadGuest, S.ctx, &ckey);
     if (cacheable) {
         const double t0 = CFAbsoluteTimeGetCurrent();
         gcn_shader* sh = sc::Lookup(ckey, code_addr, ud, ReadGuest, S.ctx);
@@ -3752,7 +3778,7 @@ Shader* GetShader(gcn_hw_stage hw, gcn_sw_stage sw, const gcn_runtime_info& rt, 
     d.profile = &S.profile;
     d.read_guest = ReadGuest;
     d.read_ctx = S.ctx;
-    d.flags = GCN_COMPILE_EMIT_MSL;
+    d.flags = emit_msl ? GCN_COMPILE_EMIT_MSL : 0;
     d.msl = &S.msl;
     char err[1024] = {0};
     gcn_shader* sh = nullptr;
@@ -3970,6 +3996,7 @@ MTLTextureType ShaderTextureType(const gcn_image_binding& b) {
     // Color1D / Color1DArray: the translator declares 1D images as 2D ones of height 1
     // (DecodeImageUncached makes 1D T#s such textures)
     case 8: return MTLTextureType2D;
+    case 9: return MTLTextureType2D;
     case 12: return MTLTextureType2DArray;
     case 10: return MTLTextureType3D;
     // Cube: the translator declares every cube image as a 2D array of its faces (a GCN cube
@@ -3978,7 +4005,6 @@ MTLTextureType ShaderTextureType(const gcn_image_binding& b) {
     case 13: return MTLTextureType2DArray;
     case 14: return MTLTextureType2DMultisample;
     case 15: return MTLTextureType2DMultisampleArray;
-    case 9:
     default: return b.is_array ? MTLTextureType2DArray : MTLTextureType2D;
     }
 }
@@ -4037,7 +4063,8 @@ id<MTLTexture> AdaptTextureUncached(id<MTLTexture> t, MTLTextureType want, const
     id<MTLTexture> v = [t newTextureViewWithPixelFormat:t.pixelFormat
                                             textureType:want
                                                  levels:NSMakeRange(lv, nl)
-                                                 slices:NSMakeRange(first, slices)];
+                                                 slices:NSMakeRange(first, slices)
+                                                swizzle:t.swizzle];
     return v;
 }
 
@@ -5715,11 +5742,16 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
                 if (!tex) RLog("depth-as-color", "depth surface 0x%llx sampled as color: no companion",
                                (unsigned long long)img.address);
             } else if (id<MTLTexture> mc = MipChainFor(img, false)) {
-                tex = (mc.pixelFormat == (MTLPixelFormat)img.pixel.mtl_format)
-                          ? [mc newTextureViewWithPixelFormat:mc.pixelFormat textureType:MTLTextureType2D
-                                                       levels:NSMakeRange(0, mc.mipmapLevelCount) slices:NSMakeRange(0, 1)
-                                                      swizzle:ToMTLSwizzle(img.view_swizzle)]
-                          : mc;
+                const NSUInteger mc_slices =
+                    (mc.textureType == MTLTextureTypeCube || mc.textureType == MTLTextureTypeCubeArray)
+                        ? mc.arrayLength * 6
+                        : mc.arrayLength;
+                id<MTLTexture> mv = [mc newTextureViewWithPixelFormat:(MTLPixelFormat)img.pixel.mtl_format
+                                                          textureType:mc.textureType
+                                                               levels:NSMakeRange(0, mc.mipmapLevelCount)
+                                                               slices:NSMakeRange(0, std::max<NSUInteger>(1, mc_slices))
+                                                              swizzle:ToMTLSwizzle(img.view_swizzle)];
+                tex = mv ? mv : mc;
             } else {
                 tex = SampledTexture(img);
                 static const bool texdbg3d = getenv("PS4_GNM_TEXDBG3D") != nullptr;
@@ -5755,12 +5787,12 @@ bool BindStage(const Shader* s, const uint32_t ud[16], const std::vector<uint32_
         for (uint32_t k = 0; k < nb; ++k) {
             id<MTLTexture> v = nil;
             if (tex) {
-                uint32_t level = 0, nlevels = 0;
+                uint32_t level = img.base_level, nlevels = img.NumViewLevels();
                 if (ib.mip_fallback_mode == 1) {
-                    level = k;
+                    level = img.base_level + k;
                     nlevels = 1;
                 } else if (ib.mip_fallback_mode == 2) {
-                    level = ib.constant_mip_index;
+                    level = img.base_level + ib.constant_mip_index;
                     nlevels = 1;
                 } else if (ib.is_storage) {
                     nlevels = 1;
@@ -5814,7 +5846,7 @@ struct StageImages {
         approx.clear();
     }
 };
-thread_local const StageImages* t_stage_images[3] = {};
+thread_local const StageImages* t_stage_images[4] = {};
 
 void DecodeStageImages(const Shader* s, const std::vector<uint32_t>& flat, StageImages* out) {
     out->s = s;
@@ -5851,12 +5883,16 @@ bool StageImage(const Shader* s, const std::vector<uint32_t>& flat, uint32_t i, 
 
 // Installs the tables of a draw / dispatch for the encoder while it is being encoded.
 struct StageImagesScope {
-    StageImagesScope(const StageImages* a, const StageImages* b, const StageImages* c) {
+    StageImagesScope(const StageImages* a, const StageImages* b, const StageImages* c,
+                     const StageImages* d = nullptr) {
         t_stage_images[0] = a;
         t_stage_images[1] = b;
         t_stage_images[2] = c;
+        t_stage_images[3] = d;
     }
-    ~StageImagesScope() { t_stage_images[0] = t_stage_images[1] = t_stage_images[2] = nullptr; }
+    ~StageImagesScope() {
+        t_stage_images[0] = t_stage_images[1] = t_stage_images[2] = t_stage_images[3] = nullptr;
+    }
 };
 
 uint64_t ApproxImageBytes(const ImageDesc& img) {
@@ -6082,9 +6118,23 @@ id<MTLTexture> DepthCompanion(id<MTLTexture> dt, bool encode) {
     return c.tex;
 }
 
+static bool IsMipChainType(uint32_t mtl_type) {
+    return mtl_type == MTLTextureType2D || mtl_type == MTLTextureType2DArray ||
+           mtl_type == MTLTextureTypeCube || mtl_type == MTLTextureTypeCubeArray;
+}
+
+static uint32_t TextureTotalSlices(id<MTLTexture> t) {
+    if (!t) return 0;
+    return (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray)
+               ? (uint32_t)(t.arrayLength * 6)
+               : (uint32_t)t.arrayLength;
+}
+
 uint64_t MipChainKey(const ImageDesc& img) {
-    uint64_t k[4] = {img.address, ((uint64_t)img.width << 32) | img.height,
-                     ((uint64_t)img.pixel.mtl_format << 32) | img.NumViewLevels(), (uint64_t)img.tile_mode};
+    uint64_t k[5] = {img.address, ((uint64_t)img.width << 32) | img.height,
+                     ((uint64_t)img.pixel.mtl_format << 32) | img.num_levels,
+                     ((uint64_t)img.tile_mode << 32) | img.mtl_texture_type,
+                     img.num_layers};
     return Fnv(k, sizeof(k));
 }
 
@@ -6107,37 +6157,62 @@ id<MTLTexture> ColorTargetFor(uint64_t address, uint32_t w, uint32_t h) {
 
 // The render targets a mip chain of `img` is assembled from (MipChainFor), given `base`, the
 // color target at img.address (FindColorTarget): srcs[m] is the one at level m's address (nil:
-// none; srcs[0] = base). Returns the number of levels, 0 if `img` is not a mipmapped 2D texture
+// none; srcs[0] = base). Returns the number of levels, 0 if `img` is not a mipmapped texture
 // whose base level is a GPU render target of its size. addrs (optional, kMaxMips): level m's address.
 uint32_t MipChainSources(const ImageDesc& img, id<MTLTexture> base, __strong id<MTLTexture> (&srcs)[kMaxMips],
                          uint64_t* addrs) {
-    if (img.mtl_texture_type != MTLTextureType2D || img.NumViewLevels() < 2 || img.pixel.compressed) return 0;
-    if (!base || base.sampleCount > 1 || base.width != img.width || base.height != img.height) return 0;
+    if (!IsMipChainType(img.mtl_texture_type) || img.num_levels < 2 || img.pixel.compressed) return 0;
+    const uint32_t want_slices = (img.mtl_texture_type == MTLTextureType2D) ? 1u : std::max(1u, img.num_layers);
+    if (!base || base.sampleCount > 1 || base.width != img.width || base.height != img.height ||
+        TextureTotalSlices(base) < want_slices)
+        return 0;
     SurfaceLayout layout;
     if (!ComputeSurfaceLayout(img.ToSurfaceDesc(), &layout)) return 0;
-    const uint32_t levels = std::min<uint32_t>(std::min<uint32_t>(img.NumViewLevels(), layout.num_mips), kMaxMips);
+    SurfaceLayout unpadded_layout{};
+    bool have_unpadded = false;
+    if (img.layout_layers != img.num_layers) {
+        SurfaceDesc usd = img.ToSurfaceDesc();
+        usd.layers = img.num_layers;
+        have_unpadded = ComputeSurfaceLayout(usd, &unpadded_layout);
+    }
+    const uint32_t levels = std::min<uint32_t>(std::min<uint32_t>(img.num_levels, layout.num_mips), kMaxMips);
     srcs[0] = base;
-    for (uint32_t m = 1; m < levels; ++m)
-        srcs[m] = ColorTargetFor(img.address + layout.mips[m].offset, std::max(1u, img.width >> m),
-                                 std::max(1u, img.height >> m));
-    if (addrs)
-        for (uint32_t m = 0; m < levels; ++m) addrs[m] = img.address + layout.mips[m].offset;
+    if (addrs) addrs[0] = img.address;
+    for (uint32_t m = 1; m < levels; ++m) {
+        const uint32_t mw = std::max(1u, img.width >> m), mh = std::max(1u, img.height >> m);
+        uint64_t maddr = img.address + layout.mips[m].offset;
+        id<MTLTexture> st = ColorTargetFor(maddr, mw, mh);
+        if (!st && have_unpadded && m < unpadded_layout.num_mips) {
+            const uint64_t uaddr = img.address + unpadded_layout.mips[m].offset;
+            if (id<MTLTexture> ust = ColorTargetFor(uaddr, mw, mh)) {
+                st = ust;
+                maddr = uaddr;
+            }
+        }
+        srcs[m] = st;
+        if (addrs) addrs[m] = maddr;
+    }
     return levels;
 }
 
-// A sampled 2D texture with several mip levels whose base level is a GPU render target: the game
-// rendered each level separately (bloom/downsample chains). Assemble a mipmapped copy from the
-// render targets found at the mip addresses (blits encoded into the current command buffer).
+// A sampled 2D / array / cube texture with several mip levels whose base level is a GPU render
+// target: the game rendered each level separately (bloom/downsample/IBL chains). Assemble a
+// mipmapped copy from the render targets found at the mip addresses (blits encoded into the
+// current command buffer).
 id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode) {
-    if (img.mtl_texture_type != MTLTextureType2D || img.NumViewLevels() < 2 || img.pixel.compressed) return nil;
+    if (!IsMipChainType(img.mtl_texture_type) || img.num_levels < 2 || img.pixel.compressed) return nil;
+    const uint32_t want_slices = (img.mtl_texture_type == MTLTextureType2D) ? 1u : std::max(1u, img.num_layers);
     id<MTLTexture> base = ColorTargetFor(img.address, img.width, img.height);
-    if (!base || base.sampleCount > 1 || base.width != img.width || base.height != img.height) return nil;
+    if (!base || base.sampleCount > 1 || base.width != img.width || base.height != img.height ||
+        TextureTotalSlices(base) < want_slices)
+        return nil;
     const uint64_t key = MipChainKey(img);
     auto it = S.mip_chains.find(key);
     if (!encode) return it != S.mip_chains.end() ? it->second.tex : nil;
     if (!BackendHas(kGnmCapCopies, "mip chain of render targets")) return nil;
     State::MipChain& mc = S.mip_chains[key];
-    if (mc.tex && mc.built_submit == S.submit_idx + (S.n_draws << 20)) return mc.tex;
+    const uint64_t stamp = S.submit_idx + (S.n_draws << 20) + (S.n_dispatches << 40);
+    if (mc.tex && mc.built_submit == stamp) return mc.tex;
     id<MTLTexture> srcs[kMaxMips];
     uint64_t addrs[kMaxMips] = {};
     const uint32_t levels = MipChainSources(img, base, srcs, addrs);
@@ -6145,12 +6220,17 @@ id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode) {
     // the targets of the other levels are read by the blits below (level 0: ResolveTextureHazards)
     for (uint32_t m = 1; m < levels; ++m)
         if (srcs[m]) RefreshGuestNewer(addrs[m], srcs[m], false);
-    if (!mc.tex || mc.tex.mipmapLevelCount != levels) {
-        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:base.pixelFormat
-                                                                                      width:img.width
-                                                                                     height:img.height
-                                                                                  mipmapped:YES];
+    if (!mc.tex || mc.tex.mipmapLevelCount != levels || mc.tex.textureType != (MTLTextureType)img.mtl_texture_type ||
+        TextureTotalSlices(mc.tex) != want_slices) {
+        MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+        td.textureType = (MTLTextureType)img.mtl_texture_type;
+        td.pixelFormat = base.pixelFormat;
+        td.width = img.width;
+        td.height = img.height;
         td.mipmapLevelCount = levels;
+        if (img.mtl_texture_type == MTLTextureTypeCube) td.arrayLength = 1;
+        else if (img.mtl_texture_type == MTLTextureTypeCubeArray) td.arrayLength = std::max(1u, want_slices / 6);
+        else td.arrayLength = want_slices;
         td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
         td.storageMode = MTLStorageModePrivate;
         OwnTextureDropped(mc.tex); // the chain with another level count
@@ -6165,12 +6245,14 @@ id<MTLTexture> MipChainFor(const ImageDesc& img, bool encode) {
         const uint32_t w = std::max(1u, img.width >> m), h = std::max(1u, img.height >> m);
         id<MTLTexture> src = srcs[m];
         if (!src || src.pixelFormat != base.pixelFormat || src.sampleCount > 1 || src.width < w || src.height < h) continue;
-        S.be->CopyTextureRegion(src, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), mc.tex, 0, m,
-                                MTLOriginMake(0, 0, 0));
+        const uint32_t copy_slices = std::min(want_slices, TextureTotalSlices(src));
+        for (uint32_t sl = 0; sl < copy_slices; ++sl)
+            S.be->CopyTextureRegion(src, sl, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), mc.tex, sl, m,
+                                    MTLOriginMake(0, 0, 0));
     }
     S.be->EndEncoder();
     S.pending = true;
-    mc.built_submit = S.submit_idx + (S.n_draws << 20);
+    mc.built_submit = stamp;
     LogWork("mip chain assembly");
     return mc.tex;
 }
@@ -6773,6 +6855,7 @@ bool BeginPass(const PassKey& key, const ClearReq& clr, id<MTLTexture> const* ho
         if (!key.color[i]) continue;
         any = true;
         pd.color[i].tex = key.color[i];
+        pd.color[i].slice = key.color_slice[i];
         pd.color[i].load = clr.color[i] ? GnmLoad::Clear : GnmLoad::Load;
         if (clr.color[i]) pd.clear_color[i] = clr.color_value[i];
     }
@@ -6880,6 +6963,11 @@ void RegisterMeta(uint64_t addr) {
     if (addr) S.meta.emplace(addr, MetaState{});
 }
 
+uint64_t CmaskSliceBytesOf(const ColorTarget& c) {
+    const uint32_t tile_max = c.regs[8] & 0x3fffu; // CB_COLOR_CMASK_SLICE.TILE_MAX
+    return tile_max ? (uint64_t)(tile_max + 1u) * 128ull : 0;
+}
+
 // seq (optional): the command buffer the clear belongs to. slice / slice_bytes: the draw's
 // slice of an array whose metadata holds slice_bytes per slice (0: not known, one slice).
 // The clear covers cleared_bytes / slice_bytes slices from the base. That count does not depend on
@@ -6895,6 +6983,8 @@ bool TakeMetaCleared(uint64_t addr, uint64_t* seq = nullptr, uint32_t slice = 0,
     uint64_t covered = 1;
     if (slice_bytes)
         covered = std::max<uint64_t>(1, std::min<uint64_t>(64, m.cleared_bytes == kAllMeta ? 64 : m.cleared_bytes / slice_bytes));
+    else if (m.cleared_bytes == kAllMeta)
+        covered = 64;
     if (slice >= covered || (m.taken_slices >> slice & 1)) return false;
     m.taken_slices |= 1ull << slice;
     if ((uint64_t)__builtin_popcountll(m.taken_slices) >= covered) m.cleared = false;
@@ -7120,6 +7210,538 @@ id<MTLRenderPipelineState> GetGfxPipeline(const Shader* vs, const Shader* ps, co
     }
     S.gfx_pipes[key] = p;
     return p;
+}
+
+void RefreshShaderBindings(Shader* s) {
+    if (!s || !s->sh) return;
+    gcn_shader_get_info(s->sh, &s->info);
+    s->bufs.resize(s->info.num_buffers);
+    for (uint32_t i = 0; i < s->info.num_buffers; ++i) gcn_shader_get_buffer(s->sh, i, &s->bufs[i]);
+    s->imgs.resize(s->info.num_images);
+    for (uint32_t i = 0; i < s->info.num_images; ++i) gcn_shader_get_image(s->sh, i, &s->imgs[i]);
+    s->samps.resize(s->info.num_samplers);
+    for (uint32_t i = 0; i < s->info.num_samplers; ++i) gcn_shader_get_sampler(s->sh, i, &s->samps[i]);
+    s->tables.resize(s->info.num_image_tables);
+    for (uint32_t i = 0; i < s->info.num_image_tables; ++i) gcn_shader_get_image_table(s->sh, i, &s->tables[i]);
+    s->attrs.resize(s->info.num_vertex_attribs);
+    for (uint32_t i = 0; i < s->info.num_vertex_attribs; ++i)
+        gcn_shader_get_vertex_attrib(s->sh, i, &s->attrs[i]);
+}
+
+id<MTLFunction> CompileStageFn(const char* raw_msl, bool invariant_pos, const char* entry_name,
+                               const char* tag, uint64_t code_addr, const char* fallback_entry = nullptr) {
+    if (!raw_msl || !raw_msl[0]) return nil;
+    const std::string msl_str = FinalMslStr(raw_msl, invariant_pos);
+    const uint64_t mh = Fnv(msl_str.data(), msl_str.size());
+    id<MTLLibrary> lib = nil;
+    if (auto it = S.libs.find(mh); it != S.libs.end()) {
+        lib = it->second;
+    } else {
+        StoreMslInDiskCache(mh, msl_str.c_str());
+        NSError* e = nil;
+        const double t0 = CFAbsoluteTimeGetCurrent();
+        lib = [S.dev newLibraryWithSource:[NSString stringWithUTF8String:msl_str.c_str()]
+                                  options:CompileOptions()
+                                    error:&e];
+        g_hitch.mtl_ms += (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+        g_compile.lib_sync.Add((CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+        if (!lib) {
+            RLog("msl-fail", "Metal rejected %s MSL of shader 0x%llx: %s", tag,
+                 (unsigned long long)code_addr, e ? e.localizedDescription.UTF8String : "unknown");
+            return nil;
+        }
+        S.libs[mh] = lib;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:entry_name]];
+    if (!fn && fallback_entry)
+        fn = [lib newFunctionWithName:[NSString stringWithUTF8String:fallback_entry]];
+    return fn;
+}
+
+struct TessShaderCacheEntry {
+    id<MTLFunction> ls_fn = nil;
+    id<MTLFunction> ls_u16_fn = nil;
+    id<MTLFunction> ls_u32_fn = nil;
+    id<MTLFunction> hs_fn = nil;
+    id<MTLFunction> ds_fn = nil;
+    uint32_t ls_stride = 0;
+    uint32_t hs_cp_stride = 0;
+    uint32_t hs_patch_stride = 0;
+    uint32_t output_control_points = 0;
+    uint32_t domain = 0;
+    uint32_t spacing = 0;
+    bool winding_cw = false;
+    bool point_mode = false;
+    uint32_t patch_first = 0;
+    uint32_t patch_end = 0;
+    uint32_t hs_local_size[3] = {1, 1, 1};
+    bool valid = false;
+};
+
+struct TessPipelineState {
+    id<MTLComputePipelineState> ls_pso = nil;
+    id<MTLComputePipelineState> hs_pso = nil;
+    id<MTLRenderPipelineState> ds_ps_pso = nil;
+    uint32_t ls_stride = 0;
+    uint32_t hs_cp_stride = 0;
+    uint32_t hs_patch_stride = 0;
+    uint32_t output_control_points = 0;
+    uint32_t domain = 0;
+    uint32_t hs_local_size[3] = {1, 1, 1};
+};
+
+static std::unordered_map<uint64_t, TessShaderCacheEntry>& s_tess_shaders =
+    *new std::unordered_map<uint64_t, TessShaderCacheEntry>;
+static std::unordered_map<std::string, TessPipelineState>& s_tess_pipelines =
+    *new std::unordered_map<std::string, TessPipelineState>;
+
+const TessPipelineState* GetTessPipelines(Shader* ls, Shader* hs, Shader* vs, Shader* ps,
+                                          const RenderState& rs, const uint32_t color_fmt[8],
+                                          const uint32_t write_mask[8], uint32_t depth_fmt,
+                                          uint32_t samples, const std::vector<VertexAttr>& attrs,
+                                          const std::vector<uint32_t>& attr_locs, bool alpha_to_cov,
+                                          uint32_t index_mode) {
+    if (!ls || !hs || !vs) return nullptr;
+
+    std::string key;
+    key.reserve(256);
+    auto put = [&](const void* p, size_t n) { key.append((const char*)p, n); };
+    put(&ls->uid, 8);
+    put(&hs->uid, 8);
+    put(&vs->uid, 8);
+    const uint64_t ps_id = ps ? ps->uid : 0;
+    put(&ps_id, 8);
+    put(&index_mode, 4);
+    for (int i = 0; i < 8; ++i) {
+        put(&color_fmt[i], 4);
+        if (!color_fmt[i]) continue;
+        put(&write_mask[i], 4);
+        const BlendState& b = rs.blend[i];
+        uint32_t bl[7] = {b.enable, b.src_rgb, b.dst_rgb, b.op_rgb, b.src_alpha, b.dst_alpha, b.op_alpha};
+        put(bl, sizeof(bl));
+    }
+    put(&depth_fmt, 4);
+    put(&samples, 4);
+    uint32_t a2c = alpha_to_cov, rd = rs.raster.rasterizer_discard;
+    put(&a2c, 4);
+    put(&rd, 4);
+    for (size_t i = 0; i < attrs.size(); ++i) {
+        put(&attrs[i], sizeof(VertexAttr));
+        put(&attr_locs[i], 4);
+    }
+
+    auto pit = s_tess_pipelines.find(key);
+    if (pit != s_tess_pipelines.end()) {
+        return pit->second.ds_ps_pso ? &pit->second : nullptr;
+    }
+
+    const uint64_t sh_ids[3] = {ls->uid, hs->uid, vs->uid};
+    const uint64_t sh_key = Fnv(sh_ids, sizeof(sh_ids));
+    auto sit = s_tess_shaders.find(sh_key);
+    if (sit == s_tess_shaders.end()) {
+        TessShaderCacheEntry entry{};
+        GcnTessShaderSet tset{};
+        if (gcn_compile_tess_shaders_msl(ls->sh, hs->sh, vs->sh, &S.msl, &tset)) {
+            RefreshShaderBindings(ls);
+            RefreshShaderBindings(hs);
+            RefreshShaderBindings(vs);
+            entry.ls_fn = CompileStageFn(tset.ls_msl, false, "main0", "Tess LS", ls->code_addr);
+            entry.ls_u16_fn = CompileStageFn(tset.ls_u16_msl, false, "main0", "Tess LS u16", ls->code_addr);
+            entry.ls_u32_fn = CompileStageFn(tset.ls_u32_msl, false, "main0", "Tess LS u32", ls->code_addr);
+            entry.hs_fn = CompileStageFn(tset.hs_msl, false, "main0", "Tess HS", hs->code_addr);
+            entry.ds_fn = CompileStageFn(tset.vs_msl, true, "main0", "Tess DS", vs->code_addr);
+            entry.ls_stride = tset.ls_stride;
+            entry.hs_cp_stride = tset.cp_stride;
+            entry.hs_patch_stride = tset.patch_stride;
+            entry.output_control_points = tset.output_control_points;
+            entry.domain = tset.domain;
+            entry.spacing = tset.spacing;
+            entry.winding_cw = tset.clockwise;
+            entry.point_mode = tset.point_mode;
+            entry.patch_first = tset.patch_first;
+            entry.patch_end = tset.patch_end;
+            entry.hs_local_size[0] = std::max(1u, tset.hs_local_size[0]);
+            entry.hs_local_size[1] = std::max(1u, tset.hs_local_size[1]);
+            entry.hs_local_size[2] = std::max(1u, tset.hs_local_size[2]);
+            entry.valid = entry.ls_fn != nil && entry.hs_fn != nil && entry.ds_fn != nil;
+        } else {
+            RLog("tess-fail", "gcn_compile_tess_shaders_msl failed (LS=0x%llx HS=0x%llx DS=0x%llx): %s",
+                 (unsigned long long)ls->code_addr, (unsigned long long)hs->code_addr,
+                 (unsigned long long)vs->code_addr, tset.error ? tset.error : "unknown");
+        }
+        gcn_free_tess_shaders_msl(&tset);
+        sit = s_tess_shaders.emplace(sh_key, entry).first;
+    }
+    const TessShaderCacheEntry& tsh = sit->second;
+    if (!tsh.valid) {
+        s_tess_pipelines.emplace(key, TessPipelineState{});
+        return nullptr;
+    }
+
+    id<MTLFunction> ls_fn = index_mode == 1 ? tsh.ls_u16_fn : index_mode == 2 ? tsh.ls_u32_fn : tsh.ls_fn;
+    if (!ls_fn) {
+        s_tess_pipelines.emplace(key, TessPipelineState{});
+        return nullptr;
+    }
+
+    NSError* err = nil;
+    MTLComputePipelineDescriptor* ls_desc = [[MTLComputePipelineDescriptor alloc] init];
+    ls_desc.computeFunction = ls_fn;
+    if (!attrs.empty() || index_mode != 0) {
+        MTLStageInputOutputDescriptor* sio = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+        for (size_t i = 0; i < attrs.size(); ++i) {
+            const VertexAttr& a = attrs[i];
+            const uint32_t loc = attr_locs[i];
+            const uint32_t slot = a.buffer;
+            sio.attributes[loc].format = (MTLAttributeFormat)a.format;
+            sio.attributes[loc].offset = a.offset;
+            sio.attributes[loc].bufferIndex = slot;
+            sio.layouts[slot].stride = a.stride ? a.stride : 4;
+            if (a.stride == 0) {
+                sio.layouts[slot].stepFunction = MTLStepFunctionConstant;
+                sio.layouts[slot].stepRate = 0;
+            } else if (a.step_fn == MTLVertexStepFunctionPerInstance) {
+                sio.layouts[slot].stepFunction = MTLStepFunctionThreadPositionInGridY;
+                sio.layouts[slot].stepRate = std::max(1u, a.step_rate);
+            } else {
+                sio.layouts[slot].stepFunction =
+                    index_mode != 0 ? MTLStepFunctionThreadPositionInGridXIndexed
+                                    : MTLStepFunctionThreadPositionInGridX;
+                sio.layouts[slot].stepRate = 1;
+            }
+        }
+        if (index_mode != 0) {
+            sio.indexBufferIndex = GCN_TESS_INDEX_BUFFER_SLOT;
+            sio.indexType = index_mode == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+        }
+        ls_desc.stageInputDescriptor = sio;
+    }
+    id<MTLComputePipelineState> ls_pso =
+        [S.dev newComputePipelineStateWithDescriptor:ls_desc
+                                             options:MTLPipelineOptionNone
+                                          reflection:nil
+                                               error:&err];
+    if (!ls_pso) {
+        RLog("pso-fail", "Tess LS compute pipeline failed: %s",
+             err ? err.localizedDescription.UTF8String : "unknown");
+        s_tess_pipelines.emplace(key, TessPipelineState{});
+        return nullptr;
+    }
+
+    err = nil;
+    id<MTLComputePipelineState> hs_pso = [S.dev newComputePipelineStateWithFunction:tsh.hs_fn error:&err];
+    if (!hs_pso) {
+        RLog("pso-fail", "Tess HS compute pipeline failed: %s",
+             err ? err.localizedDescription.UTF8String : "unknown");
+        s_tess_pipelines.emplace(key, TessPipelineState{});
+        return nullptr;
+    }
+
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = tsh.ds_fn;
+    d.fragmentFunction = (ps && !rs.raster.rasterizer_discard) ? PipelineFn(ps) : nil;
+    for (int i = 0; i < 8; ++i) {
+        if (!color_fmt[i]) continue;
+        MTLRenderPipelineColorAttachmentDescriptor* ca = d.colorAttachments[i];
+        BlendState b = rs.blend[i];
+        if (b.unsupported) b.enable = false;
+        ApplyBlend(b, color_fmt[i], ca);
+        ca.writeMask = (MTLColorWriteMask)write_mask[i];
+        if (ca.pixelFormat == MTLPixelFormatR32Uint || ca.pixelFormat == MTLPixelFormatR32Sint ||
+            ca.pixelFormat == MTLPixelFormatRG32Uint || ca.pixelFormat == MTLPixelFormatRGBA32Uint ||
+            ca.pixelFormat == MTLPixelFormatR16Uint || ca.pixelFormat == MTLPixelFormatRGBA16Uint ||
+            ca.pixelFormat == MTLPixelFormatR8Uint || ca.pixelFormat == MTLPixelFormatRGBA8Uint ||
+            ca.pixelFormat == MTLPixelFormatRG16Uint || ca.pixelFormat == MTLPixelFormatRG8Uint)
+            ca.blendingEnabled = NO;
+    }
+    if (depth_fmt) {
+        d.depthAttachmentPixelFormat = (MTLPixelFormat)depth_fmt;
+        if (HasStencil((MTLPixelFormat)depth_fmt)) d.stencilAttachmentPixelFormat = (MTLPixelFormat)depth_fmt;
+    }
+    d.rasterSampleCount = samples;
+    d.alphaToCoverageEnabled = alpha_to_cov && !rs.raster.rasterizer_discard && ps != nullptr;
+    d.rasterizationEnabled = !rs.raster.rasterizer_discard;
+    d.maxTessellationFactor = 64;
+    d.tessellationFactorScaleEnabled = NO;
+    d.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+    d.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+    d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+    d.tessellationOutputWindingOrder = tsh.winding_cw ? MTLWindingCounterClockwise : MTLWindingClockwise;
+    switch (tsh.spacing) {
+        case GCN_TESS_SPACING_FRACTIONAL_ODD:
+            d.tessellationPartitionMode = MTLTessellationPartitionModeFractionalOdd;
+            break;
+        case GCN_TESS_SPACING_FRACTIONAL_EVEN:
+            d.tessellationPartitionMode = MTLTessellationPartitionModeFractionalEven;
+            break;
+        default:
+            d.tessellationPartitionMode = MTLTessellationPartitionModeInteger;
+            break;
+    }
+
+    err = nil;
+    id<MTLRenderPipelineState> ds_ps_pso = [S.dev newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!ds_ps_pso && ps && ReplaceStoredFns(nullptr, ps)) {
+        d.fragmentFunction = PipelineFn(ps);
+        err = nil;
+        ds_ps_pso = [S.dev newRenderPipelineStateWithDescriptor:d error:&err];
+    }
+    if (!ds_ps_pso) {
+        RLog("pso-fail", "Tess DS+PS render pipeline failed: %s",
+             err ? err.localizedDescription.UTF8String : "unknown");
+        s_tess_pipelines.emplace(key, TessPipelineState{});
+        return nullptr;
+    }
+
+    TessPipelineState out{};
+    out.ls_pso = ls_pso;
+    out.hs_pso = hs_pso;
+    out.ds_ps_pso = ds_ps_pso;
+    out.ls_stride = tsh.ls_stride;
+    out.hs_cp_stride = tsh.hs_cp_stride;
+    out.hs_patch_stride = tsh.hs_patch_stride;
+    out.output_control_points = tsh.output_control_points;
+    out.domain = tsh.domain;
+    out.hs_local_size[0] = tsh.hs_local_size[0];
+    out.hs_local_size[1] = tsh.hs_local_size[1];
+    out.hs_local_size[2] = tsh.hs_local_size[2];
+    auto ins = s_tess_pipelines.emplace(key, out);
+    return &ins.first->second;
+}
+
+struct GsShaderCacheEntry {
+    id<MTLFunction> es_fn = nil;
+    id<MTLFunction> es_u16_fn = nil;
+    id<MTLFunction> es_u32_fn = nil;
+    id<MTLFunction> gs_fn = nil;
+    id<MTLFunction> vs_fn = nil;
+    uint32_t es_stride = 0;
+    uint32_t record_stride = 0;
+    uint32_t index_slots = 0;
+    uint32_t input_primitive = 0;
+    uint32_t input_vertices = 0;
+    uint32_t output_primitive = 0;
+    uint32_t max_vertices = 0;
+    uint32_t num_varyings = 0;
+    uint32_t gs_local_size[3] = {64, 1, 1};
+    bool valid = false;
+};
+
+struct GsPipelineState {
+    id<MTLComputePipelineState> es_pso = nil;
+    id<MTLComputePipelineState> gs_pso = nil;
+    id<MTLRenderPipelineState> vs_ps_pso = nil;
+    uint32_t es_stride = 0;
+    uint32_t record_stride = 0;
+    uint32_t index_slots = 0;
+    uint32_t input_primitive = 0;
+    uint32_t input_vertices = 0;
+    uint32_t output_primitive = 0;
+    uint32_t max_vertices = 0;
+    uint32_t num_varyings = 0;
+    uint32_t gs_local_size[3] = {64, 1, 1};
+};
+
+static std::unordered_map<uint64_t, GsShaderCacheEntry>& s_gs_shaders =
+    *new std::unordered_map<uint64_t, GsShaderCacheEntry>;
+static std::unordered_map<std::string, GsPipelineState>& s_gs_pipelines =
+    *new std::unordered_map<std::string, GsPipelineState>;
+
+const GsPipelineState* GetGsPipelines(Shader* es, Shader* gs, Shader* ps,
+                                      const RenderState& rs, const uint32_t color_fmt[8],
+                                      const uint32_t write_mask[8], uint32_t depth_fmt,
+                                      uint32_t samples, const std::vector<VertexAttr>& attrs,
+                                      const std::vector<uint32_t>& attr_locs, bool alpha_to_cov,
+                                      uint32_t index_mode, bool emulate_depth_neg_one_to_one) {
+    if (!es || !gs) return nullptr;
+
+    std::string key;
+    key.reserve(256);
+    auto put = [&](const void* p, size_t n) { key.append((const char*)p, n); };
+    put(&es->uid, 8);
+    put(&gs->uid, 8);
+    const uint64_t ps_id = ps ? ps->uid : 0;
+    put(&ps_id, 8);
+    const uint32_t flags = (index_mode & 3u) | (emulate_depth_neg_one_to_one ? 4u : 0u);
+    put(&flags, 4);
+    for (int i = 0; i < 8; ++i) {
+        put(&color_fmt[i], 4);
+        if (!color_fmt[i]) continue;
+        put(&write_mask[i], 4);
+        const BlendState& b = rs.blend[i];
+        uint32_t bl[7] = {b.enable, b.src_rgb, b.dst_rgb, b.op_rgb, b.src_alpha, b.dst_alpha, b.op_alpha};
+        put(bl, sizeof(bl));
+    }
+    put(&depth_fmt, 4);
+    put(&samples, 4);
+    uint32_t a2c = alpha_to_cov, rd = rs.raster.rasterizer_discard;
+    put(&a2c, 4);
+    put(&rd, 4);
+    for (size_t i = 0; i < attrs.size(); ++i) {
+        put(&attrs[i], sizeof(VertexAttr));
+        put(&attr_locs[i], 4);
+    }
+
+    auto pit = s_gs_pipelines.find(key);
+    if (pit != s_gs_pipelines.end()) {
+        return pit->second.vs_ps_pso ? &pit->second : nullptr;
+    }
+
+    const uint64_t sh_ids[3] = {es->uid, gs->uid, (uint64_t)(emulate_depth_neg_one_to_one ? 1 : 0)};
+    const uint64_t sh_key = Fnv(sh_ids, sizeof(sh_ids));
+    auto sit = s_gs_shaders.find(sh_key);
+    if (sit == s_gs_shaders.end()) {
+        GsShaderCacheEntry entry{};
+        GcnGsShaderSet gset{};
+        if (gcn_compile_gs_shaders_msl(es->sh, gs->sh, emulate_depth_neg_one_to_one, &S.msl, &gset)) {
+            RefreshShaderBindings(es);
+            RefreshShaderBindings(gs);
+            entry.es_fn = CompileStageFn(gset.es_msl, false, "main0", "GS ES", es->code_addr);
+            entry.es_u16_fn = CompileStageFn(gset.es_u16_msl, false, "main0", "GS ES u16", es->code_addr);
+            entry.es_u32_fn = CompileStageFn(gset.es_u32_msl, false, "main0", "GS ES u32", es->code_addr);
+            entry.gs_fn = CompileStageFn(gset.gs_msl, false, "main0", "GS Kernel", gs->code_addr);
+            entry.vs_fn = CompileStageFn(gset.vs_msl, true, "main0", "GS PassThrough VS", gs->code_addr, "bb_gs_pass");
+            entry.es_stride = gset.es_stride;
+            entry.record_stride = gset.record_stride;
+            entry.index_slots = gset.index_slots;
+            entry.input_primitive = gset.input_primitive;
+            entry.input_vertices = gset.input_vertices;
+            entry.output_primitive = gset.output_primitive;
+            entry.max_vertices = gset.max_vertices;
+            entry.num_varyings = gset.num_varyings;
+            entry.gs_local_size[0] = std::max(1u, gset.gs_local_size[0]);
+            entry.gs_local_size[1] = std::max(1u, gset.gs_local_size[1]);
+            entry.gs_local_size[2] = std::max(1u, gset.gs_local_size[2]);
+            entry.valid = entry.es_fn != nil && entry.gs_fn != nil && entry.vs_fn != nil;
+        } else {
+            RLog("gs-fail", "gcn_compile_gs_shaders_msl failed (ES=0x%llx GS=0x%llx): %s",
+                 (unsigned long long)es->code_addr, (unsigned long long)gs->code_addr,
+                 gset.error ? gset.error : "unknown");
+        }
+        gcn_free_gs_shaders_msl(&gset);
+        sit = s_gs_shaders.emplace(sh_key, entry).first;
+    }
+    const GsShaderCacheEntry& gsh = sit->second;
+    if (!gsh.valid) {
+        s_gs_pipelines.emplace(key, GsPipelineState{});
+        return nullptr;
+    }
+
+    id<MTLFunction> es_fn = index_mode == 1 ? gsh.es_u16_fn : index_mode == 2 ? gsh.es_u32_fn : gsh.es_fn;
+    if (!es_fn) {
+        s_gs_pipelines.emplace(key, GsPipelineState{});
+        return nullptr;
+    }
+
+    NSError* err = nil;
+    MTLComputePipelineDescriptor* es_desc = [[MTLComputePipelineDescriptor alloc] init];
+    es_desc.computeFunction = es_fn;
+    if (!attrs.empty() || index_mode != 0) {
+        MTLStageInputOutputDescriptor* sio = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+        for (size_t i = 0; i < attrs.size(); ++i) {
+            const VertexAttr& a = attrs[i];
+            const uint32_t loc = attr_locs[i];
+            const uint32_t slot = a.buffer;
+            sio.attributes[loc].format = (MTLAttributeFormat)a.format;
+            sio.attributes[loc].offset = a.offset;
+            sio.attributes[loc].bufferIndex = slot;
+            sio.layouts[slot].stride = a.stride ? a.stride : 4;
+            if (a.stride == 0) {
+                sio.layouts[slot].stepFunction = MTLStepFunctionConstant;
+                sio.layouts[slot].stepRate = 0;
+            } else if (a.step_fn == MTLVertexStepFunctionPerInstance) {
+                sio.layouts[slot].stepFunction = MTLStepFunctionThreadPositionInGridY;
+                sio.layouts[slot].stepRate = std::max(1u, a.step_rate);
+            } else {
+                sio.layouts[slot].stepFunction =
+                    index_mode != 0 ? MTLStepFunctionThreadPositionInGridXIndexed
+                                    : MTLStepFunctionThreadPositionInGridX;
+                sio.layouts[slot].stepRate = 1;
+            }
+        }
+        if (index_mode != 0) {
+            sio.indexBufferIndex = GCN_TESS_INDEX_BUFFER_SLOT;
+            sio.indexType = index_mode == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+        }
+        es_desc.stageInputDescriptor = sio;
+    }
+    id<MTLComputePipelineState> es_pso =
+        [S.dev newComputePipelineStateWithDescriptor:es_desc
+                                             options:MTLPipelineOptionNone
+                                          reflection:nil
+                                               error:&err];
+    if (!es_pso) {
+        RLog("pso-fail", "GS ES compute pipeline failed: %s",
+             err ? err.localizedDescription.UTF8String : "unknown");
+        s_gs_pipelines.emplace(key, GsPipelineState{});
+        return nullptr;
+    }
+
+    err = nil;
+    id<MTLComputePipelineState> gs_pso = [S.dev newComputePipelineStateWithFunction:gsh.gs_fn error:&err];
+    if (!gs_pso) {
+        RLog("pso-fail", "GS compute pipeline failed: %s",
+             err ? err.localizedDescription.UTF8String : "unknown");
+        s_gs_pipelines.emplace(key, GsPipelineState{});
+        return nullptr;
+    }
+
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = gsh.vs_fn;
+    d.fragmentFunction = (ps && !rs.raster.rasterizer_discard) ? PipelineFn(ps) : nil;
+    for (int i = 0; i < 8; ++i) {
+        if (!color_fmt[i]) continue;
+        MTLRenderPipelineColorAttachmentDescriptor* ca = d.colorAttachments[i];
+        BlendState b = rs.blend[i];
+        if (b.unsupported) b.enable = false;
+        ApplyBlend(b, color_fmt[i], ca);
+        ca.writeMask = (MTLColorWriteMask)write_mask[i];
+        if (ca.pixelFormat == MTLPixelFormatR32Uint || ca.pixelFormat == MTLPixelFormatR32Sint ||
+            ca.pixelFormat == MTLPixelFormatRG32Uint || ca.pixelFormat == MTLPixelFormatRGBA32Uint ||
+            ca.pixelFormat == MTLPixelFormatR16Uint || ca.pixelFormat == MTLPixelFormatRGBA16Uint ||
+            ca.pixelFormat == MTLPixelFormatR8Uint || ca.pixelFormat == MTLPixelFormatRGBA8Uint ||
+            ca.pixelFormat == MTLPixelFormatRG16Uint || ca.pixelFormat == MTLPixelFormatRG8Uint)
+            ca.blendingEnabled = NO;
+    }
+    if (depth_fmt) {
+        d.depthAttachmentPixelFormat = (MTLPixelFormat)depth_fmt;
+        if (HasStencil((MTLPixelFormat)depth_fmt)) d.stencilAttachmentPixelFormat = (MTLPixelFormat)depth_fmt;
+    }
+    d.rasterSampleCount = samples;
+    d.alphaToCoverageEnabled = alpha_to_cov && !rs.raster.rasterizer_discard && ps != nullptr;
+    d.rasterizationEnabled = !rs.raster.rasterizer_discard;
+
+    err = nil;
+    id<MTLRenderPipelineState> vs_ps_pso = [S.dev newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!vs_ps_pso && ps && ReplaceStoredFns(nullptr, ps)) {
+        d.fragmentFunction = PipelineFn(ps);
+        err = nil;
+        vs_ps_pso = [S.dev newRenderPipelineStateWithDescriptor:d error:&err];
+    }
+    if (!vs_ps_pso) {
+        RLog("pso-fail", "GS VS+PS render pipeline failed: %s",
+             err ? err.localizedDescription.UTF8String : "unknown");
+        s_gs_pipelines.emplace(key, GsPipelineState{});
+        return nullptr;
+    }
+
+    GsPipelineState out{};
+    out.es_pso = es_pso;
+    out.gs_pso = gs_pso;
+    out.vs_ps_pso = vs_ps_pso;
+    out.es_stride = gsh.es_stride;
+    out.record_stride = gsh.record_stride;
+    out.index_slots = gsh.index_slots;
+    out.input_primitive = gsh.input_primitive;
+    out.input_vertices = gsh.input_vertices;
+    out.output_primitive = gsh.output_primitive;
+    out.max_vertices = gsh.max_vertices;
+    out.num_varyings = gsh.num_varyings;
+    out.gs_local_size[0] = gsh.gs_local_size[0];
+    out.gs_local_size[1] = gsh.gs_local_size[1];
+    out.gs_local_size[2] = gsh.gs_local_size[2];
+    auto ins = s_gs_pipelines.emplace(key, out);
+    return &ins.first->second;
 }
 
 id<MTLDepthStencilState> GetDepthStencil(const DepthStencilState& ds, bool has_depth, bool has_stencil) {
@@ -7568,10 +8190,23 @@ void NoteClearedColor(const ColorTarget& c, id<MTLTexture> t, uint64_t seq) {
 void EliminateFastClear(const RenderState& rs) {
     const ColorTarget& c = rs.color[0];
     if (!c.bound || !c.fast_clear) return;
+    RegisterMeta(c.cmask_address);
     uint64_t clear_seq = 0;
-    if (!TakeMetaCleared(c.cmask_address, &clear_seq)) return;
-    id<MTLTexture> t = S.tex->GetColorTarget(c);
+    const uint32_t cmask_slice = std::min<uint32_t>(c.base_slice, 63);
+    const uint64_t cmask_sb = CmaskSliceBytesOf(c);
+    if (!TakeMetaCleared(c.cmask_address, &clear_seq, cmask_slice, cmask_sb)) return;
+    id<MTLTexture> grown_from = nil;
+    id<MTLTexture> t = S.tex->GetColorTarget(c, true, true, false, &grown_from);
     if (!t) return;
+    if (grown_from && BackendHas(kGnmCapCopies, "copy of a grown color array's slices")) {
+        EndEncoders();
+        EnsureCmd();
+        S.be->BeginCopies();
+        for (NSUInteger sl = 0; sl < grown_from.arrayLength && sl < t.arrayLength; ++sl)
+            S.be->CopyTextureRegion(grown_from, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0),
+                                    MTLSizeMake(t.width, t.height, 1), t, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0));
+        S.be->EndEncoder();
+    }
     RefreshGuestNewer(c.address, t, true); // the clear of a slice keeps the rest
     ClearReq clr;
     if (!ClearColorFor(t.pixelFormat, c.clear_word0, c.clear_word1, &clr.color_value[0])) {
@@ -7580,11 +8215,20 @@ void EliminateFastClear(const RenderState& rs) {
     }
     clr.color[0] = true;
     NoteClearedColor(c, t, clear_seq);
-    PassKey k;
-    k.color[0] = t;
-    id<MTLTexture> hold[9] = {t};
-    BeginPass(k, clr, hold, false);
-    EndEncoders();
+    const uint32_t slice_end = t.textureType == MTLTextureType2DArray
+                                   ? std::min<uint32_t>(c.num_slices, (uint32_t)t.arrayLength)
+                                   : (c.base_slice + 1u);
+    for (uint32_t sl = c.base_slice; sl < slice_end; ++sl) {
+        if (sl > c.base_slice) TakeMetaCleared(c.cmask_address, nullptr, std::min<uint32_t>(sl, 63), cmask_sb);
+        PassKey k;
+        k.color[0] = t;
+        k.color_slice[0] = t.textureType == MTLTextureType2DArray
+                               ? std::min<uint32_t>(sl, (uint32_t)t.arrayLength - 1)
+                               : 0;
+        id<MTLTexture> hold[9] = {t};
+        BeginPass(k, clr, hold, false);
+        EndEncoders();
+    }
     S.pending = true;
     LogWork("fast-clear-elim");
 }
@@ -8987,15 +9631,23 @@ struct DrawRec {
     RenderState rs;
     RegSnap regs;
     bool trace = false;
+    uint8_t stage_mode = 0; // 0: VsPs, 1: Tess (LsHsVsPs), 2: Gs (EsGsVsPs)
     Shader* vs = nullptr;
     Shader* ps = nullptr;
+    Shader* ls_es = nullptr;
+    Shader* hs_gs = nullptr;
     uint64_t vs_addr = 0, ps_addr = 0;
+    uint64_t ls_es_addr = 0, hs_gs_addr = 0;
     uint32_t vs_ud[16] = {}, ps_ud[16] = {};
-    gcn_runtime_info vs_rt{}, ps_rt{}; // the stages' runtime state (ResolveTableHazards)
-    uint64_t table_snap = 0;           // TableReadBegin when the CP read guest memory for it
+    uint32_t ls_es_ud[16] = {}, hs_gs_ud[16] = {};
+    gcn_runtime_info vs_rt{}, ps_rt{};       // the stages' runtime state (ResolveTableHazards)
+    gcn_runtime_info ls_es_rt{}, hs_gs_rt{}; // LS/ES and HS/GS runtime state when stage_mode != 0
+    uint64_t table_snap = 0;                 // TableReadBegin when the CP read guest memory for it
     std::vector<uint32_t> vs_flat, ps_flat;
+    std::vector<uint32_t> ls_es_flat, hs_gs_flat;
     std::vector<VtxIn> vtx;
     StageImages vs_img, ps_img;
+    StageImages ls_es_img, hs_gs_img;
     // ready for the next draw, keeping the capacity of the vectors. Draw() sets everything else
     // (rs is reset by DecodeRenderState, regs entirely written by Capture).
     void Recycle() {
@@ -9010,6 +9662,17 @@ struct DrawRec {
         vtx.clear();
         vs_img.Clear();
         ps_img.Clear();
+        if (stage_mode != 0) {
+            stage_mode = 0;
+            ls_es = hs_gs = nullptr;
+            ls_es_addr = hs_gs_addr = 0;
+            memset(ls_es_ud, 0, sizeof(ls_es_ud));
+            memset(hs_gs_ud, 0, sizeof(hs_gs_ud));
+            ls_es_flat.clear();
+            hs_gs_flat.clear();
+            ls_es_img.Clear();
+            hs_gs_img.Clear();
+        }
     }
 };
 void DrawEncode(DrawRec& r);
@@ -9059,6 +9722,262 @@ bool GuestRangeOk(uint64_t addr, uint64_t size) {
 // Frame capture: an indirect draw the GPU path cannot take; the caller reads its arguments and
 // issues it again as a direct draw (the next pass of the capture).
 constexpr const char* kCapIndirectFallback = "indirect draw replaced by a direct draw (next pass)";
+
+bool PrepareTessDraw(const uint32_t* regs, const DrawArgs& args,
+                     std::unique_ptr<DrawRec, RecPool<DrawRec>::Back> rp,
+                     TableReadCp& table_read) {
+    DrawRec& r = *rp;
+    RenderState& rs = r.rs;
+    if (rs.raster.cull_front_and_back) return true;
+    if (args.indirect_addr != 0) {
+        NoteIndirectFallback(IndirectFallback::Emulation, rs.raster.prim);
+        cap::SetSkipped(kCapIndirectFallback);
+        return false;
+    }
+
+    DrainAsyncCompiles();
+
+    gcn_stage_from_regs(regs, 0x10000, GCN_HW_LS, &r.ls_es_addr, r.ls_es_ud);
+    gcn_stage_from_regs(regs, 0x10000, GCN_HW_HS, &r.hs_gs_addr, r.hs_gs_ud);
+    gcn_stage_from_regs(regs, 0x10000, GCN_HW_VS, &r.vs_addr, r.vs_ud);
+    gcn_stage_from_regs(regs, 0x10000, GCN_HW_PS, &r.ps_addr, r.ps_ud);
+
+    // 1. Translate HS first so its tessellation constant buffer V# provides ls_stride for LS.
+    gcn_runtime_info_from_regs(regs, 0x10000, GCN_HW_HS, GCN_SW_TESS_CONTROL, &S.profile, &r.hs_gs_rt);
+    Shader* hs = GetShader(GCN_HW_HS, GCN_SW_TESS_CONTROL, r.hs_gs_rt, r.hs_gs_addr, r.hs_gs_ud, false);
+    if (!hs) {
+        NoteSkip(SkipReason::ShaderStages);
+        RLog("skip-hs", "%s skipped: HS 0x%llx unavailable", args.name, (unsigned long long)r.hs_gs_addr);
+        return true;
+    }
+
+    // 2. Read ls_stride from the HS tessellation constant buffer V# and translate LS.
+    gcn_runtime_info_from_regs(regs, 0x10000, GCN_HW_LS, GCN_SW_VERTEX, &S.profile, &r.ls_es_rt);
+    uint32_t ls_stride = GmCpGuarded([&](gcn_read_guest_fn read) {
+        GcnGuestMemory mem{};
+        mem.read = read;
+        mem.ctx = S.ctx;
+        return gcn_read_tess_ls_stride(&hs->info, r.hs_gs_ud, 16, mem);
+    });
+    if (ls_stride != 0) r.ls_es_rt.ls.ls_stride = ls_stride;
+    Shader* ls = GetShader(GCN_HW_LS, GCN_SW_VERTEX, r.ls_es_rt, r.ls_es_addr, r.ls_es_ud, false);
+    if (!ls) {
+        NoteSkip(SkipReason::VsUnavailable);
+        RLog("skip-ls", "%s skipped: LS 0x%llx unavailable", args.name, (unsigned long long)r.ls_es_addr);
+        return true;
+    }
+
+    // 3. Translate DS (HW VS running as SW TessEval).
+    gcn_runtime_info_from_regs(regs, 0x10000, GCN_HW_VS, GCN_SW_TESS_EVAL, &S.profile, &r.vs_rt);
+    Shader* vs = GetShader(GCN_HW_VS, GCN_SW_TESS_EVAL, r.vs_rt, r.vs_addr, r.vs_ud, false);
+    if (!vs) {
+        NoteSkip(SkipReason::VsUnavailable);
+        RLog("skip-ds", "%s skipped: DS 0x%llx unavailable", args.name, (unsigned long long)r.vs_addr);
+        return true;
+    }
+
+    // 4. Translate PS if bound.
+    Shader* ps = nullptr;
+    if (r.ps_addr) {
+        gcn_runtime_info_from_regs(regs, 0x10000, GCN_HW_PS, GCN_SW_FRAGMENT, &S.profile, &r.ps_rt);
+        for (int i = 0; i < 8; ++i) {
+            if (!r.ps_rt.fs.color_buffers[i].data_format) continue;
+            const CompMapping& ex = rs.color[i].export_swizzle;
+            for (int k = 0; k < 4; ++k) r.ps_rt.fs.color_buffers[i].swizzle[k] = (uint8_t)ex[k];
+        }
+        ps = GetShader(GCN_HW_PS, GCN_SW_FRAGMENT, r.ps_rt, r.ps_addr, r.ps_ud, false);
+        if (ps && !ps->fn && ShaderCompiling(ps)) {
+            NoteDrawPendingCompile();
+            g_hitch.pending_draws++;
+            return true;
+        }
+        if (!ps || !ps->fn) {
+            NoteSkip(SkipReason::PsUnavailable);
+            RLog("skip-ps", "%s skipped: PS 0x%llx unavailable", args.name, (unsigned long long)r.ps_addr);
+            return true;
+        }
+    }
+
+    // 5. Fetch LS vertex attribute sharps.
+    r.vtx.resize(ls->attrs.size());
+    for (uint32_t i = 0; i < ls->attrs.size(); ++i) {
+        VtxIn& vi = r.vtx[i];
+        uint32_t v[4] = {};
+        GmCpGuarded([&](gcn_read_guest_fn read) {
+            return gcn_shader_fetch_vertex_attrib_sharp(ls->sh, i, r.ls_es_ud, read, S.ctx, v);
+        });
+        DecodeBuffer(v, &vi.bd);
+        vi.vf = GetVertexFormat(vi.bd.raw_dfmt, vi.bd.raw_nfmt);
+        const uint32_t slot = GCN_TESS_VERTEX_ATTR_BASE_SLOT + i;
+        if (slot > 30 || !vi.vf.mtl_vertex_format) {
+            RLog("vtx-fmt", "%s: LS 0x%llx attribute %u unsupported (fmt %u/%u slot %u)", args.name,
+                 (unsigned long long)ls->code_addr, i, vi.bd.raw_dfmt, vi.bd.raw_nfmt, slot);
+            NoteSkip(SkipReason::VertexFormat);
+            return true;
+        }
+        if ((vi.bd.stride & 3) || (vi.bd.address & 3)) {
+            RLog("vtx-stride", "%s: LS 0x%llx attribute %u: stride %u / address 0x%llx not a multiple of 4",
+                 args.name, (unsigned long long)ls->code_addr, i, vi.bd.stride,
+                 (unsigned long long)vi.bd.address);
+            NoteSkip(SkipReason::VertexAlign);
+            return true;
+        }
+    }
+
+    // 6. Build flattened user data and decode stage images for LS, HS, DS, PS.
+    StageFlat(6, ls, r.ls_es_ud);
+    r.ls_es_flat = S.flat_scratch[6];
+    StageFlat(5, hs, r.hs_gs_ud);
+    r.hs_gs_flat = S.flat_scratch[5];
+    StageFlat(0, vs, r.vs_ud);
+    r.vs_flat = S.flat_scratch[0];
+    if (ps) {
+        StageFlat(1, ps, r.ps_ud);
+        r.ps_flat = S.flat_scratch[1];
+    }
+    DecodeStageImages(ls, r.ls_es_flat, &r.ls_es_img);
+    DecodeStageImages(hs, r.hs_gs_flat, &r.hs_gs_img);
+    DecodeStageImages(vs, r.vs_flat, &r.vs_img);
+    if (ps) DecodeStageImages(ps, r.ps_flat, &r.ps_img);
+
+    r.stage_mode = 1;
+    r.ls_es = ls;
+    r.hs_gs = hs;
+    r.vs = vs;
+    r.ps = ps;
+    if (cap::g_pass) {
+        cap::NoteStage("vs", vs, r.vs_ud);
+        if (ps) cap::NoteStage("ps", ps, r.ps_ud);
+    }
+    r.regs.Capture(regs);
+    table_read.armed = false;
+    encq::Defer([rec = rp.release()] {
+        DrawEncode(*rec);
+        g_draw_recs.Put(rec);
+    });
+    return true;
+}
+
+bool PrepareGsDraw(const uint32_t* regs, const DrawArgs& args,
+                   std::unique_ptr<DrawRec, RecPool<DrawRec>::Back> rp,
+                   TableReadCp& table_read) {
+    DrawRec& r = *rp;
+    RenderState& rs = r.rs;
+    if (rs.raster.cull_front_and_back) return true;
+    if (args.indirect_addr != 0) {
+        NoteIndirectFallback(IndirectFallback::Emulation, rs.raster.prim);
+        cap::SetSkipped(kCapIndirectFallback);
+        return false;
+    }
+
+    DrainAsyncCompiles();
+
+    gcn_stage_from_regs(regs, 0x10000, GCN_HW_ES, &r.ls_es_addr, r.ls_es_ud);
+    gcn_stage_from_regs(regs, 0x10000, GCN_HW_GS, &r.hs_gs_addr, r.hs_gs_ud);
+    gcn_stage_from_regs(regs, 0x10000, GCN_HW_VS, &r.vs_addr, r.vs_ud);
+    gcn_stage_from_regs(regs, 0x10000, GCN_HW_PS, &r.ps_addr, r.ps_ud);
+
+    // 1. Translate ES (HW ES running as SW Vertex).
+    gcn_runtime_info_from_regs(regs, 0x10000, GCN_HW_ES, GCN_SW_VERTEX, &S.profile, &r.ls_es_rt);
+    r.ls_es_rt.vs_sw.tess_emulated_primitive = false;
+    Shader* es = GetShader(GCN_HW_ES, GCN_SW_VERTEX, r.ls_es_rt, r.ls_es_addr, r.ls_es_ud, false);
+    if (!es) {
+        NoteSkip(SkipReason::VsUnavailable);
+        RLog("skip-es", "%s skipped: ES 0x%llx unavailable", args.name, (unsigned long long)r.ls_es_addr);
+        return true;
+    }
+
+    // 2. Translate GS (with copy VS metadata from HW VS).
+    gcn_runtime_info_from_regs(regs, 0x10000, GCN_HW_GS, GCN_SW_GEOMETRY, &S.profile, &r.hs_gs_rt);
+    if (r.hs_gs_rt.gs.vs_copy_addr != 0) {
+        uint32_t copy_size = 0;
+        uint64_t copy_hash = 0;
+        if (gcn_find_binary_info(ReadGuest, S.ctx, r.hs_gs_rt.gs.vs_copy_addr, &copy_size, &copy_hash)) {
+            r.hs_gs_rt.gs.vs_copy_size = copy_size;
+            r.hs_gs_rt.gs.vs_copy_hash = copy_hash;
+        }
+    }
+    Shader* gs = GetShader(GCN_HW_GS, GCN_SW_GEOMETRY, r.hs_gs_rt, r.hs_gs_addr, r.hs_gs_ud, false);
+    if (!gs) {
+        NoteSkip(SkipReason::ShaderStages);
+        RLog("skip-gs", "%s skipped: GS 0x%llx unavailable", args.name, (unsigned long long)r.hs_gs_addr);
+        return true;
+    }
+
+    // 3. Translate PS if bound.
+    Shader* ps = nullptr;
+    if (r.ps_addr) {
+        gcn_runtime_info_from_regs(regs, 0x10000, GCN_HW_PS, GCN_SW_FRAGMENT, &S.profile, &r.ps_rt);
+        for (int i = 0; i < 8; ++i) {
+            if (!r.ps_rt.fs.color_buffers[i].data_format) continue;
+            const CompMapping& ex = rs.color[i].export_swizzle;
+            for (int k = 0; k < 4; ++k) r.ps_rt.fs.color_buffers[i].swizzle[k] = (uint8_t)ex[k];
+        }
+        ps = GetShader(GCN_HW_PS, GCN_SW_FRAGMENT, r.ps_rt, r.ps_addr, r.ps_ud, false);
+        if (ps && !ps->fn && ShaderCompiling(ps)) {
+            NoteDrawPendingCompile();
+            g_hitch.pending_draws++;
+            return true;
+        }
+        if (!ps || !ps->fn) {
+            NoteSkip(SkipReason::PsUnavailable);
+            RLog("skip-ps", "%s skipped: PS 0x%llx unavailable", args.name, (unsigned long long)r.ps_addr);
+            return true;
+        }
+    }
+
+    // 4. Fetch ES vertex attribute sharps.
+    r.vtx.resize(es->attrs.size());
+    for (uint32_t i = 0; i < es->attrs.size(); ++i) {
+        VtxIn& vi = r.vtx[i];
+        uint32_t v[4] = {};
+        GmCpGuarded([&](gcn_read_guest_fn read) {
+            return gcn_shader_fetch_vertex_attrib_sharp(es->sh, i, r.ls_es_ud, read, S.ctx, v);
+        });
+        DecodeBuffer(v, &vi.bd);
+        vi.vf = GetVertexFormat(vi.bd.raw_dfmt, vi.bd.raw_nfmt);
+        const uint32_t slot = GCN_TESS_VERTEX_ATTR_BASE_SLOT + i;
+        if (slot > 30 || !vi.vf.mtl_vertex_format) {
+            RLog("vtx-fmt", "%s: ES 0x%llx attribute %u unsupported (fmt %u/%u slot %u)", args.name,
+                 (unsigned long long)es->code_addr, i, vi.bd.raw_dfmt, vi.bd.raw_nfmt, slot);
+            NoteSkip(SkipReason::VertexFormat);
+            return true;
+        }
+        if ((vi.bd.stride & 3) || (vi.bd.address & 3)) {
+            RLog("vtx-stride", "%s: ES 0x%llx attribute %u: stride %u / address 0x%llx not a multiple of 4",
+                 args.name, (unsigned long long)es->code_addr, i, vi.bd.stride,
+                 (unsigned long long)vi.bd.address);
+            NoteSkip(SkipReason::VertexAlign);
+            return true;
+        }
+    }
+
+    // 5. Build flattened user data and decode stage images for ES, GS, PS.
+    StageFlat(4, es, r.ls_es_ud);
+    r.ls_es_flat = S.flat_scratch[4];
+    StageFlat(3, gs, r.hs_gs_ud);
+    r.hs_gs_flat = S.flat_scratch[3];
+    if (ps) {
+        StageFlat(1, ps, r.ps_ud);
+        r.ps_flat = S.flat_scratch[1];
+    }
+    DecodeStageImages(es, r.ls_es_flat, &r.ls_es_img);
+    DecodeStageImages(gs, r.hs_gs_flat, &r.hs_gs_img);
+    if (ps) DecodeStageImages(ps, r.ps_flat, &r.ps_img);
+
+    r.stage_mode = 2;
+    r.ls_es = es;
+    r.hs_gs = gs;
+    r.ps = ps;
+    if (cap::g_pass && ps) cap::NoteStage("ps", ps, r.ps_ud);
+    r.regs.Capture(regs);
+    table_read.armed = false;
+    encq::Defer([rec = rp.release()] {
+        DrawEncode(*rec);
+        g_draw_recs.Put(rec);
+    });
+    return true;
+}
 
 bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
     if (!Init(ctx) || S.hung) return true;
@@ -9129,7 +10048,17 @@ bool Draw(GuestContext* ctx, const uint32_t* regs, const DrawArgs& args) {
             return true;
         }
         const uint32_t stages = regs[0xA2D5]; // VGT_SHADER_STAGES_EN
-        if (stages & 0x3F) {
+        if (stages & 0x3Fu) {
+            const uint32_t ls_en = stages & 0x03u;
+            const uint32_t hs_en = (stages >> 2) & 0x01u;
+            const uint32_t es_en = (stages >> 3) & 0x03u;
+            const uint32_t gs_en = (stages >> 5) & 0x01u;
+            if (ls_en && hs_en && !es_en && !gs_en) {
+                return PrepareTessDraw(regs, args, std::move(rp), table_read);
+            }
+            if (es_en && gs_en && !ls_en && !hs_en) {
+                return PrepareGsDraw(regs, args, std::move(rp), table_read);
+            }
             RLog("stages", "%s: unsupported shader stages enabled (VGT_SHADER_STAGES_EN=0x%x)", args.name, stages);
             NoteSkip(SkipReason::ShaderStages);
             return true;
@@ -9313,6 +10242,1000 @@ void CommitEachForDebug() {
     if (each && MainCmdOpen()) Commit();
 }
 
+void EncodeTessDraw(DrawRec& r) {
+    const DrawArgs& args = r.args;
+    RenderState& rs = r.rs;
+    const RegSnap& regs = r.regs;
+    Shader* const ls = r.ls_es;
+    Shader* const hs = r.hs_gs;
+    Shader* const vs = r.vs;
+    Shader* const ps = r.ps;
+    if (!ls || !hs || !vs) return;
+
+    StageImagesScope images(&r.ls_es_img, &r.hs_gs_img, &r.vs_img, &r.ps_img);
+
+    PassKey key;
+    id<MTLTexture> hold[9] = {};
+    uint32_t color_fmt[8] = {}, write_mask[8] = {};
+    ClearReq clr;
+    MetaTakeUndo meta_undo;
+    uint32_t rt_w = 16384, rt_h = 16384, samples = 0;
+    bool any_rt = false;
+    const uint32_t mrt_mask = ps ? ps->info.mrt_mask : 0;
+    for (int i = 0; i < 8; ++i) {
+        const ColorTarget& c = rs.color[i];
+        if (!c.enabled || !(mrt_mask & (1u << i))) continue;
+        if (!c.mtl_format) continue;
+        if (c.fast_clear || c.compression) RegisterMeta(c.cmask_address);
+        const bool pending_write = c.num_samples == 1 && S.detile_pso != nil &&
+                                   BackendHas(kGnmCapCompute | kGnmCapCopies) &&
+                                   OverlapsPendingWrite(c.address, std::max<uint64_t>(c.slice_bytes, 1));
+        id<MTLTexture> grown_from = nil;
+        id<MTLTexture> t = S.tex->GetColorTarget(c, true, c.mtl_write_mask != 0, pending_write, &grown_from);
+        if (!t) continue;
+        if (grown_from && BackendHas(kGnmCapCopies, "copy of a grown color array's slices")) {
+            EndEncoders();
+            EnsureCmd();
+            S.be->BeginCopies();
+            for (NSUInteger sl = 0; sl < grown_from.arrayLength && sl < t.arrayLength; ++sl)
+                S.be->CopyTextureRegion(grown_from, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0),
+                                        MTLSizeMake(t.width, t.height, 1), t, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0));
+            S.be->EndEncoder();
+        }
+        if (samples && t.sampleCount != samples) continue;
+        samples = (uint32_t)t.sampleCount;
+        key.color[i] = t;
+        key.color_slice[i] = t.textureType == MTLTextureType2DArray
+                                 ? std::min<uint32_t>(c.base_slice, (uint32_t)t.arrayLength - 1)
+                                 : 0;
+        hold[i] = t;
+        color_fmt[i] = (uint32_t)t.pixelFormat;
+        write_mask[i] = c.mtl_write_mask;
+        rt_w = std::min<uint32_t>(rt_w, (uint32_t)t.width);
+        rt_h = std::min<uint32_t>(rt_h, (uint32_t)t.height);
+        any_rt = true;
+        uint64_t clear_seq = 0;
+        const uint32_t cmask_slice = std::min<uint32_t>(c.base_slice, 63);
+        if (c.fast_clear && TakeMetaCleared(c.cmask_address, &clear_seq, cmask_slice, CmaskSliceBytesOf(c))) {
+            meta_undo.Add(c.cmask_address, cmask_slice, clear_seq);
+            if (ClearColorFor(t.pixelFormat, c.clear_word0, c.clear_word1, &clr.color_value[i])) {
+                clr.color[i] = true;
+                NoteClearedColor(c, t, clear_seq);
+            }
+        }
+    }
+
+    uint32_t depth_fmt = 0;
+    const DepthTarget& db = rs.depth;
+    const bool want_depth = rs.ds.depth_test || rs.ds.stencil_test;
+    if (want_depth && db.bound && db.mtl_format) {
+        if (db.htile_enable) RegisterMeta(db.htile_address);
+        id<MTLTexture> grown_from = nil;
+        const auto stencil_writes = [](const StencilFace& f) {
+            return f.write_mask != 0 && (f.fail != MTLStencilOperationKeep || f.depth_fail != MTLStencilOperationKeep ||
+                                         f.pass != MTLStencilOperationKeep);
+        };
+        const bool ds_written = rs.ds.depth_write || db.depth_clear_enable || db.stencil_clear_enable ||
+                                (rs.ds.stencil_test && (stencil_writes(rs.ds.front) || stencil_writes(rs.ds.back)));
+        id<MTLTexture> t = S.tex->GetDepthTarget(db, &grown_from, ds_written);
+        if (t && grown_from && BackendHas(kGnmCapCopies, "copy of a grown depth array's slices")) {
+            EndEncoders();
+            EnsureCmd();
+            S.be->BeginCopies();
+            for (NSUInteger sl = 0; sl < grown_from.arrayLength && sl < t.arrayLength; ++sl)
+                S.be->CopyTextureRegion(grown_from, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0),
+                                        MTLSizeMake(t.width, t.height, 1), t, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0));
+            S.be->EndEncoder();
+        }
+        if (t && (!samples || t.sampleCount == samples)) {
+            SyncDepthSibling(db, t);
+            samples = (uint32_t)t.sampleCount;
+            key.depth = t;
+            key.depth_slice = t.textureType == MTLTextureType2DArray
+                                  ? std::min<uint32_t>(db.base_slice, (uint32_t)t.arrayLength - 1)
+                                  : 0;
+            hold[8] = t;
+            depth_fmt = (uint32_t)t.pixelFormat;
+            rt_w = std::min<uint32_t>(rt_w, (uint32_t)t.width);
+            rt_h = std::min<uint32_t>(rt_h, (uint32_t)t.height);
+            any_rt = true;
+            if (db.stencil_read_address) S.stencil_to_z[db.stencil_read_address] = db.z_read_address;
+            const uint32_t dc = regs[0xA200];
+            const bool depth_enable = (dc >> 1) & 1, depth_write = (dc >> 2) & 1;
+            if (depth_write || rs.ds.stencil_test || db.depth_clear_enable || db.stencil_clear_enable)
+                BumpDepthVersion(t);
+            uint64_t htile_seq = 0;
+            const uint32_t htile_slice = std::min<uint32_t>(db.base_slice, 63);
+            const bool htile_clear =
+                db.htile_enable && TakeMetaCleared(db.htile_address, &htile_seq, htile_slice, HtileSliceBytesOf(db));
+            if (htile_clear) meta_undo.Add(db.htile_address, htile_slice, htile_seq);
+            if ((db.depth_clear_enable && depth_enable && depth_write) || htile_clear) {
+                clr.depth = true;
+                clr.depth_value = db.depth_clear;
+                const uint64_t za = db.z_read_address ? db.z_read_address : db.stencil_read_address;
+                const uint64_t seq = (db.depth_clear_enable && depth_enable && depth_write) ? S.committed_seq + 1
+                                                                                              : htile_seq;
+                if (db.z_read_address && db.slice_bytes && seq)
+                    S.tex->NoteExactWrite(za, t, za + (uint64_t)db.base_slice * db.slice_bytes,
+                                          za + (uint64_t)(db.base_slice + 1) * db.slice_bytes, seq);
+            }
+            if (db.stencil_clear_enable && HasStencil(t.pixelFormat)) {
+                clr.stencil = true;
+                clr.stencil_value = db.stencil_clear;
+            }
+        }
+    }
+    if (!samples) samples = 1;
+    const uint32_t aa_samples = 1u << (regs[0xA2F8] & 7);
+    if (samples > 1 && aa_samples > 1) key.sample_locs = regs[0xA2FE];
+    if (!any_rt) {
+        if (!ps) {
+            rt_w = 16;
+            rt_h = 16;
+        } else {
+            rt_w = std::max(1u, std::min(16384u, rs.scissor.x + rs.scissor.width));
+            rt_h = std::max(1u, std::min(16384u, rs.scissor.y + rs.scissor.height));
+        }
+    }
+    key.width = any_rt ? 0 : rt_w;
+    key.height = any_rt ? 0 : rt_h;
+
+    static std::vector<VertexAttr>& vattrs = *new std::vector<VertexAttr>;
+    static std::vector<uint32_t>& vlocs = *new std::vector<uint32_t>;
+    static std::vector<std::pair<id<MTLBuffer>, uint64_t>>& vbufs = *new std::vector<std::pair<id<MTLBuffer>, uint64_t>>;
+    vattrs.clear();
+    vlocs.clear();
+    vbufs.clear();
+    for (uint32_t i = 0; i < ls->attrs.size(); ++i) {
+        const gcn_vertex_attrib& a = ls->attrs[i];
+        const BufferDesc& bd = r.vtx[i].bd;
+        const VertexFormatInfo& vf = r.vtx[i].vf;
+        const uint32_t slot = GCN_TESS_VERTEX_ATTR_BASE_SLOT + i;
+        VertexAttr va{};
+        va.format = vf.mtl_vertex_format;
+        va.offset = 0;
+        va.buffer = slot;
+        uint32_t stride = bd.stride;
+        id<MTLBuffer> mb = S.dummy;
+        uint64_t off = 0;
+        if (bd.address && bd.size) {
+            if (!GuestBuffer(bd.address & ~3ull, bd.size + 4, GuestAccess::Read, &mb, &off)) {
+                mb = S.dummy;
+                off = 0;
+            }
+        }
+        if (a.step_rate == 0) {
+            va.step_fn = stride ? MTLVertexStepFunctionPerVertex : MTLVertexStepFunctionConstant;
+            va.step_rate = stride ? 1 : 0;
+        } else {
+            va.step_fn = MTLVertexStepFunctionPerInstance;
+            va.step_rate = std::max(1u, a.divisor);
+        }
+        if (stride == 0) va.step_fn = MTLVertexStepFunctionConstant, va.step_rate = 0;
+        va.stride = stride;
+        vattrs.push_back(va);
+        vlocs.push_back(a.location);
+        vbufs.push_back({mb, off});
+    }
+
+    const uint32_t index_mode = args.indexed ? (args.index_type == 1 ? 2u : 1u) : 0u;
+    id<MTLBuffer> ib = nil;
+    uint64_t ib_off = 0;
+    if (args.indexed) {
+        const uint64_t isz = args.index_type == 1 ? 4 : 2;
+        const uint64_t addr = args.index_base + (uint64_t)args.index_offset * isz;
+        const uint64_t bytes = (uint64_t)args.count * isz;
+        if (!args.index_base || !GuestBuffer(addr, bytes, GuestAccess::Read, &ib, &ib_off)) {
+            RLog("ib", "%s: index buffer 0x%llx unavailable", args.name, (unsigned long long)addr);
+            NoteSkip(SkipReason::IndexBuffer);
+            return;
+        }
+        if (ib_off & 3) {
+            void* ptr;
+            size_t aoff;
+            if (!S.arena.Alloc(S.dev, bytes, 16, &ib, &aoff, &ptr)) {
+                NoteSkip(SkipReason::Arena);
+                return;
+            }
+            memcpy(ptr, S.ctx->mem_base + addr, bytes);
+            ib_off = aoff;
+        }
+    }
+
+    const bool a2c = (regs[0xA2DC] & 1) != 0;
+    const TessPipelineState* tpipe =
+        GetTessPipelines(ls, hs, vs, ps, rs, color_fmt, write_mask, depth_fmt, samples, vattrs, vlocs, a2c, index_mode);
+    if (!tpipe) {
+        NoteSkip(SkipReason::PipelineFailed);
+        return;
+    }
+
+    MTLViewport vp;
+    MTLScissorRect sc;
+    const uint32_t pw = any_rt ? rt_w : key.width, ph = any_rt ? rt_h : key.height;
+    if (rs.num_viewports > 0) {
+        const Viewport& v = rs.viewports[0];
+        vp = ToMTLViewport(v);
+        vp.znear = std::min(1.0, std::max(0.0, vp.znear));
+        vp.zfar = std::min(1.0, std::max(0.0, vp.zfar));
+        sc = ToMTLScissor(rs.scissors[0], pw, ph);
+    } else {
+        vp = MTLViewport{0, 0, (double)pw, (double)ph, 0, 1};
+        sc = ToMTLScissor(rs.scissor, pw, ph);
+    }
+    if (sc.width == 0 || sc.height == 0) {
+        NoteSkip(SkipReason::ScissorEmpty);
+        return;
+    }
+
+    uint32_t vertex_offset = regs[0xA102];
+    uint32_t instance_offset = 0;
+    if (ls->info.has_fetch_shader) {
+        if (vertex_offset == 0 && ls->info.vertex_offset_sgpr >= 0 && ls->info.vertex_offset_sgpr < 16)
+            vertex_offset = r.ls_es_ud[ls->info.vertex_offset_sgpr];
+        if (ls->info.instance_offset_sgpr >= 0 && ls->info.instance_offset_sgpr < 16)
+            instance_offset = r.ls_es_ud[ls->info.instance_offset_sgpr];
+    }
+
+    const uint32_t ls_hs_config = regs[0xA2E6]; // VGT_LS_HS_CONFIG
+    uint32_t num_cp = r.hs_gs_rt.tcs.num_input_control_points ? r.hs_gs_rt.tcs.num_input_control_points
+                                                              : (ls_hs_config & 0x3Fu);
+    if (num_cp == 0) num_cp = 3;
+    const uint32_t out_cp = std::max(1u, tpipe->output_control_points);
+    const uint32_t patch_count = args.count / num_cp;
+    if (patch_count == 0) return;
+
+    const uint32_t inst = std::max(1u, args.num_instances);
+    const uint32_t ls_vertices_per_inst = patch_count * num_cp;
+    const size_t ls_out_inst_bytes =
+        ((size_t)patch_count * num_cp * std::max(4u, tpipe->ls_stride) + 255u) & ~size_t(255u);
+    const size_t hs_cp_inst_bytes =
+        ((size_t)patch_count * out_cp * std::max(4u, tpipe->hs_cp_stride) + 255u) & ~size_t(255u);
+    const size_t hs_patch_inst_bytes =
+        ((size_t)patch_count * std::max(4u, tpipe->hs_patch_stride) + 255u) & ~size_t(255u);
+    const size_t tf_elem_bytes = (tpipe->domain == GCN_TESS_DOMAIN_QUADS) ? 12 : 8;
+    const size_t tf_inst_bytes = ((size_t)patch_count * tf_elem_bytes + 255u) & ~size_t(255u);
+
+    const size_t ls_out_bytes = std::max<size_t>(256, ls_out_inst_bytes * inst);
+    const size_t hs_cp_bytes = std::max<size_t>(256, hs_cp_inst_bytes * inst);
+    const size_t hs_patch_bytes = std::max<size_t>(256, hs_patch_inst_bytes * inst);
+    const size_t tf_bytes = std::max<size_t>(256, tf_inst_bytes * inst);
+
+    id<MTLBuffer> ls_out_buf = nil, hs_cp_buf = nil, hs_patch_buf = nil, tf_buf = nil;
+    size_t ls_out_off = 0, hs_cp_off = 0, hs_patch_off = 0, tf_off = 0;
+    void* unused_ptr = nullptr;
+    if (!S.arena.Alloc(S.dev, ls_out_bytes, 256, &ls_out_buf, &ls_out_off, &unused_ptr) ||
+        !S.arena.Alloc(S.dev, hs_cp_bytes, 256, &hs_cp_buf, &hs_cp_off, &unused_ptr) ||
+        !S.arena.Alloc(S.dev, hs_patch_bytes, 256, &hs_patch_buf, &hs_patch_off, &unused_ptr) ||
+        !S.arena.Alloc(S.dev, tf_bytes, 256, &tf_buf, &tf_off, &unused_ptr)) {
+        NoteSkip(SkipReason::Arena);
+        return;
+    }
+
+    for (int i = 0; i < 8; ++i)
+        if (key.color[i]) RefreshGuestNewer(rs.color[i].address, key.color[i], true);
+    if (cap::g_pass) cap::NoteTargets(key, rs, clr.depth, clr.stencil);
+
+    const TableStage table_stages[4] = {
+        {ls, r.ls_es_ud, &r.ls_es_rt, &r.ls_es_flat, &r.ls_es_img},
+        {hs, r.hs_gs_ud, &r.hs_gs_rt, &r.hs_gs_flat, &r.hs_gs_img},
+        {vs, r.vs_ud, &r.vs_rt, &r.vs_flat, &r.vs_img},
+        {ps, r.ps_ud, &r.ps_rt, &r.ps_flat, &r.ps_img},
+    };
+    if (!ResolveTableHazards(table_stages, 4, r.table_snap)) {
+        cap::SetSkipped(kCapTableHazardSkip);
+        NoteSkip(SkipReason::TableHazard);
+        return;
+    }
+    if (!g_only_clears) {
+        for (int si = 0; si < 4; ++si) {
+            if (!table_stages[si].s) continue;
+            ResolveTextureHazards(table_stages[si].s, *table_stages[si].flat);
+            PrepareDepthCompanions(table_stages[si].s, *table_stages[si].flat);
+        }
+    }
+
+    const gcn_push_data push = MakePushData(regs);
+    BindCtx bc{&regs, 1};
+    std::string why;
+
+    // ---- Step 1: Compute Pre-Pass (LS + HS)
+    if (!g_only_clears) {
+        for (uint32_t inst_idx = 0; inst_idx < inst; ++inst_idx) {
+            const size_t ls_out_inst_off = ls_out_off + inst_idx * ls_out_inst_bytes;
+            const size_t hs_cp_inst_off = hs_cp_off + inst_idx * hs_cp_inst_bytes;
+            const size_t hs_patch_inst_off = hs_patch_off + inst_idx * hs_patch_inst_bytes;
+            const size_t tf_inst_off = tf_off + inst_idx * tf_inst_bytes;
+
+            ComputeEncoder();
+            uint64_t cserial = S.be->EncoderSerial();
+            if (!g_cstate.Tracks(cserial) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)tpipe->ls_pso))
+                S.be->SetComputePipeline(tpipe->ls_pso);
+            S.storage_bound.clear();
+            S.buffer_stores.clear();
+            Binder lb{.stage = Stage::Compute, .serial = cserial};
+            if (!BindStage(ls, r.ls_es_ud, r.ls_es_flat, lb, bc, push, &why)) {
+                RLog("bind", "%s: LS bind failed: %s", args.name, why.c_str());
+                NoteSkip(SkipReason::VsBind);
+                return;
+            }
+            if (S.be->OpenEncoder() != GnmEncoder::Compute || S.be->EncoderSerial() != cserial) {
+                ComputeEncoder();
+                cserial = S.be->EncoderSerial();
+                if (!g_cstate.Tracks(cserial) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)tpipe->ls_pso))
+                    S.be->SetComputePipeline(tpipe->ls_pso);
+                S.storage_bound.clear();
+                S.buffer_stores.clear();
+                lb = Binder{.stage = Stage::Compute, .serial = cserial};
+                if (!BindStage(ls, r.ls_es_ud, r.ls_es_flat, lb, bc, push, &why)) {
+                    NoteSkip(SkipReason::VsBind);
+                    return;
+                }
+            }
+            lb.Buffer(ls_out_buf, ls_out_inst_off, GCN_TESS_OUTPUT_BUFFER_SLOT);
+            if (args.indexed) lb.Buffer(ib, ib_off, GCN_TESS_INDEX_BUFFER_SLOT);
+            for (size_t i = 0; i < vbufs.size(); ++i) lb.Buffer(vbufs[i].first, vbufs[i].second, vattrs[i].buffer);
+            S.be->SetStageInRegion(
+                MTLRegionMake2D(vertex_offset, instance_offset + inst_idx, ls_vertices_per_inst, 1));
+
+            const uint32_t ls_tg_x =
+                std::max<uint32_t>(1u, std::min<uint32_t>(64u, (uint32_t)tpipe->ls_pso.maxTotalThreadsPerThreadgroup));
+            S.be->DispatchThreads(MTLSizeMake(ls_vertices_per_inst, 1, 1), MTLSizeMake(ls_tg_x, 1, 1));
+            FlushBufferStores();
+
+            S.be->Barrier(kGnmStageDispatch, kGnmStageDispatch, kGnmScopeBuffers);
+            S.n_cbarriers++;
+            S.cbarriers_total++;
+
+            if (!g_cstate.Tracks(cserial) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)tpipe->hs_pso))
+                S.be->SetComputePipeline(tpipe->hs_pso);
+            S.storage_bound.clear();
+            S.buffer_stores.clear();
+            Binder hb{.stage = Stage::Compute, .serial = cserial};
+            if (!BindStage(hs, r.hs_gs_ud, r.hs_gs_flat, hb, bc, push, &why)) {
+                RLog("bind", "%s: HS bind failed: %s", args.name, why.c_str());
+                NoteSkip(SkipReason::VsBind);
+                return;
+            }
+            if (S.be->OpenEncoder() != GnmEncoder::Compute || S.be->EncoderSerial() != cserial) {
+                ComputeEncoder();
+                cserial = S.be->EncoderSerial();
+                if (!g_cstate.Tracks(cserial) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)tpipe->hs_pso))
+                    S.be->SetComputePipeline(tpipe->hs_pso);
+                S.storage_bound.clear();
+                S.buffer_stores.clear();
+                hb = Binder{.stage = Stage::Compute, .serial = cserial};
+                if (!BindStage(hs, r.hs_gs_ud, r.hs_gs_flat, hb, bc, push, &why)) {
+                    NoteSkip(SkipReason::VsBind);
+                    return;
+                }
+            }
+            hb.Buffer(hs_cp_buf, hs_cp_inst_off, GCN_TESS_OUTPUT_BUFFER_SLOT);
+            hb.Buffer(hs_patch_buf, hs_patch_inst_off, GCN_TESS_PATCH_BUFFER_SLOT);
+            hb.Buffer(tf_buf, tf_inst_off, GCN_TESS_FACTOR_BUFFER_SLOT);
+            const uint32_t hs_params[2] = {num_cp, patch_count};
+            hb.Bytes(hs_params, sizeof(hs_params), GCN_TESS_PARAMS_BUFFER_SLOT);
+            hb.Buffer(ls_out_buf, ls_out_inst_off, GCN_TESS_INPUT_BUFFER_SLOT);
+
+            const uint32_t hs_tg_x =
+                std::max<uint32_t>(1u, std::min<uint32_t>(64u, (uint32_t)tpipe->hs_pso.maxTotalThreadsPerThreadgroup));
+            S.be->DispatchThreads(MTLSizeMake((uint64_t)patch_count * out_cp, 1, 1), MTLSizeMake(hs_tg_x, 1, 1));
+            FlushBufferStores();
+        }
+    }
+
+    // ---- Step 2: Render Pass (DS + PS)
+    if (!BeginPass(key, clr, hold, true)) {
+        NoteSkip(SkipReason::PassBegin);
+        return;
+    }
+    meta_undo.Keep();
+    if (g_only_clears) {
+        S.n_clear_only++;
+        return;
+    }
+
+    const uint64_t enc_serial = S.be->EncoderSerial();
+    EncoderState* es = g_rstate.Tracks(enc_serial) ? &g_rstate : nullptr;
+    if (!es || !es->Same(es->pso, (__bridge const void*)tpipe->ds_ps_pso))
+        S.be->SetRenderPipeline(tpipe->ds_ps_pso);
+    const bool has_depth = depth_fmt != 0;
+    const bool has_stencil = has_depth && HasStencil((MTLPixelFormat)depth_fmt);
+    id<MTLDepthStencilState> dss = GetDepthStencil(rs.ds, has_depth, has_stencil);
+    if (!es || !es->Same(es->dss, (__bridge const void*)dss)) S.be->SetDepthStencil(dss);
+    {
+        EncoderState::Fixed f;
+        memset(&f, 0, sizeof(f));
+        f.vp = vp;
+        f.sc = sc;
+        f.stencil_ref[0] = rs.ds.front.reference;
+        f.stencil_ref[1] = rs.ds.back.reference;
+        f.cull = (uint32_t)rs.raster.cull_mode;
+        f.winding = (uint32_t)rs.raster.winding;
+        f.fill = (uint32_t)rs.raster.fill_mode;
+        f.clip = rs.raster.depth_clip ? (uint32_t)MTLDepthClipModeClip : (uint32_t)MTLDepthClipModeClamp;
+        if (rs.raster.depth_bias) {
+            f.bias[0] = rs.raster.bias_constant;
+            f.bias[1] = rs.raster.bias_slope;
+            f.bias[2] = rs.raster.bias_clamp;
+        }
+        for (int i = 0; i < 4; ++i) f.blend[i] = rs.blend_constants[i];
+        uint32_t changed = kGnmFixedViewport | kGnmFixedScissor | kGnmFixedCull | kGnmFixedWinding |
+                           kGnmFixedFill | kGnmFixedClip | kGnmFixedBias | kGnmFixedBlend;
+        if (has_stencil) changed |= kGnmFixedStencilRef;
+        S.be->SetFixed(f, changed);
+        if (es) {
+            es->fixed_stencil = has_stencil;
+            es->fixed = f;
+            es->fixed_gen = es->gen;
+        }
+    }
+
+    Binder vb{.stage = Stage::Vertex, .serial = enc_serial};
+    S.buffer_stores.clear();
+    if (!BindStage(vs, r.vs_ud, r.vs_flat, vb, bc, push, &why)) {
+        RLog("bind", "%s: DS bind failed: %s", args.name, why.c_str());
+        NoteSkip(SkipReason::VsBind);
+        return;
+    }
+    if (ps) {
+        Binder fb{.stage = Stage::Fragment, .serial = enc_serial};
+        if (!BindStage(ps, r.ps_ud, r.ps_flat, fb, bc, push, &why)) {
+            RLog("bind", "%s: PS bind failed: %s", args.name, why.c_str());
+            NoteSkip(SkipReason::PsBind);
+            return;
+        }
+    }
+    if (S.be->OpenEncoder() != GnmEncoder::Render || S.be->EncoderSerial() != enc_serial) {
+        NoteSkip(SkipReason::Reencode);
+        return;
+    }
+
+    OcclBeforeDraw(regs[0xA001]);
+    for (uint32_t inst_idx = 0; inst_idx < inst; ++inst_idx) {
+        const size_t hs_cp_inst_off = hs_cp_off + inst_idx * hs_cp_inst_bytes;
+        const size_t hs_patch_inst_off = hs_patch_off + inst_idx * hs_patch_inst_bytes;
+        const size_t tf_inst_off = tf_off + inst_idx * tf_inst_bytes;
+        vb.Buffer(hs_cp_buf, hs_cp_inst_off, GCN_TESS_INPUT_BUFFER_SLOT);
+        vb.Buffer(hs_patch_buf, hs_patch_inst_off, GCN_TESS_PATCH_BUFFER_SLOT);
+        vb.Buffer(tf_buf, tf_inst_off, GCN_TESS_FACTOR_BUFFER_SLOT);
+        S.be->SetTessellationFactorBuffer(tf_buf, tf_inst_off, 0);
+        S.be->DrawPatches(out_cp, 0, patch_count, nil, 0, 1, instance_offset + inst_idx);
+    }
+    S.pending = true;
+    S.n_draws++;
+    FlushBufferStores();
+    if (cap::g_pass) cap::Encoded(args.indirect_addr);
+    {
+        WorkRec wr;
+        wr.what = args.name;
+        wr.a = r.vs_addr;
+        wr.b = r.ps_addr;
+        wr.n = args.count;
+        wr.inst = inst;
+        LogWork(wr);
+    }
+}
+
+void EncodeGsDraw(DrawRec& r) {
+    const DrawArgs& args = r.args;
+    RenderState& rs = r.rs;
+    const RegSnap& regs = r.regs;
+    Shader* const es = r.ls_es;
+    Shader* const gs = r.hs_gs;
+    Shader* const ps = r.ps;
+    if (!es || !gs) return;
+
+    StageImagesScope images(&r.ls_es_img, &r.hs_gs_img, &r.ps_img, nullptr);
+
+    PassKey key;
+    id<MTLTexture> hold[9] = {};
+    uint32_t color_fmt[8] = {}, write_mask[8] = {};
+    ClearReq clr;
+    MetaTakeUndo meta_undo;
+    uint32_t rt_w = 16384, rt_h = 16384, samples = 0;
+    bool any_rt = false;
+    const uint32_t mrt_mask = ps ? ps->info.mrt_mask : 0;
+    for (int i = 0; i < 8; ++i) {
+        const ColorTarget& c = rs.color[i];
+        if (!c.enabled || !(mrt_mask & (1u << i))) continue;
+        if (!c.mtl_format) continue;
+        if (c.fast_clear || c.compression) RegisterMeta(c.cmask_address);
+        const bool pending_write = c.num_samples == 1 && S.detile_pso != nil &&
+                                   BackendHas(kGnmCapCompute | kGnmCapCopies) &&
+                                   OverlapsPendingWrite(c.address, std::max<uint64_t>(c.slice_bytes, 1));
+        id<MTLTexture> grown_from = nil;
+        id<MTLTexture> t = S.tex->GetColorTarget(c, true, c.mtl_write_mask != 0, pending_write, &grown_from);
+        if (!t) continue;
+        if (grown_from && BackendHas(kGnmCapCopies, "copy of a grown color array's slices")) {
+            EndEncoders();
+            EnsureCmd();
+            S.be->BeginCopies();
+            for (NSUInteger sl = 0; sl < grown_from.arrayLength && sl < t.arrayLength; ++sl)
+                S.be->CopyTextureRegion(grown_from, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0),
+                                        MTLSizeMake(t.width, t.height, 1), t, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0));
+            S.be->EndEncoder();
+        }
+        if (samples && t.sampleCount != samples) continue;
+        samples = (uint32_t)t.sampleCount;
+        key.color[i] = t;
+        key.color_slice[i] = t.textureType == MTLTextureType2DArray
+                                 ? std::min<uint32_t>(c.base_slice, (uint32_t)t.arrayLength - 1)
+                                 : 0;
+        hold[i] = t;
+        color_fmt[i] = (uint32_t)t.pixelFormat;
+        write_mask[i] = c.mtl_write_mask;
+        rt_w = std::min<uint32_t>(rt_w, (uint32_t)t.width);
+        rt_h = std::min<uint32_t>(rt_h, (uint32_t)t.height);
+        any_rt = true;
+        uint64_t clear_seq = 0;
+        const uint32_t cmask_slice = std::min<uint32_t>(c.base_slice, 63);
+        if (c.fast_clear && TakeMetaCleared(c.cmask_address, &clear_seq, cmask_slice, CmaskSliceBytesOf(c))) {
+            meta_undo.Add(c.cmask_address, cmask_slice, clear_seq);
+            if (ClearColorFor(t.pixelFormat, c.clear_word0, c.clear_word1, &clr.color_value[i])) {
+                clr.color[i] = true;
+                NoteClearedColor(c, t, clear_seq);
+            }
+        }
+    }
+
+    uint32_t depth_fmt = 0;
+    const DepthTarget& db = rs.depth;
+    const bool want_depth = rs.ds.depth_test || rs.ds.stencil_test;
+    if (want_depth && db.bound && db.mtl_format) {
+        if (db.htile_enable) RegisterMeta(db.htile_address);
+        id<MTLTexture> grown_from = nil;
+        const auto stencil_writes = [](const StencilFace& f) {
+            return f.write_mask != 0 && (f.fail != MTLStencilOperationKeep || f.depth_fail != MTLStencilOperationKeep ||
+                                         f.pass != MTLStencilOperationKeep);
+        };
+        const bool ds_written = rs.ds.depth_write || db.depth_clear_enable || db.stencil_clear_enable ||
+                                (rs.ds.stencil_test && (stencil_writes(rs.ds.front) || stencil_writes(rs.ds.back)));
+        id<MTLTexture> t = S.tex->GetDepthTarget(db, &grown_from, ds_written);
+        if (t && grown_from && BackendHas(kGnmCapCopies, "copy of a grown depth array's slices")) {
+            EndEncoders();
+            EnsureCmd();
+            S.be->BeginCopies();
+            for (NSUInteger sl = 0; sl < grown_from.arrayLength && sl < t.arrayLength; ++sl)
+                S.be->CopyTextureRegion(grown_from, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0),
+                                        MTLSizeMake(t.width, t.height, 1), t, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0));
+            S.be->EndEncoder();
+        }
+        if (t && (!samples || t.sampleCount == samples)) {
+            SyncDepthSibling(db, t);
+            samples = (uint32_t)t.sampleCount;
+            key.depth = t;
+            key.depth_slice = t.textureType == MTLTextureType2DArray
+                                  ? std::min<uint32_t>(db.base_slice, (uint32_t)t.arrayLength - 1)
+                                  : 0;
+            hold[8] = t;
+            depth_fmt = (uint32_t)t.pixelFormat;
+            rt_w = std::min<uint32_t>(rt_w, (uint32_t)t.width);
+            rt_h = std::min<uint32_t>(rt_h, (uint32_t)t.height);
+            any_rt = true;
+            if (db.stencil_read_address) S.stencil_to_z[db.stencil_read_address] = db.z_read_address;
+            const uint32_t dc = regs[0xA200];
+            const bool depth_enable = (dc >> 1) & 1, depth_write = (dc >> 2) & 1;
+            if (depth_write || rs.ds.stencil_test || db.depth_clear_enable || db.stencil_clear_enable)
+                BumpDepthVersion(t);
+            uint64_t htile_seq = 0;
+            const uint32_t htile_slice = std::min<uint32_t>(db.base_slice, 63);
+            const bool htile_clear =
+                db.htile_enable && TakeMetaCleared(db.htile_address, &htile_seq, htile_slice, HtileSliceBytesOf(db));
+            if (htile_clear) meta_undo.Add(db.htile_address, htile_slice, htile_seq);
+            if ((db.depth_clear_enable && depth_enable && depth_write) || htile_clear) {
+                clr.depth = true;
+                clr.depth_value = db.depth_clear;
+                const uint64_t za = db.z_read_address ? db.z_read_address : db.stencil_read_address;
+                const uint64_t seq = (db.depth_clear_enable && depth_enable && depth_write) ? S.committed_seq + 1
+                                                                                              : htile_seq;
+                if (db.z_read_address && db.slice_bytes && seq)
+                    S.tex->NoteExactWrite(za, t, za + (uint64_t)db.base_slice * db.slice_bytes,
+                                          za + (uint64_t)(db.base_slice + 1) * db.slice_bytes, seq);
+            }
+            if (db.stencil_clear_enable && HasStencil(t.pixelFormat)) {
+                clr.stencil = true;
+                clr.stencil_value = db.stencil_clear;
+            }
+        }
+    }
+    if (!samples) samples = 1;
+    const uint32_t aa_samples = 1u << (regs[0xA2F8] & 7);
+    if (samples > 1 && aa_samples > 1) key.sample_locs = regs[0xA2FE];
+    if (!any_rt) {
+        if (!ps) {
+            rt_w = 16;
+            rt_h = 16;
+        } else {
+            rt_w = std::max(1u, std::min(16384u, rs.scissor.x + rs.scissor.width));
+            rt_h = std::max(1u, std::min(16384u, rs.scissor.y + rs.scissor.height));
+        }
+    }
+    key.width = any_rt ? 0 : rt_w;
+    key.height = any_rt ? 0 : rt_h;
+
+    static std::vector<VertexAttr>& vattrs = *new std::vector<VertexAttr>;
+    static std::vector<uint32_t>& vlocs = *new std::vector<uint32_t>;
+    static std::vector<std::pair<id<MTLBuffer>, uint64_t>>& vbufs = *new std::vector<std::pair<id<MTLBuffer>, uint64_t>>;
+    vattrs.clear();
+    vlocs.clear();
+    vbufs.clear();
+    for (uint32_t i = 0; i < es->attrs.size(); ++i) {
+        const gcn_vertex_attrib& a = es->attrs[i];
+        const BufferDesc& bd = r.vtx[i].bd;
+        const VertexFormatInfo& vf = r.vtx[i].vf;
+        const uint32_t slot = GCN_TESS_VERTEX_ATTR_BASE_SLOT + i;
+        VertexAttr va{};
+        va.format = vf.mtl_vertex_format;
+        va.offset = 0;
+        va.buffer = slot;
+        uint32_t stride = bd.stride;
+        id<MTLBuffer> mb = S.dummy;
+        uint64_t off = 0;
+        if (bd.address && bd.size) {
+            if (!GuestBuffer(bd.address & ~3ull, bd.size + 4, GuestAccess::Read, &mb, &off)) {
+                mb = S.dummy;
+                off = 0;
+            }
+        }
+        if (a.step_rate == 0) {
+            va.step_fn = stride ? MTLVertexStepFunctionPerVertex : MTLVertexStepFunctionConstant;
+            va.step_rate = stride ? 1 : 0;
+        } else {
+            va.step_fn = MTLVertexStepFunctionPerInstance;
+            va.step_rate = std::max(1u, a.divisor);
+        }
+        if (stride == 0) va.step_fn = MTLVertexStepFunctionConstant, va.step_rate = 0;
+        va.stride = stride;
+        vattrs.push_back(va);
+        vlocs.push_back(a.location);
+        vbufs.push_back({mb, off});
+    }
+
+    const uint32_t index_mode = args.indexed ? (args.index_type == 1 ? 2u : 1u) : 0u;
+    id<MTLBuffer> ib = nil;
+    uint64_t ib_off = 0;
+    if (args.indexed) {
+        const uint64_t isz = args.index_type == 1 ? 4 : 2;
+        const uint64_t addr = args.index_base + (uint64_t)args.index_offset * isz;
+        const uint64_t bytes = (uint64_t)args.count * isz;
+        if (!args.index_base || !GuestBuffer(addr, bytes, GuestAccess::Read, &ib, &ib_off)) {
+            RLog("ib", "%s: index buffer 0x%llx unavailable", args.name, (unsigned long long)addr);
+            NoteSkip(SkipReason::IndexBuffer);
+            return;
+        }
+        if (ib_off & 3) {
+            void* ptr;
+            size_t aoff;
+            if (!S.arena.Alloc(S.dev, bytes, 16, &ib, &aoff, &ptr)) {
+                NoteSkip(SkipReason::Arena);
+                return;
+            }
+            memcpy(ptr, S.ctx->mem_base + addr, bytes);
+            ib_off = aoff;
+        }
+    }
+
+    const bool a2c = (regs[0xA2DC] & 1) != 0;
+    const bool emulate_depth_neg_one_to_one =
+        ((regs[0xA204] >> 19) & 1u) == 0 && !S.profile.supports_depth_clip_control;
+    const GsPipelineState* gpipe =
+        GetGsPipelines(es, gs, ps, rs, color_fmt, write_mask, depth_fmt, samples, vattrs, vlocs,
+                       a2c, index_mode, emulate_depth_neg_one_to_one);
+    if (!gpipe) {
+        NoteSkip(SkipReason::PipelineFailed);
+        return;
+    }
+
+    MTLViewport vp;
+    MTLScissorRect sc;
+    const uint32_t pw = any_rt ? rt_w : key.width, ph = any_rt ? rt_h : key.height;
+    if (rs.num_viewports > 0) {
+        const Viewport& v = rs.viewports[0];
+        vp = ToMTLViewport(v);
+        vp.znear = std::min(1.0, std::max(0.0, vp.znear));
+        vp.zfar = std::min(1.0, std::max(0.0, vp.zfar));
+        sc = ToMTLScissor(rs.scissors[0], pw, ph);
+    } else {
+        vp = MTLViewport{0, 0, (double)pw, (double)ph, 0, 1};
+        sc = ToMTLScissor(rs.scissor, pw, ph);
+    }
+    if (sc.width == 0 || sc.height == 0) {
+        NoteSkip(SkipReason::ScissorEmpty);
+        return;
+    }
+
+    uint32_t vertex_offset = regs[0xA102];
+    uint32_t instance_offset = 0;
+    if (es->info.has_fetch_shader) {
+        if (vertex_offset == 0 && es->info.vertex_offset_sgpr >= 0 && es->info.vertex_offset_sgpr < 16)
+            vertex_offset = r.ls_es_ud[es->info.vertex_offset_sgpr];
+        if (es->info.instance_offset_sgpr >= 0 && es->info.instance_offset_sgpr < 16)
+            instance_offset = r.ls_es_ud[es->info.instance_offset_sgpr];
+    }
+
+    uint32_t prim_count = 0;
+    uint32_t gs_prim_type = 0; // 0=list, 1=strip, 2=fan, 3=adj_list, 4=adj_strip, 5=patch
+    uint32_t verts_per_prim = std::max(1u, gpipe->input_vertices);
+    const uint32_t index_count = args.count;
+    switch (rs.raster.prim) {
+        case PrimitiveType::PointList:
+            prim_count = index_count;
+            gs_prim_type = 0;
+            verts_per_prim = 1;
+            break;
+        case PrimitiveType::LineList:
+            prim_count = index_count / 2;
+            gs_prim_type = 0;
+            verts_per_prim = 2;
+            break;
+        case PrimitiveType::LineStrip:
+            prim_count = index_count >= 2 ? index_count - 1 : 0;
+            gs_prim_type = 1;
+            verts_per_prim = 2;
+            break;
+        case PrimitiveType::TriangleList:
+            prim_count = index_count / 3;
+            gs_prim_type = 0;
+            verts_per_prim = 3;
+            break;
+        case PrimitiveType::TriangleFan:
+            prim_count = index_count >= 3 ? index_count - 2 : 0;
+            gs_prim_type = 2;
+            verts_per_prim = 3;
+            break;
+        case PrimitiveType::TriangleStrip:
+            prim_count = index_count >= 3 ? index_count - 2 : 0;
+            gs_prim_type = 1;
+            verts_per_prim = 3;
+            break;
+        case PrimitiveType::AdjLineList:
+            prim_count = index_count / 4;
+            gs_prim_type = 3;
+            verts_per_prim = 4;
+            break;
+        case PrimitiveType::AdjLineStrip:
+            prim_count = index_count >= 4 ? index_count - 3 : 0;
+            gs_prim_type = 4;
+            verts_per_prim = 4;
+            break;
+        case PrimitiveType::AdjTriangleList:
+            prim_count = index_count / 6;
+            gs_prim_type = 3;
+            verts_per_prim = 6;
+            break;
+        case PrimitiveType::AdjTriangleStrip:
+            prim_count = index_count >= 6 ? (index_count - 4) / 2 : 0;
+            gs_prim_type = 4;
+            verts_per_prim = 6;
+            break;
+        default:
+            prim_count = index_count / verts_per_prim;
+            gs_prim_type = 0;
+            break;
+    }
+    if (prim_count == 0) return;
+
+    const uint32_t inst = std::max(1u, args.num_instances);
+    const uint32_t total_prims = prim_count * inst;
+    const uint32_t es_verts_per_inst = index_count;
+    const uint32_t total_es_verts = es_verts_per_inst * inst;
+    const uint32_t max_out_verts = std::max(1u, gpipe->max_vertices);
+    const uint32_t idx_slots = std::max(1u, gpipe->index_slots);
+
+    const size_t es_out_bytes = std::max<size_t>(256, (size_t)total_es_verts * std::max(4u, gpipe->es_stride));
+    const size_t gs_rec_bytes =
+        std::max<size_t>(256, (size_t)total_prims * max_out_verts * std::max(16u, gpipe->record_stride));
+    const size_t gs_idx_bytes = std::max<size_t>(256, (size_t)total_prims * idx_slots * sizeof(uint32_t));
+
+    id<MTLBuffer> es_out_buf = nil, gs_rec_buf = nil, gs_idx_buf = nil;
+    size_t es_out_off = 0, gs_rec_off = 0, gs_idx_off = 0;
+    void* unused_ptr = nullptr;
+    if (!S.arena.Alloc(S.dev, es_out_bytes, 256, &es_out_buf, &es_out_off, &unused_ptr) ||
+        !S.arena.Alloc(S.dev, gs_rec_bytes, 256, &gs_rec_buf, &gs_rec_off, &unused_ptr) ||
+        !S.arena.Alloc(S.dev, gs_idx_bytes, 256, &gs_idx_buf, &gs_idx_off, &unused_ptr)) {
+        NoteSkip(SkipReason::Arena);
+        return;
+    }
+
+    for (int i = 0; i < 8; ++i)
+        if (key.color[i]) RefreshGuestNewer(rs.color[i].address, key.color[i], true);
+    if (cap::g_pass) cap::NoteTargets(key, rs, clr.depth, clr.stencil);
+
+    const TableStage table_stages[3] = {
+        {es, r.ls_es_ud, &r.ls_es_rt, &r.ls_es_flat, &r.ls_es_img},
+        {gs, r.hs_gs_ud, &r.hs_gs_rt, &r.hs_gs_flat, &r.hs_gs_img},
+        {ps, r.ps_ud, &r.ps_rt, &r.ps_flat, &r.ps_img},
+    };
+    if (!ResolveTableHazards(table_stages, 3, r.table_snap)) {
+        cap::SetSkipped(kCapTableHazardSkip);
+        NoteSkip(SkipReason::TableHazard);
+        return;
+    }
+    if (!g_only_clears) {
+        for (int si = 0; si < 3; ++si) {
+            if (!table_stages[si].s) continue;
+            ResolveTextureHazards(table_stages[si].s, *table_stages[si].flat);
+            PrepareDepthCompanions(table_stages[si].s, *table_stages[si].flat);
+        }
+    }
+
+    const gcn_push_data push = MakePushData(regs);
+    BindCtx bc{&regs, 1};
+    std::string why;
+
+    // ---- Step 1: Compute Pre-Pass (ES + GS)
+    if (!g_only_clears) {
+        ComputeEncoder();
+        uint64_t cserial = S.be->EncoderSerial();
+        if (!g_cstate.Tracks(cserial) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)gpipe->es_pso))
+            S.be->SetComputePipeline(gpipe->es_pso);
+        S.storage_bound.clear();
+        S.buffer_stores.clear();
+        Binder eb{.stage = Stage::Compute, .serial = cserial};
+        if (!BindStage(es, r.ls_es_ud, r.ls_es_flat, eb, bc, push, &why)) {
+            RLog("bind", "%s: ES bind failed: %s", args.name, why.c_str());
+            NoteSkip(SkipReason::VsBind);
+            return;
+        }
+        if (S.be->OpenEncoder() != GnmEncoder::Compute || S.be->EncoderSerial() != cserial) {
+            ComputeEncoder();
+            cserial = S.be->EncoderSerial();
+            if (!g_cstate.Tracks(cserial) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)gpipe->es_pso))
+                S.be->SetComputePipeline(gpipe->es_pso);
+            S.storage_bound.clear();
+            S.buffer_stores.clear();
+            eb = Binder{.stage = Stage::Compute, .serial = cserial};
+            if (!BindStage(es, r.ls_es_ud, r.ls_es_flat, eb, bc, push, &why)) {
+                NoteSkip(SkipReason::VsBind);
+                return;
+            }
+        }
+        eb.Buffer(es_out_buf, es_out_off, GCN_TESS_OUTPUT_BUFFER_SLOT);
+        if (args.indexed) eb.Buffer(ib, ib_off, GCN_TESS_INDEX_BUFFER_SLOT);
+        for (size_t i = 0; i < vbufs.size(); ++i) eb.Buffer(vbufs[i].first, vbufs[i].second, vattrs[i].buffer);
+        S.be->SetStageInRegion(MTLRegionMake2D(vertex_offset, instance_offset, es_verts_per_inst, inst));
+
+        const uint32_t es_tg_x =
+            std::max<uint32_t>(1u, std::min<uint32_t>(64u, (uint32_t)gpipe->es_pso.maxTotalThreadsPerThreadgroup));
+        S.be->DispatchThreads(MTLSizeMake(es_verts_per_inst, inst, 1), MTLSizeMake(es_tg_x, 1, 1));
+        FlushBufferStores();
+
+        S.be->Barrier(kGnmStageDispatch, kGnmStageDispatch, kGnmScopeBuffers);
+        S.n_cbarriers++;
+        S.cbarriers_total++;
+
+        if (!g_cstate.Tracks(cserial) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)gpipe->gs_pso))
+            S.be->SetComputePipeline(gpipe->gs_pso);
+        S.storage_bound.clear();
+        S.buffer_stores.clear();
+        Binder gb{.stage = Stage::Compute, .serial = cserial};
+        if (!BindStage(gs, r.hs_gs_ud, r.hs_gs_flat, gb, bc, push, &why)) {
+            RLog("bind", "%s: GS bind failed: %s", args.name, why.c_str());
+            NoteSkip(SkipReason::VsBind);
+            return;
+        }
+        if (S.be->OpenEncoder() != GnmEncoder::Compute || S.be->EncoderSerial() != cserial) {
+            ComputeEncoder();
+            cserial = S.be->EncoderSerial();
+            if (!g_cstate.Tracks(cserial) || !g_cstate.Same(g_cstate.pso, (__bridge const void*)gpipe->gs_pso))
+                S.be->SetComputePipeline(gpipe->gs_pso);
+            S.storage_bound.clear();
+            S.buffer_stores.clear();
+            gb = Binder{.stage = Stage::Compute, .serial = cserial};
+            if (!BindStage(gs, r.hs_gs_ud, r.hs_gs_flat, gb, bc, push, &why)) {
+                NoteSkip(SkipReason::VsBind);
+                return;
+            }
+        }
+        gb.Buffer(es_out_buf, es_out_off, GCN_GEO_ES_BUFFER_SLOT);
+        gb.Buffer(gs_rec_buf, gs_rec_off, GCN_GEO_RECORD_BUFFER_SLOT);
+        gb.Buffer(gs_idx_buf, gs_idx_off, GCN_GEO_INDEX_BUFFER_SLOT);
+        const uint32_t gs_params[2] = {total_prims, 0u};
+        gb.Bytes(gs_params, sizeof(gs_params), GCN_GEO_PARAMS_BUFFER_SLOT);
+
+        const uint32_t gs_tg_x =
+            std::max<uint32_t>(1u, std::min<uint32_t>(64u, (uint32_t)gpipe->gs_pso.maxTotalThreadsPerThreadgroup));
+        S.be->DispatchThreads(MTLSizeMake(total_prims, 1, 1), MTLSizeMake(gs_tg_x, 1, 1));
+        FlushBufferStores();
+    }
+
+    // ---- Step 2: Render Pass (Pass-Through VS + PS)
+    if (!BeginPass(key, clr, hold, true)) {
+        NoteSkip(SkipReason::PassBegin);
+        return;
+    }
+    meta_undo.Keep();
+    if (g_only_clears) {
+        S.n_clear_only++;
+        return;
+    }
+
+    const uint64_t enc_serial = S.be->EncoderSerial();
+    EncoderState* est = g_rstate.Tracks(enc_serial) ? &g_rstate : nullptr;
+    if (!est || !est->Same(est->pso, (__bridge const void*)gpipe->vs_ps_pso))
+        S.be->SetRenderPipeline(gpipe->vs_ps_pso);
+    const bool has_depth = depth_fmt != 0;
+    const bool has_stencil = has_depth && HasStencil((MTLPixelFormat)depth_fmt);
+    id<MTLDepthStencilState> dss = GetDepthStencil(rs.ds, has_depth, has_stencil);
+    if (!est || !est->Same(est->dss, (__bridge const void*)dss)) S.be->SetDepthStencil(dss);
+    {
+        EncoderState::Fixed f;
+        memset(&f, 0, sizeof(f));
+        f.vp = vp;
+        f.sc = sc;
+        f.stencil_ref[0] = rs.ds.front.reference;
+        f.stencil_ref[1] = rs.ds.back.reference;
+        f.cull = (uint32_t)rs.raster.cull_mode;
+        f.winding = (uint32_t)rs.raster.winding;
+        f.fill = (uint32_t)rs.raster.fill_mode;
+        f.clip = rs.raster.depth_clip ? (uint32_t)MTLDepthClipModeClip : (uint32_t)MTLDepthClipModeClamp;
+        if (rs.raster.depth_bias) {
+            f.bias[0] = rs.raster.bias_constant;
+            f.bias[1] = rs.raster.bias_slope;
+            f.bias[2] = rs.raster.bias_clamp;
+        }
+        for (int i = 0; i < 4; ++i) f.blend[i] = rs.blend_constants[i];
+        uint32_t changed = kGnmFixedViewport | kGnmFixedScissor | kGnmFixedCull | kGnmFixedWinding |
+                           kGnmFixedFill | kGnmFixedClip | kGnmFixedBias | kGnmFixedBlend;
+        if (has_stencil) changed |= kGnmFixedStencilRef;
+        S.be->SetFixed(f, changed);
+        if (est) {
+            est->fixed_stencil = has_stencil;
+            est->fixed = f;
+            est->fixed_gen = est->gen;
+        }
+    }
+
+    S.buffer_stores.clear();
+    if (ps) {
+        Binder fb{.stage = Stage::Fragment, .serial = enc_serial};
+        if (!BindStage(ps, r.ps_ud, r.ps_flat, fb, bc, push, &why)) {
+            RLog("bind", "%s: PS bind failed: %s", args.name, why.c_str());
+            NoteSkip(SkipReason::PsBind);
+            return;
+        }
+    }
+    if (S.be->OpenEncoder() != GnmEncoder::Render || S.be->EncoderSerial() != enc_serial) {
+        NoteSkip(SkipReason::Reencode);
+        return;
+    }
+    Binder vb{.stage = Stage::Vertex, .serial = enc_serial};
+    // The pass-through vertex shader generated by RewriteGeometryShader reads `records [[buffer(0)]]`.
+    vb.Buffer(gs_rec_buf, gs_rec_off, 0);
+
+    OcclBeforeDraw(regs[0xA001]);
+    const uint32_t gs_out_type = regs[0xA29B] & 0x3u; // VGT_GS_OUT_PRIM_TYPE: 0=PointList, 1=LineStrip, 2=TriStrip
+    GnmDraw d;
+    d.kind = GnmDrawKind::Indexed;
+    if (gs_out_type == 0)
+        d.prim = MTLPrimitiveTypePoint;
+    else if (gs_out_type == 1 || gpipe->output_primitive == GCN_GS_OUTPUT_LINE_STRIP)
+        d.prim = MTLPrimitiveTypeLineStrip;
+    else
+        d.prim = MTLPrimitiveTypeTriangleStrip;
+    d.index_type = MTLIndexTypeUInt32;
+    d.index_buffer = gs_idx_buf;
+    d.index_offset = gs_idx_off;
+    d.index_length = gs_idx_bytes;
+    d.count = total_prims * idx_slots;
+    d.instances = 1;
+    S.be->Draw(d);
+    S.pending = true;
+    S.n_draws++;
+    FlushBufferStores();
+    if (cap::g_pass) cap::Encoded(args.indirect_addr);
+    {
+        WorkRec wr;
+        wr.what = args.name;
+        wr.a = r.hs_gs_addr;
+        wr.b = r.ps_addr;
+        wr.n = args.count;
+        wr.inst = inst;
+        LogWork(wr);
+    }
+}
+
 void DrawEncode(DrawRec& r) {
     const AliasJob alias_job;
     const TableReadEncoded table_read(r.table_snap);
@@ -9320,6 +11243,11 @@ void DrawEncode(DrawRec& r) {
     if (S.hung) return;
     cap::EncodeScope cap_scope;
     DrainAsyncPsos();
+    if (r.stage_mode != 0) {
+        if (r.stage_mode == 1) EncodeTessDraw(r);
+        else if (r.stage_mode == 2) EncodeGsDraw(r);
+        return;
+    }
     const DrawArgs& args = r.args;
     RenderState& rs = r.rs;
     const RegSnap& regs = r.regs;
@@ -9353,14 +11281,27 @@ void DrawEncode(DrawRec& r) {
             const bool pending_write = c.num_samples == 1 && S.detile_pso != nil &&
                                        BackendHas(kGnmCapCompute | kGnmCapCopies) &&
                                        OverlapsPendingWrite(c.address, std::max<uint64_t>(c.slice_bytes, 1));
-            id<MTLTexture> t = S.tex->GetColorTarget(c, true, c.mtl_write_mask != 0, pending_write);
+            id<MTLTexture> grown_from = nil;
+            id<MTLTexture> t = S.tex->GetColorTarget(c, true, c.mtl_write_mask != 0, pending_write, &grown_from);
             if (!t) continue;
+            if (grown_from && BackendHas(kGnmCapCopies, "copy of a grown color array's slices")) {
+                EndEncoders();
+                EnsureCmd();
+                S.be->BeginCopies();
+                for (NSUInteger sl = 0; sl < grown_from.arrayLength && sl < t.arrayLength; ++sl)
+                    S.be->CopyTextureRegion(grown_from, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0),
+                                            MTLSizeMake(t.width, t.height, 1), t, (uint32_t)sl, 0, MTLOriginMake(0, 0, 0));
+                S.be->EndEncoder();
+            }
             if (samples && t.sampleCount != samples) {
                 RLog("rt-samples", "%s: mixed sample counts", args.name);
                 continue;
             }
             samples = (uint32_t)t.sampleCount;
             key.color[i] = t;
+            key.color_slice[i] = t.textureType == MTLTextureType2DArray
+                                     ? std::min<uint32_t>(c.base_slice, (uint32_t)t.arrayLength - 1)
+                                     : 0;
             hold[i] = t;
             color_fmt[i] = (uint32_t)t.pixelFormat;
             write_mask[i] = c.mtl_write_mask;
@@ -9368,8 +11309,9 @@ void DrawEncode(DrawRec& r) {
             rt_h = std::min<uint32_t>(rt_h, (uint32_t)t.height);
             any_rt = true;
             uint64_t clear_seq = 0;
-            if (c.fast_clear && TakeMetaCleared(c.cmask_address, &clear_seq)) {
-                meta_undo.Add(c.cmask_address, 0, clear_seq);
+            const uint32_t cmask_slice = std::min<uint32_t>(c.base_slice, 63);
+            if (c.fast_clear && TakeMetaCleared(c.cmask_address, &clear_seq, cmask_slice, CmaskSliceBytesOf(c))) {
+                meta_undo.Add(c.cmask_address, cmask_slice, clear_seq);
                 if (ClearColorFor(t.pixelFormat, c.clear_word0, c.clear_word1, &clr.color_value[i])) {
                     clr.color[i] = true;
                     NoteClearedColor(c, t, clear_seq);
@@ -9483,9 +11425,16 @@ void DrawEncode(DrawRec& r) {
         // MSAA passes use the game's sample locations (PA_SC_AA_SAMPLE_LOCS)
         if (samples > 1 && aa_samples > 1) key.sample_locs = regs[0xA2FE];
         if (!any_rt) {
-            // UAV-only rendering: size the pass from the screen scissor
-            rt_w = std::max(1u, std::min(16384u, rs.scissor.x + rs.scissor.width));
-            rt_h = std::max(1u, std::min(16384u, rs.scissor.y + rs.scissor.height));
+            if (!ps) {
+                // Vertex-only pass with no attachments and no fragment shader: clamp to 16x16 so
+                // Apple Silicon's TBDR tiler does not bin up to 262,144 tiles on dummy passes.
+                rt_w = 16;
+                rt_h = 16;
+            } else {
+                // UAV-only rendering: size the pass from the screen scissor
+                rt_w = std::max(1u, std::min(16384u, rs.scissor.x + rs.scissor.width));
+                rt_h = std::max(1u, std::min(16384u, rs.scissor.y + rs.scissor.height));
+            }
         }
         key.width = any_rt ? 0 : rt_w;
         key.height = any_rt ? 0 : rt_h;
@@ -10888,6 +12837,123 @@ void DispatchEncode(DispatchRec*& rp) {
         // Metadata clears (CMASK/HTILE written by a compute shader): track instead of running
         // (shadPS4 Rasterizer::IsComputeMetaClear)
         std::vector<uint32_t>& flat = r.flat;
+        // HLE buffer copy compute shader (shadPS4 ExecuteCopyShaderHLE, pgm_hash 0xfefebf9f /
+        // msl_hash 0xbbefe89a74224c0c): copies slices of a source buffer into a destination buffer
+        // via a 12-byte-stride control buffer ({dst_idx, src_idx, end}). Running it as a translated
+        // shader binds a 57+ MiB V# as written (which marks all GPU color render targets in the
+        // heap as guest_newer and wipes the G-buffer to black) and copies raw uint32 indices
+        // through float registers.
+        if ((cs->msl_hash == 0xbbefe89a74224c0cull || cs->code_addr == 0xdf920100ull ||
+             cs->info.pgm_hash == 0xfefebf9full) &&
+            cs->bufs.size() >= 3 && !indirect_addr && dim_x > 0) {
+            uint32_t guest_idx[3] = {0, 1, 2};
+            uint32_t n_guest = 0;
+            for (uint32_t bi = 0; bi < cs->bufs.size() && n_guest < 3; ++bi) {
+                if (cs->bufs[bi].type == GCN_BUFFER_GUEST) guest_idx[n_guest++] = bi;
+            }
+            uint32_t v0[4], v1[4], v2[4];
+            gcn_buffer_desc ctl_bd{}, src_bd{}, dst_bd{};
+            if (n_guest == 3 &&
+                gcn_shader_fetch_buffer_sharp(cs->sh, guest_idx[0], flat.data(), cs->code_addr, v0) &&
+                gcn_shader_fetch_buffer_sharp(cs->sh, guest_idx[1], flat.data(), cs->code_addr, v1) &&
+                gcn_shader_fetch_buffer_sharp(cs->sh, guest_idx[2], flat.data(), cs->code_addr, v2)) {
+                gcn_decode_buffer(v0, &ctl_bd);
+                gcn_decode_buffer(v1, &src_bd);
+                gcn_decode_buffer(v2, &dst_bd);
+                const uint32_t buf_stride = src_bd.stride;
+                struct CopyShaderControl {
+                    uint32_t dst_idx;
+                    uint32_t src_idx;
+                    uint32_t end;
+                };
+                if (buf_stride == 0 || buf_stride != dst_bd.stride || ctl_bd.stride != sizeof(CopyShaderControl)) {
+                    cap::SetSkipped("HLE copy shader with inconsistent strides (skipped)");
+                    return;
+                }
+                const uint64_t ctl_bytes = (uint64_t)dim_x * sizeof(CopyShaderControl);
+                if (ctl_bd.base_address && src_bd.base_address && dst_bd.base_address &&
+                    GuestRangeOk(ctl_bd.base_address, ctl_bytes)) {
+                    const auto* ctl = reinterpret_cast<const CopyShaderControl*>(S.ctx->mem_base + ctl_bd.base_address);
+                    struct CopyRange {
+                        uint64_t src_off;
+                        uint64_t dst_off;
+                        uint64_t size;
+                    };
+                    static std::vector<CopyRange>& copies = *new std::vector<CopyRange>;
+                    copies.clear();
+                    copies.reserve(dim_x);
+                    for (uint32_t i = 0; i < dim_x; ++i) {
+                        const uint64_t dst_off = (uint64_t)ctl[i].dst_idx * buf_stride;
+                        const uint64_t src_off = (uint64_t)ctl[i].src_idx * buf_stride;
+                        const uint64_t count = (uint64_t)ctl[i].end + 1ull;
+                        uint64_t sz = count * buf_stride;
+                        if ((src_off & 3) || (dst_off & 3)) continue;
+                        if (src_bd.size_bytes) {
+                            if (src_off >= src_bd.size_bytes) continue;
+                            sz = std::min<uint64_t>(sz, src_bd.size_bytes - src_off);
+                        }
+                        if (dst_bd.size_bytes) {
+                            if (dst_off >= dst_bd.size_bytes) continue;
+                            sz = std::min<uint64_t>(sz, dst_bd.size_bytes - dst_off);
+                        }
+                        sz &= ~3ull;
+                        if (sz == 0) continue;
+                        if (!GuestRangeOk(src_bd.base_address + src_off, sz) ||
+                            !GuestRangeOk(dst_bd.base_address + dst_off, sz))
+                            continue;
+                        copies.push_back({src_off, dst_off, sz});
+                    }
+                    if (!copies.empty()) {
+                        if (async_route) ComputeOnMain(AsyncJoin::Preparation);
+                        EndEncoders();
+                        EnsureCmd();
+                        S.be->BeginCopies();
+                        constexpr uint64_t kMaxMerge = 64u * 1024u;
+                        size_t batch_start = 0;
+                        while (batch_start < copies.size()) {
+                            size_t batch_end = batch_start;
+                            uint64_t src_min = copies[batch_start].src_off;
+                            uint64_t src_max = src_min + copies[batch_start].size;
+                            uint64_t dst_min = copies[batch_start].dst_off;
+                            uint64_t dst_max = dst_min + copies[batch_start].size;
+                            for (++batch_end; batch_end < copies.size(); ++batch_end) {
+                                const CopyRange& c = copies[batch_end];
+                                const uint64_t n_src_min = std::min(src_min, c.src_off);
+                                const uint64_t n_src_max = std::max(src_max, c.src_off + c.size);
+                                if (n_src_max - n_src_min > kMaxMerge) break;
+                                const uint64_t n_dst_min = std::min(dst_min, c.dst_off);
+                                const uint64_t n_dst_max = std::max(dst_max, c.dst_off + c.size);
+                                if (n_dst_max - n_dst_min > kMaxMerge) break;
+                                src_min = n_src_min;
+                                src_max = n_src_max;
+                                dst_min = n_dst_min;
+                                dst_max = n_dst_max;
+                            }
+                            id<MTLBuffer> sb = nil, db = nil;
+                            uint64_t soff = 0, doff = 0;
+                            if (GuestBuffer(src_bd.base_address + src_min, src_max - src_min, GuestAccess::Read, &sb, &soff) &&
+                                GuestBuffer(dst_bd.base_address + dst_min, dst_max - dst_min, GuestAccess::Write, &db, &doff)) {
+                                for (size_t k = batch_start; k < batch_end; ++k) {
+                                    const CopyRange& c = copies[k];
+                                    S.be->CopyBuffer(sb, soff + (c.src_off - src_min), db, doff + (c.dst_off - dst_min), c.size);
+                                }
+                                NoteGpuWrite(dst_bd.base_address + dst_min, dst_max - dst_min);
+                            }
+                            batch_start = batch_end;
+                        }
+                        S.be->EndEncoder();
+                        S.pending = true;
+                        S.n_dispatches++;
+                        if (cap::g_pass) cap::Encoded(indirect_addr);
+                        S.n_cdisp++;
+                        LogWork("HLE buffer copy (compute copy shader)");
+                        return;
+                    }
+                    cap::SetSkipped("HLE copy shader (no valid copy ranges)");
+                    return;
+                }
+            }
+        }
         {
             bool reads_meta = false;
             uint64_t meta_written = 0, meta_bytes = 0;

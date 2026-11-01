@@ -487,7 +487,7 @@ static void test_scratch_freed_on_thread_exit(void) {
 
 // A stereo bed (L = 0.25) and one object (0.5, gain 1, hard right) through PortAdvance /
 // PortPush, AudioOut's 7.1 -> stereo fold and the headless device: every played frame must be
-// (0.25, 0.7071 * 0.5). Constant signals make the check independent of where the device period
+// (0.25, 0.5 * 0.5). Constant signals make the check independent of where the device period
 // boundaries fall.
 static void test_bed_plus_object(const char *dump) {
   const uint32_t gran = 256, ticks = 120;
@@ -519,7 +519,7 @@ static void test_bed_plus_object(const char *dump) {
   if (!f) return;
   fseek(f, 44, SEEK_SET);
   float fr[2];
-  const float want_l = 0.25f, want_r = 0.7071f * 0.5f;
+  const float want_l = 0.25f, want_r = 0.5f * 0.5f;
   uint64_t match = 0, silent = 0, other = 0;
   while (fread(fr, sizeof(float), 2, f) == 2) {
     if (fr[0] == 0.0f && fr[1] == 0.0f) silent++;

@@ -189,6 +189,8 @@ type Arm64Lifter struct {
 	labelCounter  uint64
 	// cpol is how ARM C holds x86 CF at the current point of the block being lifted.
 	cpol carryPol
+	// df tracks x86 DF (Direction Flag) within the current block (false = forward, true = backward).
+	df bool
 	// noTSO turns off acquire/release for non-stack guest memory (see arm64_lifter_tso.go).
 	noTSO bool
 }
@@ -207,10 +209,11 @@ const (
 	carryClear
 )
 
-// ResetFlags starts a block: C holds CF in the block-boundary sense (carrySub).
+// ResetFlags starts a block: C holds CF in the block-boundary sense (carrySub), DF is forward.
 func (l *Arm64Lifter) ResetFlags() {
 	if l != nil {
 		l.cpol = carrySub
+		l.df = false
 	}
 }
 
@@ -766,8 +769,9 @@ func (l *Arm64Lifter) LiftInstructionToBuf(inst disasm.Instruction, nextPC uint6
 	start := len(dst)
 	lines, err := l.liftInstructionInternal(inst, nextPC, fn, dst)
 	if err == nil && inst.Inst.Op == x86asm.CALL {
-		// Flags are dead after a call (System V ABI); any sense is consistent.
+		// Flags are dead after a call (System V ABI); any sense is consistent, and DF = 0.
 		l.cpol = carrySub
+		l.df = false
 	}
 	if err == nil {
 		lines = fixUpperHalves(inst.Inst, lines, start, fn != nil && fn.UsesYmm)
@@ -787,7 +791,8 @@ var (
 func vecArg0IsSource(op x86asm.Op) bool {
 	switch op {
 	case x86asm.VCOMISS, x86asm.VUCOMISS, x86asm.VCOMISD, x86asm.VUCOMISD,
-		x86asm.VPTEST, x86asm.VTESTPS, x86asm.VTESTPD:
+		x86asm.VPTEST, x86asm.VTESTPS, x86asm.VTESTPD,
+		x86asm.VMASKMOVDQU, x86asm.MASKMOVDQU:
 		return true
 	}
 	return false
@@ -933,6 +938,7 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 	if fn != l.currentFn {
 		l.currentFn = fn
 		l.cpol = carrySub
+		l.df = false
 	}
 	op := inst.Inst.Op
 	args := inst.Inst.Args
@@ -959,14 +965,13 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		return lines, nil
 
 	case x86asm.CLD:
-		// DF is not modelled: string instructions always run forward (DF = 0, as the System V
-		// ABI requires at calls).
+		l.df = false
 		lines = append(lines, "    nop")
 		return lines, nil
 
 	case x86asm.STD:
-		// DF = 1 (backward string operations) is not modelled; STD has no site in TLOU or U4.
-		lines = append(lines, l.emitUnsupported(inst, "std: backward string operations not lowered")...)
+		l.df = true
+		lines = append(lines, "    nop")
 		return lines, nil
 
 	case x86asm.CLC, x86asm.STC, x86asm.CMC, x86asm.LAHF, x86asm.SAHF:
@@ -1404,6 +1409,11 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		lines = l.liftRdtsc(lines)
 		return lines, nil
 
+	case x86asm.RDTSCP:
+		lines = l.liftRdtsc(lines)
+		lines = append(lines, "    mov w21, #0")
+		return lines, nil
+
 	case x86asm.CPUID:
 		lines = l.liftCpuid(lines)
 		return lines, nil
@@ -1418,13 +1428,13 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 	case x86asm.PCMPGTD, x86asm.PMULUDQ,
 		x86asm.PADDB, x86asm.PADDW, x86asm.PADDD, x86asm.PADDQ,
 		x86asm.PSUBB, x86asm.PSUBW, x86asm.PSUBD, x86asm.PSUBQ,
-		x86asm.PCMPEQB, x86asm.PCMPEQW, x86asm.PCMPEQD,
+		x86asm.PCMPEQB, x86asm.PCMPEQW, x86asm.PCMPEQD, x86asm.PCMPEQQ,
 		x86asm.PMAXUB, x86asm.PMINUB, x86asm.PMAXSB, x86asm.PMINSB,
 		x86asm.PMAXUW, x86asm.PMINUW, x86asm.PMAXSW, x86asm.PMINSW,
 		x86asm.PMAXUD, x86asm.PMINUD, x86asm.PMAXSD, x86asm.PMINSD,
 		x86asm.PMULLD, x86asm.PMULLW,
-		x86asm.PADDSB, x86asm.PADDSW, x86asm.PADDUSB,
-		x86asm.PSUBSB, x86asm.PSUBUSB,
+		x86asm.PADDSB, x86asm.PADDSW, x86asm.PADDUSB, x86asm.PADDUSW,
+		x86asm.PSUBSB, x86asm.PSUBSW, x86asm.PSUBUSB, x86asm.PSUBUSW,
 		x86asm.PCMPGTB, x86asm.PCMPGTW, x86asm.PCMPGTQ:
 		return l.liftVectorBinary(inst, nextPC, lines)
 
@@ -1598,7 +1608,8 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 	case x86asm.VUCOMISD, x86asm.VCOMISD:
 		return l.liftFpCmp(inst, nextPC, true, lines)
 
-	case x86asm.VMAXSD, x86asm.VMINSD, x86asm.VMAXSS, x86asm.VMINSS:
+	case x86asm.MAXSD, x86asm.MINSD, x86asm.MAXSS, x86asm.MINSS,
+		x86asm.VMAXSD, x86asm.VMINSD, x86asm.VMAXSS, x86asm.VMINSS:
 		return l.liftAvxMinMax(inst, nextPC, lines)
 
 	case x86asm.VPADDQ, x86asm.VPADDD, x86asm.VPADDW, x86asm.VPADDB:
@@ -1683,8 +1694,28 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		x86asm.MAXPD, x86asm.VMAXPD, x86asm.MINPD, x86asm.VMINPD:
 		return l.liftAvxDoubleAlu(inst, nextPC, lines)
 
-	case x86asm.VHADDPD, x86asm.VHADDPS:
+	case x86asm.HADDPD, x86asm.HADDPS, x86asm.VHADDPD, x86asm.VHADDPS:
 		return l.liftVhadd(inst, nextPC, lines)
+
+	case x86asm.VFMADD132SS, x86asm.VFMADD213SS, x86asm.VFMADD231SS,
+		x86asm.VFMADD132SD, x86asm.VFMADD213SD, x86asm.VFMADD231SD,
+		x86asm.VFMSUB132SS, x86asm.VFMSUB213SS, x86asm.VFMSUB231SS,
+		x86asm.VFMSUB132SD, x86asm.VFMSUB213SD, x86asm.VFMSUB231SD,
+		x86asm.VFNMADD132SS, x86asm.VFNMADD213SS, x86asm.VFNMADD231SS,
+		x86asm.VFNMADD132SD, x86asm.VFNMADD213SD, x86asm.VFNMADD231SD,
+		x86asm.VFNMSUB132SS, x86asm.VFNMSUB213SS, x86asm.VFNMSUB231SS,
+		x86asm.VFNMSUB132SD, x86asm.VFNMSUB213SD, x86asm.VFNMSUB231SD:
+		return l.liftFmaScalar(inst, nextPC, lines)
+
+	case x86asm.VFMADD132PS, x86asm.VFMADD213PS, x86asm.VFMADD231PS,
+		x86asm.VFMADD132PD, x86asm.VFMADD213PD, x86asm.VFMADD231PD,
+		x86asm.VFMSUB132PS, x86asm.VFMSUB213PS, x86asm.VFMSUB231PS,
+		x86asm.VFMSUB132PD, x86asm.VFMSUB213PD, x86asm.VFMSUB231PD,
+		x86asm.VFNMADD132PS, x86asm.VFNMADD213PS, x86asm.VFNMADD231PS,
+		x86asm.VFNMADD132PD, x86asm.VFNMADD213PD, x86asm.VFNMADD231PD,
+		x86asm.VFNMSUB132PS, x86asm.VFNMSUB213PS, x86asm.VFNMSUB231PS,
+		x86asm.VFNMSUB132PD, x86asm.VFNMSUB213PD, x86asm.VFNMSUB231PD:
+		return l.liftFmaPacked(inst, nextPC, lines)
 
 	case x86asm.PTEST, x86asm.VPTEST, x86asm.VTESTPD, x86asm.VTESTPS:
 		return l.liftPtestVtest(inst, nextPC, lines)
@@ -1796,6 +1827,12 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		lines = append(lines, "    brk #0")
 		return lines, nil
 
+	case x86asm.SYSCALL:
+		// PS4 Orbis userland invokes kernel services through imported library stubs, not raw
+		// SYSCALL; return -ENOSYS (-38) in RAX if a fallback path in libc/middleware reaches one.
+		lines = append(lines, "    mov x19, #-38 // syscall: ENOSYS")
+		return lines, nil
+
 	case x86asm.EMMS:
 		lines = append(lines, "    // emms")
 		return lines, nil
@@ -1846,6 +1883,9 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 	case x86asm.VMASKMOVPS, x86asm.VMASKMOVPD:
 		return l.liftMaskmov(inst, nextPC, lines)
 
+	case x86asm.MASKMOVDQU, x86asm.VMASKMOVDQU:
+		return l.liftMaskmovdqu(inst, lines)
+
 	// Vector Arithmetic & Multiplies
 	case x86asm.PMADDUBSW, x86asm.VPMADDUBSW:
 		return l.liftPmaddupsw(inst, nextPC, lines)
@@ -1853,7 +1893,7 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 	case x86asm.PMULDQ, x86asm.VPMULDQ:
 		return l.liftPmuldq(inst, nextPC, lines)
 
-	case x86asm.PMULHW, x86asm.VPMULHW:
+	case x86asm.PMULHW, x86asm.VPMULHW, x86asm.PMULHUW, x86asm.VPMULHUW:
 		return l.liftPmulhw(inst, nextPC, lines)
 
 	case x86asm.VPHMINPOSUW:

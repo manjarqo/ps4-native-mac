@@ -585,6 +585,59 @@ func parseInitArray(loaded *LoadedELF) {
 		}
 	}
 
+	// 4. Check DT_INIT (_init) for RIP-relative LEA pointing to __CTOR_END__ - 8 (used in Sony Orbis
+	// main executables where .got/.data.rel.ro sits between .ctors and DT_INIT_ARRAY).
+	var initCandidates []uint64
+	if loaded.DynamicTags != nil {
+		if initAddr, ok := loaded.DynamicTags[DT_INIT]; ok && initAddr != 0 {
+			initCandidates = append(initCandidates, initAddr)
+		}
+	}
+	if loaded.Seg0Addr+0x20 < uint64(len(loaded.MemoryImage)) && loaded.InExecutable(loaded.Seg0Addr+0x20) {
+		initCandidates = append(initCandidates, loaded.Seg0Addr+0x20)
+	}
+	for _, initPC := range initCandidates {
+		scanEnd := initPC + 64
+		if scanEnd > uint64(len(loaded.MemoryImage)) {
+			scanEnd = uint64(len(loaded.MemoryImage))
+		}
+		for pc := initPC; pc+7 <= scanEnd; pc++ {
+			b0 := loaded.MemoryImage[pc]
+			b1 := loaded.MemoryImage[pc+1]
+			b2 := loaded.MemoryImage[pc+2]
+			if (b0 == 0x48 || b0 == 0x4c) && b1 == 0x8d && (b2&0xc7) == 0x05 {
+				disp := int64(int32(binary.LittleEndian.Uint32(loaded.MemoryImage[pc+3 : pc+7])))
+				target := uint64(int64(pc+7) + disp)
+				if target&7 == 0 && target >= 8 && target+16 <= uint64(len(loaded.MemoryImage)) {
+					lastFn := binary.LittleEndian.Uint64(loaded.MemoryImage[target : target+8])
+					term := binary.LittleEndian.Uint64(loaded.MemoryImage[target+8 : target+16])
+					if term == 0 && lastFn != 0 && lastFn != ^uint64(0) && loaded.InExecutable(lastFn) {
+						end := target + 8
+						start := end
+						for start >= 8 {
+							val := binary.LittleEndian.Uint64(loaded.MemoryImage[start-8 : start])
+							if val == ^uint64(0) {
+								break
+							}
+							if val != 0 && !loaded.InExecutable(val) {
+								break
+							}
+							start -= 8
+						}
+						if end > start {
+							for addr := end - 8; addr >= start && addr < end; addr -= 8 {
+								fn := binary.LittleEndian.Uint64(loaded.MemoryImage[addr : addr+8])
+								if fn != 0 && fn != ^uint64(0) && loaded.InExecutable(fn) {
+									loaded.InitArray = append(loaded.InitArray, fn)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Deduplicate entries while preserving execution order
 	if len(loaded.InitArray) > 1 {
 		seen := make(map[uint64]struct{}, len(loaded.InitArray))

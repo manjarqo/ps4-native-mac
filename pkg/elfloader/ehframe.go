@@ -289,12 +289,14 @@ func WalkEHFrame(img []byte, frameVA, limit uint64) (end uint64, bounds []AddrRa
 		}
 		if info.ok {
 			if start, size, fdeOff, ok := readFDERange(img, int(body+4), info.enc); ok {
-				bounds = append(bounds, AddrRange{Start: start, End: start + size})
-				if info.hasAugZ && info.hasLSDA && info.lsdaEnc != dwEHPEOmit && fdeOff < int(recEnd) {
-					if augLen, augDataOff, ok := readULEB(img, fdeOff, int(recEnd)); ok && augLen > 0 && augDataOff < int(recEnd) {
-						lsdaVal, _, ok := (ehDec{img: img, hdr: frameVA}).read(augDataOff, info.lsdaEnc)
-						if ok && lsdaVal != 0 {
-							lsdaBounds = append(lsdaBounds, AddrRange{Start: start, End: start + size})
+				if start != 0 && !(start >= frameVA && start < limit) {
+					bounds = append(bounds, AddrRange{Start: start, End: start + size})
+					if info.hasAugZ && info.hasLSDA && info.lsdaEnc != dwEHPEOmit && fdeOff < int(recEnd) {
+						if augLen, augDataOff, ok := readULEB(img, fdeOff, int(recEnd)); ok && augLen > 0 && augDataOff < int(recEnd) {
+							lsdaVal, _, ok := (ehDec{img: img, hdr: frameVA}).read(augDataOff, info.lsdaEnc)
+							if ok && lsdaVal != 0 {
+								lsdaBounds = append(lsdaBounds, AddrRange{Start: start, End: start + size})
+							}
 						}
 					}
 				}
@@ -704,6 +706,30 @@ func (l *LoadedELF) IsFuncEntry(addr uint64) bool {
 		return 0
 	})
 	return ok
+}
+
+// InUnwindGap reports whether addr lies in a small gap (<= 64 KiB) between two
+// consecutive unwind function extents (e.g. a nounwind function or constructor
+// emitted without an FDE inside .text, not in trailing .rodata).
+func (l *LoadedELF) InUnwindGap(addr uint64) bool {
+	if l == nil || len(l.FuncBounds) < 2 {
+		return false
+	}
+	i, ok := slices.BinarySearchFunc(l.FuncBounds, addr, func(r AddrRange, addr uint64) int {
+		if addr >= r.End {
+			return -1
+		}
+		if addr < r.Start {
+			return 1
+		}
+		return 0
+	})
+	if ok || i <= 0 || i >= len(l.FuncBounds) {
+		return false
+	}
+	prev := l.FuncBounds[i-1]
+	next := l.FuncBounds[i]
+	return addr >= prev.End && addr < next.Start && (next.Start-prev.End) <= 0x10000
 }
 
 // CodeCeiling is the exclusive address where a decode that reached addr must

@@ -955,7 +955,102 @@ static uint64_t guest_return_address(GuestContext *ctx) {
   return ctx->rsp + 8 <= ctx->mem_size ? *(uint64_t *)(ctx->mem_base + ctx->rsp) : 0;
 }
 
-void shim_guest_nonlocal_jump(GuestContext *ctx) {
+static uint64_t *recomp_find_shim_frame(GuestContext *ctx, uint64_t *fp) {
+  for (int depth = 0; depth < 4 && fp; depth++) {
+    if (fp[3] == (uint64_t)ctx) {
+      return fp;
+    }
+    fp = (uint64_t *)fp[0];
+  }
+  return NULL;
+}
+
+__attribute__((noinline)) void shim_setjmp(GuestContext *ctx) {
+  const uint64_t env = ctx->rdi;
+  const uint64_t ret_rip = guest_return_address(ctx);
+  const uint64_t rsp_at_entry = ctx->rsp;
+
+  if (env && env + 0x48 <= ctx->mem_size) {
+    uint8_t *buf = ctx->mem_base + env;
+    *(uint64_t *)(buf + 0x00) = ret_rip;
+    *(uint64_t *)(buf + 0x08) = ctx->rbx;
+    *(uint64_t *)(buf + 0x10) = rsp_at_entry;
+    *(uint64_t *)(buf + 0x18) = ctx->rbp;
+    *(uint64_t *)(buf + 0x20) = ctx->r12;
+    *(uint64_t *)(buf + 0x28) = ctx->r13;
+    *(uint64_t *)(buf + 0x30) = ctx->r14;
+    *(uint64_t *)(buf + 0x38) = ctx->r15;
+    *(uint16_t *)(buf + 0x40) = ctx->fpu_cw;
+    *(uint32_t *)(buf + 0x44) = ctx->mxcsr;
+  }
+
+  uint64_t *shim_sp = recomp_find_shim_frame(ctx, (uint64_t *)__builtin_frame_address(0));
+  if (shim_sp && env) {
+    RecompJmpBufEntry *slot = NULL;
+    for (size_t i = 0; i < RECOMP_MAX_JMP_BUFS; i++) {
+      if (ctx->jmp_bufs[i].guest_env == env) {
+        slot = &ctx->jmp_bufs[i];
+        break;
+      }
+    }
+    if (!slot) {
+      slot = &ctx->jmp_bufs[(ctx->jmp_buf_next++) % RECOMP_MAX_JMP_BUFS];
+    }
+    slot->guest_env = env;
+    slot->guest_rip = ret_rip;
+    slot->guest_rsp = rsp_at_entry + 8ULL;
+    slot->host_sp = (uint64_t)(shim_sp + 6);
+    slot->host_fp = shim_sp[0];
+    slot->host_lr = shim_sp[1];
+    slot->guest_fpcr = shim_sp[4];
+  }
+
+  ctx->rax = 0;
+  SHIM_RETURN();
+}
+
+// Mach-O standalone host tests that link recomp_runtime.c without trampoline.s use this weak
+// fallback; trampoline.s provides the strong definition for recompiled guest builds.
+__attribute__((weak)) __attribute__((noreturn)) void recomp_longjmp_resume(
+    GuestContext *ctx, uint64_t host_sp, uint64_t host_fp, uint64_t host_lr,
+    uint64_t guest_fpcr) {
+  (void)ctx;
+  (void)host_sp;
+  (void)host_fp;
+  (void)host_lr;
+  (void)guest_fpcr;
+  abort();
+}
+
+__attribute__((noinline)) void shim_guest_nonlocal_jump(GuestContext *ctx) {
+  const uint64_t env = ctx->rdi;
+  const int val = (int)ctx->rsi;
+  uint64_t *shim_sp = recomp_find_shim_frame(ctx, (uint64_t *)__builtin_frame_address(0));
+  if (shim_sp && env && env + 0x48 <= ctx->mem_size) {
+    const uint64_t cur_host_sp = (uint64_t)(shim_sp + 6);
+    for (size_t i = 0; i < RECOMP_MAX_JMP_BUFS; i++) {
+      const RecompJmpBufEntry *slot = &ctx->jmp_bufs[i];
+      if (slot->guest_env == env && slot->host_sp != 0 && slot->host_sp >= cur_host_sp) {
+        const uint8_t *buf = ctx->mem_base + env;
+        const uint64_t saved_rip = *(const uint64_t *)(buf + 0x00);
+        if (saved_rip == slot->guest_rip) {
+          ctx->rbx = *(const uint64_t *)(buf + 0x08);
+          ctx->rsp = *(const uint64_t *)(buf + 0x10) + 8ULL;
+          ctx->rbp = *(const uint64_t *)(buf + 0x18);
+          ctx->r12 = *(const uint64_t *)(buf + 0x20);
+          ctx->r13 = *(const uint64_t *)(buf + 0x28);
+          ctx->r14 = *(const uint64_t *)(buf + 0x30);
+          ctx->r15 = *(const uint64_t *)(buf + 0x38);
+          ctx->fpu_cw = *(const uint16_t *)(buf + 0x40);
+          ctx->mxcsr = *(const uint32_t *)(buf + 0x44);
+          ctx->rip = saved_rip;
+          ctx->rax = (val == 0) ? 1ULL : (uint64_t)(uint32_t)val;
+          recomp_longjmp_resume(ctx, slot->host_sp, slot->host_fp, slot->host_lr, slot->guest_fpcr);
+        }
+      }
+    }
+  }
+
   fprintf(stderr,
           "\nFATAL: guest longjmp(env=0x%llx, val=%d) called from 0x%llx: non-local jumps are not "
           "supported by the ARM64 assembly backend\n",

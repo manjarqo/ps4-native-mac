@@ -81,6 +81,9 @@ public:
     void SetComputePipeline(id<MTLComputePipelineState> p) override;
 
     void Draw(const GnmDraw& d) override;
+    void SetStageInRegion(MTLRegion) override {}
+    void SetTessellationFactorBuffer(id<MTLBuffer>, uint64_t, uint64_t) override {}
+    void DrawPatches(uint32_t, uint32_t, uint32_t, id<MTLBuffer>, uint64_t, uint32_t, uint32_t) override {}
     void Dispatch(MTLSize groups, MTLSize tpt) override;
     void DispatchThreads(MTLSize threads, MTLSize tpt) override;
     void DispatchIndirect(id<MTLBuffer> args, uint64_t off, MTLSize tpt) override;

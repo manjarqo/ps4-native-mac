@@ -88,6 +88,7 @@ int sceKernelMapDirectMemory(GuestContext *ctx, void **addrInOut, size_t length,
 int sceKernelReleaseDirectMemory(off_t physAddr, size_t length);
 int sceKernelCheckedReleaseDirectMemory(off_t physAddr, size_t length);
 int sceKernelDirectMemoryQuery(off_t offset, int flags, OrbisDirectMemoryQueryInfo *info, size_t infoSize);
+int sceKernelGetDirectMemoryType(off_t start, int *memTypeOut, off_t *regionStartOut, off_t *regionEndOut);
 
 // Flexible Memory & VMM
 int sceKernelMapFlexibleMemory(GuestContext *ctx, void **addrInOut, size_t length, int prot, int flags);
@@ -114,6 +115,7 @@ void shim_sceKernelAllocateMainDirectMemory(GuestContext *ctx);
 void shim_sceKernelReleaseDirectMemory(GuestContext *ctx);
 void shim_sceKernelCheckedReleaseDirectMemory(GuestContext *ctx);
 void shim_sceKernelDirectMemoryQuery(GuestContext *ctx);
+void shim_sceKernelGetDirectMemoryType(GuestContext *ctx);
 void shim_sceKernelMapDirectMemory(GuestContext *ctx);
 void shim_sceKernelGetDirectMemorySize(GuestContext *ctx);
 void shim_sceKernelAvailableDirectMemorySize(GuestContext *ctx);

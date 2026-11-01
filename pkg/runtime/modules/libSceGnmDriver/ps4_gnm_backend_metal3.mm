@@ -298,6 +298,31 @@ void Metal3Backend::Draw(const GnmDraw& d) {
     }
 }
 
+void Metal3Backend::SetStageInRegion(MTLRegion region) {
+    TargetState& x = Cur();
+    if (x.cenc) [x.cenc setStageInRegion:region];
+}
+
+void Metal3Backend::SetTessellationFactorBuffer(id<MTLBuffer> buf, uint64_t offset, uint64_t instance_stride) {
+    TargetState& x = Cur();
+    if (x.renc) [x.renc setTessellationFactorBuffer:buf offset:offset instanceStride:instance_stride];
+}
+
+void Metal3Backend::DrawPatches(uint32_t num_control_points, uint32_t patch_start, uint32_t patch_count,
+                                id<MTLBuffer> patch_index_buffer, uint64_t patch_index_buffer_offset,
+                                uint32_t instance_count, uint32_t base_instance) {
+    TargetState& x = Cur();
+    if (!x.renc) return;
+    BeforeCommand();
+    [x.renc drawPatches:num_control_points
+             patchStart:patch_start
+             patchCount:patch_count
+       patchIndexBuffer:patch_index_buffer
+ patchIndexBufferOffset:patch_index_buffer_offset
+          instanceCount:instance_count
+           baseInstance:base_instance];
+}
+
 // MipChainFor (:5070), DrawEncode's grown depth array (:7131), ResolvePass (:6060)
 void Metal3Backend::CopyTextureRegion(id<MTLTexture> src, uint32_t src_slice, uint32_t src_level, MTLOrigin src_origin,
                                       MTLSize size, id<MTLTexture> dst, uint32_t dst_slice, uint32_t dst_level,

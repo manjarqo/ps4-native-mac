@@ -287,6 +287,12 @@ clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address -I "$R/pkg/runtime/core
   "$R/pkg/runtime/modules/libSceVdecsw/ps4_vdecsw.c" "$V/ps4_videodec.c" "$V/ps4_videodec2.c" "$V/ps4_h264_vt.c" -framework VideoToolbox \
   -framework CoreMedia -framework CoreVideo -framework CoreFoundation -o "$T/vdecsw_test"
 "$T/vdecsw_test" "$R/tests/host/data/game/infamous/splash_europe.bsf"
+# libSceAvPlayer: MP4 demuxing, VideoToolbox NV12 decoding, and concurrent Stop/Close vs GetVideoDataEx mutex safety.
+AVP="$R/pkg/runtime/modules/libSceAvPlayer"
+clang -std=gnu11 -Wall -Werror -g -O1 -fsanitize=address,undefined -I "$R/pkg/runtime/core" -I "$R/pkg/runtime/kernel/vfs" -I "$AVP" -I "$V" \
+  "$R/tests/host/avplayer_test.c" "$AVP/ps4_avplayer.c" "$V/ps4_h264_vt.c" "$R/pkg/runtime/kernel/vfs/ps4_vfs.c" \
+  -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -o "$T/avplayer_test"
+"$T/avplayer_test" 2>/dev/null
 # AAC through libSceAudiodec on AudioToolbox: streams made by AudioToolbox's encoder and a stored
 # FFmpeg-encoded stream, fed with U4's ctrl layout, must decode to the source signal (frame count, delay, SNR, checksum).
 AD="$R/pkg/runtime/modules/libSceAudiodec"

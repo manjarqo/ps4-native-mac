@@ -383,6 +383,58 @@ void shim_sceNpPartyCheckCallback(GuestContext *ctx);
 void shim_sceNpPartyGetVoiceChatPriority(GuestContext *ctx);
 void shim_sceNpPartySetVoiceChatPriority(GuestContext *ctx);
 
+// Additional libSceNp* shims (Common, Manager, WebApi, Matching2, Signaling, Score, Lookup)
+void shim_sceNpCmpNpId(GuestContext *ctx);
+void shim_sceNpCmpOnlineId(GuestContext *ctx);
+void shim_sceNpWebApiCreatePushEventFilter(GuestContext *ctx);
+void shim_sceNpWebApiRegisterPushEventCallback(GuestContext *ctx);
+void shim_sceNpWebApiUnregisterPushEventCallback(GuestContext *ctx);
+void shim_sceNpWebApiDeletePushEventFilter(GuestContext *ctx);
+void shim_sceNpWebApiGetHttpStatusCode(GuestContext *ctx);
+void shim_sceNpWebApiGetHttpResponseHeaderValueLength(GuestContext *ctx);
+void shim_sceNpWebApiGetHttpResponseHeaderValue(GuestContext *ctx);
+void shim_sceNpRegisterGamePresenceCallback(GuestContext *ctx);
+void shim_sceNpRegisterPlusEventCallback(GuestContext *ctx);
+void shim_sceNpUnregisterPlusEventCallback(GuestContext *ctx);
+void shim_sceNpMatching2RegisterContextCallback(GuestContext *ctx);
+void shim_sceNpMatching2ContextStart(GuestContext *ctx);
+void shim_sceNpMatching2GetServerId(GuestContext *ctx);
+void shim_sceNpMatching2SetDefaultRequestOptParam(GuestContext *ctx);
+void shim_sceNpMatching2RegisterRoomEventCallback(GuestContext *ctx);
+void shim_sceNpMatching2RegisterSignalingCallback(GuestContext *ctx);
+void shim_sceNpMatching2RegisterLobbyEventCallback(GuestContext *ctx);
+void shim_sceNpSignalingDeactivateConnection(GuestContext *ctx);
+void shim_sceNpMatching2JoinLobby(GuestContext *ctx);
+void shim_sceNpMatching2LeaveLobby(GuestContext *ctx);
+void shim_sceNpMatching2ContextStop(GuestContext *ctx);
+void shim_sceNpMatching2DestroyContext(GuestContext *ctx);
+void shim_sceNpMatching2SearchRoom(GuestContext *ctx);
+void shim_sceNpMatching2GetLobbyInfoList(GuestContext *ctx);
+void shim_sceNpMatching2GetWorldInfoList(GuestContext *ctx);
+void shim_sceNpMatching2SignalingGetPingInfo(GuestContext *ctx);
+void shim_sceNpMatching2CreateJoinRoom(GuestContext *ctx);
+void shim_sceNpMatching2JoinRoom(GuestContext *ctx);
+void shim_sceNpMatching2LeaveRoom(GuestContext *ctx);
+void shim_sceNpMatching2KickoutRoomMember(GuestContext *ctx);
+void shim_sceNpMatching2GrantRoomOwner(GuestContext *ctx);
+void shim_sceNpMatching2SetRoomDataInternal(GuestContext *ctx);
+void shim_sceNpMatching2SetRoomDataExternal(GuestContext *ctx);
+void shim_sceNpMatching2SetRoomMemberDataInternal(GuestContext *ctx);
+void shim_sceNpMatching2SignalingGetConnectionStatus(GuestContext *ctx);
+void shim_sceNpScoreGetRankingByNpIdPcId(GuestContext *ctx);
+void shim_sceNpScoreGetRankingByRange(GuestContext *ctx);
+void shim_sceNpScoreSetPlayerCharacterId(GuestContext *ctx);
+void shim_sceNpScoreGetGameData(GuestContext *ctx);
+void shim_sceNpScoreRecordScore(GuestContext *ctx);
+void shim_sceNpScoreGetBoardInfo(GuestContext *ctx);
+void shim_sceNpScoreAbortRequest(GuestContext *ctx);
+void shim_sceNpScoreRecordGameData(GuestContext *ctx);
+void shim_sceNpScoreCensorComment(GuestContext *ctx);
+void shim_sceNpScoreSanitizeComment(GuestContext *ctx);
+void shim_sceNpLookupAbortRequest(GuestContext *ctx);
+void shim_sceNpLookupCreateAsyncRequest(GuestContext *ctx);
+void shim_sceNpLookupPollAsync(GuestContext *ctx);
+
 #ifdef __cplusplus
 }
 #endif

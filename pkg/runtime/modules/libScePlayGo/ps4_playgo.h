@@ -57,6 +57,7 @@ int32_t scePlayGoGetToDoList(OrbisPlayGoHandle handle, OrbisPlayGoToDo *outToDoL
 int32_t scePlayGoSetToDoList(OrbisPlayGoHandle handle, const OrbisPlayGoToDo *toDoList, uint32_t numEntries);
 int32_t scePlayGoGetEta(OrbisPlayGoHandle handle, const OrbisPlayGoChunkId *chunkIds, uint32_t count, OrbisPlayGoEta *outEta);
 int32_t scePlayGoPrefetch(OrbisPlayGoHandle handle, const OrbisPlayGoChunkId *chunkIds, uint32_t count);
+int32_t scePlayGoGetChunkId(OrbisPlayGoHandle handle, OrbisPlayGoChunkId *outChunkIdList, uint32_t numberOfEntries, uint32_t *outEntries);
 
 // Guest ABI shims
 void shim_scePlayGoInitialize(GuestContext *ctx);
@@ -73,6 +74,7 @@ void shim_scePlayGoGetToDoList(GuestContext *ctx);
 void shim_scePlayGoSetToDoList(GuestContext *ctx);
 void shim_scePlayGoGetEta(GuestContext *ctx);
 void shim_scePlayGoPrefetch(GuestContext *ctx);
+void shim_scePlayGoGetChunkId(GuestContext *ctx);
 
 #ifdef __cplusplus
 }

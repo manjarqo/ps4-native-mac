@@ -243,6 +243,26 @@ Lcall_shim_host:
     ldp  x29, x30, [sp], #48
     ret
 
+// _recomp_longjmp_resume(ctx, host_sp, host_fp, host_lr, guest_fpcr):
+// Restores the host stack frame and guest registers captured by shim_setjmp and returns
+// directly to the instruction following the guest setjmp call.
+HOST_SECTION
+.globl _recomp_longjmp_resume
+_recomp_longjmp_resume:
+    mrs  x5, fpcr
+    cmp  x4, x5
+    b.eq 1f
+    msr  fpcr, x4
+1:
+    mov  sp, x1
+    mov  x29, x2
+    mov  x30, x3
+    LOAD_GPRS x0
+    LOAD_XMM0_7 x0
+    ldr  x27, [x0, #0x88]        // fs_base
+    ldr  x28, [x0, #0x330]       // mem_base
+    ret
+
 // ---- Helpers called in the middle of a guest instruction ----------------------------
 // The lifter calls these with bl and keeps x8-x15 itself; every other guest register the
 // instruction does not write must survive, but C code clobbers v0-v7, v16-v31, the upper

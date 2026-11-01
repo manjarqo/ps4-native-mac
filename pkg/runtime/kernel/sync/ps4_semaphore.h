@@ -28,7 +28,7 @@ void shim_scePthreadSemPost(GuestContext *ctx);
 void shim_scePthreadSemGetvalue(GuestContext *ctx);
 
 // Orbis Kernel Semaphores
-typedef int32_t OrbisKernelSema;
+typedef int64_t OrbisKernelSema;
 
 int sceKernelCreateSema(OrbisKernelSema *sem, const char *pName, uint32_t attr, int32_t initCount, int32_t maxCount, const void *pOptParam);
 int sceKernelDeleteSema(OrbisKernelSema sem);

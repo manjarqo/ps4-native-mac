@@ -64,6 +64,12 @@ int main(void) {
   g_ctx.rcx = 0x3200;
   CHECK(call(shim_scePlayGoGetToDoList, h, 0x3100, 4) == 0 && *(uint32_t *)(g_mem + 0x3200) == 0,
         "nothing left to install after a to-do list");
+  *(uint32_t *)(g_mem + 0x3300) = 99;
+  *(uint16_t *)(g_mem + 0x3310) = 0xFFFF;
+  g_ctx.rcx = 0x3300;
+  CHECK(call(shim_scePlayGoGetChunkId, h, 0x3310, 4) == 0 &&
+            *(uint32_t *)(g_mem + 0x3300) == 4 && *(uint16_t *)(g_mem + 0x3310) == 0,
+        "scePlayGoGetChunkId returns 4 chunks (starting at id 0)");
   if (g_failures) {
     printf("playgo_sigset_test: %d failure(s)\n", g_failures);
     return 1;

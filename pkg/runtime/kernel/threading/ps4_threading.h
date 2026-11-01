@@ -55,6 +55,7 @@ void shim_pthread_attr_init(GuestContext *ctx);
 void shim_pthread_attr_destroy(GuestContext *ctx);
 void shim_pthread_attr_setdetachstate(GuestContext *ctx);
 void shim_pthread_attr_setstacksize(GuestContext *ctx);
+void shim_pthread_attr_setschedparam(GuestContext *ctx);
 void shim_pthread_getschedparam(GuestContext *ctx);
 void shim_pthread_setschedparam(GuestContext *ctx);
 void shim_pthread_setcanceltype(GuestContext *ctx);

@@ -30,6 +30,10 @@ void shim_sceNpTrophyDestroyHandle(GuestContext *ctx);
 void shim_sceNpTrophyRegisterContext(GuestContext *ctx);
 void shim_sceNpTrophyUnlockTrophy(GuestContext *ctx);
 void shim_sceNpTrophyShowTrophyList(GuestContext *ctx);
+void shim_sceNpTrophyAbortHandle(GuestContext *ctx);
+void shim_sceNpTrophyGetGameIcon(GuestContext *ctx);
+void shim_sceNpTrophyGetGameInfo(GuestContext *ctx);
+void shim_sceNpTrophyGetTrophyInfo(GuestContext *ctx);
 
 #ifdef __cplusplus
 }

@@ -364,6 +364,12 @@ void shim_inet_pton(GuestContext *ctx) {
     SHIM_RETURN();
 }
 
+void shim_sleep(GuestContext *ctx) {
+    unsigned int seconds = (unsigned int)ctx->rdi;
+    ctx->rax = (uint64_t)sleep(seconds);
+    SHIM_RETURN();
+}
+
 void shim_usleep(GuestContext *ctx) {
     useconds_t usec = (useconds_t)ctx->rdi;
     int ret = usleep(usec);

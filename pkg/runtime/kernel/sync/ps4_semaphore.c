@@ -518,7 +518,7 @@ void shim_scePthreadSemGetvalue(GuestContext *ctx) {
 // order for both SCE_KERNEL_SEMA_ATTR_TH_FIFO and _TH_PRIO (the runtime keeps no guest
 // priority to sort by). A waiter woken by sceKernelDeleteSema returns EACCES, one woken by
 // sceKernelCancelSema ECANCELED, as shadPS4.
-#define MAX_KSEMS 1024
+#define MAX_KSEMS 4096
 #define KSEM_MAGIC 0x4b53454d // 'KSEM'
 
 #define KSEM_ERROR_ESRCH 0x80020003
@@ -553,15 +553,15 @@ typedef struct {
 
 static RecompKernelSema g_ksem_table[MAX_KSEMS];
 static pthread_mutex_t g_ksem_table_lock = PTHREAD_MUTEX_INITIALIZER;
+static int s_next_ksem_id = 1;
 
 static int alloc_ksem_slot(void) {
   pthread_mutex_lock(&g_ksem_table_lock);
-  for (int i = 1; i < MAX_KSEMS; i++) {
-    if (!g_ksem_table[i].in_use) {
-      g_ksem_table[i].in_use = 1;
-      pthread_mutex_unlock(&g_ksem_table_lock);
-      return i;
-    }
+  if (s_next_ksem_id < MAX_KSEMS) {
+    int id = s_next_ksem_id++;
+    g_ksem_table[id].in_use = 1;
+    pthread_mutex_unlock(&g_ksem_table_lock);
+    return id;
   }
   pthread_mutex_unlock(&g_ksem_table_lock);
   return -1;
@@ -596,12 +596,18 @@ static int ksem_release_all(RecompKernelSema *s, int state) {
 }
 
 int sceKernelCreateSema(OrbisKernelSema *sem, const char *pName, uint32_t attr, int32_t initCount, int32_t maxCount, const void *pOptParam) {
-  (void)pOptParam;
+  if (pOptParam != NULL) {
+    return KSEM_ERROR_EINVAL;
+  }
   if (!sem || !pName || attr > 2 || initCount < 0 || maxCount <= 0 || initCount > maxCount) {
+    if (sem) *sem = 0;
     return KSEM_ERROR_EINVAL;
   }
   int slot = alloc_ksem_slot();
-  if (slot < 0) return KSEM_ERROR_ENFILE;
+  if (slot < 0) {
+    *sem = 0;
+    return KSEM_ERROR_ENFILE;
+  }
 
   RecompKernelSema *s = &g_ksem_table[slot];
   s->magic = KSEM_MAGIC;
@@ -632,7 +638,7 @@ int sceKernelDeleteSema(OrbisKernelSema sem) {
   pthread_mutex_unlock(&s->mutex);
 
   // A woken waiter still takes the mutex to read its state, so the slot keeps its mutex and
-  // cond for good; a later CreateSema in this slot reuses them.
+  // cond for good; deleted slot IDs are never reused so stale handles always fail with ESRCH.
   pthread_mutex_lock(&g_ksem_table_lock);
   s->in_use = 0;
   pthread_mutex_unlock(&g_ksem_table_lock);
@@ -640,9 +646,9 @@ int sceKernelDeleteSema(OrbisKernelSema sem) {
 }
 
 int sceKernelSignalSema(OrbisKernelSema sem, int32_t signalCount) {
-  if (signalCount <= 0) return KSEM_ERROR_EINVAL;
   RecompKernelSema *s = get_ksem(sem);
   if (!s) return KSEM_ERROR_ESRCH;
+  if (signalCount <= 0) return KSEM_ERROR_EINVAL;
 
   pthread_mutex_lock(&s->mutex);
   if (s->current_count + signalCount > s->max_count) {
@@ -668,9 +674,9 @@ int sceKernelSignalSema(OrbisKernelSema sem, int32_t signalCount) {
 }
 
 int sceKernelWaitSema(OrbisKernelSema sem, int32_t needCount, uint32_t *pTimeout) {
-  if (needCount <= 0) return KSEM_ERROR_EINVAL;
   RecompKernelSema *s = get_ksem(sem);
   if (!s) return KSEM_ERROR_ESRCH;
+  if (needCount <= 0) return KSEM_ERROR_EINVAL;
 
   pthread_mutex_lock(&s->mutex);
   if (needCount > s->max_count) {
@@ -730,9 +736,9 @@ int sceKernelWaitSema(OrbisKernelSema sem, int32_t needCount, uint32_t *pTimeout
 }
 
 int sceKernelPollSema(OrbisKernelSema sem, int32_t needCount) {
-  if (needCount <= 0) return KSEM_ERROR_EINVAL;
   RecompKernelSema *s = get_ksem(sem);
   if (!s) return KSEM_ERROR_ESRCH;
+  if (needCount <= 0) return KSEM_ERROR_EINVAL;
 
   pthread_mutex_lock(&s->mutex);
   if (s->current_count >= needCount) {
@@ -769,14 +775,15 @@ void shim_sceKernelCreateSema(GuestContext *ctx) {
   int32_t maxCount = (int32_t)ctx->r8;
   uint64_t optGuest = ctx->r9;
 
-  const char *pName = pNameGuest ? (const char *)(ctx->mem_base + pNameGuest) : NULL;
-  const void *opt = optGuest ? (const void *)(ctx->mem_base + optGuest) : NULL;
-
-  OrbisKernelSema sem = 0;
-  int rc = sceKernelCreateSema(&sem, pName, attr, initCount, maxCount, opt);
-  if (rc == 0 && semGuest != 0) {
-    *(int32_t *)(ctx->mem_base + semGuest) = sem;
+  if (optGuest != 0) {
+    ctx->rax = (uint64_t)KSEM_ERROR_EINVAL;
+    SHIM_RETURN();
   }
+
+  OrbisKernelSema *semOut = semGuest ? (OrbisKernelSema *)(ctx->mem_base + semGuest) : NULL;
+  const char *pName = pNameGuest ? (const char *)(ctx->mem_base + pNameGuest) : NULL;
+
+  int rc = sceKernelCreateSema(semOut, pName, attr, initCount, maxCount, NULL);
   ctx->rax = (uint64_t)(int64_t)rc;
   SHIM_RETURN();
 }

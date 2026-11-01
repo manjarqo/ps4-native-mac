@@ -31,7 +31,7 @@ func SeedEntryPoints(loaded *elfloader.LoadedELF, allSymbols bool) []uint64 {
 	// addend is not a pointer and is ignored.
 	addPtr := func(addr uint64) {
 		if loaded.InUnwindScope(addr) {
-			if loaded.IsFuncEntry(addr) {
+			if loaded.IsFuncEntry(addr) || (addr&0xf == 0 && loaded.InUnwindGap(addr) && looksLikeFuncStart(loaded.MemoryImage, addr)) {
 				add(addr)
 			}
 			return
@@ -123,7 +123,7 @@ func looksLikeFuncStart(img []byte, addr uint64) bool {
 func prologueByte(b byte) bool {
 	switch b {
 	case 0x40, 0x41, 0x43, 0x44, 0x45, 0x48, 0x49, 0x4C, 0x4D, // REX prefixes
-		0x53, 0x54, 0x55, 0x56, 0x57, // push
+		0x50, 0x53, 0x54, 0x55, 0x56, 0x57, // push
 		0x89, 0x8B, // mov
 		0xC3,             // ret
 		0xE8, 0xE9, 0xEB, // call/jmp

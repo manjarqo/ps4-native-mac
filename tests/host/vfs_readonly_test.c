@@ -137,6 +137,17 @@ static void test_open(void) {
   fd = call(shim_open, guest_str(STR_A, "/app0/missing.bin"), FREEBSD_O_WRONLY, 0);
   CHECK((int32_t)fd == -1 && guest_errno() == FREEBSD_ENOENT, "write missing: fd %lld errno %d", (long long)fd,
         guest_errno());
+  // sceKernelOpen returns Orbis error codes (0x80020000 | errno) on missing files and EROFS on writes.
+  fd = call(shim_sceKernelOpen, guest_str(STR_A, "/app0/missing.bin"), 0, 0);
+  CHECK((int32_t)fd == (int32_t)(0x80020000 | FREEBSD_ENOENT), "sceKernelOpen missing: fd 0x%llx",
+        (unsigned long long)g_ctx.rax);
+  fd = call(shim_sceKernelOpen, guest_str(STR_A, "/app0/keep.bin"), FREEBSD_O_WRONLY, 0);
+  CHECK((int32_t)fd == (int32_t)(0x80020000 | FREEBSD_EROFS), "sceKernelOpen EROFS: fd 0x%llx",
+        (unsigned long long)g_ctx.rax);
+  // sceKernelOpen with FreeBSD O_DIRECTORY (0x20000) succeeds on a directory.
+  fd = call(shim_sceKernelOpen, guest_str(STR_A, "/app0/sub"), 0x20000, 0);
+  CHECK((int32_t)fd >= 0, "sceKernelOpen O_DIRECTORY on dir: fd %lld", (long long)fd);
+  if ((int32_t)fd >= 0) call(shim_sceKernelClose, (uint64_t)fd, 0, 0);
 
   // Reading works, also with O_CREAT on a file that exists.
   fd = call(shim_open, guest_str(STR_A, "/app0/keep.bin"), 0, 0);
@@ -179,6 +190,21 @@ static void test_path_ops(void) {
 
   CHECK((int32_t)call(shim_truncate, guest_str(STR_A, "/app0/keep.bin"), 0, 0) == -1 && guest_errno() == FREEBSD_EROFS,
         "truncate: errno %d", guest_errno());
+  CHECK((int32_t)call(shim_sceKernelTruncate, guest_str(STR_A, "/app0/keep.bin"), 0, 0) ==
+            (int32_t)(0x80020000 | FREEBSD_EROFS),
+        "sceKernelTruncate: rax 0x%llx", (unsigned long long)g_ctx.rax);
+  CHECK((int32_t)call(shim_sceKernelUnlink, guest_str(STR_A, "/app0/keep.bin"), 0, 0) ==
+            (int32_t)(0x80020000 | FREEBSD_EROFS),
+        "sceKernelUnlink: rax 0x%llx", (unsigned long long)g_ctx.rax);
+  CHECK((int32_t)call(shim_sceKernelMkdir, guest_str(STR_A, "/app0/newdir"), 0755, 0) ==
+            (int32_t)(0x80020000 | FREEBSD_EROFS),
+        "sceKernelMkdir: rax 0x%llx", (unsigned long long)g_ctx.rax);
+  CHECK((int32_t)call(shim_sceKernelRename, guest_str(STR_A, "/app0/keep.bin"), guest_str(STR_B, "/app0/moved.bin"), 0) ==
+            (int32_t)(0x80020000 | FREEBSD_EROFS),
+        "sceKernelRename: rax 0x%llx", (unsigned long long)g_ctx.rax);
+  CHECK((int32_t)call(shim_sceKernelStat, guest_str(STR_A, "/app0/missing.bin"), STR_B, 0) ==
+            (int32_t)(0x80020000 | FREEBSD_ENOENT),
+        "sceKernelStat missing: rax 0x%llx", (unsigned long long)g_ctx.rax);
   CHECK((int32_t)call(shim_chmod, guest_str(STR_A, "/app0/keep.bin"), 0600, 0) == -1 && guest_errno() == FREEBSD_EROFS,
         "chmod: errno %d", guest_errno());
   CHECK((int32_t)call(shim_utimes, guest_str(STR_A, "/app0/keep.bin"), 0, 0) == -1 && guest_errno() == FREEBSD_EROFS,

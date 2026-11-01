@@ -36,13 +36,16 @@ func TestLookupRules(t *testing.T) {
 
 func TestEmbeddedHasBothGames(t *testing.T) {
 	db := Embedded()
-	for _, id := range []string{"CUSA00557", "CUSA04529"} {
+	for _, id := range []string{"CUSA00557", "CUSA04529", "CUSA03173"} {
 		if v := db.Lookup(id, ""); v.Status != "other_version" || v.Name == "" {
 			t.Errorf("%s: %+v", id, v)
 		}
 	}
 	if v := db.Lookup("CUSA00557", "01.00"); v.Status != "playable" {
 		t.Errorf("TLOU 01.00 = %+v", v)
+	}
+	if v := db.Lookup("CUSA03173", "01.09"); v.Status != "playable" {
+		t.Errorf("Bloodborne 01.09 = %+v", v)
 	}
 }
 

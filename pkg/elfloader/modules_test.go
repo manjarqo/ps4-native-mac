@@ -203,3 +203,109 @@ func TestMergeImagesCanary(t *testing.T) {
 		t.Fatalf("expected merged GOT entry to point to process canary 0x%x, got 0x%x", dstCanaryAddr, gotPtr)
 	}
 }
+
+func TestDiscoverCompanionModulesFiltersSceModule(t *testing.T) {
+	dir := t.TempDir()
+	sceModDir := filepath.Join(dir, "sce_module")
+	if err := os.MkdirAll(sceModDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Retail libc.prx and libSceFios2.prx (> 64 KB) must be kept.
+	retailPayload := make([]byte, 128*1024)
+	for _, name := range []string{"libc.prx", "libSceFios2.prx"} {
+		if err := os.WriteFile(filepath.Join(sceModDir, name), retailPayload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Explicitly referenced PRX in sce_module/ must be kept.
+	if err := os.WriteFile(filepath.Join(sceModDir, "libCustomEngine.prx"), []byte("referenced-prx"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unreferenced middleware PRXs with no matching exports must be skipped.
+	for _, unused := range []string{
+		"libSceFace.prx",
+		"libSceHand.prx",
+		"libSceHeadTracker.prx",
+		"libSceS3DConversion.prx",
+		"libSceSmart.prx",
+	} {
+		if err := os.WriteFile(filepath.Join(sceModDir, unused), retailPayload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	img := append([]byte{0, 0, 0, 0}, []byte("/app0/sce_module/libCustomEngine.prx\x00")...)
+	refs := DiscoverCompanionModules(filepath.Join(dir, "eboot.bin"), dir, img)
+
+	got := make(map[string]bool)
+	for _, r := range refs {
+		got[filepath.Base(r.Path)] = true
+	}
+
+	for _, want := range []string{"libc.prx", "libSceFios2.prx", "libCustomEngine.prx"} {
+		if !got[want] {
+			t.Errorf("expected %s to be kept, got refs=%+v", want, refs)
+		}
+	}
+	for _, unwanted := range []string{
+		"libSceFace.prx",
+		"libSceHand.prx",
+		"libSceHeadTracker.prx",
+		"libSceS3DConversion.prx",
+		"libSceSmart.prx",
+	} {
+		if got[unwanted] {
+			t.Errorf("expected unreferenced %s to be filtered out, got refs=%+v", unwanted, refs)
+		}
+	}
+}
+
+func TestUnresolvedAndExportedSymbolsIntersection(t *testing.T) {
+	mainELF := &LoadedELF{
+		MemoryImage: make([]byte, 0x2000),
+		Relocations: []Relocation{
+			{Offset: 0x1000, Type: R_X86_64_JUMP_SLOT, SymName: "needed_nid#A#B"},
+		},
+	}
+	unresolved := make(map[string]struct{})
+	addUnresolvedSymbols(unresolved, mainELF)
+
+	usedPRX := &LoadedELF{
+		MemoryImage: make([]byte, 0x2000),
+		DynSymbols: []Symbol{
+			{Name: "needed_nid#C#D", Address: 0x120, Type: 2},
+		},
+	}
+	unusedPRX := &LoadedELF{
+		MemoryImage: make([]byte, 0x2000),
+		DynSymbols: []Symbol{
+			{Name: "other_nid#C#D", Address: 0x120, Type: 2},
+		},
+	}
+
+	if !exportsIntersectUnresolved(usedPRX.ExportedSymbols(), unresolved) {
+		t.Fatalf("expected usedPRX exports to intersect mainELF unresolved symbols")
+	}
+	if exportsIntersectUnresolved(unusedPRX.ExportedSymbols(), unresolved) {
+		t.Fatalf("expected unusedPRX exports NOT to intersect mainELF unresolved symbols")
+	}
+}
+
+func TestDiscoverCompanionModulesBloodborne(t *testing.T) {
+	bbDir := "/Users/manjarqo/Library/Application Support/PS4Native/games/CUSA03173/content"
+	ebootPath := filepath.Join(bbDir, "eboot.bin")
+	if !fileExists(ebootPath) {
+		t.Skip("Bloodborne CUSA03173 not present")
+	}
+	refs := DiscoverCompanionModules(ebootPath, bbDir, nil)
+	got := make(map[string]bool)
+	for _, r := range refs {
+		got[filepath.Base(r.Path)] = true
+	}
+	if len(refs) != 2 || !got["libc.prx"] || !got["libSceFios2.prx"] {
+		t.Fatalf("expected exactly libc.prx and libSceFios2.prx for Bloodborne, got %+v", refs)
+	}
+}

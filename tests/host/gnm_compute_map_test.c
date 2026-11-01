@@ -73,8 +73,55 @@ int main(void) {
 
     read_ptr = 0x66;
     g_seen = 0;
-    sceGnmUnmapComputeQueue(1, 0);
+    sceGnmUnmapComputeQueue((uint32_t)vqid);
     check(g_resets == 2, "unmapping resets the slot");
     check(g_seen == 0x66, "unmapping resets it before the mapping is cleared");
+
+    // sceGnmSetLsShader: 23 dwords (0x17), including SET_SH_REG(0x14b, ls_regs[3]) at dwords 20..22.
+    uint32_t ls_dcb[23] = {0};
+    uint32_t ls_regs[6] = {0x1111u, 0x0u, 0x3333u, 0x4444u, 0x5555u, 0x6666u};
+    int32_t ls_ret = sceGnmSetLsShader(ls_dcb, 23, ls_regs, 0u);
+    check(ls_ret == 0 && ls_dcb[20] == 0xC0017600u && ls_dcb[21] == 0x14Bu && ls_dcb[22] == 0x4444u,
+          "sceGnmSetLsShader writes 23 dwords ending with SPI_SHADER_PGM_RSRC2_LS (0x14b)");
+
+    // sceGnmComputeWaitOnAddress: 14 dwords (0x0e) and returns 0x0e.
+    uint32_t wait_dcb[14] = {0};
+    int32_t wait_ret = sceGnmComputeWaitOnAddress(wait_dcb, 14, 0x123456789ABCDEF0ULL, 0xFFFFFFFFu, 3u, 0x42u);
+    check(wait_ret == 0x0e, "sceGnmComputeWaitOnAddress returns 14 dwords");
+    check(wait_dcb[3] == 0xC0053C00u && wait_dcb[7] == 0x42u && wait_dcb[8] == 0xFFFFFFFFu,
+          "sceGnmComputeWaitOnAddress emits WAIT_REG_MEM with ref and mask");
+
+    // sceGnmSetPsShader(..., NULL): clears PS regs without overwriting CB_SHADER_MASK (0x008F).
+    uint32_t ps_dcb[40] = {0};
+    sceGnmSetPsShader(ps_dcb, 40, NULL);
+    int wrote_cb_shader_mask = 0;
+    for (int i = 0; i < 39; i++) {
+        if (ps_dcb[i] == 0xC0016900u && ps_dcb[i + 1] == 0x008Fu) {
+            wrote_cb_shader_mask = 1;
+        }
+    }
+    check(!wrote_cb_shader_mask, "sceGnmSetPsShader(NULL) preserves CB_SHADER_MASK");
+
+    // sceGnmPrepareFlip*: writes sentinel 0xabcdef10..0xabcdef13 into dcb[0].
+    static uint8_t fake_mem[4096];
+    GuestContext ctx = {0};
+    ctx.mem_base = fake_mem;
+    ctx.mem_size = sizeof(fake_mem);
+    uint32_t *flip_dcb = (uint32_t *)(fake_mem + 256);
+    ctx.rdi = 256;
+    ctx.rsi = 0x14;
+    shim_sceGnmPrepareFlip(&ctx);
+    check((int32_t)ctx.rax == 0x0f && flip_dcb[0] == 0xabcdef10u, "sceGnmPrepareFlip writes 0xabcdef10");
+    ctx.rdi = 256;
+    ctx.rsi = 0x14;
+    shim_sceGnmPrepareFlipWithEopInterrupt(&ctx);
+    check((int32_t)ctx.rax == 0x14 && flip_dcb[0] == 0xabcdef12u, "sceGnmPrepareFlipWithEopInterrupt writes 0xabcdef12");
+    ctx.rdi = 256;
+    ctx.rsi = 0x14;
+    shim_sceGnmPrepareFlipWithEopInterruptRequeued(&ctx);
+    check((int32_t)ctx.rax == 0x14 && flip_dcb[0] == 0xabcdef13u, "sceGnmPrepareFlipWithEopInterruptRequeued writes 0xabcdef13");
+
+    // sceGnmValidateCommandBuffers: returns 0x80D11001.
+    check(sceGnmValidateCommandBuffers() == (int32_t)0x80D11001, "sceGnmValidateCommandBuffers returns 0x80D11001");
     return g_fail;
 }

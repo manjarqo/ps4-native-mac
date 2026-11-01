@@ -196,11 +196,33 @@ static void test_set_time_t_shim(void) {
   CHECK((int32_t)ctx.rax == INVALID_VALUE, "shim without process param");
 }
 
+static void test_convert_utc_local_and_rfc2822(void) {
+  setenv("TZ", "Europe/Moscow", 1); // UTC+03:00
+  tzset();
+  OrbisRtcTick utc = {1792413296ULL * 1000000}; // 2026-10-19 12:34:56 UTC (Monday)
+  OrbisRtcTick local = {0};
+  CHECK(sceRtcConvertUtcToLocalTime(&utc, &local) == 0, "UtcToLocalTime");
+  CHECK(local.tick == utc.tick + 3ULL * 3600 * 1000000, "UtcToLocalTime +3h: got %llu", (unsigned long long)local.tick);
+  OrbisRtcTick roundtrip = {0};
+  CHECK(sceRtcConvertLocalTimeToUtc(&local, &roundtrip) == 0 && roundtrip.tick == utc.tick,
+        "LocalTimeToUtc roundtrip: got %llu", (unsigned long long)roundtrip.tick);
+  CHECK(sceRtcConvertUtcToLocalTime(NULL, &local) == INVALID_POINTER, "UtcToLocalTime NULL");
+  CHECK(sceRtcConvertLocalTimeToUtc(&local, NULL) == INVALID_POINTER, "LocalTimeToUtc NULL");
+
+  char buf[64];
+  memset(buf, 0, sizeof(buf));
+  CHECK(sceRtcFormatRFC2822LocalTime(buf, &utc) == 0 &&
+            strcmp(buf, "Mon, 19 Oct 2026 15:34:56 +0300") == 0,
+        "RFC2822LocalTime: got '%s'", buf);
+  CHECK(sceRtcFormatRFC2822LocalTime(NULL, &utc) == INVALID_POINTER, "RFC2822LocalTime NULL");
+}
+
 int main(void) {
   test_set_time_t();
   test_format_local();
   test_format_explicit_zone();
   test_set_time_t_shim();
+  test_convert_utc_local_and_rfc2822();
   fflush(stdout);
   if (g_failures) {
     printf("rtc_test: %d FAILED\n", g_failures);

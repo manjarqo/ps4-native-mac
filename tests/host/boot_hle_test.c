@@ -266,6 +266,27 @@ static void test_np_content_restriction(void) {
   CHECK(ps4_np_age_for_country("us", &age) == 0 && age == 12, "earlier us entry replaced, got %d", age);
 }
 
+static void test_bb_np_symbols(void) {
+  memset(g_mem + 0x7000, 0, 64);
+  memset(g_mem + 0x7100, 0, 64);
+  strcpy((char *)(g_mem + 0x7000), "HunterA");
+  strcpy((char *)(g_mem + 0x7100), "HunterA");
+  CHECK(call(shim_sceNpCmpOnlineId, 0x7000, 0x7100, 0) == 0, "CmpOnlineId equal");
+  CHECK(call(shim_sceNpCmpNpId, 0x7000, 0x7100, 0) == 0, "CmpNpId equal");
+  strcpy((char *)(g_mem + 0x7100), "HunterB");
+  CHECK(call(shim_sceNpCmpOnlineId, 0x7000, 0x7100, 0) != 0, "CmpOnlineId diff");
+  CHECK(call(shim_sceNpCmpOnlineId, 0, 0x7100, 0) == (int32_t)ORBIS_NP_ERROR_INVALID_ARGUMENT, "CmpOnlineId NULL");
+  CHECK(call(shim_sceNpRegisterGamePresenceCallback, 0x6000, 0, 0) == 0, "RegisterGamePresenceCallback");
+  CHECK(call(shim_sceNpRegisterPlusEventCallback, 0x6000, 0, 0) == 0, "RegisterPlusEventCallback");
+  CHECK(call(shim_sceNpUnregisterPlusEventCallback, 0, 0, 0) == 0, "UnregisterPlusEventCallback");
+  *(uint16_t *)(g_mem + 0x7200) = 0;
+  CHECK(call(shim_sceNpMatching2GetServerId, 1, 0x7200, 0) == 0 && *(uint16_t *)(g_mem + 0x7200) == 1, "Matching2GetServerId");
+  *(int32_t *)(g_mem + 0x7210) = -1;
+  CHECK(call(shim_sceNpWebApiGetHttpStatusCode, 1, 0x7210, 0) == 0 && *(int32_t *)(g_mem + 0x7210) == 200, "WebApiGetHttpStatusCode");
+  CHECK(call(shim_sceNpScoreCreateRequest, 1, 0, 0) >= 1, "ScoreCreateRequest");
+  CHECK(call(shim_sceNpScoreRecordScore, 1, 0, 0) == (int32_t)ORBIS_NP_COMMUNITY_ERROR_NO_LOGIN, "ScoreRecordScore signed out");
+}
+
 int main(void) {
   g_ctx.mem_base = g_mem;
   g_ctx.mem_size = MEM_SIZE;
@@ -277,6 +298,7 @@ int main(void) {
   test_coredump();
   test_np_title_and_presence();
   test_np_content_restriction();
+  test_bb_np_symbols();
   fflush(stdout);
   if (g_failures) {
     printf("boot_hle_test: %d FAILED\n", g_failures);

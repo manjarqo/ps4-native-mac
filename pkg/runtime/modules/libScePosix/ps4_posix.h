@@ -28,6 +28,7 @@ void shim_select(GuestContext *ctx);
 void shim_inet_pton(GuestContext *ctx);
 
 // POSIX System & Threading
+void shim_sleep(GuestContext *ctx);
 void shim_usleep(GuestContext *ctx);
 void shim_getpid(GuestContext *ctx);
 void shim_pthread_exit(GuestContext *ctx);

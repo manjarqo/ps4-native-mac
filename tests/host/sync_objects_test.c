@@ -246,6 +246,10 @@ static void test_cond_and_rwlock(GuestContext *ctx) {
   CHECK(sync_obj_slot(rw) >= 0, "rwlock handle is an object");
   CHECK(call(ctx, shim_pthread_rwlock_wrlock, VAR_RW, 0, 0) == 0, "wrlock");
   CHECK(call(ctx, shim_pthread_rwlock_unlock, VAR_RW, 0, 0) == 0, "unlock");
+  CHECK(call(ctx, shim_scePthreadRwlockTimedrdlock, VAR_RW, 10000, 0) == 0, "timedrdlock");
+  CHECK(call(ctx, shim_pthread_rwlock_unlock, VAR_RW, 0, 0) == 0, "unlock after timedrdlock");
+  CHECK(call(ctx, shim_scePthreadRwlockTimedwrlock, VAR_RW, 10000, 0) == 0, "timedwrlock");
+  CHECK(call(ctx, shim_pthread_rwlock_unlock, VAR_RW, 0, 0) == 0, "unlock after timedwrlock");
   CHECK(call(ctx, shim_pthread_rwlock_destroy, VAR_RW, 0, 0) == 0 && sync_obj_slot(rw) < 0, "rwlock destroy frees");
 }
 

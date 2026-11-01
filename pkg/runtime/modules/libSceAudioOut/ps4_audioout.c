@@ -855,11 +855,19 @@ static int audio_convert(Ps4AudioPort *p, const uint8_t *src, float *dst, uint32
         p->stat_ch_sq[ch] += (double)raw * raw;
         c[ch] = raw * p->vol[ch];
       }
-      l = c[0] + k * c[2] + k * c[4] + k * c[6];
-      r = c[1] + k * c[2] + k * c[5] + k * c[7];
+      l = c[0] + k * c[2] + 0.5f * (c[4] + c[6]);
+      r = c[1] + k * c[2] + 0.5f * (c[5] + c[7]);
+      if (l > 1.0f) l = 1.0f;
+      else if (l < -1.0f) l = -1.0f;
+      if (r > 1.0f) r = 1.0f;
+      else if (r < -1.0f) r = -1.0f;
     }
     l *= g;
     r *= g;
+    if (l > 1.0f) l = 1.0f;
+    else if (l < -1.0f) l = -1.0f;
+    if (r > 1.0f) r = 1.0f;
+    else if (r < -1.0f) r = -1.0f;
     dst[f * 2 + 0] = l;
     dst[f * 2 + 1] = r;
     if (l != 0.0f || r != 0.0f) nonzero = 1;

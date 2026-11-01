@@ -447,6 +447,68 @@ int main(int argc, char **argv) {
     ret = sceSaveDataTerminate();
     assert(ret == 0);
 
+    // 9. Verify v1 sceSaveDataMount (80-byte layout: userId +0x00, titleId +0x08, dirName +0x10,
+    // fingerprint +0x18, blocks +0x20, mountMode +0x28)
+    // and v1 SaveDataMemory round-trip (SetupSaveDataMemory, SetSaveDataMemory, GetSaveDataMemory).
+    ret = sceSaveDataInitialize3(NULL);
+    assert(ret == 0);
+
+    strcpy((char *)(ctx.mem_base + 0x70000), "sprj0005");
+    strcpy((char *)(ctx.mem_base + 0x70100), "0000000000000000000000000000000000000000000000000000000000000000");
+    memset(ctx.mem_base + 0x70200, 0, 0x80);
+    *(int32_t *)(ctx.mem_base + 0x70200 + 0x00) = 0x10000000;
+    *(uint64_t *)(ctx.mem_base + 0x70200 + 0x08) = 0;       // titleId = NULL
+    *(uint64_t *)(ctx.mem_base + 0x70200 + 0x10) = 0x70000; // dirName
+    *(uint64_t *)(ctx.mem_base + 0x70200 + 0x18) = 0x70100; // fingerprint
+    *(uint64_t *)(ctx.mem_base + 0x70200 + 0x20) = 1024;    // blocks
+    *(uint32_t *)(ctx.mem_base + 0x70200 + 0x28) = 2 | 4;   // RDWR | CREATE
+    memset(ctx.mem_base + 0x70300, 0, 64);
+
+    ctx.rsp = 0x1000;
+    ctx.rdi = 0x70200;
+    ctx.rsi = 0x70300;
+    shim_sceSaveDataMount(&ctx);
+    assert((int32_t)ctx.rax == 0 && ctx.rsp == 0x1008);
+    assert(strcmp((const char *)(ctx.mem_base + 0x70300), "/savedata0") == 0);
+
+    ctx.rsp = 0x1000;
+    ctx.rdi = 0x70300;
+    shim_sceSaveDataUmount(&ctx);
+    assert((int32_t)ctx.rax == 0);
+    printf("[+] Verified v1 sceSaveDataMount & Umount\n");
+
+    // v1 SaveDataMemory round-trip via shims (multi-arg ABI)
+    ctx.rsp = 0x1000;
+    ctx.rdi = 0x10000000; // userId
+    ctx.rsi = 4096;       // memorySize
+    ctx.rdx = 0;          // param
+    shim_sceSaveDataSetupSaveDataMemory(&ctx);
+    assert((int32_t)ctx.rax == 0 && ctx.rsp == 0x1008);
+
+    const char v1_str[] = "BLOODBORNE_SAVEDATA_V1_MEMORY_TEST";
+    memcpy(ctx.mem_base + 0x71000, v1_str, sizeof(v1_str));
+    ctx.rsp = 0x1000;
+    ctx.rdi = 0x10000000;
+    ctx.rsi = 0x71000;
+    ctx.rdx = sizeof(v1_str);
+    ctx.rcx = 0;
+    shim_sceSaveDataSetSaveDataMemory(&ctx);
+    assert((int32_t)ctx.rax == 0 && ctx.rsp == 0x1008);
+
+    memset(ctx.mem_base + 0x72000, 0, sizeof(v1_str));
+    ctx.rsp = 0x1000;
+    ctx.rdi = 0x10000000;
+    ctx.rsi = 0x72000;
+    ctx.rdx = sizeof(v1_str);
+    ctx.rcx = 0;
+    shim_sceSaveDataGetSaveDataMemory(&ctx);
+    assert((int32_t)ctx.rax == 0 && ctx.rsp == 0x1008);
+    assert(strcmp((const char *)(ctx.mem_base + 0x72000), v1_str) == 0);
+    printf("[+] Verified v1 SaveDataMemory Setup/Set/Get round-trip\n");
+
+    ret = sceSaveDataTerminate();
+    assert(ret == 0);
+
     free(ctx.mem_base);
     system(rm_cmd);
     printf("[ps4-savedata-test] ALL TESTS PASSED!\n");

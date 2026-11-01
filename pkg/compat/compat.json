@@ -17,6 +17,13 @@
         "The title screen has no fog and no light shafts.",
         "Water colour and foam differ from a PS4; the sky is too dark."
       ]
+    },
+    {
+      "title_id": "CUSA03173",
+      "name": "Bloodborne™: Game of the Year Edition",
+      "versions": {"01.00": "playable", "01.09": "playable"},
+      "recommended": {"pro": 0},
+      "known_issues": ["Online multiplayer and Chalice Dungeon network features are offline."]
     }
   ]
 }

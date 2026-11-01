@@ -491,6 +491,11 @@ void shim_pthread_attr_setstacksize(GuestContext *ctx) {
   SHIM_RETURN();
 }
 
+void shim_pthread_attr_setschedparam(GuestContext *ctx) {
+  ctx->rax = 0;
+  SHIM_RETURN();
+}
+
 void shim_pthread_getschedparam(GuestContext *ctx) {
   uint64_t pol_addr = ctx->rsi;
   uint64_t param_addr = ctx->rdx;

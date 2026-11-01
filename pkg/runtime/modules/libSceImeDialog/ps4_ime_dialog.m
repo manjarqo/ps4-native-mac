@@ -49,7 +49,8 @@ OrbisImeDialogStatus sceImeDialogGetStatus(void) {
     }
 
     // Headless or non-interactive environment fallback
-    if (getenv("PS4_RECOMP_HEADLESS") != NULL || (!isatty(fileno(stdin)) && !isatty(fileno(stdout)))) {
+    if (getenv("PS4_RECOMP_HEADLESS") != NULL || getenv("PS4_PAD_SCRIPT") != NULL ||
+        (!isatty(fileno(stdin)) && !isatty(fileno(stdout)))) {
         size_t cur_len = utf16_strlen(g_ime_param.input_text_buffer, g_ime_param.max_text_length);
         if (cur_len == 0 && g_ime_param.max_text_length >= 6) {
             // Provide sensible default character name for offline run
@@ -216,9 +217,33 @@ int32_t sceImeDialogGetPanelSizeExtended(const OrbisImeDialogParam *param,
 }
 
 // Shims
+static OrbisImeDialogParam translate_guest_ime_param(GuestContext *ctx, const OrbisImeDialogParam *guest_param) {
+    OrbisImeDialogParam p = *guest_param;
+    uintptr_t base = (uintptr_t)ctx->mem_base;
+    if (p.input_text_buffer && (uintptr_t)p.input_text_buffer < base) {
+        p.input_text_buffer = (uint16_t *)(base + (uintptr_t)p.input_text_buffer);
+    }
+    if (p.placeholder && (uintptr_t)p.placeholder < base) {
+        p.placeholder = (const uint16_t *)(base + (uintptr_t)p.placeholder);
+    }
+    if (p.title && (uintptr_t)p.title < base) {
+        p.title = (const uint16_t *)(base + (uintptr_t)p.title);
+    }
+    if (p.filter && (uintptr_t)p.filter < base) {
+        p.filter = (void *)(base + (uintptr_t)p.filter);
+    }
+    return p;
+}
+
 void shim_sceImeDialogInit(GuestContext *ctx) {
+    OrbisImeDialogParam translated;
+    OrbisImeDialogParam *param_ptr = NULL;
+    if (ctx->rdi) {
+        translated = translate_guest_ime_param(ctx, (const OrbisImeDialogParam *)(ctx->mem_base + ctx->rdi));
+        param_ptr = &translated;
+    }
     ctx->rax = (uint64_t)sceImeDialogInit(
-        ctx->rdi ? (OrbisImeDialogParam *)(ctx->mem_base + ctx->rdi) : NULL,
+        param_ptr,
         ctx->rsi ? (OrbisImeParamExtended *)(ctx->mem_base + ctx->rsi) : NULL
     );
     SHIM_RETURN();

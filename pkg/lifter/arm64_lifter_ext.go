@@ -300,7 +300,7 @@ func (l *Arm64Lifter) liftPmuldq(inst disasm.Instruction, nextPC uint64, lines [
 	return lines, nil
 }
 
-// liftPmulhw handles PMULHW and VPMULHW.
+// liftPmulhw handles PMULHW, VPMULHW, PMULHUW, and VPMULHUW.
 func (l *Arm64Lifter) liftPmulhw(inst disasm.Instruction, nextPC uint64, lines []string) ([]string, error) {
 	lines, handled, err := l.liftMmxBinary(inst, nextPC, lines)
 	if err != nil {
@@ -311,7 +311,8 @@ func (l *Arm64Lifter) liftPmulhw(inst disasm.Instruction, nextPC uint64, lines [
 	}
 
 	op := inst.Inst.Op
-	isAvx := (op == x86asm.VPMULHW)
+	isAvx := (op == x86asm.VPMULHW || op == x86asm.VPMULHUW)
+	isUnsigned := (op == x86asm.PMULHUW || op == x86asm.VPMULHUW)
 
 	var dstReg, s1Reg x86asm.Reg
 	var src2 x86asm.Arg
@@ -347,10 +348,14 @@ func (l *Arm64Lifter) liftPmulhw(inst disasm.Instruction, nextPC uint64, lines [
 		}
 	}
 
+	mullOp := "smull"
+	if isUnsigned {
+		mullOp = "umull"
+	}
 	emitLanePmulhw := func(dLane, s1Lane, s2Lane string) {
 		lines = append(lines,
-			fmt.Sprintf("    smull  v20.4s, %s.4h, %s.4h", s1Lane, s2Lane),
-			fmt.Sprintf("    smull2 v21.4s, %s.8h, %s.8h", s1Lane, s2Lane),
+			fmt.Sprintf("    %s  v20.4s, %s.4h, %s.4h", mullOp, s1Lane, s2Lane),
+			fmt.Sprintf("    %s2 v21.4s, %s.8h, %s.8h", mullOp, s1Lane, s2Lane),
 			fmt.Sprintf("    uzp2   %s.8h, v20.8h, v21.8h", dLane),
 		)
 	}
@@ -360,6 +365,40 @@ func (l *Arm64Lifter) liftPmulhw(inst disasm.Instruction, nextPC uint64, lines [
 		emitLanePmulhw(dHighV, s1HighV, s2High)
 	} else if isAvx {
 		lines = append(lines, fmt.Sprintf("    movi %s.16b, #0", dHighV))
+	}
+	return lines, nil
+}
+
+// liftMaskmovdqu handles MASKMOVDQU and VMASKMOVDQU: conditional store of bytes from src (Args[0])
+// to [RDI] (or [EDI] when AddrSize == 32) where the corresponding byte of mask (Args[1]) has bit 7
+// set. Unmasked bytes are not read or written in memory so a tail store near an unmapped page
+// boundary never faults on disabled lanes.
+func (l *Arm64Lifter) liftMaskmovdqu(inst disasm.Instruction, lines []string) ([]string, error) {
+	srcReg, okS := inst.Inst.Args[0].(x86asm.Reg)
+	maskReg, okM := inst.Inst.Args[1].(x86asm.Reg)
+	_, _, _, sLowV, _, _, _, okSD := getVectorDesc(srcReg)
+	_, _, _, mLowV, _, _, _, okMD := getVectorDesc(maskReg)
+	if !okS || !okM || !okSD || !okMD {
+		lines = append(lines, l.emitUnsupported(inst, "unsupported maskmovdqu operands")...)
+		return lines, nil
+	}
+	if inst.Inst.AddrSize == 32 {
+		lines = append(lines, "    uxtw x16, w24")
+	} else {
+		lines = append(lines, "    mov x16, x24")
+	}
+	lines = append(lines, "    add x16, x28, x16")
+	l.labelCounter++
+	id := l.labelCounter
+	for i := 0; i < 16; i++ {
+		lbl := fmt.Sprintf("L_maskmovdqu_skip_%d_%d", id, i)
+		lines = append(lines,
+			fmt.Sprintf("    umov w17, %s.b[%d]", mLowV, i),
+			fmt.Sprintf("    tbz w17, #7, %s", lbl),
+			fmt.Sprintf("    umov w17, %s.b[%d]", sLowV, i),
+			fmt.Sprintf("    strb w17, [x16, #%d]", i),
+			fmt.Sprintf("%s:", lbl),
+		)
 	}
 	return lines, nil
 }

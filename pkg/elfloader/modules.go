@@ -205,21 +205,106 @@ func thisAppModuleDirs(elfPath, appDir string) []string {
 	return dirs
 }
 
+func isCoreCompanionModule(name string) bool {
+	switch strings.ToLower(filepath.Base(name)) {
+	case "libc.prx", "libscelibc.prx", "libscefios2.prx", "libscelibc.sprx", "libscefios2.sprx":
+		return true
+	default:
+		return false
+	}
+}
+
+func moduleStem(name string) string {
+	base := strings.ToLower(filepath.Base(name))
+	ext := filepath.Ext(base)
+	return strings.TrimSuffix(base, ext)
+}
+
+func addReferencedNames(refSet map[string]struct{}, image []byte) {
+	for _, ref := range ReferencedModuleNames(image) {
+		base := strings.ToLower(filepath.Base(ref))
+		refSet[base] = struct{}{}
+		refSet[moduleStem(base)] = struct{}{}
+		cleanRef := strings.TrimPrefix(strings.ReplaceAll(ref, "\\", "/"), "%s/")
+		if cleanRef != ref {
+			cleanBase := strings.ToLower(filepath.Base(cleanRef))
+			refSet[cleanBase] = struct{}{}
+			refSet[moduleStem(cleanBase)] = struct{}{}
+		}
+	}
+}
+
+func isReferencedModuleName(name string, refSet map[string]struct{}) bool {
+	base := strings.ToLower(filepath.Base(name))
+	if _, ok := refSet[base]; ok {
+		return true
+	}
+	if _, ok := refSet[moduleStem(base)]; ok {
+		return true
+	}
+	return false
+}
+
+func addUnresolvedSymbols(unresolved map[string]struct{}, mod *LoadedELF) {
+	if mod == nil {
+		return
+	}
+	for _, sym := range mod.UnresolvedSymbols() {
+		unresolved[sym] = struct{}{}
+		if nid := NIDPrefix(sym); nid != "" {
+			unresolved[nid] = struct{}{}
+		}
+		if canon, ok := ResolveNID(sym); ok && canon != "" {
+			unresolved[canon] = struct{}{}
+		}
+	}
+}
+
+func exportsIntersectUnresolved(exports []Symbol, unresolved map[string]struct{}) bool {
+	if len(exports) == 0 || len(unresolved) == 0 {
+		return false
+	}
+	for _, sym := range exports {
+		if sym.Name == "" || sym.Address == 0 {
+			continue
+		}
+		if _, ok := unresolved[sym.Name]; ok {
+			return true
+		}
+		if nid := NIDPrefix(sym.Name); nid != "" {
+			if _, ok := unresolved[nid]; ok {
+				return true
+			}
+		}
+		if canon, ok := ResolveNID(sym.Name); ok && canon != "" {
+			if _, ok := unresolved[canon]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // DiscoverCompanionModules finds PRX/SPRX files that belong to this app:
 // files in <appDir>/sce_module, and guest paths such as /app0/sce_module/foo.prx
 // resolved through MapGuestPath. It does not search sibling projects.
+// Candidate modules in sce_module/ are included only if they are referenced by
+// name, are core runtime modules (libc.prx / libSceFios2.prx), or export at least
+// one symbol imported by the main binary or another kept companion module.
 func DiscoverCompanionModules(elfPath, appDir string, image []byte) []ModuleRef {
 	if appDir == "" && elfPath != "" {
 		appDir = filepath.Dir(elfPath)
 	}
 	seen := make(map[string]struct{})
 	var out []ModuleRef
+	var sceModuleCandidates []string
 
 	for _, dir := range thisAppModuleDirs(elfPath, appDir) {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			continue
 		}
+		isSceModDir := strings.EqualFold(filepath.Base(dir), "sce_module")
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
@@ -228,7 +313,12 @@ func DiscoverCompanionModules(elfPath, appDir string, image []byte) []ModuleRef 
 			if ext != ".prx" && ext != ".sprx" {
 				continue
 			}
-			addModuleRef(&out, seen, filepath.Join(dir, e.Name()), e.Name())
+			fullPath := filepath.Join(dir, e.Name())
+			if isSceModDir {
+				sceModuleCandidates = append(sceModuleCandidates, fullPath)
+			} else {
+				addModuleRef(&out, seen, fullPath, e.Name())
+			}
 		}
 	}
 
@@ -251,6 +341,73 @@ func DiscoverCompanionModules(elfPath, appDir string, image []byte) []ModuleRef 
 			}
 		}
 	}
+
+	if len(sceModuleCandidates) == 0 {
+		return out
+	}
+
+	refSet := make(map[string]struct{})
+	addReferencedNames(refSet, image)
+
+	for _, cand := range sceModuleCandidates {
+		if isCoreCompanionModule(cand) || isReferencedModuleName(cand, refSet) {
+			addModuleRef(&out, seen, cand, filepath.Base(cand))
+		}
+	}
+
+	unresolved := make(map[string]struct{})
+	loadedCache := make(map[string]*LoadedELF)
+	processedKept := make(map[string]struct{})
+	loadCached := func(p string) *LoadedELF {
+		if p == "" || !fileExists(p) {
+			return nil
+		}
+		if mod, ok := loadedCache[p]; ok {
+			return mod
+		}
+		mod, err := LoadELF(p)
+		if err != nil {
+			loadedCache[p] = nil
+			return nil
+		}
+		loadedCache[p] = mod
+		return mod
+	}
+
+	if mainMod := loadCached(elfPath); mainMod != nil {
+		addReferencedNames(refSet, mainMod.MemoryImage)
+		addUnresolvedSymbols(unresolved, mainMod)
+	}
+
+	for {
+		for _, kept := range out {
+			if _, ok := processedKept[kept.Path]; ok {
+				continue
+			}
+			processedKept[kept.Path] = struct{}{}
+			if mod := loadCached(kept.Path); mod != nil {
+				addReferencedNames(refSet, mod.MemoryImage)
+				addUnresolvedSymbols(unresolved, mod)
+			}
+		}
+
+		added := false
+		for _, cand := range sceModuleCandidates {
+			before := len(out)
+			if isCoreCompanionModule(cand) || isReferencedModuleName(cand, refSet) {
+				addModuleRef(&out, seen, cand, filepath.Base(cand))
+			} else if candMod := loadCached(cand); candMod != nil && exportsIntersectUnresolved(candMod.ExportedSymbols(), unresolved) {
+				addModuleRef(&out, seen, cand, filepath.Base(cand))
+			}
+			if len(out) > before {
+				added = true
+			}
+		}
+		if !added {
+			break
+		}
+	}
+
 	return out
 }
 
@@ -498,6 +655,58 @@ func (l *LoadedELF) ExportedFunctions() []Symbol {
 	}
 	for _, sym := range l.Symbols {
 		consider(sym)
+	}
+	return out
+}
+
+// ExportedSymbols returns all exported symbols from the loaded module.
+func (l *LoadedELF) ExportedSymbols() []Symbol {
+	return l.ExportedFunctions()
+}
+
+// UnresolvedSymbols returns the unique symbol names imported (left undefined) by the loaded module.
+func (l *LoadedELF) UnresolvedSymbols() []string {
+	if l == nil {
+		return nil
+	}
+	defined := make(map[string]struct{})
+	for _, sym := range l.DynSymbols {
+		if sym.Name != "" && sym.Address != 0 {
+			defined[sym.Name] = struct{}{}
+		}
+	}
+	for _, sym := range l.Symbols {
+		if sym.Name != "" && sym.Address != 0 {
+			defined[sym.Name] = struct{}{}
+		}
+	}
+
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		if _, ok := defined[name]; ok {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+
+	for _, rel := range l.Relocations {
+		switch rel.Type {
+		case R_X86_64_JUMP_SLOT, R_X86_64_GLOB_DAT, R_X86_64_64:
+			add(rel.SymName)
+		}
+	}
+	for _, sym := range l.DynSymbols {
+		if sym.Address == 0 {
+			add(sym.Name)
+		}
 	}
 	return out
 }

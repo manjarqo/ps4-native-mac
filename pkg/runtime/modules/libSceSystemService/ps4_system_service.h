@@ -40,6 +40,7 @@ int32_t sceSystemServiceReportAbnormalTermination(int32_t reason, void *data);
 int32_t sceSystemServiceLoadExec(const char *path, const char *argv[]);
 int32_t sceSystemServiceDisablePersonalEyeToEyeDistanceSetting(void);
 int32_t sceSystemServiceEnablePersonalEyeToEyeDistanceSetting(void);
+int32_t sceSystemServiceLaunchWebBrowser(const char *uri, const void *param);
 
 // Shims
 void shim_sceSystemServiceParamGetInt(GuestContext *ctx);
@@ -59,6 +60,7 @@ void shim_sceSystemServiceReportAbnormalTermination(GuestContext *ctx);
 void shim_sceSystemServiceLoadExec(GuestContext *ctx);
 void shim_sceSystemServiceDisablePersonalEyeToEyeDistanceSetting(GuestContext *ctx);
 void shim_sceSystemServiceEnablePersonalEyeToEyeDistanceSetting(GuestContext *ctx);
+void shim_sceSystemServiceLaunchWebBrowser(GuestContext *ctx);
 
 #ifdef __cplusplus
 }

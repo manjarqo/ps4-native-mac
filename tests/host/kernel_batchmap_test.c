@@ -313,6 +313,41 @@ static void test_syscall_mprotect(GuestContext *ctx) {
   CHECK(recomp_vm_free(ctx, base, 6 * MB) == 0, "free");
 }
 
+static void test_release_direct_unmaps_virtual(GuestContext *ctx) {
+  off_t phys = 0;
+  CHECK(sceKernelAllocateDirectMemory(0, (off_t)sceKernelGetDirectMemorySize(), 4 * MB, 2 * MB, 3, &phys) == 0, "alloc direct");
+  void *vaddr = (void *)0x68000000;
+  CHECK(sceKernelMapDirectMemory(ctx, &vaddr, 4 * MB, 3, 0x10, phys, 2 * MB) == 0, "map direct");
+  CHECK(!find(ctx, 0x68000000)->is_free, "extent is mapped before ReleaseDirectMemory");
+
+  // Verify shim_sceKernelGetDirectMemoryType on the allocated physical range.
+  *(int32_t *)(ctx->mem_base + 0x9100) = -1;
+  *(uint64_t *)(ctx->mem_base + 0x9108) = 0;
+  *(uint64_t *)(ctx->mem_base + 0x9110) = 0;
+  ctx->rsp = 0x1000;
+  ctx->rdi = (uint64_t)phys + MB;
+  ctx->rsi = 0x9100;
+  ctx->rdx = 0x9108;
+  ctx->rcx = 0x9110;
+  shim_sceKernelGetDirectMemoryType(ctx);
+  CHECK(ctx->rax == 0 && *(int32_t *)(ctx->mem_base + 0x9100) == 3 &&
+            *(uint64_t *)(ctx->mem_base + 0x9108) == (uint64_t)phys &&
+            *(uint64_t *)(ctx->mem_base + 0x9110) == (uint64_t)phys + 4 * MB,
+        "shim_sceKernelGetDirectMemoryType ok");
+
+  // Releasing direct memory also unmaps any overlapping virtual mapping.
+  CHECK(sceKernelReleaseDirectMemory(phys, 4 * MB) == 0, "release direct");
+  CHECK(find(ctx, 0x68000000)->is_free, "extent is unmapped after ReleaseDirectMemory");
+
+  ctx->rsp = 0x1000;
+  ctx->rdi = (uint64_t)phys;
+  ctx->rsi = 0x9100;
+  ctx->rdx = 0;
+  ctx->rcx = 0;
+  shim_sceKernelGetDirectMemoryType(ctx);
+  CHECK((int32_t)ctx->rax == (int32_t)0x80020002, "GetDirectMemoryType after release returns ENOENT");
+}
+
 int main(void) {
   GuestContext *ctx = new_ctx();
   test_all_operations(ctx);
@@ -322,6 +357,7 @@ int main(void) {
   test_shim(ctx);
   test_unmapped_ranges(ctx);
   test_syscall_mprotect(ctx);
+  test_release_direct_unmaps_virtual(ctx);
   fflush(stdout);
   if (g_failures) {
     printf("kernel_batchmap_test: %d FAILED\n", g_failures);

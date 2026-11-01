@@ -20,6 +20,62 @@
 #include <unistd.h>
 
 static void guest_dir_cache_drop_fd(int fd);
+void ps4_gnm_notify_cpu_write(uint64_t addr, uint64_t size) __attribute__((weak));
+
+// Translates a host (Darwin/POSIX) errno to FreeBSD 9 / Orbis OS errno.
+// Errnos 1..34 (EPERM..ERANGE) and 35..84 (EAGAIN..EOVERFLOW) match between Darwin and FreeBSD.
+static int ps4_host_errno_to_freebsd(int e) {
+  if (e <= 0) return 22; // EINVAL
+#ifdef ECANCELED
+  if (e == ECANCELED) return 85;
+#endif
+#ifdef EILSEQ
+  if (e == EILSEQ) return 86;
+#endif
+#ifdef ENOATTR
+  if (e == ENOATTR) return 87;
+#endif
+#ifdef EBADMSG
+  if (e == EBADMSG) return 89;
+#endif
+#ifdef EMULTIHOP
+  if (e == EMULTIHOP) return 90;
+#endif
+#ifdef ENOLINK
+  if (e == ENOLINK) return 91;
+#endif
+#ifdef EPROTO
+  if (e == EPROTO) return 92;
+#endif
+  return e;
+}
+
+// Orbis sceKernel* functions return 0 / positive on success and (int32_t)(0x80020000 | fb_errno)
+// (sign-extended to 64 bits for ssize_t / off_t returns) on failure, while also setting TLS errno.
+static inline uint64_t ps4_sce_kernel_err(GuestContext *ctx, int host_or_fb_err) {
+  int fb_err = ps4_host_errno_to_freebsd(host_or_fb_err);
+  set_guest_errno(ctx, fb_err);
+  return (uint64_t)(int64_t)(int32_t)(0x80020000U | ((uint32_t)fb_err & 0xFFFFU));
+}
+
+// Translates FreeBSD / Orbis open(2) flags to host flags.
+// FreeBSD O_RDONLY..O_EXCL (low 12 bits) match Darwin, whereas FreeBSD O_DIRECT (0x00010000),
+// O_DIRECTORY (0x00020000), O_EXEC (0x00040000), and O_CLOEXEC (0x00100000) differ on Darwin
+// (where 0x00020000 is O_NOFOLLOW_ANY and O_DIRECTORY is 0x00100000).
+static int ps4_open_flags_to_host(int flags) {
+  int host_flags = flags & 0x0FFF;
+  if (flags & 0x00020000) { // FreeBSD O_DIRECTORY
+#ifdef O_DIRECTORY
+    host_flags |= O_DIRECTORY;
+#endif
+  }
+  if (flags & 0x00100000) { // FreeBSD O_CLOEXEC
+#ifdef O_CLOEXEC
+    host_flags |= O_CLOEXEC;
+#endif
+  }
+  return host_flags;
+}
 
 // PS4 specific: sceKernelUsleep sleeps for microseconds
 void shim_sceKernelUsleep(GuestContext *ctx) {
@@ -38,9 +94,24 @@ void shim_write(GuestContext *ctx) {
   const void *host_ptr = ctx->mem_base + buf_addr;
   ssize_t ret = write(fd, host_ptr, count);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
   }
   ctx->rax = (uint64_t)ret;
+  SHIM_RETURN();
+}
+
+void shim_sceKernelWrite(GuestContext *ctx) {
+  int fd = (int)ctx->rdi;
+  uint64_t buf_addr = ctx->rsi;
+  size_t count = (size_t)ctx->rdx;
+
+  const void *host_ptr = ctx->mem_base + buf_addr;
+  ssize_t ret = write(fd, host_ptr, count);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
+  } else {
+    ctx->rax = (uint64_t)ret;
+  }
   SHIM_RETURN();
 }
 
@@ -209,6 +280,9 @@ void shim_mmap(GuestContext *ctx) {
         ctx->rax = (uint64_t)-1;
         SHIM_RETURN();
       }
+      if (ps4_gnm_notify_cpu_write && nread > 0) {
+        ps4_gnm_notify_cpu_write(alloc_addr, (uint64_t)nread);
+      }
       printf("[ps4-sys] mmap file read SUCCESS: read=%zd bytes into 0x%llx\n",
              nread, (unsigned long long)alloc_addr);
       fflush(stdout);
@@ -261,9 +335,28 @@ void shim_read(GuestContext *ctx) {
   ssize_t ret;
   PS4_HITCH_TIMED(PS4_HITCH_IO, ret = read(fd, ctx->mem_base + buf_addr, count));
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
+  } else if (ret > 0 && ps4_gnm_notify_cpu_write) {
+    ps4_gnm_notify_cpu_write(buf_addr, (uint64_t)ret);
   }
   ctx->rax = (uint64_t)ret;
+  SHIM_RETURN();
+}
+
+void shim_sceKernelRead(GuestContext *ctx) {
+  int fd = (int)ctx->rdi;
+  uint64_t buf_addr = ctx->rsi;
+  size_t count = (size_t)ctx->rdx;
+  ssize_t ret;
+  PS4_HITCH_TIMED(PS4_HITCH_IO, ret = read(fd, ctx->mem_base + buf_addr, count));
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
+  } else {
+    if (ret > 0 && ps4_gnm_notify_cpu_write) {
+      ps4_gnm_notify_cpu_write(buf_addr, (uint64_t)ret);
+    }
+    ctx->rax = (uint64_t)ret;
+  }
   SHIM_RETURN();
 }
 
@@ -290,7 +383,13 @@ void shim_readv(GuestContext *ctx) {
 
   ssize_t ret = readv(fd, host_iov, iovcnt);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
+  } else if (ret > 0 && ps4_gnm_notify_cpu_write) {
+    for (int i = 0; i < iovcnt; i++) {
+      if (guest_iov[i].iov_len > 0) {
+        ps4_gnm_notify_cpu_write(guest_iov[i].iov_base, guest_iov[i].iov_len);
+      }
+    }
   }
   ctx->rax = (uint64_t)ret;
   SHIM_RETURN();
@@ -306,9 +405,13 @@ void shim_sceKernelPread(GuestContext *ctx) {
   ssize_t ret;
   PS4_HITCH_TIMED(PS4_HITCH_IO, ret = pread(fd, ctx->mem_base + buf_addr, nbytes, offset));
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
+  } else {
+    if (ret > 0 && ps4_gnm_notify_cpu_write) {
+      ps4_gnm_notify_cpu_write(buf_addr, (uint64_t)ret);
+    }
+    ctx->rax = (uint64_t)ret;
   }
-  ctx->rax = (uint64_t)ret;
   SHIM_RETURN();
 }
 
@@ -320,8 +423,7 @@ void shim_sceKernelPreadv(GuestContext *ctx) {
   off_t offset = (off_t)ctx->rcx;
 
   if (iovcnt <= 0 || iovcnt > 1024) {
-    set_guest_errno(ctx, EINVAL);
-    ctx->rax = (uint64_t)-1;
+    ctx->rax = ps4_sce_kernel_err(ctx, EINVAL);
     SHIM_RETURN();
   }
 
@@ -337,9 +439,17 @@ void shim_sceKernelPreadv(GuestContext *ctx) {
   ssize_t ret;
   PS4_HITCH_TIMED(PS4_HITCH_IO, ret = preadv(fd, host_iov, iovcnt, offset));
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
+  } else {
+    if (ret > 0 && ps4_gnm_notify_cpu_write) {
+      for (int i = 0; i < iovcnt; i++) {
+        if (guest_iov[i].iov_len > 0) {
+          ps4_gnm_notify_cpu_write(guest_iov[i].iov_base, guest_iov[i].iov_len);
+        }
+      }
+    }
+    ctx->rax = (uint64_t)ret;
   }
-  ctx->rax = (uint64_t)ret;
   SHIM_RETURN();
 }
 
@@ -419,15 +529,16 @@ void shim_open(GuestContext *ctx) {
   if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
     actual_path = resolved_path;
   }
+  int host_flags = ps4_open_flags_to_host(flags);
   int ret;
-  int ro_err = ro_open_errno(path, actual_path, flags);
+  int ro_err = ro_open_errno(path, actual_path, host_flags);
   if (ro_err) {
-    set_guest_errno(ctx, ro_err);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(ro_err));
     ret = -1;
   } else {
-    ret = open(actual_path, flags, mode);
+    ret = open(actual_path, host_flags, mode);
     if (ret < 0) {
-      set_guest_errno(ctx, errno);
+      set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     }
   }
   printf("[ps4-sys] open: '%s' (resolved='%s', flags=0x%x) -> fd=%d\n",
@@ -437,15 +548,61 @@ void shim_open(GuestContext *ctx) {
   SHIM_RETURN();
 }
 
+void shim_sceKernelOpen(GuestContext *ctx) {
+  uint64_t path_addr = ctx->rdi;
+  int flags = (int)ctx->rsi;
+  mode_t mode = (mode_t)ctx->rdx;
+  if (!path_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
+  const char *path = (const char *)(ctx->mem_base + path_addr);
+  char resolved_path[1024];
+  const char *actual_path = path;
+  if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
+    actual_path = resolved_path;
+  }
+  int host_flags = ps4_open_flags_to_host(flags);
+  int ret = -1;
+  int err = ro_open_errno(path, actual_path, host_flags);
+  if (!err) {
+    ret = open(actual_path, host_flags, mode);
+    if (ret < 0) {
+      err = errno;
+    }
+  }
+  printf("[ps4-sys] sceKernelOpen: '%s' (resolved='%s', flags=0x%x) -> fd=%d\n",
+         path ? path : "(null)", actual_path ? actual_path : "(null)", flags, ret);
+  fflush(stdout);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, err);
+  } else {
+    ctx->rax = (uint64_t)ret;
+  }
+  SHIM_RETURN();
+}
+
 // close
 void shim_close(GuestContext *ctx) {
   int fd = (int)ctx->rdi;
   guest_dir_cache_drop_fd(fd);
   int ret = close(fd);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
   }
   ctx->rax = (uint64_t)ret;
+  SHIM_RETURN();
+}
+
+void shim_sceKernelClose(GuestContext *ctx) {
+  int fd = (int)ctx->rdi;
+  guest_dir_cache_drop_fd(fd);
+  int ret = close(fd);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
+  } else {
+    ctx->rax = 0;
+  }
   SHIM_RETURN();
 }
 
@@ -456,9 +613,22 @@ void shim_lseek(GuestContext *ctx) {
   int whence = (int)ctx->rdx;
   off_t ret = lseek(fd, offset, whence);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
   }
   ctx->rax = (uint64_t)ret;
+  SHIM_RETURN();
+}
+
+void shim_sceKernelLseek(GuestContext *ctx) {
+  int fd = (int)ctx->rdi;
+  off_t offset = (off_t)ctx->rsi;
+  int whence = (int)ctx->rdx;
+  off_t ret = lseek(fd, offset, whence);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
+  } else {
+    ctx->rax = (uint64_t)ret;
+  }
   SHIM_RETURN();
 }
 
@@ -538,8 +708,32 @@ void shim_stat(GuestContext *ctx) {
     fill_ps4_stat(gst, &st);
     ctx->rax = 0;
   } else {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
+  }
+  SHIM_RETURN();
+}
+
+void shim_sceKernelStat(GuestContext *ctx) {
+  uint64_t path_addr = ctx->rdi;
+  uint64_t statbuf_addr = ctx->rsi;
+  if (!path_addr || !statbuf_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
+  const char *path = (const char *)(ctx->mem_base + path_addr);
+  char resolved_path[1024];
+  if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
+    path = resolved_path;
+  }
+  struct stat st;
+  int ret = stat(path, &st);
+  if (ret == 0) {
+    struct ps4_stat *gst = (struct ps4_stat *)(ctx->mem_base + statbuf_addr);
+    fill_ps4_stat(gst, &st);
+    ctx->rax = 0;
+  } else {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   }
   SHIM_RETURN();
 }
@@ -577,8 +771,27 @@ void shim_fstat(GuestContext *ctx) {
     fill_ps4_stat(gst, &st);
     ctx->rax = 0;
   } else {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
+  }
+  SHIM_RETURN();
+}
+
+void shim_sceKernelFstat(GuestContext *ctx) {
+  int fd = (int)ctx->rdi;
+  uint64_t statbuf_addr = ctx->rsi;
+  if (!statbuf_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
+  struct stat st;
+  int ret = fstat(fd, &st);
+  if (ret == 0) {
+    struct ps4_stat *gst = (struct ps4_stat *)(ctx->mem_base + statbuf_addr);
+    fill_ps4_stat(gst, &st);
+    ctx->rax = 0;
+  } else {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   }
   SHIM_RETURN();
 }
@@ -595,14 +808,41 @@ void shim_chmod(GuestContext *ctx) {
   }
   int ro_err = ro_modify_errno(guest_path, path);
   if (ro_err) {
-    set_guest_errno(ctx, ro_err);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(ro_err));
     ctx->rax = (uint64_t)-1;
     SHIM_RETURN();
   }
   int ret = chmod(path, mode);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
+  } else {
+    ctx->rax = 0;
+  }
+  SHIM_RETURN();
+}
+
+void shim_sceKernelChmod(GuestContext *ctx) {
+  uint64_t path_addr = ctx->rdi;
+  mode_t mode = (mode_t)ctx->rsi;
+  if (!path_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
+  char resolved_path[1024];
+  if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
+    path = resolved_path;
+  }
+  int ro_err = ro_modify_errno(guest_path, path);
+  if (ro_err) {
+    ctx->rax = ps4_sce_kernel_err(ctx, ro_err);
+    SHIM_RETURN();
+  }
+  int ret = chmod(path, mode);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = 0;
   }
@@ -615,7 +855,7 @@ void shim_fchmod(GuestContext *ctx) {
   mode_t mode = (mode_t)ctx->rsi;
   int ret = fchmod(fd, mode);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
   } else {
     ctx->rax = 0;
@@ -635,7 +875,7 @@ void shim_utimes(GuestContext *ctx) {
   }
   int ro_err = ro_modify_errno(guest_path, path);
   if (ro_err) {
-    set_guest_errno(ctx, ro_err);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(ro_err));
     ctx->rax = (uint64_t)-1;
     SHIM_RETURN();
   }
@@ -651,8 +891,45 @@ void shim_utimes(GuestContext *ctx) {
   }
   int ret = utimes(path, host_times);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
+  } else {
+    ctx->rax = 0;
+  }
+  SHIM_RETURN();
+}
+
+void shim_sceKernelUtimes(GuestContext *ctx) {
+  uint64_t path_addr = ctx->rdi;
+  uint64_t times_addr = ctx->rsi;
+  if (!path_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
+  char resolved_path[1024];
+  if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
+    path = resolved_path;
+  }
+  int ro_err = ro_modify_errno(guest_path, path);
+  if (ro_err) {
+    ctx->rax = ps4_sce_kernel_err(ctx, ro_err);
+    SHIM_RETURN();
+  }
+  const struct timeval *host_times = NULL;
+  struct timeval tv[2];
+  if (times_addr && ctx->mem_base) {
+    const int64_t *guest_tv = (const int64_t *)(ctx->mem_base + times_addr);
+    tv[0].tv_sec = (time_t)guest_tv[0];
+    tv[0].tv_usec = (suseconds_t)guest_tv[1];
+    tv[1].tv_sec = (time_t)guest_tv[2];
+    tv[1].tv_usec = (suseconds_t)guest_tv[3];
+    host_times = tv;
+  }
+  int ret = utimes(path, host_times);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = 0;
   }
@@ -675,7 +952,7 @@ void shim_futimes(GuestContext *ctx) {
   }
   int ret = futimes(fd, host_times);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
   } else {
     ctx->rax = 0;
@@ -688,7 +965,7 @@ void shim_fsync(GuestContext *ctx) {
   int fd = (int)ctx->rdi;
   int ret = fsync(fd);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
   } else {
     ctx->rax = 0;
@@ -700,7 +977,7 @@ void shim_sceKernelFsync(GuestContext *ctx) {
   int fd = (int)ctx->rdi;
   int ret = fsync(fd);
   if (ret < 0) {
-    ctx->rax = 0x80020000 | (uint32_t)errno;
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = 0;
   }
@@ -713,7 +990,7 @@ void shim_ftruncate(GuestContext *ctx) {
   off_t length = (off_t)ctx->rsi;
   int ret = ftruncate(fd, length);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
   } else {
     ctx->rax = 0;
@@ -726,7 +1003,7 @@ void shim_sceKernelFtruncate(GuestContext *ctx) {
   off_t length = (off_t)ctx->rsi;
   int ret = ftruncate(fd, length);
   if (ret < 0) {
-    ctx->rax = 0x80020000 | (uint32_t)errno;
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = 0;
   }
@@ -741,7 +1018,7 @@ void shim_msync(GuestContext *ctx) {
   void *host_addr = (addr && ctx->mem_base) ? (void *)(ctx->mem_base + addr) : NULL;
   int ret = msync(host_addr, len, flags);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
   } else {
     ctx->rax = 0;
@@ -758,7 +1035,7 @@ void shim_pwrite(GuestContext *ctx) {
   const void *buf = (buf_addr && ctx->mem_base) ? (const void *)(ctx->mem_base + buf_addr) : NULL;
   ssize_t ret = pwrite(fd, buf, nbyte, offset);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
   } else {
     ctx->rax = (uint64_t)ret;
@@ -774,7 +1051,7 @@ void shim_sceKernelPwrite(GuestContext *ctx) {
   const void *buf = (buf_addr && ctx->mem_base) ? (const void *)(ctx->mem_base + buf_addr) : NULL;
   ssize_t ret = pwrite(fd, buf, nbyte, offset);
   if (ret < 0) {
-    ctx->rax = 0x80020000 | (uint32_t)errno;
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = (uint64_t)ret;
   }
@@ -792,14 +1069,40 @@ void shim_unlink(GuestContext *ctx) {
   }
   int ro_err = ro_modify_errno(guest_path, path);
   if (ro_err) {
-    set_guest_errno(ctx, ro_err);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(ro_err));
     ctx->rax = (uint64_t)-1;
     SHIM_RETURN();
   }
   int ret = unlink(path);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
+  } else {
+    ctx->rax = 0;
+  }
+  SHIM_RETURN();
+}
+
+void shim_sceKernelUnlink(GuestContext *ctx) {
+  uint64_t path_addr = ctx->rdi;
+  if (!path_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
+  char resolved_path[1024];
+  if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
+    path = resolved_path;
+  }
+  int ro_err = ro_modify_errno(guest_path, path);
+  if (ro_err) {
+    ctx->rax = ps4_sce_kernel_err(ctx, ro_err);
+    SHIM_RETURN();
+  }
+  int ret = unlink(path);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = 0;
   }
@@ -818,14 +1121,41 @@ void shim_mkdir(GuestContext *ctx) {
   }
   int ro_err = ro_create_errno(guest_path, path);
   if (ro_err) {
-    set_guest_errno(ctx, ro_err);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(ro_err));
     ctx->rax = (uint64_t)-1;
     SHIM_RETURN();
   }
   int ret = mkdir(path, mode);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
+  } else {
+    ctx->rax = 0;
+  }
+  SHIM_RETURN();
+}
+
+void shim_sceKernelMkdir(GuestContext *ctx) {
+  uint64_t path_addr = ctx->rdi;
+  mode_t mode = (mode_t)ctx->rsi;
+  if (!path_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
+  char resolved_path[1024];
+  if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
+    path = resolved_path;
+  }
+  int ro_err = ro_create_errno(guest_path, path);
+  if (ro_err) {
+    ctx->rax = ps4_sce_kernel_err(ctx, ro_err);
+    SHIM_RETURN();
+  }
+  int ret = mkdir(path, mode);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = 0;
   }
@@ -843,13 +1173,13 @@ void shim_rmdir(GuestContext *ctx) {
   }
   int ro_err = ro_modify_errno(guest_path, path);
   if (ro_err) {
-    set_guest_errno(ctx, ro_err);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(ro_err));
     ctx->rax = (uint64_t)-1;
     SHIM_RETURN();
   }
   int ret = rmdir(path);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
   } else {
     ctx->rax = 0;
@@ -859,6 +1189,10 @@ void shim_rmdir(GuestContext *ctx) {
 
 void shim_sceKernelRmdir(GuestContext *ctx) {
   uint64_t path_addr = ctx->rdi;
+  if (!path_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
   const char *guest_path = (const char *)(ctx->mem_base + path_addr);
   const char *path = guest_path;
   char resolved_path[1024];
@@ -867,12 +1201,12 @@ void shim_sceKernelRmdir(GuestContext *ctx) {
   }
   int ro_err = ro_modify_errno(guest_path, path);
   if (ro_err) {
-    ctx->rax = 0x80020000 | (uint32_t)ro_err;
+    ctx->rax = ps4_sce_kernel_err(ctx, ro_err);
     SHIM_RETURN();
   }
   int ret = rmdir(path);
   if (ret < 0) {
-    ctx->rax = 0x80020000 | (uint32_t)errno;
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = 0;
   }
@@ -896,14 +1230,45 @@ void shim_rename(GuestContext *ctx) {
     ro_err = lstat(oldpath, &st) != 0 ? errno : EROFS;
   }
   if (ro_err) {
-    set_guest_errno(ctx, ro_err);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(ro_err));
     ctx->rax = (uint64_t)-1;
     SHIM_RETURN();
   }
   int ret = rename(oldpath, newpath);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
+  } else {
+    ctx->rax = 0;
+  }
+  SHIM_RETURN();
+}
+
+void shim_sceKernelRename(GuestContext *ctx) {
+  uint64_t old_addr = ctx->rdi;
+  uint64_t new_addr = ctx->rsi;
+  if (!old_addr || !new_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
+  const char *oldpath = (const char *)(ctx->mem_base + old_addr);
+  const char *newpath = (const char *)(ctx->mem_base + new_addr);
+  const char *guest_old = oldpath, *guest_new = newpath;
+  char res_old[1024], res_new[1024];
+  if (ps4_vfs_resolve(oldpath, res_old, sizeof(res_old)) == 0) oldpath = res_old;
+  if (ps4_vfs_resolve(newpath, res_new, sizeof(res_new)) == 0) newpath = res_new;
+  int ro_err = 0;
+  if (ps4_vfs_is_read_only(guest_old) || ps4_vfs_is_read_only(guest_new)) {
+    struct stat st;
+    ro_err = lstat(oldpath, &st) != 0 ? errno : EROFS;
+  }
+  if (ro_err) {
+    ctx->rax = ps4_sce_kernel_err(ctx, ro_err);
+    SHIM_RETURN();
+  }
+  int ret = rename(oldpath, newpath);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = 0;
   }
@@ -922,14 +1287,41 @@ void shim_truncate(GuestContext *ctx) {
   }
   int ro_err = ro_modify_errno(guest_path, path);
   if (ro_err) {
-    set_guest_errno(ctx, ro_err);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(ro_err));
     ctx->rax = (uint64_t)-1;
     SHIM_RETURN();
   }
   int ret = truncate(path, length);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
+  } else {
+    ctx->rax = 0;
+  }
+  SHIM_RETURN();
+}
+
+void shim_sceKernelTruncate(GuestContext *ctx) {
+  uint64_t path_addr = ctx->rdi;
+  off_t length = (off_t)ctx->rsi;
+  if (!path_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
+  const char *guest_path = (const char *)(ctx->mem_base + path_addr);
+  const char *path = guest_path;
+  char resolved_path[1024];
+  if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
+    path = resolved_path;
+  }
+  int ro_err = ro_modify_errno(guest_path, path);
+  if (ro_err) {
+    ctx->rax = ps4_sce_kernel_err(ctx, ro_err);
+    SHIM_RETURN();
+  }
+  int ret = truncate(path, length);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = 0;
   }
@@ -1088,8 +1480,25 @@ void shim_getdents(GuestContext *ctx) {
   size_t nbytes = (size_t)ctx->rdx;
   int ret = guest_getdirentries(fd, buf, nbytes, NULL);
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
+  } else {
+    ctx->rax = (uint64_t)ret;
+  }
+  SHIM_RETURN();
+}
+
+void shim_sceKernelGetdents(GuestContext *ctx) {
+  int fd = (int)ctx->rdi;
+  if (!ctx->rsi || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
+  char *buf = (char *)(ctx->mem_base + ctx->rsi);
+  size_t nbytes = (size_t)ctx->rdx;
+  int ret = guest_getdirentries(fd, buf, nbytes, NULL);
+  if (ret < 0) {
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = (uint64_t)ret;
   }
@@ -1109,7 +1518,7 @@ void shim_getdirentries(GuestContext *ctx) {
     *(int64_t *)(ctx->mem_base + basep_addr) = base;
   }
   if (ret < 0) {
-    set_guest_errno(ctx, errno);
+    set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)-1;
   } else {
     ctx->rax = (uint64_t)ret;
@@ -1122,6 +1531,10 @@ void shim_sceKernelGetdirentries(GuestContext *ctx) {
   uint64_t buf_addr = ctx->rsi;
   size_t nbytes = (size_t)ctx->rdx;
   uint64_t basep_addr = ctx->rcx;
+  if (!buf_addr || !ctx->mem_base) {
+    ctx->rax = ps4_sce_kernel_err(ctx, EFAULT);
+    SHIM_RETURN();
+  }
   char *buf = (char *)(ctx->mem_base + buf_addr);
   int64_t base = -2;
   int ret = guest_getdirentries(fd, buf, nbytes, basep_addr ? &base : NULL);
@@ -1129,7 +1542,7 @@ void shim_sceKernelGetdirentries(GuestContext *ctx) {
     *(int64_t *)(ctx->mem_base + basep_addr) = base;
   }
   if (ret < 0) {
-    ctx->rax = 0x80020000 | (uint32_t)errno;
+    ctx->rax = ps4_sce_kernel_err(ctx, errno);
   } else {
     ctx->rax = (uint64_t)ret;
   }
@@ -1296,7 +1709,11 @@ void shim_syscall(GuestContext *ctx) {
     size_t count = (size_t)ctx->rcx;
     ssize_t ret;
     PS4_HITCH_TIMED(PS4_HITCH_IO, ret = read(fd, ctx->mem_base + buf, count));
-    if (ret < 0) set_guest_errno(ctx, errno);
+    if (ret < 0) {
+      set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
+    } else if (ret > 0 && ps4_gnm_notify_cpu_write) {
+      ps4_gnm_notify_cpu_write(buf, (uint64_t)ret);
+    }
     ctx->rax = (uint64_t)ret;
     SHIM_RETURN();
   }
@@ -1305,7 +1722,7 @@ void shim_syscall(GuestContext *ctx) {
     uint64_t buf = ctx->rdx;
     size_t count = (size_t)ctx->rcx;
     ssize_t ret = write(fd, ctx->mem_base + buf, count);
-    if (ret < 0) set_guest_errno(ctx, errno);
+    if (ret < 0) set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)ret;
     SHIM_RETURN();
   }
@@ -1319,13 +1736,14 @@ void shim_syscall(GuestContext *ctx) {
     if (ps4_vfs_resolve(path, resolved_path, sizeof(resolved_path)) == 0) {
       actual_path = resolved_path;
     }
+    int host_flags = ps4_open_flags_to_host(flags);
     int ret = -1;
-    int ro_err = ro_open_errno(path, actual_path, flags);
+    int ro_err = ro_open_errno(path, actual_path, host_flags);
     if (ro_err) {
-      set_guest_errno(ctx, ro_err);
+      set_guest_errno(ctx, ps4_host_errno_to_freebsd(ro_err));
     } else {
-      ret = open(actual_path, flags, mode);
-      if (ret < 0) set_guest_errno(ctx, errno);
+      ret = open(actual_path, host_flags, mode);
+      if (ret < 0) set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     }
     printf("[ps4-sys] syscall 5 (SYS_open): '%s' (resolved='%s', flags=0x%x) -> fd=%d\n",
            path ? path : "(null)", actual_path ? actual_path : "(null)", flags, ret);
@@ -1335,8 +1753,9 @@ void shim_syscall(GuestContext *ctx) {
   }
   case 6: { // SYS_close
     int fd = (int)ctx->rsi;
+    guest_dir_cache_drop_fd(fd);
     int ret = close(fd);
-    if (ret < 0) set_guest_errno(ctx, errno);
+    if (ret < 0) set_guest_errno(ctx, ps4_host_errno_to_freebsd(errno));
     ctx->rax = (uint64_t)ret;
     SHIM_RETURN();
   }
@@ -1423,6 +1842,9 @@ void shim_syscall(GuestContext *ctx) {
           recomp_vm_free(ctx, alloc_addr, aligned_len);
           ctx->rax = (uint64_t)-1;
           SHIM_RETURN();
+        }
+        if (ps4_gnm_notify_cpu_write && nread > 0) {
+          ps4_gnm_notify_cpu_write(alloc_addr, (uint64_t)nread);
         }
         printf("[ps4-sys] syscall 477 file read SUCCESS: read=%zd bytes into 0x%llx\n",
                nread, (unsigned long long)alloc_addr);

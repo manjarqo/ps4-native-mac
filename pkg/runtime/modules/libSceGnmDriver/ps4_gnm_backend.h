@@ -309,6 +309,11 @@ public:
 
     // ---- work
     virtual void Draw(const GnmDraw& d) = 0;
+    virtual void SetStageInRegion(MTLRegion region) = 0;
+    virtual void SetTessellationFactorBuffer(id<MTLBuffer> buf, uint64_t offset, uint64_t instance_stride) = 0;
+    virtual void DrawPatches(uint32_t num_control_points, uint32_t patch_start, uint32_t patch_count,
+                             id<MTLBuffer> patch_index_buffer, uint64_t patch_index_buffer_offset,
+                             uint32_t instance_count, uint32_t base_instance) = 0;
     virtual void Dispatch(MTLSize groups, MTLSize threads_per_group) = 0;
     virtual void DispatchThreads(MTLSize threads, MTLSize threads_per_group) = 0;
     virtual void DispatchIndirect(id<MTLBuffer> args, uint64_t off, MTLSize threads_per_group) = 0;

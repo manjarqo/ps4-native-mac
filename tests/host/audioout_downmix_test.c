@@ -2,7 +2,8 @@
 // the real module with its headless device (PS4_AUDIO_NULL=1) and the final-mix WAV dump
 // (PS4_AUDIO_DUMP). Every channel of a FLOAT_8CH_STD grain gets a distinct constant, so the
 // played frame identifies each channel's destination and gain:
-//   L = FL + 0.7071 * (FC + BL + SL),  R = FR + 0.7071 * (FC + BR + SR),  LFE dropped.
+//   L = clamp(FL + 0.7071 * FC + 0.5 * (BL + SL), -1, 1),
+//   R = clamp(FR + 0.7071 * FC + 0.5 * (BR + SR), -1, 1),  LFE dropped.
 // A swapped pair, a lost centre, LFE leaking in or a wrong surround gain all change the frame.
 // A PADSPK (controller speaker) port is mixed into both sides at its mix level: -9 dB
 // (11626 / 32768) as opened, the level sceAudioOutSetMixLevelPadSpk sets after that; and the
@@ -82,13 +83,19 @@ int main(void) {
 
   // 8 channels, FL FR FC LFE BL BR SL SR, distinct values.
   const float c8[8] = {0.10f, 0.02f, 0.20f, 0.40f, 0.05f, 0.03f, 0.01f, 0.07f};
-  const float l8 = c8[0] + k * c8[2] + k * c8[4] + k * c8[6];
-  const float r8 = c8[1] + k * c8[2] + k * c8[5] + k * c8[7];
+  const float l8 = c8[0] + k * c8[2] + 0.5f * (c8[4] + c8[6]);
+  const float r8 = c8[1] + k * c8[2] + 0.5f * (c8[5] + c8[7]);
   long other = 0;
   long m = play(dump, PS4_AUDIO_OUT_FMT_FLOAT_8CH_STD, c8, 8, l8, r8, &other, 0);
   fprintf(stderr, "audioout_downmix_test: 8ch: %ld frames (%.6f, %.6f), %ld other\n", m, l8, r8, other);
   CHECK(m >= (long)GRAINS * LEN * 9 / 10 && m <= (long)GRAINS * LEN);
   CHECK(other == 0);
+
+  // 8-channel clamping to [-1.0f, 1.0f].
+  const float clip8[8] = {0.9f, -0.9f, 0.0f, 0.0f, 0.5f, -0.5f, 0.5f, -0.5f};
+  long start_clip = dump_frames(dump);
+  m = play(dump, PS4_AUDIO_OUT_FMT_FLOAT_8CH_STD, clip8, 8, 1.0f, -1.0f, &other, start_clip);
+  CHECK(m >= (long)GRAINS * LEN * 9 / 10 && other == 0);
 
   // Centre alone: -3 dB into both sides, equal.
   const float fc[8] = {0, 0, 0.5f, 0, 0, 0, 0, 0};

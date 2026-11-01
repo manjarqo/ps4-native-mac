@@ -13,9 +13,11 @@
 // The dialog's texts follow the system language (libSceSystemService); this test reads no text.
 int ps4_host_choose_language(void) { return 1; }
 
+void shim_sceSaveDataMount(GuestContext *ctx);
 void shim_sceSaveDataMount2(GuestContext *ctx);
 void shim_sceSaveDataUmount(GuestContext *ctx);
 void shim_sceSaveDataSetParam(GuestContext *ctx);
+void shim_sceSaveDataDelete(GuestContext *ctx);
 void shim_sceSaveDataDirNameSearch(GuestContext *ctx);
 
 static int g_failures;
@@ -232,6 +234,38 @@ int main(int argc, char **argv) {
   dir = list_answer(ORBIS_SAVE_DATA_DIALOG_TYPE_LOAD, order, 3, FOCUS_DATALATEST, &res);
   CHECK(strcmp(dir, "gameAuto0") == 0, "pick by name: got '%.31s'", dir);
   unsetenv("PS4_SAVEDATA_DIALOG_PICK");
+
+  // OrbisSaveDataMount v1 (80-byte layout with titleId at +0x08, dirName at +0x10,
+  // fingerprint at +0x18, blocks at +0x20, mountMode at +0x28) as used by Bloodborne:
+  // mounting without CREATE returns 0x809f0008 (NOT_FOUND), then ORing CREATE succeeds.
+  {
+    memset(g_mem + DIRNAME, 0, 32);
+    strcpy((char *)g_mem + DIRNAME, "SPRJ0005");
+    memset(g_mem + MOUNT, 0, 80);
+    *(int32_t *)(g_mem + MOUNT + 0x00) = USER;
+    *(uint64_t *)(g_mem + MOUNT + 0x08) = 0;       // titleId = NULL
+    *(uint64_t *)(g_mem + MOUNT + 0x10) = DIRNAME; // dirName
+    *(uint64_t *)(g_mem + MOUNT + 0x18) = 0;       // fingerprint = NULL
+    *(uint64_t *)(g_mem + MOUNT + 0x20) = 1024;    // blocks
+    *(uint32_t *)(g_mem + MOUNT + 0x28) = 0x2;     // RDWR (no CREATE)
+    int64_t rc = call(shim_sceSaveDataMount, MOUNT, MOUNT_RES, 0, 0);
+    CHECK((uint32_t)rc == 0x809f0008u, "Mount v1 without CREATE returns NOT_FOUND, got 0x%x", (uint32_t)rc);
+    *(uint32_t *)(g_mem + MOUNT + 0x28) |= 0x4;    // RDWR | CREATE
+    rc = call(shim_sceSaveDataMount, MOUNT, MOUNT_RES, 0, 0);
+    CHECK(rc == 0, "Mount v1 with CREATE succeeds, got 0x%x", (uint32_t)rc);
+    CHECK(call(shim_sceSaveDataUmount, MOUNT_RES, 0, 0, 0) == 0, "umount SPRJ0005");
+
+    // Glob '*' pattern in DirNameSearch matches SPRJ0005.
+    memset(g_mem + COND, 0, 0x40);
+    memset(g_mem + SEARCH_RES, 0, 0x40);
+    strcpy((char *)g_mem + DIRNAME, "SPRJ*");
+    *(int32_t *)(g_mem + COND + 0x00) = USER;
+    *(uint64_t *)(g_mem + COND + 0x10) = DIRNAME;
+    *(uint64_t *)(g_mem + SEARCH_RES + 0x08) = SEARCH_NAMES;
+    *(uint32_t *)(g_mem + SEARCH_RES + 0x10) = 4;
+    CHECK(call(shim_sceSaveDataDirNameSearch, COND, SEARCH_RES, 0, 0) == 0, "DirNameSearch SPRJ*");
+    CHECK(*(uint32_t *)(g_mem + SEARCH_RES) == 1, "SPRJ* hitNum=%u", *(uint32_t *)(g_mem + SEARCH_RES));
+  }
 
 done:;
   char cmd[128];
