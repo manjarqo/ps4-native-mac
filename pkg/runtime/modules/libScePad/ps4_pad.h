@@ -139,6 +139,12 @@ int32_t scePadGetControllerInformation(int32_t handle, OrbisPadControllerInforma
 // Host input helper (called by window event pump)
 void ps4_pad_handle_key(unsigned short keyCode, int isDown);
 
+// Applies physical touchpad button/finger state and synthesizes a default center touch point
+// (960, 475) whenever ORBIS_PAD_BUTTON_TOUCH_PAD is pressed without explicit touch coordinates.
+void ps4_pad_apply_touchpad_input(uint32_t *buttons, OrbisPadTouchData *touch, int tp_btn_pressed,
+                                  int f1_active, float f1_x, float f1_y,
+                                  int f2_active, float f2_x, float f2_y);
+
 // Guest ABI shims
 void shim_scePadInit(GuestContext *ctx);
 void shim_scePadOpen(GuestContext *ctx);

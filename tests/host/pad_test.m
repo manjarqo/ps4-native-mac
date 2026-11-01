@@ -189,6 +189,46 @@ static void test_touch(int32_t handle, const char *path) {
   CHECK(late_new == 0, "the last touch lasted past its 100 ms");
   scePadReadState(handle, &d);
   CHECK(d.touch.fingers == 0, "%u fingers after the commands", d.touch.fingers);
+
+  // Physical gamepad touchpad button & capacitive axis synthesis:
+  // 1) Pressing the physical touchpad button without capacitive axes sets ORBIS_PAD_BUTTON_TOUCH_PAD
+  //    and synthesizes a 1-finger touch at the center (960, 475).
+  uint32_t btns = 0;
+  OrbisPadTouchData td;
+  memset(&td, 0, sizeof(td));
+  ps4_pad_apply_touchpad_input(&btns, &td, 1, 0, 0.0f, 0.0f, 0, 0.0f, 0.0f);
+  CHECK(btns == ORBIS_PAD_BUTTON_TOUCH_PAD, "btns=0x%x", btns);
+  CHECK(td.fingers == 1 && td.touch[0].x == 960 && td.touch[0].y == 475,
+        "center touch fingers=%u (%u, %u)", td.fingers, td.touch[0].x, td.touch[0].y);
+  uint8_t first_hw_id = td.touch[0].finger;
+
+  // 2) Holding the touchpad button with a finger at top-left (-1, +1) and second finger at
+  //    bottom-right (+1, -1) keeps finger 0's ID and maps coordinates to (0, 0) and (1919, 949).
+  memset(&td, 0, sizeof(td));
+  ps4_pad_apply_touchpad_input(&btns, &td, 1, 1, -1.0f, 1.0f, 1, 1.0f, -1.0f);
+  CHECK(td.fingers == 2, "two fingers=%u", td.fingers);
+  CHECK(td.touch[0].x == 0 && td.touch[0].y == 0 && td.touch[0].finger == first_hw_id,
+        "f0 (%u, %u) id=%u (want %u)", td.touch[0].x, td.touch[0].y, td.touch[0].finger, first_hw_id);
+  CHECK(td.touch[1].x == 1919 && td.touch[1].y == 949 && td.touch[1].finger != first_hw_id,
+        "f1 (%u, %u) id=%u", td.touch[1].x, td.touch[1].y, td.touch[1].finger);
+
+  // 3) Releasing clears touch state, and pressing T key (keyCode 17) through scePadReadState
+  //    reports ORBIS_PAD_BUTTON_TOUCH_PAD with a synthesized center touch (960, 475) and a new ID.
+  btns = 0;
+  memset(&td, 0, sizeof(td));
+  ps4_pad_apply_touchpad_input(&btns, &td, 0, 0, 0.0f, 0.0f, 0, 0.0f, 0.0f);
+  CHECK(td.fingers == 0, "released fingers=%u", td.fingers);
+
+  ps4_pad_handle_key(17, 1);
+  scePadReadState(handle, &d);
+  CHECK((d.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD) != 0, "key T did not set TOUCH_PAD (0x%x)", d.buttons);
+  CHECK(d.touch.fingers == 1 && d.touch.touch[0].x == 960 && d.touch.touch[0].y == 475,
+        "key T touch fingers=%u (%u, %u)", d.touch.fingers, d.touch.touch[0].x, d.touch.touch[0].y);
+  CHECK(d.touch.touch[0].finger != first_hw_id, "new press kept old id %u", d.touch.touch[0].finger);
+  ps4_pad_handle_key(17, 0);
+  scePadReadState(handle, &d);
+  CHECK((d.buttons & ORBIS_PAD_BUTTON_TOUCH_PAD) == 0 && d.touch.fingers == 0,
+        "key T release buttons=0x%x fingers=%u", d.buttons, d.touch.fingers);
 }
 
 // Motion sensors. The script clock is PS4_PAD_CLOCK=frames: flip count f is f*1000/30 ms, so the

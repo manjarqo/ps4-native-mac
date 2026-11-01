@@ -3295,7 +3295,7 @@ bool TextureCache::ComputeGuestDigestLocked(Entry* e, uint64_t* out) {
         return (h ^ v) * 0x9e3779b97f4a7c15ULL;
     };
     uint64_t h = n ^ 0x517cc1b727220a95ULL;
-    const bool full_scan = (n <= 4096) || (!e->surf.is_block && e->levels == 1 && n <= 8 * 1024 * 1024);
+    const bool full_scan = (n <= 4096);
     if (full_scan) {
         uint64_t i = 0;
         for (; i + 8 <= n; i += 8) {
@@ -3660,8 +3660,18 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
             e->width == width && e->height == height && e->depth == depth && e->levels == levels &&
             e->layers == layers && e->swizzle == img.view_swizzle && e->surf.pitch == sd.pitch &&
             e->surf.tile_mode == sd.tile_mode && e->surf.is_pow2 == sd.is_pow2) {
-            const bool is_static_asset = (e->surf.is_block || e->levels > 1) && e->cpu_unchanged_streak >= 4;
-            const uint64_t poll_interval = is_static_asset ? 64 : 1;
+            const bool is_block_or_mip = e->surf.is_block || e->levels > 1;
+            uint64_t poll_interval = 1;
+            if (is_block_or_mip) {
+                if (e->cpu_unchanged_streak >= 3) poll_interval = 1024;
+                else if (e->cpu_unchanged_streak == 2) poll_interval = 256;
+                else if (e->cpu_unchanged_streak == 1) poll_interval = 64;
+            } else {
+                if (e->cpu_unchanged_streak >= 7) poll_interval = 512;
+                else if (e->cpu_unchanged_streak == 6) poll_interval = 256;
+                else if (e->cpu_unchanged_streak == 5) poll_interval = 64;
+                else if (e->cpu_unchanged_streak == 4) poll_interval = 16;
+            }
             const bool need_cpu_check = e->dirty || (sub_epoch - e->cpu_check_epoch) >= poll_interval;
             if (refresh_min_bytes) {
                 // stale contents: big surfaces are copied on the GPU, small ones by the CPU

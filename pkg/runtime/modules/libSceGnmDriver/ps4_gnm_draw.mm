@@ -8174,6 +8174,123 @@ bool BuildQuadListIndices(const DrawArgs& a, uint32_t count, __strong id<MTLBuff
     return true;
 }
 
+bool BuildQuadStripIndices(const DrawArgs& a, uint32_t count, __strong id<MTLBuffer>* out, size_t* off,
+                           uint32_t* out_count) {
+    if (count < 4) return false;
+    uint32_t quads = (count - 2) / 2;
+    uint32_t avail = count;
+    if (a.indexed && a.max_index) {
+        avail = a.max_index > a.index_offset ? std::min(count, a.max_index - a.index_offset) : 0;
+        quads = avail >= 4 ? std::min(quads, (avail - 2) / 2) : 0;
+    }
+    if (quads == 0) return false;
+    if (count > (8u << 20)) {
+        RLog("quad-strip-count", "quad strip with %u vertices rejected", count);
+        return false;
+    }
+    const uint32_t n = quads * 6;
+    void* ptr;
+    if (!S.arena.Alloc(S.dev, (size_t)n * 4, 16, out, off, &ptr)) return false;
+    uint32_t* dst = (uint32_t*)ptr;
+    const bool i32 = a.index_type == 1;
+    const uint8_t* src = nullptr;
+    if (a.indexed) {
+        const uint64_t isz = i32 ? 4 : 2;
+        const uint64_t addr = a.index_base + (uint64_t)a.index_offset * isz;
+        if (!a.index_base || addr >= S.ctx->mem_size || (uint64_t)avail * isz > S.ctx->mem_size - addr)
+            return false;
+        src = S.ctx->mem_base + addr;
+    }
+    auto idx = [&](uint32_t i) -> uint32_t {
+        if (!src) return i;
+        if (i >= avail) return 0;
+        return i32 ? ((const uint32_t*)src)[i] : ((const uint16_t*)src)[i];
+    };
+    for (uint32_t q = 0; q < quads; ++q) {
+        const uint32_t v0 = idx(q * 2 + 0), v1 = idx(q * 2 + 1), v2 = idx(q * 2 + 2), v3 = idx(q * 2 + 3);
+        dst[q * 6 + 0] = v0;
+        dst[q * 6 + 1] = v1;
+        dst[q * 6 + 2] = v3;
+        dst[q * 6 + 3] = v0;
+        dst[q * 6 + 4] = v3;
+        dst[q * 6 + 5] = v2;
+    }
+    *out_count = n;
+    return true;
+}
+
+bool BuildTriangleFanIndices(const DrawArgs& a, uint32_t count, __strong id<MTLBuffer>* out, size_t* off,
+                             uint32_t* out_count) {
+    if (count < 3) return false;
+    uint32_t tris = count - 2;
+    uint32_t avail = count;
+    if (a.indexed && a.max_index) {
+        avail = a.max_index > a.index_offset ? std::min(count, a.max_index - a.index_offset) : 0;
+        tris = avail >= 3 ? std::min(tris, avail - 2) : 0;
+    }
+    if (tris == 0 || count > (8u << 20)) return false;
+    const uint32_t n = tris * 3;
+    void* ptr;
+    if (!S.arena.Alloc(S.dev, (size_t)n * 4, 16, out, off, &ptr)) return false;
+    uint32_t* dst = (uint32_t*)ptr;
+    const bool i32 = a.index_type == 1;
+    const uint8_t* src = nullptr;
+    if (a.indexed) {
+        const uint64_t isz = i32 ? 4 : 2;
+        const uint64_t addr = a.index_base + (uint64_t)a.index_offset * isz;
+        if (!a.index_base || addr >= S.ctx->mem_size || (uint64_t)avail * isz > S.ctx->mem_size - addr)
+            return false;
+        src = S.ctx->mem_base + addr;
+    }
+    auto idx = [&](uint32_t i) -> uint32_t {
+        if (!src) return i;
+        if (i >= avail) return 0;
+        return i32 ? ((const uint32_t*)src)[i] : ((const uint16_t*)src)[i];
+    };
+    const uint32_t v0 = idx(0);
+    for (uint32_t t = 0; t < tris; ++t) {
+        dst[t * 3 + 0] = v0;
+        dst[t * 3 + 1] = idx(t + 1);
+        dst[t * 3 + 2] = idx(t + 2);
+    }
+    *out_count = n;
+    return true;
+}
+
+bool BuildLineLoopIndices(const DrawArgs& a, uint32_t count, __strong id<MTLBuffer>* out, size_t* off,
+                          uint32_t* out_count) {
+    if (count < 2) return false;
+    uint32_t avail = count;
+    if (a.indexed && a.max_index) {
+        avail = a.max_index > a.index_offset ? std::min(count, a.max_index - a.index_offset) : 0;
+    }
+    if (avail < 2 || count > (8u << 20)) return false;
+    const uint32_t n = avail * 2;
+    void* ptr;
+    if (!S.arena.Alloc(S.dev, (size_t)n * 4, 16, out, off, &ptr)) return false;
+    uint32_t* dst = (uint32_t*)ptr;
+    const bool i32 = a.index_type == 1;
+    const uint8_t* src = nullptr;
+    if (a.indexed) {
+        const uint64_t isz = i32 ? 4 : 2;
+        const uint64_t addr = a.index_base + (uint64_t)a.index_offset * isz;
+        if (!a.index_base || addr >= S.ctx->mem_size || (uint64_t)avail * isz > S.ctx->mem_size - addr)
+            return false;
+        src = S.ctx->mem_base + addr;
+    }
+    auto idx = [&](uint32_t i) -> uint32_t {
+        if (!src) return i;
+        if (i >= avail) return 0;
+        return i32 ? ((const uint32_t*)src)[i] : ((const uint16_t*)src)[i];
+    };
+    for (uint32_t i = 0; i < avail; ++i) {
+        dst[i * 2 + 0] = idx(i);
+        dst[i * 2 + 1] = idx((i + 1) % avail);
+    }
+    *out_count = n;
+    return true;
+}
+
 // =====================================================================================
 // Fast clear elimination / resolve passes (shadPS4 Rasterizer::FilterDraw)
 // =====================================================================================
@@ -11589,23 +11706,34 @@ void DrawEncode(DrawRec& r) {
             if (args.base_vertex_ud < 0 || args.start_instance_ud < 0)
                 IndirectRecordOffsets(args, vertex_offset, instance_offset, &arg_buf, &arg_off);
         } else if (rs.raster.needs_emulation && !rect) {
+            size_t aoff = 0;
+            bool ok = false;
+            MTLPrimitiveType emu_prim = MTLPrimitiveTypeTriangle;
             if (rs.raster.prim == PrimitiveType::QuadList) {
-                size_t aoff;
-                if (!BuildQuadListIndices(args, args.count, &ib, &aoff, &draw_count)) {
-                    NoteSkip(SkipReason::QuadIndices);
-                    return;
-                }
-                ib_off = aoff;
-                ib_len = (uint64_t)draw_count * 4;
-                itype = MTLIndexTypeUInt32;
-                indexed = true;
-                prim = MTLPrimitiveTypeTriangle;
+                ok = BuildQuadListIndices(args, args.count, &ib, &aoff, &draw_count);
+            } else if (rs.raster.prim == PrimitiveType::QuadStrip) {
+                ok = BuildQuadStripIndices(args, args.count, &ib, &aoff, &draw_count);
+            } else if (rs.raster.prim == PrimitiveType::TriangleFan ||
+                       rs.raster.prim == PrimitiveType::Polygon) {
+                ok = BuildTriangleFanIndices(args, args.count, &ib, &aoff, &draw_count);
+            } else if (rs.raster.prim == PrimitiveType::LineLoop) {
+                ok = BuildLineLoopIndices(args, args.count, &ib, &aoff, &draw_count);
+                emu_prim = MTLPrimitiveTypeLine;
             } else {
                 RLog("prim", "%s: primitive type %s not supported yet; skipped (VS 0x%llx PS 0x%llx n=%u)", args.name,
                      NameOf(rs.raster.prim), (unsigned long long)vs_addr, (unsigned long long)ps_addr, args.count);
                 NoteSkip(SkipReason::Primitive);
                 return;
             }
+            if (!ok) {
+                NoteSkip(SkipReason::QuadIndices);
+                return;
+            }
+            ib_off = aoff;
+            ib_len = (uint64_t)draw_count * 4;
+            itype = MTLIndexTypeUInt32;
+            indexed = true;
+            prim = emu_prim;
         } else if (indexed) {
             const uint64_t isz = args.index_type == 1 ? 4 : 2;
             const uint64_t addr = args.index_base + (uint64_t)args.index_offset * isz;

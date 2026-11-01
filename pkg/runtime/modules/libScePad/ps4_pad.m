@@ -620,6 +620,61 @@ typedef struct {
 
 static int pad_clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
+void ps4_pad_apply_touchpad_input(uint32_t *buttons, OrbisPadTouchData *touch, int tp_btn_pressed,
+                                  int f1_active, float f1_x, float f1_y,
+                                  int f2_active, float f2_x, float f2_y) {
+  static int hw_down_prev[ORBIS_PAD_MAX_TOUCH_NUM];
+  static uint8_t hw_ids[ORBIS_PAD_MAX_TOUCH_NUM];
+  static uint8_t hw_next_id;
+
+  if (tp_btn_pressed) {
+    *buttons |= ORBIS_PAD_BUTTON_TOUCH_PAD;
+  }
+
+  // If PS4_PAD_CTL "t" already supplied explicit touch points for this read, keep them as-is.
+  if (touch->fingers > 0) {
+    hw_down_prev[0] = 0;
+    hw_down_prev[1] = 0;
+    return;
+  }
+
+  int active[ORBIS_PAD_MAX_TOUCH_NUM] = {f1_active ? 1 : 0, f2_active ? 1 : 0};
+  float fx[ORBIS_PAD_MAX_TOUCH_NUM] = {f1_x, f2_x};
+  float fy[ORBIS_PAD_MAX_TOUCH_NUM] = {f1_y, f2_y};
+
+  // When the touchpad button is pressed without capacitive axis coordinates (e.g. keyboard T,
+  // PS4_PAD_CTL "p 100000", Xbox/generic View button, or a click at the dead center of the pad),
+  // report a single finger at the center of the 1920x950 touchpad (960, 475).
+  if ((*buttons & ORBIS_PAD_BUTTON_TOUCH_PAD) && !active[0] && !active[1]) {
+    active[0] = 1;
+    fx[0] = 0.0f;
+    fy[0] = 0.0f;
+  }
+
+  uint8_t out_fingers = 0;
+  for (int i = 0; i < ORBIS_PAD_MAX_TOUCH_NUM; i++) {
+    if (!active[i]) {
+      hw_down_prev[i] = 0;
+      continue;
+    }
+    if (!hw_down_prev[i]) {
+      hw_ids[i] = hw_next_id++ & 0x7f;
+      hw_down_prev[i] = 1;
+    }
+    uint16_t px = 960;
+    uint16_t py = 475;
+    if (fabsf(fx[i]) > 1e-4f || fabsf(fy[i]) > 1e-4f) {
+      px = (uint16_t)pad_clamp((int)lroundf((fx[i] + 1.0f) * 0.5f * 1919.0f), 0, 1919);
+      py = (uint16_t)pad_clamp((int)lroundf((1.0f - fy[i]) * 0.5f * 949.0f), 0, 949);
+    }
+    touch->touch[out_fingers].x = px;
+    touch->touch[out_fingers].y = py;
+    touch->touch[out_fingers].finger = hw_ids[i];
+    out_fingers++;
+  }
+  touch->fingers = out_fingers;
+}
+
 // The touch points of the active "t" command at time now (us) in a command that runs from
 // start_us for dur_us. A finger keeps its id while it stays down from one command to the next;
 // a finger that comes down again gets a new id, as on the console (ids count 0..127).
@@ -919,6 +974,9 @@ int32_t scePadReadState(int32_t handle, OrbisPadData *data) {
   ps4_pad_control_file(&buttons, &lx, &ly, &rx, &ry, &touch);
 
   PadMotionSample motion = virtual_sample(script_us);
+  int tp_pressed = 0;
+  int f1_active = 0, f2_active = 0;
+  float f1_x = 0.0f, f1_y = 0.0f, f2_x = 0.0f, f2_y = 0.0f;
   @autoreleasepool {
     GCController *controller = nil;
     // Automated background runs (PS4_BACKGROUND_WINDOW) take input only from the scripts above:
@@ -979,20 +1037,79 @@ int32_t scePadReadState(int32_t handle, OrbisPadData *data) {
         buttons |= ORBIS_PAD_BUTTON_R3;
       }
 
-      if (gp.buttonMenu.isPressed ||
-          (gp.buttonOptions && gp.buttonOptions.isPressed)) {
+      if (gp.buttonMenu.isPressed) {
         buttons |= ORBIS_PAD_BUTTON_OPTIONS;
+      }
+
+      // Map Share/Create/View/Back (buttonOptions) and Home/Guide (buttonHome) to the PS4 touchpad
+      // click by default so both PlayStation and non-PlayStation controllers can open touchpad menus
+      // (such as TLOU's crafting backpack). Set PS4_PAD_SHARE_AS_OPTIONS=1 to keep buttonOptions as
+      // ORBIS_PAD_BUTTON_OPTIONS.
+      static int share_as_options = -1;
+      if (share_as_options < 0) {
+        const char *env = getenv("PS4_PAD_SHARE_AS_OPTIONS");
+        share_as_options = (env && env[0] == '1') ? 1 : 0;
+      }
+      if (gp.buttonOptions && gp.buttonOptions.isPressed) {
+        buttons |= share_as_options ? ORBIS_PAD_BUTTON_OPTIONS : ORBIS_PAD_BUTTON_TOUCH_PAD;
+      }
+      if (gp.buttonHome && gp.buttonHome.isPressed) {
+        buttons |= ORBIS_PAD_BUTTON_TOUCH_PAD;
+      }
+
+      // Read DualSense / DualShock 4 physical touchpad click & capacitive 2-finger touch surfaces.
+      if ([gp respondsToSelector:@selector(touchpadButton)]) {
+        GCControllerButtonInput *tpBtn = [(id)gp valueForKey:@"touchpadButton"];
+        if (tpBtn && tpBtn.isPressed) tp_pressed = 1;
+      }
+      if (!tp_pressed && controller.physicalInputProfile) {
+        GCControllerButtonInput *tpBtn = controller.physicalInputProfile.buttons[@"Touchpad Button"];
+        if (tpBtn && tpBtn.isPressed) tp_pressed = 1;
+      }
+      if ([gp respondsToSelector:@selector(touchpadPrimary)]) {
+        GCControllerDirectionPad *dpad1 = [(id)gp valueForKey:@"touchpadPrimary"];
+        if (dpad1) {
+          f1_x = dpad1.xAxis.value;
+          f1_y = dpad1.yAxis.value;
+          if (fabsf(f1_x) > 1e-4f || fabsf(f1_y) > 1e-4f) f1_active = 1;
+        }
+      } else if (controller.physicalInputProfile) {
+        GCControllerDirectionPad *dpad1 = controller.physicalInputProfile.dpads[@"Touchpad Primary"];
+        if (dpad1) {
+          f1_x = dpad1.xAxis.value;
+          f1_y = dpad1.yAxis.value;
+          if (fabsf(f1_x) > 1e-4f || fabsf(f1_y) > 1e-4f) f1_active = 1;
+        }
+      }
+      if ([gp respondsToSelector:@selector(touchpadSecondary)]) {
+        GCControllerDirectionPad *dpad2 = [(id)gp valueForKey:@"touchpadSecondary"];
+        if (dpad2) {
+          f2_x = dpad2.xAxis.value;
+          f2_y = dpad2.yAxis.value;
+          if (fabsf(f2_x) > 1e-4f || fabsf(f2_y) > 1e-4f) f2_active = 1;
+        }
+      } else if (controller.physicalInputProfile) {
+        GCControllerDirectionPad *dpad2 = controller.physicalInputProfile.dpads[@"Touchpad Secondary"];
+        if (dpad2) {
+          f2_x = dpad2.xAxis.value;
+          f2_y = dpad2.yAxis.value;
+          if (fabsf(f2_x) > 1e-4f || fabsf(f2_y) > 1e-4f) f2_active = 1;
+        }
       }
 
       float stickX = gp.leftThumbstick.xAxis.value;
       float stickY = gp.leftThumbstick.yAxis.value;
-      lx = (uint8_t)((stickX + 1.0f) * 127.5f);
-      ly = (uint8_t)((-stickY + 1.0f) * 127.5f);
+      if (fabsf(stickX) > 0.05f || fabsf(stickY) > 0.05f || (lx == 128 && ly == 128)) {
+        lx = (uint8_t)((stickX + 1.0f) * 127.5f);
+        ly = (uint8_t)((-stickY + 1.0f) * 127.5f);
+      }
 
       float rstickX = gp.rightThumbstick.xAxis.value;
       float rstickY = gp.rightThumbstick.yAxis.value;
-      rx = (uint8_t)((rstickX + 1.0f) * 127.5f);
-      ry = (uint8_t)((-rstickY + 1.0f) * 127.5f);
+      if (fabsf(rstickX) > 0.05f || fabsf(rstickY) > 0.05f || (rx == 128 && ry == 128)) {
+        rx = (uint8_t)((rstickX + 1.0f) * 127.5f);
+        ry = (uint8_t)((-rstickY + 1.0f) * 127.5f);
+      }
     }
     GCMotion *gm = controller ? controller.motion : nil;
     if (gm && slot->motion.on) {
@@ -1013,6 +1130,11 @@ int32_t scePadReadState(int32_t handle, OrbisPadData *data) {
     }
   }
   motion_update(&slot->motion, &motion, script_us, data);
+
+  // Ensure any touchpad button press (from a physical DualSense/DualShock touchpad, Share/View
+  // button, keyboard T/backtick, PS4_PAD_CTL "p 100000", or PS4_PAD_SCRIPT) also populates a valid
+  // touch point when no explicit scripted touch coordinates were provided.
+  ps4_pad_apply_touchpad_input(&buttons, &touch, tp_pressed, f1_active, f1_x, f1_y, f2_active, f2_x, f2_y);
 
   // The L2/R2 bits of a pad come from its analog triggers: a scripted or auto press of the bit
   // is a fully pulled trigger.
