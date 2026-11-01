@@ -569,6 +569,7 @@ rc=0; "$T/alloc_count_test" > /dev/null || rc=$?
 # makes the GPU copy guest memory into its texture before it is next sampled; a partial store
 # keeps the GPU-only contents; a storage write after the store survives (the copy runs first).
 for m in 3 4; do rtest $m "$T/replay/gnm_buffer_over_target_test"; done
+for m in 3 4; do rtest $m "$T/replay/gnm_buffer_over_target_test" usage-upgrade; done
 # A texture uploaded on the GPU while a draw is being bound (upload command buffer): the draw's
 # encoder serial is unchanged (it is per target), so it is drawn, not skipped.
 for m in 3 4; do rtest $m "$T/replay/gnm_upload_bind_test"; done

@@ -573,13 +573,51 @@ func TestRegressJumpDispatchKeepsFlags(t *testing.T) {
 	requireInOrder(t, "add; jmp 0x6000", lift("4801d8", "e9f84f0000"), "adds x19, x19, x20", "cfinv", "b _recomp_indirect_jump")
 }
 
-// STD sets DF = 1 for the remainder of the block (or until CLD/CALL), so a following string
-// instruction steps RSI/RDI backward with SUB instead of ADD.
+// Backward string operations require persistent guest DF. Reject STD rather than
+// silently copying in the wrong direction, while retaining CLD and forward copies.
 func TestRegressStdTraps(t *testing.T) {
-	forbid(t, "std", liftBlock(t, "fd")[0], "b _recomp_unsupported_instruction")
+	requireInOrder(t, "std", liftBlock(t, "fd")[0], "b _recomp_unsupported_instruction")
 	forbid(t, "cld", liftBlock(t, "fc")[0], "b _recomp_unsupported_instruction")
-	// std; movsq; cld; movsq -> backward step then forward step
-	blk := liftBlock(t, "fd", "48a5", "fc", "48a5")
-	requireInOrder(t, "std; movsq", blk[1], "ldr x16, [x28, x23]", "str x16, [x28, x24]", "sub x23, x23, #8", "sub x24, x24, #8")
-	requireInOrder(t, "cld; movsq", blk[3], "ldr x16, [x28, x23]", "str x16, [x28, x24]", "add x23, x23, #8", "add x24, x24, #8")
+	blk := liftBlock(t, "fc", "48a5")
+	requireInOrder(t, "cld; movsq", blk[1], "ldr x16, [x28, x23]", "str x16, [x28, x24]", "add x23, x23, #8", "add x24, x24, #8")
+}
+
+// A backward copy must not silently become a forward copy when a branch starts a
+// new basic block. Until DF is represented in guest state, STD must stop execution.
+func TestRegressStdBeforeCrossBlockRepMovsbTraps(t *testing.T) {
+	l := NewArm64Lifter(nil)
+	fn := &disasm.Function{
+		EntryAddr: 0x1000,
+		EndAddr:   0x1006,
+		Blocks: map[uint64]*disasm.BasicBlock{
+			0x1000: {StartAddr: 0x1000},
+			0x1003: {StartAddr: 0x1003},
+		},
+	}
+	// std; jmp next_block; next_block: rep movsb; cld
+	var lowered [][]string
+	pc := uint64(0x1000)
+	for i, raw := range [][]byte{{0xfd}, {0xeb, 0x00}, {0xf3, 0xa4}, {0xfc}} {
+		if i == 0 || i == 2 {
+			l.ResetFlags() // The emitter resets state at each basic block.
+		}
+		inst, err := x86asm.Decode(raw, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := pc + uint64(inst.Len)
+		lines, err := l.LiftInstructionToBuf(disasm.Instruction{Address: pc, Inst: inst}, next, fn, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lowered = append(lowered, lines)
+		pc = next
+	}
+	requireInOrder(t, "std before cross-block copy", lowered[0], "b _recomp_unsupported_instruction")
+	if IsOpcodeSupported(x86asm.STD) {
+		t.Error("STD must not be advertised as supported without persistent guest DF")
+	}
+	// Forward string operations and CLD remain usable without STD.
+	requireInOrder(t, "rep movsb", lowered[2], "add x23, x23, #1", "add x24, x24, #1")
+	forbid(t, "cld", lowered[3], "b _recomp_unsupported_instruction")
 }

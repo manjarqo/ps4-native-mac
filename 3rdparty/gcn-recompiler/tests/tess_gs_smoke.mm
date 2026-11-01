@@ -115,12 +115,6 @@ uint32_t EncVMovB32FromSgpr(uint32_t vdst, uint32_t sgpr) {
     return (0x3Fu << 25) | (1u << 9) | (vdst << 17) | sgpr;
 }
 
-uint32_t EncVMovB32InlineInt(uint32_t vdst, uint32_t pos_int) {
-    // v_mov_b32 v[vdst], pos_int (1..64 -> 129..192, 0 -> 128)
-    const uint32_t src = (pos_int == 0) ? 128u : (128u + pos_int);
-    return (0x3Fu << 25) | (1u << 9) | (vdst << 17) | src;
-}
-
 uint32_t EncVAddF32(uint32_t vdst, uint32_t src0, uint32_t vsrc1) {
     // v_add_f32 v[vdst], src0, v[vsrc1] (op = 3)
     return (3u << 25) | (vdst << 17) | (vsrc1 << 9) | src0;

@@ -189,8 +189,6 @@ type Arm64Lifter struct {
 	labelCounter  uint64
 	// cpol is how ARM C holds x86 CF at the current point of the block being lifted.
 	cpol carryPol
-	// df tracks x86 DF (Direction Flag) within the current block (false = forward, true = backward).
-	df bool
 	// noTSO turns off acquire/release for non-stack guest memory (see arm64_lifter_tso.go).
 	noTSO bool
 }
@@ -209,11 +207,10 @@ const (
 	carryClear
 )
 
-// ResetFlags starts a block: C holds CF in the block-boundary sense (carrySub), DF is forward.
+// ResetFlags starts a block: C holds CF in the block-boundary sense (carrySub).
 func (l *Arm64Lifter) ResetFlags() {
 	if l != nil {
 		l.cpol = carrySub
-		l.df = false
 	}
 }
 
@@ -769,9 +766,8 @@ func (l *Arm64Lifter) LiftInstructionToBuf(inst disasm.Instruction, nextPC uint6
 	start := len(dst)
 	lines, err := l.liftInstructionInternal(inst, nextPC, fn, dst)
 	if err == nil && inst.Inst.Op == x86asm.CALL {
-		// Flags are dead after a call (System V ABI); any sense is consistent, and DF = 0.
+		// Flags are dead after a call (System V ABI); any sense is consistent.
 		l.cpol = carrySub
-		l.df = false
 	}
 	if err == nil {
 		lines = fixUpperHalves(inst.Inst, lines, start, fn != nil && fn.UsesYmm)
@@ -938,7 +934,6 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 	if fn != l.currentFn {
 		l.currentFn = fn
 		l.cpol = carrySub
-		l.df = false
 	}
 	op := inst.Inst.Op
 	args := inst.Inst.Args
@@ -965,13 +960,13 @@ func (l *Arm64Lifter) liftInstructionInternal(inst disasm.Instruction, nextPC ui
 		return lines, nil
 
 	case x86asm.CLD:
-		l.df = false
+		// String instructions run forward, as required at System V call boundaries.
+		// STD traps until DF can be preserved in guest state across basic blocks.
 		lines = append(lines, "    nop")
 		return lines, nil
 
 	case x86asm.STD:
-		l.df = true
-		lines = append(lines, "    nop")
+		lines = append(lines, l.emitUnsupported(inst, "std: backward string operations not lowered")...)
 		return lines, nil
 
 	case x86asm.CLC, x86asm.STC, x86asm.CMC, x86asm.LAHF, x86asm.SAHF:

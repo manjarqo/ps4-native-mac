@@ -915,13 +915,6 @@ public:
     // dst_addr (an exactly known write, see NoteExactWrite).
     bool CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, uint64_t written_bytes, id<MTLTexture>* src,
                          id<MTLTexture>* dst, int* kind_out);
-    // GPU-side clear of a whole color surface via a compute shader (shadPS4 Rasterizer::IsComputeImageClear):
-    // finds the cached single-sample 2D GPU color target at `dst_addr` whose guest allocation size matches
-    // `written_bytes`, unmarks any pending guest-newer state, credits the exact write, and returns its
-    // texture and raw format so the caller can clear it via a render pass load action.
-    id<MTLTexture> FindColorTargetForClear(uint64_t dst_addr, uint64_t written_bytes, DataFormat* dfmt_out,
-                                           NumberFormat* nfmt_out);
-
     // Debugging: visit every GPU-owned texture (kind: 1 color/storage, 2 depth).
     void ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<MTLTexture> tex)) const;
     // ---- Frame capture and pass replay (ps4_gnm_capture.h) ----
@@ -982,6 +975,9 @@ public:
     struct GpuCopyHook {
         void* ctx = nullptr;
         void (*copy)(void* ctx, id<MTLTexture> src, id<MTLTexture> dst, MTLSize size) = nullptr;
+        // A usage upgrade replaces the original texture. Preserve writes already encoded in
+        // the current command buffer; unlike sampled aliases, this copy cannot run on Upload.
+        void (*preserve)(void* ctx, id<MTLTexture> src, id<MTLTexture> dst, MTLSize size) = nullptr;
     };
     void SetGpuCopyHook(const GpuCopyHook& h) { copy_hook_ = h; }
     // Evicts sampled textures chosen by ps4_texcache_select: only entries whose last command

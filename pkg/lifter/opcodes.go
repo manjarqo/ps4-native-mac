@@ -61,7 +61,7 @@ func IsOpcodeSupported(op x86asm.Op) bool {
 		x86asm.CALL, x86asm.RET, x86asm.LRET, x86asm.JMP,
 		x86asm.LOOP, x86asm.LOOPE, x86asm.LOOPNE, x86asm.JRCXZ,
 		x86asm.UD2, x86asm.INT, x86asm.INTO, x86asm.ICEBP, x86asm.HLT, x86asm.SYSCALL,
-		x86asm.FWAIT, x86asm.CLD, x86asm.STD, x86asm.CLC, x86asm.STC, x86asm.CMC, x86asm.LAHF, x86asm.SAHF,
+		x86asm.FWAIT, x86asm.CLD, x86asm.CLC, x86asm.STC, x86asm.CMC, x86asm.LAHF, x86asm.SAHF,
 		x86asm.MFENCE, x86asm.LFENCE, x86asm.SFENCE,
 		x86asm.RDTSC, x86asm.RDTSCP, x86asm.CPUID, x86asm.PAUSE, x86asm.EMMS,
 		x86asm.PUSHFQ, x86asm.POPFQ, x86asm.XGETBV, x86asm.XLATB,

@@ -442,7 +442,104 @@ void CheckRed(const char* name, const std::vector<float>& red, const std::functi
 
 } // namespace
 
-int main() {
+// A draw produces a target in the still-open Main command buffer. Its first storage bind
+// upgrades the texture's usage and writes only row zero; the remaining rows must retain the
+// draw, rather than contents copied on Upload before that draw executes.
+static int UsageUpgrade() {
+    setenv("PS4_GNM_SYNC_ENCODE", "1", 1);
+    setenv("PS4_GNM_SYNC_COMPILE", "1", 1);
+    setenv("PS4_GNM_NO_SHADER_CACHE", "1", 1);
+    setenv("PS4_GNM_NO_PSO_ARCHIVE", "1", 1);
+    setenv("PS4_GNM_NO_LIB_STORE", "1", 1);
+    @autoreleasepool {
+        static GuestContext ctx{};
+        ctx.mem_size = kMemSize;
+        ctx.mem_base = (uint8_t*)mmap(nullptr, kMemSize, PROT_READ | PROT_WRITE,
+                                     MAP_ANON | MAP_PRIVATE, -1, 0);
+        CHECK(ctx.mem_base != MAP_FAILED, "usage upgrade: guest memory");
+        if (ctx.mem_base == MAP_FAILED) return 1;
+        ctx.process_ctx = &ctx;
+        CHECK(ps4draw::Init(&ctx), "usage upgrade: renderer initialization");
+        constexpr uint64_t tex = 0x600000;
+        auto gid = ColorId(tex);
+        gid.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        gid.storage_mode = MTLStorageModePrivate;
+        std::vector<uint8_t> initial(RawSize(gid), 0);
+        CHECK(ps4draw::ReplayAdoptTexture(gid, &initial), "usage upgrade: adopt restricted private target");
+        memcpy(ctx.mem_base + kVs, kProgVs.data(), kProgVs.size() * 4);
+        memcpy(ctx.mem_base + kPs, kProgPs.data(), kProgPs.size() * 4);
+        memcpy(ctx.mem_base + kCodeS, kProgS.data(), kProgS.size() * 4);
+        const float verts[12] = {-3, -3, .5f, 1, -3, 9, .5f, 1, 9, -3, .5f, 1};
+        memcpy(ctx.mem_base + kVb, verts, sizeof(verts));
+        const uint32_t extents[8] = {kW | (kH << 16)};
+        ps4draw::SetExtentHints(extents, 0);
+        const uint64_t skipped = ps4draw::SkippedCount();
+        ps4draw::DrawArgs a;
+        a.count = 3;
+        const auto draw = DrawRegs(tex);
+        CHECK(ps4draw::Draw(&ctx, draw.data(), a), "usage upgrade: producer draw accepted");
+        const auto store = DispatchRegs(kCodeS, kOut, 256, tex);
+        ps4draw::Dispatch(&ctx, store.data(), 1, 1, 1, 0, "gfx", ps4draw::kQueueGfx);
+        ps4draw::Flush(true);
+        CHECK(ps4draw::SkippedCount() == skipped, "usage upgrade: no work skipped");
+        std::vector<uint8_t> got;
+        CHECK(ps4draw::ReplayReadTexture(gid, &got), "usage upgrade: read upgraded target");
+        uint32_t bad = 0;
+        for (uint32_t y = 1; y < kH; ++y)
+            for (uint32_t x = 0; x < kW; ++x) {
+                const size_t off = (y * kW + x) * 4;
+                if (off + 4 > got.size() || got[off] != 255 || got[off + 1] != 0 ||
+                    got[off + 2] != 0 || got[off + 3] != 255) ++bad;
+            }
+        CHECK(!bad, "usage upgrade: %u untouched texels lost the preceding draw", bad);
+
+        // Matching the former clear heuristic does not make a program a clear. This shader
+        // reads one scalar from a 16-byte buffer and stores one dword per local thread: each
+        // group writes the same 256 bytes of an 8192-byte surface. The old shortcut cleared the texture and
+        // never executed any of these buffer stores.
+        constexpr uint64_t clear_tex = 0x700000, color = 0x710000, code_at = 0x720000;
+        auto ts = Tsharp(clear_tex);
+        ts[2] = 63 | (31u << 14);
+        ps4gnm::ImageDesc img;
+        ps4gnm::DecodeImage(ts.data(), 8, &img);
+        ps4gnm::SurfaceLayout layout;
+        ps4gnm::ComputeSurfaceLayout(img.ToSurfaceDesc(), &layout);
+        auto cg = StorageId(clear_tex);
+        cg.height = cg.mtl_height = 32;
+        cg.size = layout.total_size;
+        ps4gnm::PackSurface(img.ToSurfaceDesc(), layout, &cg.surface);
+        std::vector<uint8_t> blank(RawSize(cg), 0);
+        CHECK(cg.size == 8192 && ps4draw::ReplayAdoptTexture(cg, &blank), "clear shape: cached surface");
+        const float cv[4] = {.25f, .5f, .75f, 1};
+        memcpy(ctx.mem_base + color, cv, sizeof(cv));
+        memset(ctx.mem_base + clear_tex, 0xCD, cg.size);
+        const auto prog = WithFooter({0xE0300000, 0x80000100, 0xBF8C0000, 0x34040082,
+                                       0xE0701000, 0x80010102, kEnd}, 0x5CA1AB1E000003B1ull);
+        memcpy(ctx.mem_base + code_at, prog.data(), prog.size() * 4);
+        auto cr = DispatchRegs(code_at, clear_tex, uint32_t(cg.size), clear_tex);
+        cr[0x2E40] = uint32_t(color);
+        cr[0x2E41] = 0;
+        cr[0x2E42] = 16;
+        cr[0x2E43] = cr[0x2E47];
+        ps4draw::Dispatch(&ctx, cr.data(), 16, 1, 1, 0, "gfx", ps4draw::kQueueGfx);
+        ps4draw::Flush(true);
+        uint32_t scalar;
+        memcpy(&scalar, cv, 4);
+        const uint32_t* words = reinterpret_cast<const uint32_t*>(ctx.mem_base + clear_tex);
+        bool exact = true;
+        for (unsigned i = 0; i < 2048; ++i)
+            exact &= words[i] == (i < 64 ? scalar : 0xCDCDCDCDu);
+        CHECK(exact, "clear shape: generic shader must execute its partial dword stores "
+                     "(first %08x, last written %08x, first untouched %08x, want %08x)",
+              words[0], words[63], words[64], scalar);
+        printf("gnm_buffer_over_target_test usage-upgrade: %s\n", g_fail ? "FAIL" : "PASS");
+        return g_fail ? 1 : 0;
+    }
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && !strcmp(argv[1], "usage-upgrade")) return UsageUpgrade();
+    if (argc != 1) return 2;
     // case H: guest memory dispatches with a prediction take the fast path (opt-in)
     setenv("PS4_GNM_GUEST_MEMORY_FAST", "1", 1);
     @autoreleasepool {

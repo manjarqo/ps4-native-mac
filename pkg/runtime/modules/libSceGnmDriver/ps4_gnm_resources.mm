@@ -3587,8 +3587,8 @@ bool TextureCache::UpgradeEntryUsageLocked(Entry* e, MTLTextureUsage needed) {
     id<MTLTexture> t = NewTextureLocked(td);
     if (!t) return false;
     const MTLSize sz = MTLSizeMake(e->tex.width, e->tex.height, e->tex.depth);
-    if (copy_hook_.copy) {
-        copy_hook_.copy(copy_hook_.ctx, e->tex, t, sz);
+    if (copy_hook_.preserve) {
+        copy_hook_.preserve(copy_hook_.ctx, e->tex, t, sz);
     } else if (queue_) {
         id<MTLCommandBuffer> cb = [queue_ commandBuffer];
         id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
@@ -4319,23 +4319,6 @@ bool TextureCache::CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, uint64_
     ExactWriteLocked(d, dst_addr, dst_addr + written_bytes); // the copy writes exactly these bytes
     if (kind_out) *kind_out = s->kind == Entry::Depth ? 2 : 1;
     return true;
-}
-
-id<MTLTexture> TextureCache::FindColorTargetForClear(uint64_t dst_addr, uint64_t written_bytes, DataFormat* dfmt_out,
-                                                     NumberFormat* nfmt_out) {
-    if (!device_ || !dst_addr || !written_bytes) return nil;
-    TimedLock lk(mutex_);
-    Entry* c = LastWrittenLocked(dst_addr, Entry::Color, [&](const Entry* e) {
-        return e->samples == 1 && e->layers == 1 && e->levels == 1 && e->size == written_bytes &&
-               e->tex.textureType == MTLTextureType2D;
-    });
-    if (!c) return nil;
-    UnmarkLocked(c);
-    c->generation++;
-    ExactWriteLocked(c, dst_addr, dst_addr + written_bytes);
-    if (dfmt_out) *dfmt_out = c->dfmt;
-    if (nfmt_out) *nfmt_out = c->nfmt;
-    return c->tex;
 }
 
 void TextureCache::ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<MTLTexture> tex)) const {

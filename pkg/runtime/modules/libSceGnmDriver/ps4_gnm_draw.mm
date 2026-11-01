@@ -6646,11 +6646,10 @@ void ResolveTextureHazards(const Shader* s, const std::vector<uint32_t>& flat) {
     const bool check_guest_newer = S.tex->GuestNewerCount() || S.store_tickets;
     for (uint32_t i = 0; i < s->imgs.size(); ++i) {
         if (s->imgs[i].is_depth) continue;
-        if (!check_guest_newer && !s->imgs[i].is_storage) continue;
         ImageDesc img;
         if (!StageImage(s, flat, i, &img) || !img.valid) continue;
         if (check_guest_newer) RefreshGuestNewer(img.address, nil, s->imgs[i].is_storage);
-        if (s->imgs[i].is_storage) S.tex->EnsureColorTargetUsage(img, true);
+        S.tex->EnsureColorTargetUsage(img, s->imgs[i].is_storage);
     }
     PruneCompletedWrites();
     if (S.pending_writes.Empty()) return;
@@ -8915,6 +8914,19 @@ void AliasCopy(void*, id<MTLTexture> src, id<MTLTexture> dst, MTLSize size) {
     S.be->EndEncoder();
 }
 
+// Lazy usage upgrades replace the producer's texture. Copy after its encoded writes on Main,
+// rather than on Upload (which executes before all of the open Main command buffer).
+// Called with the cache lock held, so this must not perform texture-cache lookups.
+void PreserveTexture(void*, id<MTLTexture> src, id<MTLTexture> dst, MTLSize) {
+    RequireMainTarget("texture usage preservation");
+    EndEncoders();
+    EnsureCmd();
+    S.be->BeginCopies();
+    S.be->CopyTexture(src, dst);
+    S.be->EndEncoder();
+    S.pending = true;
+}
+
 void ReleaseBackend();
 
 bool Init(GuestContext* ctx) {
@@ -9036,7 +9048,7 @@ bool Init(GuestContext* ctx) {
                                                                                   QOS_CLASS_USER_INTERACTIVE, 0))];
         S.tex = new TextureCache(S.dev, S.be->SideQueue(), proc->mem_base, proc->mem_size);
         S.tex->SetHooks(TextureCache::TextureHooks{nullptr, ResidentTexture, ReleasedTexture});
-        S.tex->SetGpuCopyHook(TextureCache::GpuCopyHook{nullptr, AliasCopy});
+        S.tex->SetGpuCopyHook(TextureCache::GpuCopyHook{nullptr, AliasCopy, PreserveTexture});
         if (ps4_metal_screen_get_device()) { // not under the replay: it never presents
             ps4_metal_screen_set_texture_hooks(ScreenTextureCreated, ScreenTextureReleased, nullptr);
             // the performance overlay names the backend
@@ -13785,43 +13797,7 @@ void DispatchEncode(DispatchRec*& rp) {
                         return;
                     }
                 }
-                // Surface clears through buffers (shadPS4 Rasterizer::IsComputeImageClear):
-                // 2 buffers (buf0 = 16-byte float4 clear color, buf1 = written surface buffer),
-                // 64 threads per group, no images, each thread clears 2 texels (128 * bpp bytes per group).
-                if (n_read == 1 && n_written == 1 && rd.size_bytes == 16 && rd.base_address && wr.base_address &&
-                    wr.size_bytes > 4096 && wx == 64 && wy == 1 && wz == 1 && cs->imgs.empty() && !indirect_addr &&
-                    GuestRangeOk(rd.base_address, 16)) {
-                    DataFormat dfmt{};
-                    NumberFormat nfmt{};
-                    id<MTLTexture> dst = S.tex->FindColorTargetForClear(wr.base_address, wr.size_bytes, &dfmt, &nfmt);
-                    if (dst) {
-                        const PixelFormatInfo pf = GetPixelFormat(dfmt, nfmt);
-                        const uint64_t bpp = pf.bytes_per_block ? pf.bytes_per_block : 0;
-                        if (bpp > 0 && (uint64_t)dim_x * 128ull * bpp == wr.size_bytes) {
-                            FlushPendingTess();
-                            FlushDeferredHleCopies();
-                            if (async_route) ComputeOnMain(AsyncJoin::Preparation);
-                            if (S.store_tickets && S.tex) S.tex->NoteWriteSite(wr.base_address, dst, ++S.write_site_seq);
-                            const float* cv = reinterpret_cast<const float*>(S.ctx->mem_base + rd.base_address);
-                            PassKey ckey{};
-                            ckey.color[0] = dst;
-                            ClearReq cclr{};
-                            cclr.color[0] = true;
-                            cclr.color_value[0] = MTLClearColorMake(cv[0], cv[1], cv[2], cv[3]);
-                            id<MTLTexture> chold[9] = {dst};
-                            if (BeginPass(ckey, cclr, chold, false)) {
-                                S.pending = true;
-                                LogWork("surface clear (compute clear shader)");
-                                cap::SetSkipped("surface clear (compute clear shader): a clear pass, not a shader pass");
-                                if (ShouldTrace())
-                                    fprintf(stderr, "[gnm-trace] %s CS 0x%llx: surface clear 0x%llx (%g,%g,%g,%g)\n",
-                                            queue, (unsigned long long)addr, (unsigned long long)wr.base_address,
-                                            cv[0], cv[1], cv[2], cv[3]);
-                                return;
-                            }
-                        }
-                    }
-                }
+                // Buffer binding shapes do not establish clear semantics; execute the shader.
             }
             if (meta_written && !reads_meta) {
                 cap::SetSkipped("CMASK/HTILE clear by a compute shader (tracked, not run)");

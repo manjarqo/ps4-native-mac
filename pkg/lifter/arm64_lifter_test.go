@@ -1225,7 +1225,7 @@ func TestIsOpcodeSupportedSync(t *testing.T) {
 		x86asm.VMAXSD, x86asm.VMINSD, x86asm.VBLENDVPD, x86asm.VPCMPGTQ, x86asm.VCVTTPD2DQ,
 		x86asm.VPSRLDQ, x86asm.VPCMPEQB, x86asm.VPCMPEQW, x86asm.VPABSD, x86asm.VPINSRQ,
 		x86asm.VPSUBB, x86asm.LOOPNE, x86asm.LOOPE, x86asm.LOOP, x86asm.VPBLENDW,
-		x86asm.VPMOVZXWQ, x86asm.CLD, x86asm.STD, x86asm.STC, x86asm.CLC, x86asm.CMC,
+		x86asm.VPMOVZXWQ, x86asm.CLD, x86asm.STC, x86asm.CLC, x86asm.CMC,
 		x86asm.VBLENDPD, x86asm.VPADDUSW, x86asm.VPCMPGTW, x86asm.VPMOVZXBQ, x86asm.VPMOVZXBW,
 		x86asm.VANDNPD, x86asm.VPMAXSW, x86asm.VPMINSW, x86asm.LEAVE, x86asm.ENTER,
 		x86asm.VCMPPD, x86asm.VMAXPD, x86asm.VMINPD, x86asm.VMOVMSKPD, x86asm.VMOVNTDQA,
