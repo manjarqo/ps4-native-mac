@@ -7,14 +7,11 @@ arm64 `.app`. The game code is lifted once, at build time, into ARM64 assembly. 
 against a high-level emulation (HLE) runtime of the Orbis OS libraries and a GNM command processor
 that renders with Metal. There is no JIT, no interpreter, no Rosetta and no MoltenVK.
 
-**The Last of Us Remastered** is playable on Mac from boot to gameplay, at about 99 fps in 1080p
-on a scripted chapter 1 route (and 85.6 fps in 3D combat) on an M1 Pro. **Bloodborne: Game of the
-Year Edition** (`CUSA03173`, v1.09) is playable from boot to 3D gameplay at **60.0 fps** in menus
-and **55.4–58.8 fps** in heavy 3D gameplay (Iosefka's Clinic / Central Yharnam) with the 60 FPS
-timestep patch. **Uncharted 4: A Thief's End** is in progress: it boots and reaches gameplay in
-chapter 1 at about 20 fps, with visible rendering differences from a PS4 still open. Sonic Origins
-Plus now reaches basic Sonic 1 and Sonic CD gameplay on Metal 3, at about 55 FPS in the measured
-scenario. See [Supported games](#supported-games-on-mac) for the exact status.
+**Three titles currently reach playable offline gameplay on the tested Mac:**
+**The Last of Us Remastered**, **Sonic Origins Plus** (Sonic 1 and Sonic CD verified), and
+**Bloodborne: Game of the Year Edition** (bring-up targets update 1.09). This is tested scene
+coverage, not a claim that every level, mode or version has been completed. Uncharted 4 remains
+in progress. See [Supported games](#supported-games-on-mac) for FPS, hardware and limits.
 
 ![The Last of Us Remastered on a Mac: Joel and Ellie in the Beyond the Wall warehouse](images/tlou_beyond_the_wall.jpg)
 
@@ -55,16 +52,19 @@ bring-up work.
 
 ## Supported games on Mac
 
-Measured on an Apple M1 Pro (16 GB), macOS 27.0.1 (Sonic: macOS 27.2). Only measured numbers are listed; "TBD" means
-not measured yet. The TLOU/U4 results below predate 0.4.2; gameplay has not yet been
-rechecked with the final 0.4.2 runtime.
+Test machine: **Apple M1 Pro, 16 GB unified memory**. The current development system is
+**macOS 27.2 (26B123)**; historical TLOU route measurements used macOS 27.0.1 and the Sonic
+benchmark used macOS 27.2. Bloodborne logs record M1 Pro, Metal 3, 1920x1080 and **Pro mode on**;
+they do not stamp an OS version. All numbers below are local observations, not cross-hardware
+results or full-game averages. The final 0.5.0 package has not received a new controlled gameplay
+benchmark after its release-review safety fixes.
 
 | Game | Stage | fps | Resolution | Notes |
 | --- | --- | --- | --- | --- |
-| The Last of Us Remastered (CUSA00557) | Playable: boot, menus, movies, gameplay, saves | Chapter 1 courtyard route (300 s, median of 5 runs): **98.9 fps** on Metal 3 (the default), 85.5 fps on Metal 4; 3D combat scene: **85.6 fps** (120.0 fps in menus). Earlier walking and standing numbers: see below. | 1920x1080 (base PS4 mode, `PS4_PRO=0`), MetalFX off. Pro mode: TBD | 30-minute courtyard soak (commit 8145002): no fatal errors, no hangs, memory footprint flat at ~3.5 GB. Exit: 3/3 by closing the window, 3/3 by terminate, no crash reports. 300 s route on Metal 3 and on Metal 4: no fatal errors, GPU errors or watchdog reports. Includes `QuadStrip` aiming reticle emulation, DualSense/DualShock 4 touchpad button and capacitive touch support (for the crafting backpack), and adaptive texture digest backoff. Since v0.3.0 the colours are close to a PS4 reference in interiors and on characters; sunlit daylight surfaces are still darker (see [Colour fidelity](#colour-fidelity-tlou)). |
-| Bloodborne: Game of the Year Edition (CUSA03173, v1.00 / v1.09) | Playable: boot, menus, character creation, cutscenes, 3D gameplay, saves, audio | Title screen and menus: **60.0 fps** locked; 3D gameplay in Iosefka's Clinic / Central Yharnam: **55.4–58.8 fps** (52.6–56.7 fps while rotating the camera) with the 60 FPS dynamic timestep patch | 1920x1080 (base PS4 mode, `PS4_PRO=0`), Metal 3, MetalFX off | Full 4-stage tessellation (`LS -> HS -> VS(DS) -> PS`) and Geometry Shader (`ES -> GS -> VS(Copy) -> PS`) pipelines, 100% GPU-side indirect GS draws, batched tessellation and in-pass LS+HS hoisting (`GnmCmdTarget::Upload`), hardware AFRC lossless framebuffer compression, deferred HLE multi-region buffer copies, and hardware `IsComputeImageClear` surface clears. Online multiplayer and Chalice Dungeon network features are offline. |
+| The Last of Us Remastered (CUSA00557 v1.00) | Playable: boot, menus, movies, gameplay, saves | Latest operator-reported combat smoke: **84.5–85.6 fps**, menus **120 fps**. Historical 300 s courtyard route: **98.9 fps** Metal 3 / 85.5 fps Metal 4 | 1920x1080, base PS4 mode, MetalFX off; current smoke Metal 3 | M1 Pro / 16 GB. Latest reticle/crafting checks are operator-reported, not a new controlled 0.5.0 benchmark. Historical route details below; daylight lighting remains imperfect. |
+| Bloodborne: Game of the Year Edition (CUSA03173 v1.09) | Playable offline 3D gameplay in the tested early areas | Local patched candidate: menus about **60 fps**; heavier late windows **49.4–58.8 fps**, including compilation. Selected windows without skipped draws: **52.6–58.8 fps** | 1920x1080, Metal 3, Pro mode on, MetalFX off | M1 Pro / 16 GB. Requires the separate local 60 FPS/timestep modification for these numbers; the published compiler does not apply it. Without that modification the game retains its 30 FPS cap. Candidate predates final release-review fixes. |
 | Uncharted 4: A Thief's End (CUSA04529) | In progress: boots, menus, New Game, chapter 1 (boat cutscene and boat gameplay), saves, audio | Title screen about 21–22 fps, boat gameplay about 20–21 fps (`PS4_PRO=0`, 1080p, measured while other work ran on the machine). Pro mode: not re-measured (TBD) | 1920x1080 (`PS4_PRO=0`); 2560x1440 in Pro mode | Title screen: the scene is lit, but fog and light shafts are missing. Boat cutscene: Drake and Sully are lit and the motion-blur smear is fixed. Gameplay: water colour and foam differ from a PS4 and the sky is too dark. Base mode is recommended. |
-| Sonic Origins Plus (CUSA30448, update 02.00) | Experimental: Sonic 1 and Sonic CD basic gameplay/control verified; Sonic 2 launcher selection verified | Sonic 1, idle Green Hill: **54.7 fps** in the measured candidate; earlier control run **55.5 fps**. Sonic CD: about 55 fps observed, not a controlled benchmark | 1920x1080, base PS4 mode (`PS4_PRO=0`), Metal 3, MetalFX off | Menu text/sky and SaveDataMemory2 persistence fixes included. Sonic 2/3 gameplay and campaign save/reload remain unverified. Metal 4 flickers and is not recommended for this title. |
+| Sonic Origins Plus (CUSA30448, update 02.00) | Playable in verified Sonic 1 / Sonic CD scenarios; other parts unverified | Sonic 1 idle Green Hill: **54.7 fps** median (control **55.5 fps**). Sonic CD: about **55 fps** observed | 1920x1080, base PS4 mode, Metal 3, MetalFX off | M1 Pro / 16 GB, macOS 27.2. Sonic 1/CD gameplay and input verified. Sonic 2 selection only; Sonic 2/3 gameplay and campaign save/reload unverified. Metal 4 flickers. Historical benchmark, not a fresh 0.5.0 run. |
 
 How the TLOU numbers were taken:
 
@@ -85,48 +85,63 @@ How the TLOU numbers were taken:
   that now runs costs about 0.4 ms of GPU time per frame in scenes with much hair and foliage; the
   route was not re-measured.
 
+### Current TLOU combat checks
+
+The integration handoff reports **84.5–85.6 fps** in a 3D combat scene and **120 fps** in menus,
+with the QuadStrip weapon reticle and gamepad touchpad crafting screen working. These short
+operator checks are distinct from the older scripted courtyard route above; they are not a
+controlled A/B or proof of zero regression across the game. Older gate logs include shader
+compilation and are not comparable steady-state measurements.
+
 ### Bloodborne: Game of the Year Edition (CUSA03173)
 
-Status as of 2026-11-01: **Bloodborne: Game of the Year Edition** (`CUSA03173`, v1.00 and v1.09)
-is playable from boot through title screen, character creation, cutscenes, and 3D gameplay in
-Iosefka's Clinic and Central Yharnam on Metal 3 (`1920x1080`, `PS4_PRO=0`).
+Update **01.09** reaches title/menu, character creation, cutscenes and offline 3D gameplay in the
+operator-identified Iosefka's Clinic / Central Yharnam areas. Base **01.00** is also registered in
+the compatibility database; a separate 01.00 benchmark was not established by this release audit.
 
-#### Measured performance (v1.09 on Apple Silicon, Metal 3, 1080p)
+#### Local candidate performance (Metal 3, 1920x1080)
 
-| Stage / Optimization | Menus / Title | 3D Gameplay (Iosefka's Clinic / Central Yharnam) | Notes |
-| --- | --- | --- | --- |
-| Initial playable bring-up (`c63fda6`) | 30.0 fps | 19.1 fps | 50.2 GPU stalls/frame (`33.3 ms waiting`), 2,700 `GuestNewer` refreshes per 300 frames |
-| Zero GPU stalls + GPU Indirect GS + 60 FPS timestep patch | 60.0 fps | 34.3 fps | `0.0 waits/frame` (`0.0 ms waiting`), 100% GPU-side indirect Geometry Shader draws |
-| Batched Tessellation (`FlushPendingTess`) + AFRC compression + Deferred HLE Multi-Copy | 60.0 fps | 47.1 fps | Compute encoders reduced from 167 to 79/frame; `MTLStorageModePrivate` AFRC lossless compression |
-| In-pass Tessellation hoisting (`kHoistTess`) + Hardware `IsComputeImageClear` (`6e73215`) | **60.0 fps** | **55.4–58.8 fps** *(52.6–56.7 fps rotating camera)* | **0 `GuestNewer` refreshes**, `alias waits` reduced from 4.27 to 0.28/frame, `GPU busy` 15.7–17.8 ms |
+The available `bb_boot20`–`bb_boot28` logs identify Apple M1 Pro, **Pro mode on** and MetalFX off.
+Each FPS sample below covers **300 renderer-reported presents**. These were successive bring-up
+runs, not controlled alternating A/B measurements. Scene and camera attribution comes from the
+operator, not automatic log classification.
 
-#### Implemented features for Bloodborne
+| Candidate | Late observed FPS | Notes |
+| --- | --- | --- |
+| Initial bring-up (`bb_boot20` / `21`) | 19.0 / 19.1 | Menu cap 30 fps; about 50 GPU waits per frame |
+| Reduced synchronization + GPU indirect GS + local 60 FPS modification (`22`) | 34.2–34.3 | Menus about 60 fps |
+| Batched tessellation (`23`) | 37.8–37.9 | Successive-run observation |
+| Private render targets + deferred copies (`25`) | 45.5–47.1 | Descriptor changes permit hardware compression; actual AFRC use was not measured |
+| Additional candidate hoisting / compute-clear substitution (`28`) | 49.4–58.8 | Includes compilation windows; selected zero-skipped-draw windows 52.6–58.8 |
 
-- **Lifter & Emitter:** `BT`/`BTS`/`BTR`/`BTC` (`reg, imm8` / `mem, imm8` / `reg, reg` / `mem, reg`),
-  `SHLD`/`SHRD` (`cl` / `imm8`), `CMPXCHG16B`, `REP STOS` (`stosb`/`stosw`/`stosd`/`stosq`), and
-  FMA3 (`VFMADD*`/`VFMSUB*`/`VFNMADD*`/`VFNMSUB*`), plus guest module initialization (`DT_INIT` /
-  `module_start` for `libc.prx` and `libSceFios2.prx`), `RTLD_DEFAULT` `dlsym` resolution, and
-  64-bit pointer returns for `mmap`/`sceKernelMapDirectMemory`.
-- **HLE Runtime:** `libSceCoredump` signal/exception handler registration, `libSceUlt` UltQueue /
-  UltRuntime worker pool, `libSceGnmDriver` `sceGnmConvertVsToLs`, `sceGnmDrawIndexIndirect`,
-  `sceGnmSetGsRingSizes`, and `sceGnmSetWaveLimitMultipliers`.
-- **4-Stage Tessellation (`LS -> HS -> VS(DS) -> PS`):** Compute pre-passes for `LS` and `HS` writing
-  control points, patch constants, and `MTLQuadTessellationFactorsHalf` /
-  `MTLTriangleTessellationFactorsHalf`, followed by `drawIndexedPatches` (`GnmBackend::DrawPatches`).
-  Consecutive tessellated draws are batched (`FlushPendingTess`), and single in-pass tessellated
-  draws (such as Bloodborne's 43 deferred point-light volumes) hoist their `LS+HS` pre-pass to
-  `GnmCmdTarget::Upload` (`kHoistTess`) without breaking the active render pass.
-- **4-Stage Geometry Shader (`ES -> GS -> VS(Copy) -> PS`) & GPU Indirect GS:** `ES` and `GS` run as
-  compute stages writing the GSVS ring buffer, consumed by the translated copy vertex shader and
-  pixel shader. Indirect GS draws (`PKT3_DRAW_INDEX_INDIRECT` / `PKT3_DRAW_INDIRECT`) execute 100%
-  on the GPU via `bb_gs_prep` / `bb_gs_copy` compute kernels and `DrawIndexedBufferIndirect` with
-  zero CPU-GPU synchronization stalls.
-- **Hardware `IsComputeImageClear` & AFRC Framebuffer Compression:** Bloodborne's 9 full-screen
-  compute buffer surface clears per frame are intercepted via `TextureCache::FindColorTargetForClear`
-  and executed as hardware render pass clears (`MTLLoadActionClear`), eliminating all 2,700
-  `GuestNewer` GPU target refreshes per 300 frames. Large GPU color targets (`>= 256x256`) use
-  `MTLStorageModePrivate` with on-demand `MTLTextureUsageShaderWrite` / `MTLTextureUsagePixelFormatView`
-  upgrades to preserve Apple Silicon AFRC lossless framebuffer compression.
+The handoff reports selected heavy-scene windows at **55.4–58.8 fps**, and **52.6–56.7 fps** while
+rotating the camera. The wider range above includes all six late windows of the latest log,
+including a 49.4 fps window with pending compilation. No sustained 60 fps or full-game average
+is claimed. Sanitized samples and log hashes: [0.5.0 measurement provenance](docs/performance-0.5.0.json).
+
+**The 60 FPS/timestep modification exists in the local generated game assembly, not in the
+published recompiler or engine kit.** A clean rebuild from this release does not install it and
+normally retains Bloodborne's 30 FPS cap. No game assembly, executable, save or patch payload is
+distributed. The final release also removes an unproven shape-only compute-clear substitution,
+restores CPU/GPU write ordering, and fixes private-texture upgrade ordering; the candidate FPS
+numbers therefore do not benchmark the final 0.5.0 artifact.
+
+#### Included engine work
+
+- x86-64 integer/bit, double-shift, CMPXCHG16B, REP STOS and FMA lowering improvements; guest PRX
+  initialization and pointer-return corrections. Backward string execution through `STD` remains
+  explicitly unsupported rather than silently using the wrong direction across blocks.
+- AvPlayer MP4 demux with VideoToolbox H.264 / AudioToolbox AAC playback, plus boot-path HLE, save,
+  audio, thread and memory compatibility changes. This does not imply complete OS-library support.
+- Tessellation (`LS -> HS -> VS(DS) -> PS`) and geometry (`ES -> GS -> VS(Copy) -> PS`) translation,
+  GPU indirect geometry draws, batched tessellation and queued buffer-copy work.
+- Large private render targets with lazy usage upgrades. The descriptor policy is compatible with
+  Apple GPU compression; AFRC activation or compression ratios have not been independently measured.
+- Hardware clear replacement is **not enabled merely from buffer sizes or dispatch shape**; the
+  guest compute shader runs unless its semantics can be established safely.
+
+Online multiplayer and networked Chalice Dungeon features are unavailable. Coverage of later
+areas, long sessions and every save/reload scenario remains incomplete.
 
 ### Sonic Origins Plus
 
@@ -151,8 +166,8 @@ These are medians of renderer-reported telemetry windows, not independent hardwa
 a full-game average or proof of statistical significance. The measured correctness changes did
 **not** demonstrate an FPS improvement over the control run. Sustained 60 fps has not been
 established. Sonic CD reached about 55 fps in a gameplay smoke run, but was not benchmarked
-under this controlled scenario. No Sonic 2/3 gameplay FPS is claimed. The final 0.4.2 release
-adds save-error and dense-branch regression fixes after these measurements; it was not re-benchmarked.
+under this controlled scenario. No Sonic 2/3 gameplay FPS is claimed. These measurements predate the final 0.4.2 save-error and
+dense-branch fixes and have not been repeated for 0.5.0.
 
 **Use Metal 3 for Sonic.** The Metal 4 comparison was stopped after the user observed flickering;
 early telemetry was also slower. Static host readback tests passing on Metal 4 do not establish
@@ -207,7 +222,7 @@ slice of the shadow depth array). Sunlit daylight surfaces are still darker than
 ## Known issues
 
 - **Sonic Origins Plus:** Metal 4 flickers; use Metal 3. Sonic 2/3 gameplay and campaign
-  save/reload remain unverified. The final 0.4.2 build has not been re-benchmarked.
+  save/reload remain unverified. These measurements have not been repeated for 0.5.0.
 
 - **The Last of Us: daylight.** Sunlit daylight surfaces are darker than on a PS4 (plank courtyard
   L\* 11–19 against 32). The sun direction is the game's own data, so the remaining difference is in
@@ -501,14 +516,14 @@ Saves and per-game settings are not in the library. The runtime keeps them in
 - **Requirements.** An Apple Silicon Mac, macOS 26 or later (`Package.swift`, `Info.plist`) and
   Apple's Command Line Tools with clang 17 or later. The packaged app bundles ninja and FreeType, so
   Homebrew is not needed.
-- **Games.** The database lists three titles: The Last of Us Remastered CUSA00557 v1.00 (playable),
-  Bloodborne: Game of the Year Edition CUSA03173 v1.00 / v1.09 (playable), and Uncharted 4 CUSA04529
-  v1.32 (in progress, see [Supported games](#supported-games-on-mac)). Any other game is
-  experimental.
+- **Games.** Three title families have playable entries: TLOU Remastered CUSA00557 v1.00,
+  Sonic Origins Plus CUSA30448 update 02.00 (Sonic 1/CD verified), and Bloodborne GOTY CUSA03173
+  (bring-up measured on v1.09; v1.00 also registered). Uncharted 4 CUSA04529 v1.32 remains in
+  progress. Version and scenario limits are in [Supported games](#supported-games-on-mac).
 - **Signing.** The app and the built games are signed ad hoc, not notarized. On another Mac,
   Gatekeeper blocks the first launch of a downloaded copy of the app; allow it in System Settings,
   Privacy & Security, "Open Anyway".
-- **Status: preview.** Download the app as `PS4Native-0.4.3.dmg` from GitHub Releases. The app
+- **Status: preview.** Download the app as `PS4Native-0.5.0.dmg` from GitHub Releases. The app
   first shipped in v0.4.0.
   `app/PS4Native/scripts/package.sh` builds the engine kit and packages `PS4 Native.app` and a
   `.dmg`; `scripts/smoke.sh` smoke-tests that
@@ -676,12 +691,10 @@ supported-games table uses base PS4 mode.
 
 ### Can I play PS4 games on my Mac?
 
-Some, with this project. The Last of Us Remastered (`CUSA00557`) and Bloodborne: Game of the Year
-Edition (`CUSA03173`, v1.00 / v1.09) are playable from start to gameplay on an Apple Silicon Mac.
-Uncharted 4 boots and reaches gameplay but still has rendering issues, and Sonic Origins Plus
-reaches basic Sonic 1 and Sonic CD gameplay on Metal 3. Other PS4 games are not supported yet:
-each game needs its own bring-up work, so do not expect an arbitrary game to run. See
-[Supported games](#supported-games-on-mac).
+Three titles reach playable offline gameplay on the tested M1 Pro: **The Last of Us Remastered**,
+**Sonic Origins Plus** (Sonic 1 and Sonic CD verified), and **Bloodborne GOTY** (update 1.09).
+This does not establish every level/mode/version. Uncharted 4 remains in progress; arbitrary PS4
+games are not supported automatically. See [Supported games](#supported-games-on-mac).
 
 ### Is this a PS4 emulator?
 
@@ -692,9 +705,9 @@ translated to Metal at run time; translated shaders are cached on disk.
 
 ### Which Macs are supported?
 
-Macs with Apple Silicon (M1, M2, M3, M4 and later), on macOS. All measurements so far were taken
-on an M1 Pro with 16 GB of memory running macOS 27.0.1; other chips and older macOS versions have
-not been tested. Intel Macs are not supported. See [Requirements](#requirements).
+Macs with Apple Silicon (M1, M2, M3, M4 and later), on macOS. Measurements here use an M1 Pro
+with 16 GB unified memory; the current test system is macOS 27.2, while older TLOU measurements
+used macOS 27.0.1. These results have not been established on other chips or older OS versions. Intel Macs are not supported. See [Requirements](#requirements).
 
 ### Do I need my own copy of the game?
 

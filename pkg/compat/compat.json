@@ -4,15 +4,25 @@
     {
       "title_id": "CUSA00557",
       "name": "The Last of Us Remastered",
-      "versions": {"01.00": "playable"},
-      "recommended": {"pro": 0},
-      "known_issues": ["Sunlit daylight surfaces are darker than on a PS4."]
+      "versions": {
+        "01.00": "playable"
+      },
+      "recommended": {
+        "pro": 0
+      },
+      "known_issues": [
+        "Sunlit daylight surfaces are darker than on a PS4."
+      ]
     },
     {
       "title_id": "CUSA04529",
       "name": "Uncharted 4: A Thief's End",
-      "versions": {"01.32": "in_progress"},
-      "recommended": {"pro": 0},
+      "versions": {
+        "01.32": "in_progress"
+      },
+      "recommended": {
+        "pro": 0
+      },
       "known_issues": [
         "The title screen has no fog and no light shafts.",
         "Water colour and foam differ from a PS4; the sky is too dark."
@@ -21,9 +31,31 @@
     {
       "title_id": "CUSA03173",
       "name": "Bloodborne™: Game of the Year Edition",
-      "versions": {"01.00": "playable", "01.09": "playable"},
-      "recommended": {"pro": 0},
-      "known_issues": ["Online multiplayer and Chalice Dungeon network features are offline."]
+      "versions": {
+        "01.00": "playable",
+        "01.09": "playable"
+      },
+      "recommended": {
+        "pro": 0
+      },
+      "known_issues": [
+        "Online multiplayer and Chalice Dungeon network features are offline."
+      ]
+    },
+    {
+      "title_id": "CUSA30448",
+      "name": "Sonic Origins Plus",
+      "versions": {
+        "02.00": "playable"
+      },
+      "recommended": {
+        "pro": 0
+      },
+      "known_issues": [
+        "Basic gameplay and control verified for Sonic 1 and Sonic CD; Sonic 2/3 gameplay is not verified.",
+        "Metal 4 flickers; use Metal 3.",
+        "Campaign save/reload remains unverified."
+      ]
     }
   ]
 }

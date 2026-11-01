@@ -1,0 +1,157 @@
+{
+  "test_machine": {
+    "chip": "Apple M1 Pro",
+    "unified_memory_gib": 16,
+    "publication_host_macos": "27.2 (26B123)",
+    "note": "Bloodborne logs identify chip/backend/resolution and Pro mode, but do not record macOS or RAM."
+  },
+  "bloodborne": {
+    "title_id": "CUSA03173",
+    "target_update": "01.09",
+    "renderer": "Metal 3",
+    "resolution": "1920x1080",
+    "pro_mode_logged": true,
+    "metalfx_logged": false,
+    "local_60fps_modification": "generated game assembly only; not applied by published compiler",
+    "samples_cover_presents": 300,
+    "runs": {
+      "bb_boot20": {
+        "log_sha256": "5b9ce680677247f97cb90b3669fc9e00deb3e203fe7b92fba5733d05a3b3d6a2",
+        "fps_samples": [
+          29.3,
+          30.0,
+          25.7,
+          19.0
+        ]
+      },
+      "bb_boot21": {
+        "log_sha256": "ce9f93f7a9d907633a60edf9f19b76bb4db4ad6e44eb5dc777a1256556261be9",
+        "fps_samples": [
+          29.3,
+          30.0,
+          25.7,
+          19.1
+        ]
+      },
+      "bb_boot22": {
+        "log_sha256": "b956336968d5b3715810ea5d2b5572a21ad6585427bf785f92230aa21f45d5b2",
+        "fps_samples": [
+          54.8,
+          60.0,
+          60.0,
+          60.0,
+          60.0,
+          56.4,
+          37.0,
+          34.2,
+          34.3
+        ]
+      },
+      "bb_boot23": {
+        "log_sha256": "0a6692d105aca932df1cb2c6c747c37ada5ea47d928f6e74df724f91a145ce2c",
+        "fps_samples": [
+          54.7,
+          60.0,
+          60.0,
+          60.0,
+          60.0,
+          56.5,
+          41.4,
+          37.9,
+          37.8,
+          37.8
+        ]
+      },
+      "bb_boot24": {
+        "log_sha256": "6ce7959b5707123a946d4f33322bccfdf142f3fee599d545c48df42e6a66963b",
+        "fps_samples": [
+          54.2,
+          60.3,
+          60.0,
+          60.0,
+          59.9
+        ]
+      },
+      "bb_boot25": {
+        "log_sha256": "90e730c82dc195e8fbe94a2ae37a4a91fd3260df8eb4517c041d5ef66429dc32",
+        "fps_samples": [
+          54.5,
+          60.0,
+          60.0,
+          60.0,
+          60.0,
+          56.8,
+          46.1,
+          45.5,
+          45.9,
+          47.1,
+          46.4
+        ]
+      },
+      "bb_boot26": {
+        "log_sha256": "b19d3ee7459caa646cc84f298a3d4e6500621dd14a512d408b1fcd61e56cae34",
+        "fps_samples": [
+          54.6,
+          60.0,
+          60.0,
+          60.0,
+          60.0,
+          58.0,
+          47.0,
+          46.7,
+          46.1,
+          46.4,
+          46.6
+        ]
+      },
+      "bb_boot27": {
+        "log_sha256": "09aa31fb6ebdae423a705c4a3f797a6e8229cabe2158199dae0bc131c7fed42f",
+        "fps_samples": [
+          54.7,
+          60.0,
+          60.0,
+          60.0,
+          60.0,
+          58.4,
+          43.6,
+          52.1,
+          52.0,
+          52.0,
+          52.7
+        ]
+      },
+      "bb_boot28": {
+        "log_sha256": "2c37a56f6edf75ad71ce38494c25c56606bc4d3db8186db0c5d8e567580a402c",
+        "fps_samples": [
+          55.0,
+          60.0,
+          60.0,
+          60.0,
+          58.7,
+          60.0,
+          52.2,
+          55.4,
+          58.8,
+          56.7,
+          52.6,
+          49.4
+        ]
+      }
+    }
+  },
+  "tlou": {
+    "title_id": "CUSA00557",
+    "combat_fps_operator_reported": [
+      84.5,
+      85.6
+    ],
+    "menus_fps_operator_reported": 120,
+    "evidence_scope": "User-provided integration handoff; not an independently verified controlled release benchmark."
+  },
+  "sonic": {
+    "title_id": "CUSA30448",
+    "report": "sonic-origins-performance.json",
+    "scope": "Sonic 1 idle-scene benchmark; Sonic CD short gameplay check; no Sonic 2/3 gameplay measurement."
+  },
+  "release_scope": "Historical pre-release candidate measurements. Final release safety fixes were not re-benchmarked in games."
+}

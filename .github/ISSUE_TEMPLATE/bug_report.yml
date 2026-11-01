@@ -65,7 +65,7 @@ body:
     attributes:
       label: PS4 Native version
       description: The release you installed, or the commit if you built from source.
-      placeholder: "0.4.3"
+      placeholder: "0.5.0"
     validations:
       required: true
   - type: dropdown

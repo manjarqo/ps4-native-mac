@@ -1,5 +1,7 @@
 # Bloodborne: Game of the Year Edition (CUSA03173 v01.09) Bring-up Implementation Plan
 
+> 0.5.0 publication scope: this is the development design/plan, not independent proof that every acceptance criterion passed. See README, CHANGELOG and docs/performance-0.5.0.json for audited measurement scope. The local Bloodborne 60 FPS modification is not distributed; unsafe compute-clear substitution was removed, write/upgrade ordering corrected, and STD remains unsupported. No new controlled gameplay benchmark of those final safety changes is claimed.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Bring Bloodborne: Game of the Year Edition (`CUSA03173` v01.09) to an excellently playable state on Apple Silicon Mac using our native AOT x86-64 → ARM64 recompiler and HLE runtime, adapting all applicable GPL-2.0 findings from `Wooloomooloo2/bloodborne_mac_port` (`mac-v0.5.12`) while guaranteeing zero regression on The Last of Us Remastered (`CUSA00557`).

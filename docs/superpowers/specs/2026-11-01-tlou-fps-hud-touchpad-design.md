@@ -1,5 +1,7 @@
 # The Last of Us Remastered (`CUSA00557`) — FPS Restoration & Optimization, Aiming Reticle (`QuadStrip`), and Gamepad Touchpad Design Spec
 
+> 0.5.0 publication scope: this is the development design/plan, not independent proof that every acceptance criterion passed. See README, CHANGELOG and docs/performance-0.5.0.json for audited measurement scope. The local Bloodborne 60 FPS modification is not distributed; unsafe compute-clear substitution was removed, write/upgrade ordering corrected, and STD remains unsupported. No new controlled gameplay benchmark of those final safety changes is claimed.
+
 - **Date:** 2026-11-01
 - **Target Title:** The Last of Us Remastered (`CUSA00557`)
 - **Cross-Game Non-Regression Gates:** Bloodborne GOTY (`CUSA03173` v1.09), Sonic Mania (`CUSA30448`)

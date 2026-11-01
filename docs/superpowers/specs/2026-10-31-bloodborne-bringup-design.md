@@ -1,5 +1,7 @@
 # Bloodborne: Game of the Year Edition (CUSA03173 v01.09) bring-up — design
 
+> 0.5.0 publication scope: this is the development design/plan, not independent proof that every acceptance criterion passed. See README, CHANGELOG and docs/performance-0.5.0.json for audited measurement scope. The local Bloodborne 60 FPS modification is not distributed; unsafe compute-clear substitution was removed, write/upgrade ordering corrected, and STD remains unsupported. No new controlled gameplay benchmark of those final safety changes is claimed.
+
 Date: 2026-10-31. Branch `bloodborne-bringup` from `main` `28c6679` (`v0.4.3`, `/Users/manjarqo/ps4recomp-work/publication-20261031`).
 The Last of Us Remastered (`CUSA00557`) plays on this codebase at ~90–99 fps (Metal 3). Uncharted 4 (`CUSA00917`) and inFAMOUS Second Son (`CUSA00004`) reach gameplay. This spec brings Bloodborne: Game of the Year Edition (`CUSA03173` v01.09) to the TLOU bar using our native AOT x86-64 → ARM64 recompiler and HLE runtime, adapting all applicable GPL-2.0 findings from `Wooloomooloo2/bloodborne_mac_port` (`mac-v0.5.12`) to our architecture while guaranteeing zero regression on The Last of Us Remastered (`CUSA00557`).
 

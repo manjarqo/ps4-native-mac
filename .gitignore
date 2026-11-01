@@ -34,3 +34,6 @@ tools/
 # Python test caches
 __pycache__/
 *.py[cod]
+
+# Locally generated manager bundle (release artifacts are published separately)
+/PS4 Native.app/

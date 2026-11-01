@@ -1,5 +1,7 @@
 # The Last of Us Remastered (`CUSA00557`) — FPS, Aiming Reticle (`QuadStrip`), and Gamepad Touchpad Implementation Plan
 
+> 0.5.0 publication scope: this is the development design/plan, not independent proof that every acceptance criterion passed. See README, CHANGELOG and docs/performance-0.5.0.json for audited measurement scope. The local Bloodborne 60 FPS modification is not distributed; unsafe compute-clear substitution was removed, write/upgrade ordering corrected, and STD remains unsupported. No new controlled gameplay benchmark of those final safety changes is claimed.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Restore and increase TLOU (`CUSA00557`) FPS beyond the `83.3 fps` baseline, render the missing aiming reticle (`QuadStrip` primitive emulation), and enable opening the crafting menu from a physical gamepad touchpad press (or Share/View fallback button) without regressing Bloodborne (`CUSA03173`) or Sonic Mania (`CUSA30448`).
