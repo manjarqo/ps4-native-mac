@@ -67,8 +67,16 @@ public enum ImportMode: String, Sendable, CaseIterable {
 /// The command lines of the typed helpers, shared by `Engine` and `FakeEngine`.
 enum EngineCommand {
     static func inspect(_ src: URL) -> [String] { ["inspect", src.path, "--json"] }
-    static func importGame(_ src: URL, library: URL, mode: ImportMode) -> [String] {
-        ["import", src.path, "--library", library.path, "--mode", mode.rawValue, "--json"]
+    static func importGame(_ src: URL, library: URL, mode: ImportMode, gameDir: URL? = nil) -> [String] {
+        var args = ["import", src.path, "--library", library.path, "--mode", mode.rawValue]
+        if let gameDir {
+            args += ["--game-dir", gameDir.path]
+        }
+        args.append("--json")
+        return args
+    }
+    static func moveGame(titleID: String, destination: URL, library: URL) -> [String] {
+        ["move-game", titleID, destination.path, "--library", library.path, "--json"]
     }
     static func analyze(content: URL) -> [String] { ["analyze-game", content.path, "--json"] }
     static func build(content: URL, buildDir: URL) -> [String] {
@@ -82,10 +90,16 @@ public extension Engine {
         try await run(EngineCommand.inspect(src), log: nil) { _ in }.result(InspectResult.self)
     }
 
-    func importGame(_ src: URL, library: URL, mode: ImportMode, log: URL?,
+    func importGame(_ src: URL, library: URL, mode: ImportMode, gameDir: URL? = nil, log: URL?,
                     onEvent: @escaping @Sendable (EngineEvent) -> Void) async throws -> ImportResult {
-        try await run(EngineCommand.importGame(src, library: library, mode: mode), log: log, onEvent: onEvent)
+        try await run(EngineCommand.importGame(src, library: library, mode: mode, gameDir: gameDir), log: log, onEvent: onEvent)
             .result(ImportResult.self)
+    }
+
+    func moveGame(titleID: String, destination: URL, library: URL, log: URL?,
+                  onEvent: @escaping @Sendable (EngineEvent) -> Void) async throws -> MoveResult {
+        try await run(EngineCommand.moveGame(titleID: titleID, destination: destination, library: library), log: log, onEvent: onEvent)
+            .result(MoveResult.self)
     }
 
     func analyze(content: URL, log: URL?,

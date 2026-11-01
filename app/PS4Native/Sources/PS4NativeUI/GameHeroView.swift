@@ -111,6 +111,16 @@ struct GameActionBar: View {
             Button("Show in Finder") {
                 if let dir = try? model.library.gameDir(titleID: id) { Panels.reveal(dir) }
             }
+            Button("Move game…") {
+                if let dest = Panels.chooseFolder(
+                    title: "Move \(game.title.isEmpty ? id : game.title)",
+                    message: "Choose the destination folder where \(id) (content and build) should be moved.",
+                    prompt: "Move"
+                ) {
+                    attempt { try model.moveGame(id, to: dest) }
+                }
+            }
+            .disabled(model.isBusy(id))
             Button("Open build log") {
                 if let log = model.latestLog(id, kind: "build") { Panels.open(log) }
             }

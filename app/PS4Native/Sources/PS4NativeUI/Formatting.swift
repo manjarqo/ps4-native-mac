@@ -51,6 +51,7 @@ enum Format {
     static func kind(_ kind: OperationItem.Kind) -> String {
         switch kind {
         case .importGame: "Import"
+        case .moveGame: "Move"
         case .analyze: "Analysis"
         case .build: "Build"
         }

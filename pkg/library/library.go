@@ -65,8 +65,21 @@ var (
 // Library is a game library rooted at Root.
 type Library struct{ Root string }
 
-// GameDir is the directory of one game.
-func (l Library) GameDir(titleID string) string { return filepath.Join(l.Root, "games", titleID) }
+// DefaultGameDir is the default directory of one game inside the library root, games/<TITLE_ID>.
+func (l Library) DefaultGameDir(titleID string) string {
+	return filepath.Join(l.Root, "games", titleID)
+}
+
+// GameDir is the directory of one game: its custom GameDir from library.json when set,
+// or games/<TITLE_ID> under Root by default.
+func (l Library) GameDir(titleID string) string {
+	if games, err := l.Load(); err == nil {
+		if g := games[titleID]; g != nil && g.GameDir != "" {
+			return g.GameDir
+		}
+	}
+	return l.DefaultGameDir(titleID)
+}
 
 // ContentDir holds the extracted game with its patches applied and, for a copied game, its DLC
 // in addcont/. For a game imported by reference it is a symlink to the user's folder.
@@ -126,6 +139,7 @@ type Game struct {
 	BuiltWith    string   `json:"built_with"`
 	LastPlayed   string   `json:"last_played"`
 	PlaySeconds  int64    `json:"play_seconds"`
+	GameDir      string   `json:"game_dir,omitempty"` // custom game and build directory; "" uses games/<TITLE_ID>
 
 	// extra holds the fields of this game in library.json that the engine does not know
 	// (written by a newer app), so that Save keeps them.
@@ -380,7 +394,14 @@ type ImportResult struct {
 // game directory, if this import created it, is removed unless it holds a kept scratch
 // directory.
 func (l Library) Import(src string, mode string, ev *events.Writer, cancel <-chan struct{}) (*ImportResult, error) {
-	im := &importer{lib: l, ev: ev, cancel: cancel}
+	return l.ImportTo(src, mode, "", ev, cancel)
+}
+
+// ImportTo is Import with an optional custom destination directory destDir for the game
+// and its build. When destDir is empty, the default games/<TITLE_ID> directory under
+// Root (or the game's existing custom directory when already installed) is used.
+func (l Library) ImportTo(src string, mode string, destDir string, ev *events.Writer, cancel <-chan struct{}) (*ImportResult, error) {
+	im := &importer{lib: l, destDir: destDir, ev: ev, cancel: cancel}
 	defer im.release()
 	r, err := im.run(src, mode)
 	if err != nil {
@@ -392,6 +413,59 @@ func (l Library) Import(src string, mode string, ev *events.Writer, cancel <-cha
 		return nil, ev.Error(f.code, f.err.Error())
 	}
 	return r, nil
+}
+
+// resolveExistingPath resolves symlinks on the longest existing prefix of p and returns
+// its absolute cleaned path, so a path that does not exist yet still resolves any
+// parent symlink (such as /var -> /private/var on macOS).
+func resolveExistingPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	existing := abs
+	var tail []string
+	for !exists(existing) {
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			break
+		}
+		tail = append(tail, filepath.Base(existing))
+		existing = parent
+	}
+	resolved, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		resolved = existing
+	}
+	slices.Reverse(tail)
+	for _, part := range tail {
+		resolved = filepath.Join(resolved, part)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+// resolveTargetGameDir resolves destDir for titleID: if destDir does not already end in
+// titleID, titleID is appended. customDir is "" when the resolved directory is the
+// library's default games/<titleID>, and gameDir otherwise.
+func resolveTargetGameDir(root, destDir, titleID string) (gameDir string, customDir string, err error) {
+	defDir, err := resolveExistingPath(filepath.Join(root, "games", titleID))
+	if err != nil {
+		return "", "", err
+	}
+	if destDir == "" {
+		return defDir, "", nil
+	}
+	resolved, err := resolveExistingPath(destDir)
+	if err != nil {
+		return "", "", err
+	}
+	if filepath.Base(resolved) != titleID {
+		resolved = filepath.Join(resolved, titleID)
+	}
+	if resolved == defDir {
+		return filepath.Join(root, "games", titleID), "", nil
+	}
+	return resolved, resolved, nil
 }
 
 // failure is an error with its events code.
@@ -434,14 +508,66 @@ func asPKG(err error) error { return &failure{code: classify(err, "bad_pkg"), er
 var overlayHook func(rel string) error
 
 type importer struct {
-	lib     Library
-	ev      *events.Writer
-	cancel  <-chan struct{}
-	scratch []scratchPath // removed on failure
-	unlock  func()
+	lib           Library
+	destDir       string // optional custom destination passed to ImportTo
+	activeGameDir string // resolved game directory for this import
+	customGameDir string // non-empty when activeGameDir is outside default games/<id>
+	ev            *events.Writer
+	cancel        <-chan struct{}
+	scratch       []scratchPath // removed on failure
+	unlock        func()
 	// marker identifies the source in the resume marker of each resumable scratch
 	// directory: its CONTENT_ID and the PKG's size and mtime, or the folder's path.
 	marker string
+}
+
+func (im *importer) resolveGameDir(id string, isBaseGame bool, games map[string]*Game) error {
+	if isBaseGame && im.destDir != "" {
+		gdir, cdir, err := resolveTargetGameDir(im.lib.Root, im.destDir, id)
+		if err != nil {
+			return err
+		}
+		im.activeGameDir, im.customGameDir = gdir, cdir
+		return nil
+	}
+	if prev := games[id]; prev != nil && prev.GameDir != "" {
+		im.activeGameDir, im.customGameDir = prev.GameDir, prev.GameDir
+		return nil
+	}
+	im.activeGameDir, im.customGameDir = im.lib.DefaultGameDir(id), ""
+	return nil
+}
+
+func (im *importer) gameDir(id string) string {
+	if im.activeGameDir != "" {
+		return im.activeGameDir
+	}
+	return im.lib.GameDir(id)
+}
+
+func (im *importer) contentDir(id string) string {
+	return filepath.Join(im.gameDir(id), "content")
+}
+
+func (im *importer) refAddcontDir(id string) string {
+	return filepath.Join(im.gameDir(id), "addcont")
+}
+
+func (im *importer) addcontDir(id string) string {
+	if isSymlink(im.contentDir(id)) {
+		return im.refAddcontDir(id)
+	}
+	return filepath.Join(im.contentDir(id), "addcont")
+}
+
+func (im *importer) gameBytes(id string) (int64, error) {
+	content := im.contentDir(id)
+	n, err := dirSize(content)
+	if err != nil || !isSymlink(content) {
+		return n, err
+	}
+	dlc, err := optionalDirSize(im.refAddcontDir(id))
+	return n + dlc, err
 }
 
 // scratchPath is a path cleanup removes when the import fails.
@@ -562,11 +688,14 @@ func (im *importer) importPKG(src string) (*ImportResult, error) {
 	if err := im.lock(); err != nil {
 		return nil, err
 	}
-	if err := im.recoverGame(id); err != nil {
-		return nil, err
-	}
 	games, err := im.lib.Load()
 	if err != nil {
+		return nil, err
+	}
+	if err := im.resolveGameDir(id, kind == fpkg.KindGame, games); err != nil {
+		return nil, err
+	}
+	if err := im.recoverGame(id); err != nil {
 		return nil, err
 	}
 	switch kind {
@@ -586,8 +715,8 @@ func (im *importer) importPKG(src string) (*ImportResult, error) {
 // switch to a copy (or a switch to reference that did not commit), whose files the copy
 // already holds as hard links.
 func (im *importer) recoverGame(id string) error {
-	dir := im.lib.GameDir(id)
-	content := im.lib.ContentDir(id)
+	dir := im.gameDir(id)
+	content := im.contentDir(id)
 	if err := im.recoverPair(content, content+".old"); err != nil {
 		return err
 	}
@@ -595,7 +724,7 @@ func (im *importer) recoverGame(id string) error {
 		return err
 	}
 	if isRealDir(content) {
-		if err := os.RemoveAll(im.lib.refAddcontDir(id)); err != nil {
+		if err := os.RemoveAll(im.refAddcontDir(id)); err != nil {
 			return err
 		}
 	}
@@ -606,7 +735,7 @@ func (im *importer) recoverGame(id string) error {
 	for _, old := range olds {
 		label := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(old), "dlc-"), ".old")
 		if labelPattern.MatchString(label) {
-			if err := im.recoverPair(filepath.Join(im.lib.AddcontDir(id), label), old); err != nil {
+			if err := im.recoverPair(filepath.Join(im.addcontDir(id), label), old); err != nil {
 				return err
 			}
 		}
@@ -729,28 +858,49 @@ func (im *importer) progress(stage string) fpkg.ProgressFunc {
 	}
 }
 
-// prepareGameDir creates games/<id>; a directory this import creates is removed on failure.
+// prepareGameDir creates the game directory for id; a directory this import creates is removed on failure.
 func (im *importer) prepareGameDir(id string) error {
-	dir := im.lib.GameDir(id)
+	dir := im.gameDir(id)
 	if !exists(dir) {
 		im.scratch = append(im.scratch, scratchPath{path: dir, gameDir: true})
 	}
 	return os.MkdirAll(dir, 0o755)
 }
 
-// checkSpace fails with no_space when the library volume has less than need bytes free.
-func (im *importer) checkSpace(need int64) error {
+// existingAncestor returns the deepest existing directory along path.
+func existingAncestor(path string) string {
+	cur := filepath.Clean(path)
+	for {
+		if fi, err := os.Stat(cur); err == nil && fi.IsDir() {
+			return cur
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return cur
+		}
+		cur = parent
+	}
+}
+
+// checkSpaceAt fails with no_space when the volume of targetDir has less than need bytes free.
+func (im *importer) checkSpaceAt(targetDir string, need int64) error {
 	if err := os.MkdirAll(im.lib.Root, 0o755); err != nil {
 		return err
 	}
+	checkDir := existingAncestor(targetDir)
 	var st syscall.Statfs_t
-	if err := syscall.Statfs(im.lib.Root, &st); err != nil {
-		return &fs.PathError{Op: "statfs", Path: im.lib.Root, Err: err}
+	if err := syscall.Statfs(checkDir, &st); err != nil {
+		return &fs.PathError{Op: "statfs", Path: checkDir, Err: err}
 	}
 	if free := int64(st.Bavail) * int64(st.Bsize); free < need {
-		return fail("no_space", "%s needs %d bytes free, %d available", im.lib.Root, need, free)
+		return fail("no_space", "%s needs %d bytes free, %d available", targetDir, need, free)
 	}
 	return nil
+}
+
+// checkSpace fails with no_space when the library volume has less than need bytes free.
+func (im *importer) checkSpace(need int64) error {
+	return im.checkSpaceAt(im.lib.Root, need)
 }
 
 func exists(path string) bool {
@@ -868,13 +1018,13 @@ func addUnique(list []string, v string) []string {
 }
 
 func (im *importer) installGame(p *fpkg.Package, s *sfo.File, id string, size int64, games map[string]*Game) (*ImportResult, error) {
-	if err := im.checkSpace(size + spaceMargin); err != nil {
+	if err := im.checkSpaceAt(im.gameDir(id), size+spaceMargin); err != nil {
 		return nil, err
 	}
 	if err := im.prepareGameDir(id); err != nil {
 		return nil, err
 	}
-	partial := im.lib.ContentDir(id) + ".partial"
+	partial := im.contentDir(id) + ".partial"
 	if err := im.extract(p, partial); err != nil {
 		return nil, err
 	}
@@ -894,8 +1044,9 @@ func (im *importer) finishCopy(s *sfo.File, id, partial string, games map[string
 	}
 	prev := games[id]
 	g := newGame(s, id, prev)
-	content := im.lib.ContentDir(id)
-	addcont := im.lib.AddcontDir(id)
+	g.GameDir = im.customGameDir
+	content := im.contentDir(id)
+	addcont := im.addcontDir(id)
 	wasRef := isSymlink(content)
 	if prev != nil && isRealDir(addcont) {
 		if err := linkTree(addcont, filepath.Join(partial, "addcont")); err != nil {
@@ -1031,7 +1182,7 @@ func (im *importer) dropPending(id string) {
 // over it, then commits it; content is untouched until the commit.
 func (im *importer) installPatch(p *fpkg.Package, s *sfo.File, id string, size int64, games map[string]*Game) (*ImportResult, error) {
 	g := games[id]
-	content := im.lib.ContentDir(id)
+	content := im.contentDir(id)
 	if g == nil || !exists(content) {
 		return im.storePending(p, s, id, size)
 	}
@@ -1042,7 +1193,7 @@ func (im *importer) installPatch(p *fpkg.Package, s *sfo.File, id string, size i
 	if older(v, g.AppVer) {
 		return nil, fail("bad_input", "%s: patch %s is older than the installed version %s; patches are cumulative, so apply the newest one", id, v, g.AppVer)
 	}
-	dir := im.lib.GameDir(id)
+	dir := im.gameDir(id)
 	contentBytes, err := dirSize(content)
 	if err != nil {
 		return nil, err
@@ -1052,7 +1203,7 @@ func (im *importer) installPatch(p *fpkg.Package, s *sfo.File, id string, size i
 	if !clone {
 		need += contentBytes
 	}
-	if err := im.checkSpace(need); err != nil {
+	if err := im.checkSpaceAt(dir, need); err != nil {
 		return nil, err
 	}
 	patch := filepath.Join(dir, "patch.partial")
@@ -1170,14 +1321,14 @@ func (im *importer) installDLC(p *fpkg.Package, s *sfo.File, id string, size int
 		return nil, fail("bad_pkg", "DLC CONTENT_ID %q has no valid entitlement label", cid)
 	}
 	g := games[id]
-	content := im.lib.ContentDir(id)
+	content := im.contentDir(id)
 	if g == nil || !exists(content) {
 		return nil, fail("bad_input", "%s is not in the library; import the game before its DLC", id)
 	}
-	if err := im.checkSpace(size + spaceMargin); err != nil {
+	dir := im.gameDir(id)
+	if err := im.checkSpaceAt(dir, size+spaceMargin); err != nil {
 		return nil, err
 	}
-	dir := im.lib.GameDir(id)
 	partial := filepath.Join(dir, "dlc-"+label+".partial")
 	if err := im.extract(p, partial); err != nil {
 		return nil, err
@@ -1185,10 +1336,10 @@ func (im *importer) installDLC(p *fpkg.Package, s *sfo.File, id string, size int
 	if err := dropMarker(partial); err != nil {
 		return nil, err
 	}
-	live := filepath.Join(im.lib.AddcontDir(id), label)
+	live := filepath.Join(im.addcontDir(id), label)
 	ng := g.clone()
 	ng.DLC = addUnique(ng.DLC, label)
-	total, err := im.lib.gameBytes(id)
+	total, err := im.gameBytes(id)
 	if err != nil {
 		return nil, err
 	}
@@ -1292,11 +1443,18 @@ func (im *importer) importFolder(src, mode string) (*ImportResult, error) {
 	if within(dir, root) || within(root, dir) {
 		return nil, fail("bad_input", "%s and the library %s must not contain each other", src, im.lib.Root)
 	}
-	if err := im.recoverGame(id); err != nil {
-		return nil, err
-	}
 	games, err := im.lib.Load()
 	if err != nil {
+		return nil, err
+	}
+	if err := im.resolveGameDir(id, true, games); err != nil {
+		return nil, err
+	}
+	gdir := im.gameDir(id)
+	if within(dir, gdir) || within(gdir, dir) {
+		return nil, fail("bad_input", "%s and the destination %s must not contain each other", src, gdir)
+	}
+	if err := im.recoverGame(id); err != nil {
 		return nil, err
 	}
 	if err := im.prepareGameDir(id); err != nil {
@@ -1310,15 +1468,15 @@ func (im *importer) importFolder(src, mode string) (*ImportResult, error) {
 		return nil, err
 	}
 	// An APFS clone takes almost no space, as in installPatch.
-	clone := canClone(dir, im.lib.GameDir(id))
+	clone := canClone(dir, gdir)
 	need := int64(spaceMargin)
 	if !clone {
 		need += size
 	}
-	if err := im.checkSpace(need); err != nil {
+	if err := im.checkSpaceAt(gdir, need); err != nil {
 		return nil, err
 	}
-	partial := im.lib.ContentDir(id) + ".partial"
+	partial := im.contentDir(id) + ".partial"
 	if err := im.scratchDir(partial, true); err != nil {
 		return nil, err
 	}
@@ -1334,7 +1492,7 @@ func (im *importer) importFolder(src, mode string) (*ImportResult, error) {
 // hard-linked from content/addcont into games/<id>/addcont before the commit (recoverGame
 // removes it again if the commit does not happen).
 func (im *importer) reference(s *sfo.File, id, dir string, games map[string]*Game) (*ImportResult, error) {
-	content := im.lib.ContentDir(id)
+	content := im.contentDir(id)
 	ref := content + ".ref.partial"
 	if err := im.scratchDir(ref, false); err != nil {
 		return nil, err
@@ -1344,7 +1502,8 @@ func (im *importer) reference(s *sfo.File, id, dir string, games map[string]*Gam
 	}
 	prev := games[id]
 	g := newGame(s, id, prev)
-	refAddcont := im.lib.refAddcontDir(id)
+	g.GameDir = im.customGameDir
+	refAddcont := im.refAddcontDir(id)
 	if prev != nil {
 		if copied := filepath.Join(content, "addcont"); isRealDir(content) && isRealDir(copied) {
 			if err := im.scratchDir(refAddcont, false); err != nil {
@@ -1625,4 +1784,196 @@ func fileHash(path string) ([sha256.Size]byte, error) {
 	}
 	h.Sum(sum[:0])
 	return sum, nil
+}
+
+// MoveResult is the result payload of Move.
+type MoveResult struct {
+	TitleID string `json:"title_id"`
+	FromDir string `json:"from_dir"`
+	GameDir string `json:"game_dir"`
+	Game    *Game  `json:"game"`
+}
+
+// Move relocates an installed game directory (content/, build/, addcont/, logs/, analysis.json)
+// to destDir (or destDir/<titleID> when destDir does not already end with <titleID>) and updates
+// library.json under the library lock.
+func (l Library) Move(titleID, destDir string, ev *events.Writer, cancel <-chan struct{}) (*MoveResult, error) {
+	if ev == nil {
+		ev = events.New(io.Discard, "move-game", false)
+	}
+	im := &importer{lib: l, ev: ev, cancel: cancel}
+	defer im.release()
+	res, err := im.runMove(titleID, destDir)
+	if err != nil {
+		var f *failure
+		if !errors.As(err, &f) {
+			f = &failure{code: classify(err, "io"), err: err}
+		}
+		im.cleanup(f.code == "cancelled")
+		return nil, ev.Error(f.code, f.err.Error())
+	}
+	return res, nil
+}
+
+func (im *importer) runMove(titleID, destDir string) (*MoveResult, error) {
+	if !titleIDPattern.MatchString(titleID) {
+		return nil, fail("bad_input", "invalid PS4 title id %q", titleID)
+	}
+	if strings.TrimSpace(destDir) == "" {
+		return nil, fail("bad_input", "destination directory is required")
+	}
+	if err := im.lock(); err != nil {
+		return nil, err
+	}
+	games, err := im.lib.Load()
+	if err != nil {
+		return nil, err
+	}
+	g := games[titleID]
+	if g == nil {
+		return nil, fail("bad_input", "%s is not in the library", titleID)
+	}
+	oldDir := im.lib.GameDir(titleID)
+	oldResolved, err := resolveExistingPath(oldDir)
+	if err != nil {
+		return nil, err
+	}
+	if !exists(oldResolved) {
+		return nil, fail("bad_input", "game directory %s does not exist", oldDir)
+	}
+	newDir, customDir, err := resolveTargetGameDir(im.lib.Root, destDir, titleID)
+	if err != nil {
+		return nil, err
+	}
+	rootResolved, err := resolveExistingPath(im.lib.Root)
+	if err != nil {
+		return nil, err
+	}
+	if newDir == rootResolved || within(rootResolved, newDir) {
+		return nil, fail("bad_input", "destination %s must not contain library root %s", newDir, im.lib.Root)
+	}
+	if oldResolved == newDir {
+		ng := g.clone()
+		ng.GameDir = customDir
+		if err := im.lib.update(func(m map[string]*Game) error {
+			m[titleID] = ng
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		im.ev.Progress("move", 1, 1, "stages", newDir)
+		return &MoveResult{TitleID: titleID, FromDir: oldResolved, GameDir: newDir, Game: ng}, nil
+	}
+	if within(newDir, oldResolved) || within(oldResolved, newDir) {
+		return nil, fail("bad_input", "cannot move %s into or around its current directory (%s -> %s)", titleID, oldResolved, newDir)
+	}
+	if exists(newDir) {
+		entries, rerr := os.ReadDir(newDir)
+		if rerr != nil || len(entries) > 0 {
+			return nil, fail("bad_input", "destination %s already exists and is not empty", newDir)
+		}
+		if err := os.Remove(newDir); err != nil {
+			return nil, err
+		}
+	}
+	if im.cancelled() {
+		return nil, &failure{code: "cancelled", err: fpkg.ErrCancelled}
+	}
+	if err := os.MkdirAll(filepath.Dir(newDir), 0o755); err != nil {
+		return nil, err
+	}
+	im.ev.Progress("move", 0, 1, "stages", newDir)
+	renameErr := os.Rename(oldResolved, newDir)
+	crossDev := errors.Is(renameErr, syscall.EXDEV)
+	if renameErr != nil && !crossDev {
+		return nil, renameErr
+	}
+	if crossDev {
+		if err := im.moveCrossDevice(oldResolved, newDir); err != nil {
+			return nil, err
+		}
+	}
+	ng := g.clone()
+	ng.GameDir = customDir
+	if err := im.lib.update(func(m map[string]*Game) error {
+		m[titleID] = ng
+		return nil
+	}); err != nil {
+		if crossDev {
+			os.RemoveAll(newDir)
+		} else {
+			os.Rename(newDir, oldResolved)
+		}
+		return nil, err
+	}
+	if crossDev {
+		if err := os.RemoveAll(oldResolved); err != nil {
+			im.warn("could not remove old game directory %s after cross-volume move: %v", oldResolved, err)
+		}
+	}
+	im.ev.Progress("move", 1, 1, "stages", newDir)
+	return &MoveResult{TitleID: titleID, FromDir: oldResolved, GameDir: newDir, Game: ng}, nil
+}
+
+// moveCrossDevice copies a game directory across filesystems into newDir, preserving
+// symlinks and file modes, and atomically renames the staged copy into place.
+func (im *importer) moveCrossDevice(oldDir, newDir string) error {
+	var total int64
+	err := filepath.WalkDir(oldDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() {
+			fi, ierr := d.Info()
+			if ierr != nil {
+				return ierr
+			}
+			total += fi.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if err := im.checkSpaceAt(filepath.Dir(newDir), total+spaceMargin); err != nil {
+		return err
+	}
+	staging := newDir + ".moving"
+	if err := im.scratchDir(staging, false); err != nil {
+		return err
+	}
+	var done int64
+	progress := im.progress("move")
+	buf := make([]byte, 1<<20)
+	err = filepath.WalkDir(oldDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(oldDir, path)
+		if rerr != nil {
+			return rerr
+		}
+		target := filepath.Join(staging, rel)
+		switch {
+		case d.IsDir():
+			return os.MkdirAll(target, 0o755)
+		case d.Type()&fs.ModeSymlink != 0:
+			link, lerr := os.Readlink(path)
+			if lerr != nil {
+				return lerr
+			}
+			if !filepath.IsAbs(link) {
+				link = filepath.Join(filepath.Dir(path), link)
+			}
+			return os.Symlink(link, target)
+		case d.Type().IsRegular():
+			return im.copyFile(path, target, buf, &done, total, progress)
+		default:
+			return nil
+		}
+	})
+	if err != nil {
+		return err
+	}
+	return os.Rename(staging, newDir)
 }

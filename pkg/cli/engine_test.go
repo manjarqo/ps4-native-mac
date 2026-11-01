@@ -217,3 +217,27 @@ func TestVersionJSON(t *testing.T) {
 		t.Fatalf("result: %v", res)
 	}
 }
+
+func TestImportCustomGameDirAndMoveGameCLI(t *testing.T) {
+	p, err := fpkgtest.BuildTestPKG(t.TempDir(), []sfo.Entry{{Key: "TITLE_ID", Str: "CUSA00557"}, {Key: "CATEGORY", Str: "gd"},
+		{Key: "APP_VER", Str: "01.00"}, {Key: "TITLE", Str: "T"}, {Key: "CONTENT_ID", Str: "UP9000-CUSA00557_00-T"}},
+		map[string][]byte{"eboot.bin": []byte("ELF")}, fpkgtest.Opts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lib := t.TempDir()
+	custom1 := t.TempDir()
+	ls, err := runJSON(t, "import", p, "--library", lib, "--game-dir", custom1, "--json")
+	if err != nil || ls[len(ls)-1]["event"] != "done" {
+		t.Fatalf("import --game-dir: %v %v", err, ls)
+	}
+	custom2 := t.TempDir()
+	ls, err = runJSON(t, "move-game", "CUSA00557", custom2, "--library", lib, "--json")
+	if err != nil || ls[len(ls)-1]["event"] != "done" {
+		t.Fatalf("move-game: %v %v", err, ls)
+	}
+	res := ls[len(ls)-1]["result"].(map[string]any)
+	if res["title_id"] != "CUSA00557" {
+		t.Errorf("move-game result = %v", res)
+	}
+}

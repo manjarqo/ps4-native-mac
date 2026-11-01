@@ -833,4 +833,52 @@ private func makeApp(at app: URL, version: String) throws {
         try await wait("free space after confirm") { h.model.libraryFreeBytes == 333 }
         try await wait("import") { finished(h.model.queue) }
     }
+
+    @Test func customDestinationOnAddAndMoveGameUpdatesBuildAndShortcut() async throws {
+        let h = try Harness()
+        defer { h.cleanUp() }
+        let pkg = h.src.appendingPathComponent("game.pkg")
+        let custom1 = h.root.appendingPathComponent("custom1", isDirectory: true)
+        let custom2 = h.root.appendingPathComponent("custom2", isDirectory: true)
+
+        await h.model.add([pkg])
+        let candidate = try #require(h.model.pendingCandidates.first)
+        #expect(candidate.canChooseDestination)
+        h.model.setDestination(custom1, for: candidate.id)
+        let updated = try #require(h.model.pendingCandidates.first)
+        #expect(updated.destination == custom1)
+        #expect(h.model.targetGameDir(for: updated)?.path == custom1.appendingPathComponent(titleID).path)
+
+        try h.model.confirm(updated, mode: .copy)
+        try await wait("import and analysis") {
+            h.model.queue.items.count == 2 && finished(h.model.queue) && h.model.analyses[titleID] != nil
+        }
+        let importCall = try #require(h.engine.calls.first { $0.first == "import" })
+        #expect(importCall == ["import", pkg.path, "--library", h.paths.libraryRoot.path, "--mode", "copy", "--game-dir", custom1.path, "--json"])
+        let expectedDir1 = custom1.appendingPathComponent(titleID)
+        #expect(try h.record().gameDir == expectedDir1.path)
+        #expect(try h.library.gameDir(titleID: titleID).path == expectedDir1.path)
+
+        // Build into custom1/<titleID>/build and create an Applications shortcut.
+        try h.model.build(titleID, confirmed: true)
+        try await wait("build") { finished(h.model.queue) && h.model.isBuilt(titleID) }
+        try h.model.addToApplications(titleID)
+        let link = h.applications.appendingPathComponent("Test Game.app")
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: link.path) == expectedDir1.appendingPathComponent("build/eboot.app").path)
+
+        // Move the game to custom2 and verify build bundle, library.json, shortcut and play PS4_APP_DIR.
+        try h.model.moveGame(titleID, to: custom2)
+        try await wait("move") {
+            finished(h.model.queue) && (try? h.record().gameDir) == custom2.appendingPathComponent(titleID).path
+        }
+        let expectedDir2 = custom2.appendingPathComponent(titleID)
+        #expect(h.model.isBuilt(titleID))
+        #expect(!FileManager.default.fileExists(atPath: expectedDir1.path))
+        #expect(FileManager.default.fileExists(atPath: expectedDir2.appendingPathComponent("build/eboot.app").path))
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: link.path) == expectedDir2.appendingPathComponent("build/eboot.app").path)
+
+        try h.model.play(titleID)
+        #expect(h.spawner.lastEnvironment?["PS4_APP_DIR"] == expectedDir2.appendingPathComponent("content").path)
+        try await wait("exit") { h.model.launcher.running[titleID] == nil }
+    }
 }

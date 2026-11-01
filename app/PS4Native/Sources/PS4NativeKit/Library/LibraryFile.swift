@@ -63,6 +63,8 @@ public struct GameRecord: Codable, Sendable, Equatable, Identifiable {
     /// ISO-8601 when set, "" otherwise.
     public var lastPlayed: String
     public var playSeconds: Int64
+    /// Optional custom game directory path outside the default games/<TITLE_ID>; "" for default.
+    public var gameDir: String
     /// The fields of this game that this app does not know.
     public var extra: [String: JSONValue]
 
@@ -70,7 +72,7 @@ public struct GameRecord: Codable, Sendable, Equatable, Identifiable {
 
     public init(titleID: String, contentID: String = "", title: String = "", appVer: String = "", version: String = "",
                 patches: [String] = [], dlc: [String] = [], contentBytes: Int64 = 0, status: String = "",
-                builtWith: String = "", lastPlayed: String = "", playSeconds: Int64 = 0,
+                builtWith: String = "", lastPlayed: String = "", playSeconds: Int64 = 0, gameDir: String = "",
                 extra: [String: JSONValue] = [:]) {
         self.titleID = titleID
         self.contentID = contentID
@@ -84,12 +86,13 @@ public struct GameRecord: Codable, Sendable, Equatable, Identifiable {
         self.builtWith = builtWith
         self.lastPlayed = lastPlayed
         self.playSeconds = playSeconds
+        self.gameDir = gameDir
         self.extra = extra
     }
 
     static let knownKeys: Set<String> = [
         "title_id", "content_id", "title", "app_ver", "version", "patches", "dlc",
-        "content_bytes", "status", "built_with", "last_played", "play_seconds",
+        "content_bytes", "status", "built_with", "last_played", "play_seconds", "game_dir",
     ]
 
     public init(from decoder: Decoder) throws {
@@ -106,6 +109,7 @@ public struct GameRecord: Codable, Sendable, Equatable, Identifiable {
         builtWith = try c.value("built_with", or: "")
         lastPlayed = try c.value("last_played", or: "")
         playSeconds = try c.value("play_seconds", or: 0)
+        gameDir = try c.value("game_dir", or: "")
         extra = try c.extra(excluding: Self.knownKeys)
     }
 
@@ -124,6 +128,9 @@ public struct GameRecord: Codable, Sendable, Equatable, Identifiable {
         try c.encode(builtWith, forKey: AnyKey("built_with"))
         try c.encode(lastPlayed, forKey: AnyKey("last_played"))
         try c.encode(playSeconds, forKey: AnyKey("play_seconds"))
+        if !gameDir.isEmpty {
+            try c.encode(gameDir, forKey: AnyKey("game_dir"))
+        }
     }
 }
 

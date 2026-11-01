@@ -261,4 +261,28 @@ import Testing
             #"{"result":{"title_id":"CUSA00557","kind":"patch","pending":true}}"#.utf8)).result
         #expect(try pending.gameRecord == nil)
     }
+
+    @Test func customGameDirResolvesPathsAndUninstallsCleanly() async throws {
+        let tmp = try makeTemp("customdir")
+        defer { cleanup(tmp) }
+        let root = tmp.appendingPathComponent("lib", isDirectory: true)
+        let customRoot = tmp.appendingPathComponent("external", isDirectory: true)
+        let customGame = LibraryStore.resolveGameDir(destination: customRoot, titleID: "CUSA00557")
+        #expect(customGame.path == customRoot.appendingPathComponent("CUSA00557").path)
+        #expect(LibraryStore.resolveGameDir(destination: customGame, titleID: "CUSA00557").path == customGame.path)
+
+        let store = LibraryStore(root: root)
+        try await store.update {
+            $0.games.append(GameRecord(titleID: "CUSA00557", title: "Custom Game", gameDir: customGame.path))
+        }
+        #expect(try store.gameDir(titleID: "CUSA00557").path == customGame.path)
+        #expect(try store.buildDir(titleID: "CUSA00557").path == customGame.appendingPathComponent("build").path)
+        #expect(try store.contentDir(titleID: "CUSA00557").path == customGame.appendingPathComponent("content").path)
+
+        try FileManager.default.createDirectory(at: customGame.appendingPathComponent("build/eboot.app"), withIntermediateDirectories: true)
+        try Data(count: 2048).write(to: customGame.appendingPathComponent("build/eboot.app/eboot"))
+        let freed = try await store.uninstall(titleID: "CUSA00557")
+        #expect(freed >= 2048)
+        #expect(!FileManager.default.fileExists(atPath: customGame.path))
+    }
 }

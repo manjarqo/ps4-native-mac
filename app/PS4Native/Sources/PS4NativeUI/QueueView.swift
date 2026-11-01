@@ -67,6 +67,7 @@ struct QueueRow: View {
     private var symbol: String {
         switch item.kind {
         case .importGame: "square.and.arrow.down"
+        case .moveGame: "folder.badge.gearshape"
         case .analyze: "magnifyingglass"
         case .build: "hammer"
         }

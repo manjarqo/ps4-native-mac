@@ -232,6 +232,7 @@ public final class AppModel {
         if uninstalling.contains(titleID) || hasActiveBuild(titleID) { throw AppError.busy(titleID) }
         guard let app = try library.appBundle(titleID: titleID) else { throw AppError.notBuilt(titleID) }
         var environment = GameSettings.load(titleID: titleID, settingsDir: paths.settingsDir).launchEnvironment
+        environment["PS4_APP_DIR"] = try library.contentDir(titleID: titleID).path
         if let dlc = try library.launchAddcontDir(titleID: titleID) { environment["PS4_ADDCONT_DIR"] = dlc.path }
         let log = try logURL(titleID, "run")
         try launcher.launch(titleID: titleID, app: app, environment: environment, log: log)
@@ -328,7 +329,33 @@ public final class AppModel {
         return dict["CFBundleShortVersionString"] as? String
     }
 
-    // MARK: Uninstall and shortcut
+    // MARK: Move, uninstall and shortcut
+
+    /// Queues a `move-game` operation that relocates the game directory (`content/`, `build/`,
+    /// `addcont/`, `logs/`, `analysis.json`) to `destination` (or `destination/<TITLE_ID>` when
+    /// `destination`'s last path component is not `<TITLE_ID>`) and updates `library.json` and any
+    /// `/Applications` shortcut.
+    public func moveGame(_ titleID: String, to destination: URL) throws {
+        let game = try record(titleID)
+        guard !isBusy(titleID) else { throw AppError.busy(titleID) }
+        let oldGameDir = try library.gameDir(titleID: titleID)
+        let log = operationLogURL(kind: "move", titleID: titleID)
+        let engine = engine, root = library.root
+        let title = game.title.isEmpty ? titleID : game.title
+        queue.enqueue(kind: .moveGame, title: title, titleID: titleID, log: log) { [weak self] progress in
+            let result = try await engine.moveGame(titleID: titleID, destination: destination, library: root, log: log, onEvent: progress)
+            await self?.moved(titleID, from: oldGameDir, result: result)
+        }
+    }
+
+    private func moved(_ titleID: String, from oldGameDir: URL, result: MoveResult) async {
+        storedAnalyses[titleID] = nil
+        latestLogs[titleID] = nil
+        lastCrashLog[titleID] = nil
+        refresh()
+        updateShortcuts(for: titleID, from: oldGameDir)
+        await measureFreeSpace()
+    }
 
     /// Removes the game from the library, and our links to it in the Applications directory, and
     /// returns the bytes freed. Without `keepSaves` its save directories go to the Trash as well;
@@ -358,20 +385,37 @@ public final class AppModel {
         return freed
     }
 
-    /// Links `<Applications>/<TITLE>.app` to the built bundle. A link of ours (into the library)
-    /// at that path is replaced; anything else there is never touched.
+    /// Links `<Applications>/<TITLE>.app` to the built bundle. A link of ours (into the library or
+    /// the game's directory) at that path is replaced; anything else there is never touched.
     public func addToApplications(_ titleID: String) throws {
         let game = try record(titleID)
+        let gameDir = try library.gameDir(titleID: titleID)
         guard let app = try library.appBundle(titleID: titleID) else { throw AppError.notBuilt(titleID) }
         let link = applicationsDir.appendingPathComponent(Self.shortcutName(game) + ".app", isDirectory: false)
         let fm = FileManager.default
         if let target = try? fm.destinationOfSymbolicLink(atPath: link.path) {
-            guard isInside(resolve(target), library.root) else { throw AppError.shortcutExists(link) }
+            let resolved = resolve(target)
+            guard isInside(resolved, library.root) || isInside(resolved, gameDir) else { throw AppError.shortcutExists(link) }
             try fm.removeItem(at: link)
         } else if (try? fm.attributesOfItem(atPath: link.path)) != nil {
             throw AppError.shortcutExists(link)
         }
         try fm.createSymbolicLink(at: link, withDestinationURL: app)
+    }
+
+    /// Updates any symlink in the Applications directory that pointed into `oldGameDir` to point
+    /// to the game's built bundle at its new location.
+    private func updateShortcuts(for titleID: String, from oldGameDir: URL) {
+        guard let app = try? library.appBundle(titleID: titleID) else { return }
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: applicationsDir.path) else { return }
+        for name in names {
+            let link = applicationsDir.appendingPathComponent(name, isDirectory: false)
+            guard let target = try? fm.destinationOfSymbolicLink(atPath: link.path), isInside(resolve(target), oldGameDir)
+            else { continue }
+            try? fm.removeItem(at: link)
+            try? fm.createSymbolicLink(at: link, withDestinationURL: app)
+        }
     }
 
     /// Removes the symlinks in the Applications directory that point into `gameDir`. A link that

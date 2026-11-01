@@ -946,3 +946,75 @@ func TestRecoverReferencedDLC(t *testing.T) {
 		}
 	}
 }
+
+func TestImportCustomGameDirAndMove(t *testing.T) {
+	l := Library{Root: t.TempDir()}
+	customRoot := t.TempDir()
+	const id = "CUSA04529"
+
+	base := pkgFile(t, "gd", "01.00", "UP9000-CUSA04529_00-BASE", map[string][]byte{"eboot.bin": []byte("v100"), "a.dat": []byte("A")})
+	r, err := l.ImportTo(base, "copy", customRoot, ev(), nil)
+	if err != nil {
+		t.Fatalf("ImportTo custom dir: %v", err)
+	}
+	wantCustomDir, _ := resolveExistingPath(filepath.Join(customRoot, id))
+	if r.Game.GameDir != wantCustomDir || l.GameDir(id) != wantCustomDir {
+		t.Fatalf("GameDir = %q (game.GameDir=%q), want %q", l.GameDir(id), r.Game.GameDir, wantCustomDir)
+	}
+	if exists(l.DefaultGameDir(id)) {
+		t.Fatalf("default game dir %s should not exist when imported to custom dir", l.DefaultGameDir(id))
+	}
+
+	// Patch and DLC should automatically target the custom GameDir even when destDir is empty.
+	patch := pkgFile(t, "gp", "01.32", "UP9000-CUSA04529_00-PATCH", map[string][]byte{"eboot.bin": []byte("v132")})
+	if _, err := l.Import(patch, "copy", ev(), nil); err != nil {
+		t.Fatalf("patch into custom dir: %v", err)
+	}
+	dlc := pkgFile(t, "ac", "01.00", "UP9000-CUSA04529_00-EXTRAPACK", map[string][]byte{"dlc.dat": []byte("D")})
+	if _, err := l.Import(dlc, "copy", ev(), nil); err != nil {
+		t.Fatalf("dlc into custom dir: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(wantCustomDir, "content", "eboot.bin")); string(b) != "v132" {
+		t.Errorf("patched eboot in custom dir = %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(wantCustomDir, "content", "addcont", "EXTRAPACK", "dlc.dat")); string(b) != "D" {
+		t.Errorf("dlc in custom dir = %q", b)
+	}
+
+	// Simulate a build artifact inside <customDir>/build/eboot.app and move the game to a second custom dir.
+	buildBin := filepath.Join(wantCustomDir, "build", "eboot.app", "Contents", "MacOS", "eboot")
+	if err := os.MkdirAll(filepath.Dir(buildBin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(buildBin, []byte("MACH-O"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	secondRoot := t.TempDir()
+	mv, err := l.Move(id, secondRoot, ev(), nil)
+	if err != nil {
+		t.Fatalf("Move to secondRoot: %v", err)
+	}
+	wantSecondDir, _ := resolveExistingPath(filepath.Join(secondRoot, id))
+	if mv.GameDir != wantSecondDir || l.GameDir(id) != wantSecondDir {
+		t.Fatalf("after Move GameDir = %q, want %q", l.GameDir(id), wantSecondDir)
+	}
+	if exists(wantCustomDir) {
+		t.Errorf("old custom dir %s still exists after move", wantCustomDir)
+	}
+	if b, _ := os.ReadFile(filepath.Join(wantSecondDir, "build", "eboot.app", "Contents", "MacOS", "eboot")); string(b) != "MACH-O" {
+		t.Errorf("moved build binary = %q", b)
+	}
+
+	// Move back to default games/<id> directory: GameDir in library.json should clear to "".
+	mvDef, err := l.Move(id, filepath.Join(l.Root, "games"), ev(), nil)
+	if err != nil {
+		t.Fatalf("Move back to default: %v", err)
+	}
+	if mvDef.Game.GameDir != "" {
+		t.Errorf("expected empty GameDir when moved back to default, got %q", mvDef.Game.GameDir)
+	}
+	if b, _ := os.ReadFile(filepath.Join(l.ContentDir(id), "eboot.bin")); string(b) != "v132" {
+		t.Errorf("eboot after move back to default = %q", b)
+	}
+}

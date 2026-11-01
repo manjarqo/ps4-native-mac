@@ -17,6 +17,7 @@ struct OverviewTab: View {
                     row("Play time", Format.playTime(game.playSeconds))
                     row("Renderer", settings.map(renderer) ?? "—")
                     row("Content size", Format.bytes(game.contentBytes))
+                    locationRow
                     if let analysis {
                         row("Code coverage", analysis.coverage.formatted(.number.precision(.fractionLength(2))) + " %")
                         row("Unresolved imports", "\(analysis.unresolved)")
@@ -69,6 +70,37 @@ struct OverviewTab: View {
         GridRow {
             Text(label).foregroundStyle(.secondary)
             Text(value).textSelection(.enabled)
+        }
+    }
+
+    @ViewBuilder private var locationRow: some View {
+        let dir = try? model.library.gameDir(titleID: game.titleID)
+        let path = dir?.path ?? "—"
+        GridRow {
+            Text("Location").foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Text(path)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(path)
+                Button("Move…") {
+                    let id = game.titleID
+                    if let dest = Panels.chooseFolder(
+                        title: "Move \(game.title.isEmpty ? id : game.title)",
+                        message: "Choose the destination folder where \(id) (content and build) should be moved.",
+                        prompt: "Move"
+                    ) {
+                        do { try model.moveGame(id, to: dest) } catch { model.report(error) }
+                    }
+                }
+                .controlSize(.small)
+                .disabled(model.isBusy(game.titleID))
+                if let dir {
+                    Button("Show in Finder") { Panels.reveal(dir) }
+                        .controlSize(.small)
+                }
+            }
         }
     }
 }

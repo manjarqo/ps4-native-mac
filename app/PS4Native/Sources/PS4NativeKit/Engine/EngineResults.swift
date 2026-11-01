@@ -108,3 +108,23 @@ public struct VersionResult: Decodable, Sendable, Equatable {
     public let version: String
     public let go: String
 }
+
+/// `move-game`: relocated game directory.
+public struct MoveResult: Decodable, Sendable, Equatable {
+    public let titleID: String
+    public let fromDir: String
+    public let gameDir: String
+    public let game: JSONValue?
+
+    public var gameRecord: GameRecord? {
+        get throws {
+            guard let game, game != .null else { return nil }
+            return try JSONDecoder().decode(GameRecord.self, from: JSONEncoder().encode(game))
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case game
+        case titleID = "title_id", fromDir = "from_dir", gameDir = "game_dir"
+    }
+}

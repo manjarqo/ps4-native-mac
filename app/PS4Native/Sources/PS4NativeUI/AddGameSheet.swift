@@ -67,11 +67,14 @@ struct CandidateCard: View {
                 }
                 if candidate.isFolder, candidate.canConfirm {
                     Picker("Folder", selection: Binding { candidate.mode } set: { model.setMode($0, for: candidate.id) }) {
-                        Text("Copy into the library (APFS clone)").tag(ImportMode.copy)
+                        Text("Copy into the game directory (APFS clone)").tag(ImportMode.copy)
                         Text("Use in place").tag(ImportMode.reference)
                     }
                     .pickerStyle(.radioGroup)
                     .labelsHidden()
+                }
+                if candidate.canChooseDestination, candidate.canConfirm {
+                    locationRow
                 }
             }
             Spacer(minLength: 8)
@@ -100,11 +103,44 @@ struct CandidateCard: View {
     }
 
     @ViewBuilder private var space: some View {
-        let needed = "Needs \(Format.bytes(candidate.neededBytes)) of \(Format.bytes(model.libraryFreeBytes)) free"
+        let free = model.availableBytes(for: candidate)
+        let needed = "Needs \(Format.bytes(candidate.neededBytes)) of \(Format.bytes(free)) free"
         if model.spaceShort(candidate) {
             Label(needed + ": not enough space", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
         } else {
             Text(needed).foregroundStyle(.secondary)
         }
+    }
+
+    @ViewBuilder private var locationRow: some View {
+        let targetPath = model.targetGameDir(for: candidate)?.path ?? ""
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .foregroundStyle(.secondary)
+            Text(targetPath)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(targetPath)
+            Button("Choose…") {
+                let id = inspect?.titleID ?? "the game"
+                if let folder = Panels.chooseFolder(
+                    title: "Choose game & build location",
+                    message: "Choose the folder where \(id) (content and build) will be stored.",
+                    prompt: "Select"
+                ) {
+                    model.setDestination(folder, for: candidate.id)
+                }
+            }
+            .controlSize(.small)
+            if candidate.destination != nil {
+                Button("Default") {
+                    model.setDestination(nil, for: candidate.id)
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(.top, 2)
     }
 }

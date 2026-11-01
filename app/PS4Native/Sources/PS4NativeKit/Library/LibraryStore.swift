@@ -16,10 +16,30 @@ public struct LibraryStore: Sendable {
 
     // MARK: Paths
 
-    /// games/<TITLE_ID>/. Throws `LibraryError.badTitleID` for anything but a PS4 TITLE_ID.
-    public func gameDir(titleID: String) throws -> URL {
+    /// The default directory games/<TITLE_ID>/ under `root`. Throws `LibraryError.badTitleID` for
+    /// anything but a PS4 TITLE_ID.
+    public func defaultGameDir(titleID: String) throws -> URL {
         guard TitleID.isValid(titleID) else { throw LibraryError.badTitleID(titleID) }
         return root.appendingPathComponent("games", isDirectory: true).appendingPathComponent(titleID, isDirectory: true)
+    }
+
+    /// Resolves a user-selected destination directory for `titleID`: appends `<titleID>` unless
+    /// `destination`'s last path component is already `<titleID>`.
+    public static func resolveGameDir(destination: URL, titleID: String) -> URL {
+        if destination.lastPathComponent == titleID {
+            return destination
+        }
+        return destination.appendingPathComponent(titleID, isDirectory: true)
+    }
+
+    /// The game directory for `titleID` (either a custom directory recorded in `library.json` or
+    /// the default `games/<TITLE_ID>/`). Throws `LibraryError.badTitleID` for anything but a PS4 TITLE_ID.
+    public func gameDir(titleID: String) throws -> URL {
+        let def = try defaultGameDir(titleID: titleID)
+        if let rec = try? read().games.first(where: { $0.titleID == titleID }), !rec.gameDir.isEmpty {
+            return URL(fileURLWithPath: rec.gameDir, isDirectory: true)
+        }
+        return def
     }
 
     /// The game with its patches and DLC; a symlink to the source folder in reference mode (its
@@ -101,19 +121,26 @@ public struct LibraryStore: Sendable {
     /// removed, never followed, so the folder of a referenced game is untouched. Returns the bytes
     /// of the files removed.
     public func uninstall(titleID: String) async throws -> Int64 {
-        let game = try gameDir(titleID: titleID)
-        // The .json describing a pending patch goes first, so a half-removed pending/<ID>/ is ignored.
-        let paths = [
-            pendingURL.appendingPathComponent(titleID + ".json"),
-            pendingURL.appendingPathComponent(titleID + ".partial", isDirectory: true),
-            pendingURL.appendingPathComponent(titleID, isDirectory: true),
-            game,
-        ]
+        let defGame = try defaultGameDir(titleID: titleID)
         return try await locked {
             var file = try read()
+            let customPath = file.games.first(where: { $0.titleID == titleID })?.gameDir ?? ""
             let count = file.games.count
             file.games.removeAll { $0.titleID == titleID }
             if file.games.count != count { try write(file) }
+            // The .json describing a pending patch goes first, so a half-removed pending/<ID>/ is ignored.
+            var paths = [
+                pendingURL.appendingPathComponent(titleID + ".json"),
+                pendingURL.appendingPathComponent(titleID + ".partial", isDirectory: true),
+                pendingURL.appendingPathComponent(titleID, isDirectory: true),
+                defGame,
+            ]
+            if !customPath.isEmpty {
+                let customURL = URL(fileURLWithPath: customPath, isDirectory: true)
+                if customURL.standardizedFileURL.path != defGame.standardizedFileURL.path {
+                    paths.append(customURL)
+                }
+            }
             var freed: Int64 = 0
             for path in paths { freed += try removeTree(path) }
             return freed

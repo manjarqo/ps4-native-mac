@@ -30,6 +30,7 @@ const iconEntryID = 0x1200
 var engineCommands = map[string]func(args []string) error{
 	"inspect":      runInspect,
 	"import":       runImport,
+	"move-game":    runMoveGame,
 	"analyze-game": runAnalyzeGame,
 	"version":      runVersion,
 }
@@ -249,16 +250,17 @@ func writeIcon(res *inspectResult, data []byte) string {
 }
 
 func runImport(args []string) error {
-	var libDir, mode string
+	var libDir, mode, gameDir string
 	pos, ev, asJSON, err := engineFlags("import", args, func(f *flag.FlagSet) {
 		f.StringVar(&libDir, "library", "", "library directory")
 		f.StringVar(&mode, "mode", "copy", "copy or reference")
+		f.StringVar(&gameDir, "game-dir", "", "optional custom directory for the game and its build")
 	})
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 || libDir == "" {
-		return ev.Error("bad_input", "usage: ps4-recomp import <pkg|folder> --library <dir> [--mode copy|reference] [--json]")
+		return ev.Error("bad_input", "usage: ps4-recomp import <pkg|folder> --library <dir> [--mode copy|reference] [--game-dir <dir>] [--json]")
 	}
 
 	cancel := make(chan struct{})
@@ -277,13 +279,52 @@ func runImport(args []string) error {
 		close(stopped)
 	}()
 
-	// Import reports its own failures on ev.
-	r, err := library.Library{Root: libDir}.Import(pos[0], mode, ev, cancel)
+	// ImportTo reports its own failures on ev.
+	r, err := library.Library{Root: libDir}.ImportTo(pos[0], mode, gameDir, ev, cancel)
 	if err != nil {
 		return err
 	}
 	if !asJSON {
 		fmt.Fprintf(stdout, "imported %s %s (pending=%v)\n", r.Kind, r.TitleID, r.Pending)
+	}
+	ev.Done(r)
+	return nil
+}
+
+func runMoveGame(args []string) error {
+	var libDir string
+	pos, ev, asJSON, err := engineFlags("move-game", args, func(f *flag.FlagSet) {
+		f.StringVar(&libDir, "library", "", "library directory")
+	})
+	if err != nil {
+		return err
+	}
+	if len(pos) != 2 || libDir == "" {
+		return ev.Error("bad_input", "usage: ps4-recomp move-game <TITLE_ID> <dest> --library <dir> [--json]")
+	}
+
+	cancel := make(chan struct{})
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	stopped := make(chan struct{})
+	go func() {
+		select {
+		case <-sigs:
+			close(cancel)
+		case <-stopped:
+		}
+	}()
+	defer func() {
+		signal.Stop(sigs)
+		close(stopped)
+	}()
+
+	r, err := library.Library{Root: libDir}.Move(pos[0], pos[1], ev, cancel)
+	if err != nil {
+		return err
+	}
+	if !asJSON {
+		fmt.Fprintf(stdout, "moved %s from %s to %s\n", r.TitleID, r.FromDir, r.GameDir)
 	}
 	ev.Done(r)
 	return nil

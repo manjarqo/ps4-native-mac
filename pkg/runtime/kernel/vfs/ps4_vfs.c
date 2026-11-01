@@ -102,6 +102,45 @@ static char *discover_app_root(const char *hint) {
         }
     }
 
+#if defined(__APPLE__)
+    // 3b. If the game directory was moved after compilation, <exe_dir> inside
+    // <game_dir>/build/eboot.app/Contents/MacOS/<exec> has <game_dir>/content
+    // four levels up. Check parent hierarchy for a sibling content/ directory.
+    {
+        char exec_path2[1024] = {0};
+        uint32_t size2 = sizeof(exec_path2);
+        if (_NSGetExecutablePath(exec_path2, &size2) == 0) {
+            char canonical_exec2[1024];
+            if (realpath(exec_path2, canonical_exec2) != NULL) {
+                char cur[1024];
+                strncpy(cur, canonical_exec2, sizeof(cur) - 1);
+                cur[sizeof(cur) - 1] = '\0';
+                char *dir = dirname(cur);
+                strncpy(cur, dir, sizeof(cur) - 1);
+                cur[sizeof(cur) - 1] = '\0';
+                for (int i = 0; i < 5; i++) {
+                    char *parent = dirname(cur);
+                    char content_dir[1024];
+                    snprintf(content_dir, sizeof(content_dir), "%s/content", parent);
+                    char check_sfo[1100];
+                    snprintf(check_sfo, sizeof(check_sfo), "%s/sce_sys/param.sfo", content_dir);
+                    char check_eboot[1100];
+                    snprintf(check_eboot, sizeof(check_eboot), "%s/eboot.bin", content_dir);
+                    if (access(check_sfo, F_OK) == 0 || access(check_eboot, F_OK) == 0) {
+                        char canonical_content[1024];
+                        if (realpath(content_dir, canonical_content) != NULL) {
+                            return strdup(canonical_content);
+                        }
+                        return strdup(content_dir);
+                    }
+                    strncpy(cur, parent, sizeof(cur) - 1);
+                    cur[sizeof(cur) - 1] = '\0';
+                }
+            }
+        }
+    }
+#endif
+
     // 4. Check current working directory ./assets or ./Media
     if (access("assets", F_OK) == 0 || access("Media", F_OK) == 0) {
         char cwd[1024];

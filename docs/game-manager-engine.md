@@ -9,7 +9,8 @@ Each command is one process. With `--json` it writes one JSON object per line to
 | Command | Purpose |
 |---|---|
 | `ps4-recomp inspect <pkg \| folder> [--json]` | Read identity, kind, signing and sizes without writing anything to a library. |
-| `ps4-recomp import <pkg \| folder> --library <dir> [--mode copy\|reference] [--json]` | Add a game, patch or DLC to the library. |
+| `ps4-recomp import <pkg \| folder> --library <dir> [--mode copy\|reference] [--game-dir <dir>] [--json]` | Add a game, patch or DLC to the library (optionally storing the base game and its build in `--game-dir`). |
+| `ps4-recomp move-game <TITLE_ID> <dest> --library <dir> [--json]` | Relocate an installed game (`content/`, `build/`, `addcont/`, `logs/`, `analysis.json`) to `<dest>/<TITLE_ID>` (or `<dest>` if it already ends with `<TITLE_ID>`) and update `library.json`. |
 | `ps4-recomp analyze-game <content dir> [--json]` | Analyse `eboot.bin` and return a support verdict. |
 | `ps4-recomp version [--json]` | Print the engine version; with `--json` one `done` event with `{"version","go"}`. |
 | `ps4-recomp build <eboot.bin> -o <build dir> [flags] --json` | Recompile and produce a signed `.app`. |
@@ -207,7 +208,7 @@ The root is `~/Library/Application Support/PS4Native/` in the app; the engine ta
   pending/<TITLE_ID>.json     {"app_ver": "..."} describing that patch
 ```
 
-`library.json` is `{"version":1,"games":[...]}`, sorted by TITLE_ID, written atomically (a temp file in the same directory, then a rename). Each game holds `title_id`, `content_id`, `title`, `app_ver`, `version`, `patches[]` (the `APP_VER` of each applied patch), `dlc[]` (entitlement labels), `content_bytes` (the content and, in reference mode, the DLC in `games/<TITLE_ID>/addcont/`), `status` (written by the app from the `analyze-game` verdict, empty until then; the engine clears it when a patch changes the content), `built_with`, `last_played` and `play_seconds`.
+`library.json` is `{"version":1,"games":[...]}`, sorted by TITLE_ID, written atomically (a temp file in the same directory, then a rename). Each game holds `title_id`, `content_id`, `title`, `app_ver`, `version`, `patches[]` (the `APP_VER` of each applied patch), `dlc[]` (entitlement labels), `content_bytes` (the content and, in reference mode, the DLC in `<game_dir>/addcont/`), `status` (written by the app from the `analyze-game` verdict, empty until then; the engine clears it when a patch changes the content), `built_with`, `last_played`, `play_seconds`, and an optional `game_dir` (omitted when the game lives at the default `<root>/games/<TITLE_ID>`, set to the resolved custom path when imported with `--game-dir` or moved with `move-game`).
 
 **Schema.** `version` is the schema version; this engine writes and reads version 1 (a missing `version` counts as 1). A `library.json` with a higher `version` is refused with `io` ("library version N is newer than this engine supports") and is never overwritten. Fields the engine does not know, at the top level or in a game, are kept: the engine writes them back unchanged when it saves (key order may change), and a reinstalled game keeps its own. So the app may add fields of its own; it should bump `version` only for a change an older engine must not misread.
 

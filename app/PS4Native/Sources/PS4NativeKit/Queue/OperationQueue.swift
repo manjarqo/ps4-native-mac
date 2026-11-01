@@ -5,7 +5,7 @@ import Observation
 /// One import, analysis or build in the `EngineOperationQueue`.
 public struct OperationItem: Identifiable, Sendable, Equatable {
     public enum Kind: Sendable, Equatable {
-        case importGame, analyze, build
+        case importGame, moveGame, analyze, build
     }
 
     public enum State: Sendable, Equatable {

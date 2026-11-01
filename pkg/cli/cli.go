@@ -63,7 +63,8 @@ Usage:
   ps4-recomp build [flags] <eboot.bin | input.elf>
   ps4-recomp analyze <eboot.bin | input.elf | module.prx>
   ps4-recomp inspect <pkg | folder> [--json]
-  ps4-recomp import <pkg | folder> --library <dir> [--mode copy|reference] [--json]
+  ps4-recomp import <pkg | folder> --library <dir> [--mode copy|reference] [--game-dir <dir>] [--json]
+  ps4-recomp move-game <TITLE_ID> <dest> --library <dir> [--json]
   ps4-recomp analyze-game <content dir> [--json]
   ps4-recomp version [--json]
 

@@ -108,9 +108,9 @@ public extension FakeEngine {
         try await replay(EngineCommand.inspect(src), fixture: fixture, log: nil) { _ in }.result(InspectResult.self)
     }
 
-    func importGame(_ src: URL, library: URL, mode: ImportMode, log: URL?, fixture: String,
+    func importGame(_ src: URL, library: URL, mode: ImportMode, gameDir: URL? = nil, log: URL?, fixture: String,
                     onEvent: @escaping @Sendable (EngineEvent) -> Void) async throws -> ImportResult {
-        try await replay(EngineCommand.importGame(src, library: library, mode: mode), fixture: fixture,
+        try await replay(EngineCommand.importGame(src, library: library, mode: mode, gameDir: gameDir), fixture: fixture,
                          log: log, onEvent: onEvent).result(ImportResult.self)
     }
 

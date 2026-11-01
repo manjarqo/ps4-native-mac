@@ -18,8 +18,18 @@ public struct AddCandidate: Identifiable, Sendable, Equatable {
     let hasEboot: Bool
     /// The import mode the sheet preselects; always `copy` for a PKG.
     public internal(set) var mode: ImportMode
+    /// Optional custom directory for the game and its build; nil uses the default library games/<TITLE_ID>.
+    public internal(set) var destination: URL? = nil
+    /// Free bytes on `destination`'s volume when a custom destination is set.
+    public internal(set) var destinationFreeBytes: Int64? = nil
 
     public var isFolder: Bool { inspect?.kind == "folder" }
+
+    /// Base games (PKG or folder) can be placed in a custom game & build directory; updates and DLC
+    /// are installed into the base game's existing directory.
+    public var canChooseDestination: Bool {
+        inspect?.kind == "game" || inspect?.kind == "folder"
+    }
 
     /// What the import needs on the library volume: the unpacked size (nothing for a folder
     /// used in place) plus 1 GiB.
@@ -97,14 +107,36 @@ extension AppModel {
         pendingCandidates[i].mode = mode
     }
 
+    /// Sets or resets (when `destination` is nil) the custom game & build directory for a candidate.
+    public func setDestination(_ destination: URL?, for id: AddCandidate.ID) {
+        guard let i = pendingCandidates.firstIndex(where: { $0.id == id }),
+              pendingCandidates[i].canChooseDestination else { return }
+        pendingCandidates[i].destination = destination
+        pendingCandidates[i].destinationFreeBytes = destination.map(freeSpace)
+    }
+
+    /// The resolved `<gameDir>` where the candidate will live (its `content/` and `build/`).
+    public func targetGameDir(for c: AddCandidate) -> URL? {
+        guard let titleID = c.inspect?.titleID, TitleID.isValid(titleID) else { return c.destination }
+        if let dest = c.destination {
+            return LibraryStore.resolveGameDir(destination: dest, titleID: titleID)
+        }
+        return try? library.gameDir(titleID: titleID)
+    }
+
+    /// Free bytes on the candidate's target volume (custom destination volume or default library volume).
+    public func availableBytes(for c: AddCandidate) -> Int64 {
+        c.destinationFreeBytes ?? libraryFreeBytes
+    }
+
     /// Takes a candidate off the add sheet without importing it.
     public func dismiss(_ id: AddCandidate.ID) {
         pendingCandidates.removeAll { $0.id == id }
     }
 
-    /// True when the import needs more than the library volume has free.
+    /// True when the import needs more than the target volume has free.
     public func spaceShort(_ c: AddCandidate) -> Bool {
-        c.neededBytes > libraryFreeBytes
+        c.neededBytes > availableBytes(for: c)
     }
 
     /// Queues the import of a candidate. When it succeeds, a game or patch that was applied is
@@ -120,12 +152,13 @@ extension AppModel {
         if let titleID, launcher.running[titleID] != nil || uninstalling.contains(titleID) || hasActiveBuild(titleID) {
             throw AppError.busy(titleID)
         }
+        let customGameDir = c.canChooseDestination ? c.destination : nil
         pendingCandidates.removeAll { $0.id == c.id }
         Task { await measureFreeSpace() }
         let log = importLogURL(titleID)
         let engine = engine, root = library.root, url = c.url
         queue.enqueue(kind: .importGame, title: inspect.title, titleID: titleID, log: log) { [weak self] progress in
-            let result = try await engine.importGame(url, library: root, mode: mode, log: log, onEvent: progress)
+            let result = try await engine.importGame(url, library: root, mode: mode, gameDir: customGameDir, log: log, onEvent: progress)
             await self?.imported(result)
         }
     }
@@ -134,8 +167,12 @@ extension AppModel {
     /// yet), with "-2", "-3", ... added while a queued operation or a file already has the name:
     /// "Import all" confirms several items in one second, and each import keeps its own log.
     func importLogURL(_ titleID: String?) -> URL {
+        operationLogURL(kind: "import", titleID: titleID)
+    }
+
+    func operationLogURL(kind: String, titleID: String?) -> URL {
         let dir = library.root.appendingPathComponent("logs", isDirectory: true)
-        let base = "\(Self.stamp())-import-\(titleID ?? "game")"
+        let base = "\(Self.stamp())-\(kind)-\(titleID ?? "game")"
         let taken = Set(queue.items.map(\.log.lastPathComponent))
         var n = 1
         while true {

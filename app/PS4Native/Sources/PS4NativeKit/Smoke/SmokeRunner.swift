@@ -211,6 +211,11 @@ public struct SmokeRunner {
         let engine = FakeEngine(fixtures: fixtures, substitutions: [
             "$LIB": library.root.path, "$SRC": source.path, "$TMP": temp.path,
         ])
+        engine.setScript("move-game", lines: [
+            #"{"event":"progress","op":"move-game","stage":"move","done":0,"total":1,"unit":"stages","message":"moving"}"#,
+            #"{"event":"progress","op":"move-game","stage":"move","done":1,"total":1,"unit":"stages","message":"moved"}"#,
+            #"{"event":"done","op":"move-game","result":{"title_id":"CUSA00557","from_dir":"$LIB/games/CUSA00557","game_dir":"$TMP/CUSA00557"}}"#,
+        ], exitOK: true)
         engine.afterRun = { arguments, doneLine in
             try await sideEffects(of: arguments, doneLine: doneLine, library: library)
         }
@@ -231,6 +236,10 @@ public struct SmokeRunner {
         case "import":
             let result = try JSONDecoder().decode(Done<ImportResult>.self, from: doneLine).result
             guard let imported = try result.gameRecord else { return }
+            let customDest: URL? = {
+                guard let idx = arguments.firstIndex(of: "--game-dir"), idx + 1 < arguments.count else { return nil }
+                return URL(fileURLWithPath: arguments[idx + 1], isDirectory: true)
+            }()
             try await library.update { file in
                 var record = imported
                 // The engine keeps the app's fields of a game already in the library.
@@ -238,15 +247,47 @@ public struct SmokeRunner {
                     record.builtWith = old.builtWith
                     record.lastPlayed = old.lastPlayed
                     record.playSeconds = old.playSeconds
+                    if record.gameDir.isEmpty { record.gameDir = old.gameDir }
+                }
+                if let customDest {
+                    let resolved = LibraryStore.resolveGameDir(destination: customDest, titleID: record.titleID)
+                    let def = try library.defaultGameDir(titleID: record.titleID)
+                    record.gameDir = resolved.standardizedFileURL.path == def.standardizedFileURL.path ? "" : resolved.path
                 }
                 file.games.removeAll { $0.titleID == record.titleID }
                 file.games.append(record)
             }
+        case "move-game":
+            guard arguments.count >= 3 else { return }
+            let titleID = arguments[1]
+            let destURL = URL(fileURLWithPath: arguments[2], isDirectory: true)
+            let oldDir = try library.gameDir(titleID: titleID)
+            let defDir = try library.defaultGameDir(titleID: titleID)
+            let newDir = LibraryStore.resolveGameDir(destination: destURL, titleID: titleID)
+            let fm = FileManager.default
+            if fm.fileExists(atPath: oldDir.path), oldDir.standardizedFileURL.path != newDir.standardizedFileURL.path {
+                try fm.createDirectory(at: newDir.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if fm.fileExists(atPath: newDir.path) {
+                    try fm.removeItem(at: newDir)
+                }
+                try fm.moveItem(at: oldDir, to: newDir)
+            }
+            try await library.update { file in
+                guard let i = file.games.firstIndex(where: { $0.titleID == titleID }) else { return }
+                file.games[i].gameDir = newDir.standardizedFileURL.path == defDir.standardizedFileURL.path ? "" : newDir.path
+            }
         case "build":
             let result = try JSONDecoder().decode(Done<BuildResult>.self, from: doneLine).result
             guard let app = result.app else { return }
-            let version = try library.snapshot().games.first { $0.titleID == result.titleID }?.appVer ?? ""
-            try writeBundle(at: URL(fileURLWithPath: app, isDirectory: true), version: version)
+            let record = try library.snapshot().games.first { $0.titleID == result.titleID }
+            let version = record?.appVer ?? ""
+            let targetApp: URL
+            if let idx = arguments.firstIndex(of: "-o"), idx + 1 < arguments.count {
+                targetApp = URL(fileURLWithPath: arguments[idx + 1], isDirectory: true).appendingPathComponent("eboot.app", isDirectory: true)
+            } else {
+                targetApp = URL(fileURLWithPath: app, isDirectory: true)
+            }
+            try writeBundle(at: targetApp, version: version)
         default:
             break
         }
