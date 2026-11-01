@@ -903,6 +903,10 @@ public:
     // aliases it, presentation finds it). Reuses a render target at the same address when the
     // texel size matches. Usage includes ShaderRead|ShaderWrite|RenderTarget|PixelFormatView.
     id<MTLTexture> GetStorageTexture(const ImageDesc& img, bool guest_write_pending = false);
+    // Ensures any cached GPU color target backing `img` has the required Metal texture usages
+    // (ShaderWrite for storage binds, PixelFormatView for cross-family format views) before a
+    // render/compute pass begins.
+    void EnsureColorTargetUsage(const ImageDesc& img, bool is_storage);
 
     // GPU-side copies of whole surfaces (e.g. a compute shader copying a depth buffer through
     // buffer loads/stores, shadPS4 Rasterizer::IsComputeImageCopy): find the GPU-owned texture at
@@ -911,6 +915,12 @@ public:
     // dst_addr (an exactly known write, see NoteExactWrite).
     bool CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, uint64_t written_bytes, id<MTLTexture>* src,
                          id<MTLTexture>* dst, int* kind_out);
+    // GPU-side clear of a whole color surface via a compute shader (shadPS4 Rasterizer::IsComputeImageClear):
+    // finds the cached single-sample 2D GPU color target at `dst_addr` whose guest allocation size matches
+    // `written_bytes`, unmarks any pending guest-newer state, credits the exact write, and returns its
+    // texture and raw format so the caller can clear it via a render pass load action.
+    id<MTLTexture> FindColorTargetForClear(uint64_t dst_addr, uint64_t written_bytes, DataFormat* dfmt_out,
+                                           NumberFormat* nfmt_out);
 
     // Debugging: visit every GPU-owned texture (kind: 1 color/storage, 2 depth).
     void ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<MTLTexture> tex)) const;
@@ -1008,6 +1018,7 @@ private:
     struct Entry;
     bool UploadLocked(Entry* e);
     bool UploadLockedImpl(Entry* e);
+    bool UpgradeEntryUsageLocked(Entry* e, MTLTextureUsage needed);
     bool ComputeGuestDigestLocked(Entry* e, uint64_t* out);
     id<MTLTexture> GetTextureImpl(const ImageDesc& img, const uint64_t* gpu_epochs, GpuUpload* up,
                                   uint64_t refresh_min_bytes = 0);

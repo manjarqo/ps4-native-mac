@@ -370,7 +370,6 @@ static void HandleWriteData(GuestContext *ctx, const uint32_t *p, uint32_t paylo
     if (ndw == 0) return;
     uint32_t *dst = (uint32_t *)GuestMemPtr(ctx, dst_addr & ~3ULL, wr_one_addr ? 4 : (size_t)ndw * 4);
     if (!dst) return;
-    SyncGpu(3); // previously encoded GPU work may still read the old contents
     ps4draw::NotifyGuestWrite(dst_addr & ~3ULL, wr_one_addr ? 4 : (uint64_t)ndw * 4, false, 0);
     if (wr_one_addr) {
         for (uint32_t w = 0; w < ndw; w++) {
@@ -728,8 +727,7 @@ static bool RunCe(GuestContext *ctx, CeState &ce, bool force) {
             const uint64_t addr = (uint64_t)p[2] | ((uint64_t)p[3] << 32);
             void *dst = GuestMemPtr(ctx, addr, n);
             if (dst && (uint64_t)off + n <= sizeof(g_const_ram)) {
-                // draws encoded earlier may still read the memory being overwritten
-                SyncGpu(5);
+                ps4draw::NotifyGuestWrite(addr, n, false, 0);
                 memcpy(dst, g_const_ram + off, n);
             }
             break;

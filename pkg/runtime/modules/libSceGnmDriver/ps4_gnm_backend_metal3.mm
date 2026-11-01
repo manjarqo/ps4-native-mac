@@ -79,6 +79,12 @@ void Metal3Backend::BeginCmd(GnmCmdTarget t, NSString* label, bool encoder_statu
 void Metal3Backend::CommitUpload() {
     TargetState& u = t_[(int)GnmCmdTarget::Upload];
     if (!u.cmd) return;
+    if (u.renc || u.cenc || u.blit) {
+        const GnmCmdTarget prev = cur_;
+        UseTarget(GnmCmdTarget::Upload);
+        EndEncoder();
+        UseTarget(prev);
+    }
     [u.cmd commit];
     u.cmd = nil;
     commits_.fetch_add(1, std::memory_order_relaxed);
@@ -301,6 +307,11 @@ void Metal3Backend::Draw(const GnmDraw& d) {
 void Metal3Backend::SetStageInRegion(MTLRegion region) {
     TargetState& x = Cur();
     if (x.cenc) [x.cenc setStageInRegion:region];
+}
+
+void Metal3Backend::SetStageInRegionIndirect(id<MTLBuffer> buf, uint64_t offset) {
+    TargetState& x = Cur();
+    if (x.cenc) [x.cenc setStageInRegionWithIndirectBuffer:buf indirectBufferOffset:offset];
 }
 
 void Metal3Backend::SetTessellationFactorBuffer(id<MTLBuffer> buf, uint64_t offset, uint64_t instance_stride) {

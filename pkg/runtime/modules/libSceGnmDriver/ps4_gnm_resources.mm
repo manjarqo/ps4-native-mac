@@ -3339,8 +3339,8 @@ bool TextureCache::UploadLocked(Entry* e) {
 
 bool TextureCache::UploadLockedImpl(Entry* e) {
     if (!e->tex || !mem_base_) return false;
-    // MSAA / private textures cannot be written by the CPU (their contents are GPU-produced)
-    if (e->tex.sampleCount > 1 || e->tex.storageMode == MTLStorageModePrivate) {
+    // MSAA textures and non-Color private textures cannot be written from guest memory
+    if (e->tex.sampleCount > 1 || (e->tex.storageMode == MTLStorageModePrivate && e->kind != Entry::Color)) {
         e->dirty = false;
         e->cpu_check_epoch = cpu_submit_epoch_.load(std::memory_order_relaxed);
         return false;
@@ -3349,13 +3349,36 @@ bool TextureCache::UploadLockedImpl(Entry* e) {
     const PixelFormatInfo pf = GetPixelFormat(e->dfmt, e->nfmt);
     const uint32_t bpe = e->surf.bpp / 8;
     if (bpe == 0) return false;
-    std::vector<uint8_t> lin((size_t)e->layout.total_size);
     const uint64_t max_avail = std::min<uint64_t>(mem_size_ - e->address, e->layout.total_size);
     if (!e->readable_known) {
         e->readable_bytes = ReadablePrefixBytes(mem_base_ + e->address, max_avail);
         e->readable_known = (e->readable_bytes == max_avail);
     }
     const uint64_t avail = e->readable_bytes;
+    if (e->tex.storageMode == MTLStorageModePrivate && e->generation <= 1) {
+        // Newly created Metal private textures are zero-initialized; if the guest range is all
+        // zeros, skip CPU detiling and staging blit completely.
+        const uint8_t* raw = mem_base_ + e->address;
+        const size_t n64 = (size_t)avail / 8;
+        const uint64_t* p64 = reinterpret_cast<const uint64_t*>(raw);
+        bool all_zero = true;
+        for (size_t i = 0; i < n64; ++i) {
+            if (p64[i] != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        for (size_t i = n64 * 8; all_zero && i < (size_t)avail; ++i) {
+            if (raw[i] != 0) all_zero = false;
+        }
+        if (all_zero) {
+            e->dirty = false;
+            e->cpu_unchanged_streak = 0;
+            e->cpu_digest_valid = false;
+            return true;
+        }
+    }
+    std::vector<uint8_t> lin((size_t)e->layout.total_size);
     if (!DetileSurface(e->surf, e->layout, mem_base_ + e->address,
                        (size_t)avail, lin.data(),
                        lin.size(), 0, e->levels, true)) {
@@ -3363,6 +3386,17 @@ bool TextureCache::UploadLockedImpl(Entry* e) {
     }
     const bool is3d = e->tex_type == MTLTextureType3D;
     bool complete = true;
+    id<MTLBuffer> priv_stg = nil;
+    id<MTLCommandBuffer> priv_cb = nil;
+    id<MTLBlitCommandEncoder> priv_bl = nil;
+    if (e->tex.storageMode == MTLStorageModePrivate) {
+        if (!queue_) return false;
+        priv_stg = [device_ newBufferWithBytes:lin.data() length:lin.size() options:MTLResourceStorageModeShared];
+        if (!priv_stg) return false;
+        priv_cb = [queue_ commandBuffer];
+        priv_bl = [priv_cb blitCommandEncoder];
+        if (!priv_bl) return false;
+    }
     for (uint32_t m = 0; m < e->levels; ++m) {
         const MipLayout& ml = e->layout.mips[m];
         const uint32_t w = std::max(1u, e->width >> m), h = std::max(1u, e->height >> m);
@@ -3391,7 +3425,40 @@ bool TextureCache::UploadLockedImpl(Entry* e) {
                     (unsigned long long)e->address, e->tex_type, e->mtl_format, m, w, h, e->depth, e->layers, ml.pitch,
                     ml.height, bpe, ml.offset, lin.size(), (unsigned long)e->tex.width, (unsigned long)e->tex.height,
                     (unsigned long)e->tex.depth, (unsigned long)e->tex.arrayLength);
-        if (is3d) {
+        if (priv_bl) {
+            if (is3d) {
+                const uint32_t d = std::max(1u, e->depth >> m);
+                [priv_bl copyFromBuffer:priv_stg
+                           sourceOffset:ml.offset
+                      sourceBytesPerRow:row
+                    sourceBytesPerImage:img
+                             sourceSize:MTLSizeMake(w, h, d)
+                              toTexture:e->tex
+                       destinationSlice:0
+                       destinationLevel:m
+                      destinationOrigin:MTLOriginMake(0, 0, 0)];
+            } else {
+                uint32_t layers = std::min(e->layers, ml.slices);
+                const NSUInteger tex_slices =
+                    (e->tex.textureType == MTLTextureTypeCube || e->tex.textureType == MTLTextureTypeCubeArray)
+                        ? e->tex.arrayLength * 6
+                        : e->tex.arrayLength;
+                layers = std::min<uint32_t>(layers, (uint32_t)tex_slices);
+                const uint32_t copy_h =
+                    (e->tex_type == MTLTextureType1D || e->tex_type == MTLTextureType1DArray) ? 1 : h;
+                for (uint32_t s = 0; s < layers; ++s) {
+                    [priv_bl copyFromBuffer:priv_stg
+                               sourceOffset:ml.offset + (size_t)s * img
+                          sourceBytesPerRow:row
+                        sourceBytesPerImage:0
+                                 sourceSize:MTLSizeMake(w, copy_h, 1)
+                                  toTexture:e->tex
+                           destinationSlice:s
+                           destinationLevel:m
+                          destinationOrigin:MTLOriginMake(0, 0, 0)];
+                }
+            }
+        } else if (is3d) {
             const uint32_t d = std::max(1u, e->depth >> m);
             [e->tex replaceRegion:MTLRegionMake3D(0, 0, 0, w, h, d)
                       mipmapLevel:m
@@ -3414,6 +3481,10 @@ bool TextureCache::UploadLockedImpl(Entry* e) {
                         bytesPerImage:0];
             }
         }
+    }
+    if (priv_bl) {
+        [priv_bl endEncoding];
+        [priv_cb commit];
     }
     stats.uploads++;
     stats.upload_bytes += e->layout.total_size;
@@ -3479,6 +3550,109 @@ bool TextureCache::DebugCpuUploadInto(const ImageDesc& img, id<MTLTexture> dst) 
         return ok;
     }
     return false;
+}
+
+static MTLPixelFormat SrgbTwinFormat(MTLPixelFormat f) {
+    switch (f) {
+    case MTLPixelFormatR8Unorm: return MTLPixelFormatR8Unorm_sRGB;
+    case MTLPixelFormatR8Unorm_sRGB: return MTLPixelFormatR8Unorm;
+    case MTLPixelFormatRG8Unorm: return MTLPixelFormatRG8Unorm_sRGB;
+    case MTLPixelFormatRG8Unorm_sRGB: return MTLPixelFormatRG8Unorm;
+    case MTLPixelFormatRGBA8Unorm: return MTLPixelFormatRGBA8Unorm_sRGB;
+    case MTLPixelFormatRGBA8Unorm_sRGB: return MTLPixelFormatRGBA8Unorm;
+    case MTLPixelFormatBGRA8Unorm: return MTLPixelFormatBGRA8Unorm_sRGB;
+    case MTLPixelFormatBGRA8Unorm_sRGB: return MTLPixelFormatBGRA8Unorm;
+    default: return MTLPixelFormatInvalid;
+    }
+}
+
+static bool ViewNeedsPixelFormatUsage(MTLPixelFormat base_fmt, MTLPixelFormat view_fmt) {
+    if (view_fmt == MTLPixelFormatInvalid || view_fmt == base_fmt) return false;
+    return view_fmt != SrgbTwinFormat(base_fmt);
+}
+
+bool TextureCache::UpgradeEntryUsageLocked(Entry* e, MTLTextureUsage needed) {
+    if (!e || !e->tex || (e->tex.usage & needed) == needed) return true;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+    td.textureType = e->tex.textureType;
+    td.pixelFormat = e->tex.pixelFormat;
+    td.width = e->tex.width;
+    td.height = e->tex.height;
+    td.depth = e->tex.depth;
+    td.mipmapLevelCount = e->tex.mipmapLevelCount;
+    td.arrayLength = e->tex.arrayLength;
+    td.sampleCount = e->tex.sampleCount;
+    td.storageMode = e->tex.storageMode;
+    td.usage = e->tex.usage | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView | needed;
+    id<MTLTexture> t = NewTextureLocked(td);
+    if (!t) return false;
+    const MTLSize sz = MTLSizeMake(e->tex.width, e->tex.height, e->tex.depth);
+    if (copy_hook_.copy) {
+        copy_hook_.copy(copy_hook_.ctx, e->tex, t, sz);
+    } else if (queue_) {
+        id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+        id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+        [bl copyFromTexture:e->tex toTexture:t];
+        [bl endEncoding];
+        [cb commit];
+    }
+    ReleaseTextureLocked(AliasCopy(e));
+    e->alias = nil;
+    e->alias_key = 0;
+    ReleaseTextureLocked(e->tex);
+    RetireLocked(e->tex);
+    TrackLocked(e, -1);
+    e->tex = t;
+    e->alloc_bytes = (uint64_t)t.allocatedSize;
+    TrackLocked(e, +1);
+    return true;
+}
+
+void TextureCache::EnsureColorTargetUsage(const ImageDesc& img, bool is_storage) {
+    if (!img.valid || img.address == 0 || img.pixel.mtl_format == 0 || img.pixel.compressed || !device_) return;
+    if (!HintNear(img.address, 1)) return;
+    const SurfaceDesc sd = img.ToSurfaceDesc();
+    if (sd.bpp == 0) return;
+    TimedLock lk(mutex_);
+    const bool is3d = img.mtl_texture_type == MTLTextureType3D;
+    const uint32_t width = img.width;
+    const uint32_t height =
+        (img.mtl_texture_type == MTLTextureType1D || img.mtl_texture_type == MTLTextureType1DArray) ? 1 : img.height;
+    const uint32_t depth = is3d ? img.depth : 1;
+    const bool is_array = img.mtl_texture_type == MTLTextureType2DArray ||
+                          img.mtl_texture_type == MTLTextureTypeCube ||
+                          img.mtl_texture_type == MTLTextureTypeCubeArray;
+    const uint32_t layers = is3d ? 1 : (is_array ? std::max(1u, img.num_layers) : 1u);
+    if (is_storage) {
+        const auto holds = [&](const Entry* c) {
+            if (is3d != (c->tex_type == MTLTextureType3D)) return false;
+            if (is3d && (c->width != width || c->height != height || c->depth != depth)) return false;
+            return c->samples == 1 && GetPixelFormat(c->dfmt, c->nfmt).bytes_per_block == img.pixel.bytes_per_block &&
+                   c->width >= width && c->height >= height && c->layers >= layers;
+        };
+        if (Entry* e = LastWrittenLocked(img.address, Entry::Color, holds)) {
+            MTLTextureUsage needed = MTLTextureUsageShaderWrite;
+            if (ViewNeedsPixelFormatUsage((MTLPixelFormat)e->mtl_format, (MTLPixelFormat)img.pixel.mtl_format))
+                needed |= MTLTextureUsagePixelFormatView;
+            UpgradeEntryUsageLocked(e, needed);
+        }
+        return;
+    }
+    SurfaceLayout image_layout{};
+    if (!ComputeSurfaceLayout(sd, &image_layout)) return;
+    const auto texel_fits = [&](const Entry* c) {
+        if (is3d != (c->tex_type == MTLTextureType3D)) return false;
+        if (is3d && (c->width != width || c->height != height || c->depth != depth)) return false;
+        if (GetPixelFormat(c->dfmt, c->nfmt).bytes_per_block != img.pixel.bytes_per_block) return false;
+        return c->size >= image_layout.total_size;
+    };
+    Entry* rt = LastWrittenLocked(img.address, Entry::Color,
+                                  [&](const Entry* c) { return texel_fits(c) && c->width >= width && c->height >= height; });
+    if (!rt) rt = LastWrittenLocked(img.address, Entry::Color, texel_fits);
+    if (rt && rt->width == width && rt->height == height &&
+        ViewNeedsPixelFormatUsage((MTLPixelFormat)rt->mtl_format, (MTLPixelFormat)img.pixel.mtl_format)) {
+        UpgradeEntryUsageLocked(rt, MTLTextureUsagePixelFormatView);
+    }
 }
 
 // gpu_epochs: {write_epoch, upload_epoch} for GetTextureForGpuUpload / GetTextureForGpuRefresh,
@@ -3580,6 +3754,9 @@ id<MTLTexture> TextureCache::GetTextureImpl(const ImageDesc& img, const uint64_t
                                  (first_slice << 6) ^ alias_slices;
             const uint32_t alias_levels = is3d ? levels : 1;
             if (!e->alias || e->alias_key != key || e->alias.mipmapLevelCount != alias_levels) {
+                if (ViewNeedsPixelFormatUsage((MTLPixelFormat)e->mtl_format, (MTLPixelFormat)img.pixel.mtl_format)) {
+                    UpgradeEntryUsageLocked(e, MTLTextureUsagePixelFormatView);
+                }
                 ReleaseTextureLocked(AliasCopy(e)); // a copy this view replaces
                 e->alias = [e->tex newTextureViewWithPixelFormat:(MTLPixelFormat)img.pixel.mtl_format
                                                      textureType:(MTLTextureType)img.mtl_texture_type
@@ -3860,9 +4037,12 @@ id<MTLTexture> TextureCache::GetColorTarget(const ColorTarget& cb, bool load_fro
     td.height = h;
     td.arrayLength = layers;
     td.sampleCount = cb.num_samples;
-    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
-               MTLTextureUsagePixelFormatView;
-    td.storageMode = cb.num_samples > 1 ? MTLStorageModePrivate : SharedOrManaged(device_);
+    const bool large_gpu_rt = cb.num_samples > 1 || (uint64_t)w * h >= 256 * 256;
+    td.usage = large_gpu_rt
+                   ? (MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead)
+                   : (MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                      MTLTextureUsagePixelFormatView);
+    td.storageMode = large_gpu_rt ? MTLStorageModePrivate : SharedOrManaged(device_);
     e->tex = NewTextureLocked(td);
     if (!e->tex) {
         DropEntryLocked(e); // nothing created yet: reports nothing
@@ -3947,7 +4127,10 @@ id<MTLTexture> TextureCache::GetDepthTarget(const DepthTarget& db, id<MTLTexture
     td.height = dh;
     td.arrayLength = db.num_samples > 1 ? 1 : db.num_slices;
     td.sampleCount = db.num_samples;
-    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+               ((MTLPixelFormat)db.mtl_format == MTLPixelFormatDepth32Float_Stencil8
+                    ? MTLTextureUsagePixelFormatView
+                    : 0);
     td.storageMode = MTLStorageModePrivate; // depth contents are not loaded from guest memory
     e->tex = NewTextureLocked(td);
     if (!e->tex) {
@@ -4136,6 +4319,23 @@ bool TextureCache::CloneGpuTexture(uint64_t src_addr, uint64_t dst_addr, uint64_
     ExactWriteLocked(d, dst_addr, dst_addr + written_bytes); // the copy writes exactly these bytes
     if (kind_out) *kind_out = s->kind == Entry::Depth ? 2 : 1;
     return true;
+}
+
+id<MTLTexture> TextureCache::FindColorTargetForClear(uint64_t dst_addr, uint64_t written_bytes, DataFormat* dfmt_out,
+                                                     NumberFormat* nfmt_out) {
+    if (!device_ || !dst_addr || !written_bytes) return nil;
+    TimedLock lk(mutex_);
+    Entry* c = LastWrittenLocked(dst_addr, Entry::Color, [&](const Entry* e) {
+        return e->samples == 1 && e->layers == 1 && e->levels == 1 && e->size == written_bytes &&
+               e->tex.textureType == MTLTextureType2D;
+    });
+    if (!c) return nil;
+    UnmarkLocked(c);
+    c->generation++;
+    ExactWriteLocked(c, dst_addr, dst_addr + written_bytes);
+    if (dfmt_out) *dfmt_out = c->dfmt;
+    if (nfmt_out) *nfmt_out = c->nfmt;
+    return c->tex;
 }
 
 void TextureCache::ForEachGpuTexture(void (^fn)(uint64_t address, int kind, id<MTLTexture> tex)) const {
@@ -4567,6 +4767,10 @@ id<MTLTexture> TextureCache::GetStorageTexture(const ImageDesc& img, bool guest_
                c->width >= width && c->height >= height && c->layers >= layers;
     };
     if (Entry* e = LastWrittenLocked(img.address, Entry::Color, holds)) {
+        MTLTextureUsage needed = MTLTextureUsageShaderWrite;
+        if (ViewNeedsPixelFormatUsage((MTLPixelFormat)e->mtl_format, (MTLPixelFormat)img.pixel.mtl_format))
+            needed |= MTLTextureUsagePixelFormatView;
+        UpgradeEntryUsageLocked(e, needed);
         if (e->mtl_format == img.pixel.mtl_format) {
             e->generation++;
             GpuWroteLocked(e); // stored to: earlier buffer writes no longer describe it
